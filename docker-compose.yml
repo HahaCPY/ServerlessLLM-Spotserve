@@ -1,0 +1,63 @@
+services:
+  # Head Node
+  sllm_head:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: docker.io/serverlessllm/sllm:latest
+    container_name: sllm_head
+    environment:
+      - MODEL_FOLDER=${MODEL_FOLDER}
+      - MODE=HEAD
+      - RAY_NUM_CPUS=4
+      - OMP_NUM_THREADS=1
+      - MKL_NUM_THREADS=1
+      - OPENBLAS_NUM_THREADS=1
+      - NUMEXPR_NUM_THREADS=1
+      - RAYON_NUM_THREADS=1
+      - TOKENIZERS_PARALLELISM=false
+    ports:
+      - "6379:6379"    # Redis port
+      - "8343:8343"    # ServerlessLLM port
+    shm_size: "10gb"
+    pids_limit: 8192
+    networks:
+      - sllm_network
+    command: []
+
+  # Worker Node 0
+  sllm_worker_0:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: docker.io/serverlessllm/sllm:latest
+    container_name: sllm_worker_0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: ["gpu"]
+              device_ids: ["0"] # Assigns GPU 0 to the worker
+    environment:
+      - WORKER_ID=0
+      - STORAGE_PATH=/models
+      - MODE=WORKER
+      - OMP_NUM_THREADS=1
+      - MKL_NUM_THREADS=1
+      - OPENBLAS_NUM_THREADS=1
+      - NUMEXPR_NUM_THREADS=1
+      - RAYON_NUM_THREADS=1
+      - TOKENIZERS_PARALLELISM=false
+    shm_size: "10gb"
+    pids_limit: 8192
+    networks:
+      - sllm_network
+    volumes:
+      - ${MODEL_FOLDER}:/models
+    command: ["--mem-pool-size", "4GB", "--registration-required", "true"] # Customize the memory pool size here
+
+networks:
+  sllm_network:
+    driver: bridge
+    name: sllm

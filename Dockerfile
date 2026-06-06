@@ -20,7 +20,7 @@
 ARG CUDA_VERSION=12.1.1
 #################### BASE BUILD IMAGE ####################
 # prepare basic build environment
-FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu20.04 AS builder
+FROM docker.io/nvidia/cuda:${CUDA_VERSION}-devel-ubuntu20.04 AS builder
 ARG CUDA_VERSION=12.1.1
 ARG PYTHON_VERSION=3.10
 ARG TARGETPLATFORM
@@ -76,7 +76,7 @@ COPY README.md /app/
 RUN conda run -n build python setup.py bdist_wheel
 
 # Stage 2: Runner with conda environments
-FROM pytorch/pytorch:2.3.0-cuda12.1-cudnn8-devel
+FROM docker.io/pytorch/pytorch:2.3.0-cuda12.1-cudnn8-devel
 
 # Set non-interactive installation
 ENV DEBIAN_FRONTEND=noninteractive \
