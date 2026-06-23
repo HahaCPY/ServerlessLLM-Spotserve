@@ -36,7 +36,17 @@ from vllm import (
     SamplingParams,
 )
 from vllm.inputs import TokensPrompt
-from vllm.utils import Counter
+try:
+    from vllm.utils import Counter
+except ImportError:
+    from itertools import count
+
+    class Counter:
+        def __init__(self, start: int = 0):
+            self._counter = count(start)
+
+        def __next__(self) -> int:
+            return next(self._counter)
 
 from sllm.backends.backend_utils import (
     BackendStatus,

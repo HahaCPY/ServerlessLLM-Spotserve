@@ -17,8 +17,10 @@ services:
       - RAYON_NUM_THREADS=1
       - TOKENIZERS_PARALLELISM=false
     ports:
-      - "6379:6379"    # Redis port
-      - "8343:8343"    # ServerlessLLM port
+      # - "6379:6379"    # Redis port
+      - "6380:6379"
+      # - "8343:8343"  
+      - "8344:8343"    # ServerlessLLM port
     shm_size: "10gb"
     pids_limit: 8192
     networks:

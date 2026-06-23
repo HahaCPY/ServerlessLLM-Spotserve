@@ -233,3 +233,31 @@ Icon
 Network Trash Folder
 Temporary Items
 .apdisk
+
+## ServerlessLLM local artifacts ##
+# Local model/cache directories can become very large.
+/model/
+/models/
+/checkpoints/
+/hf_cache/
+/huggingface_cache/
+
+# Common model weight formats.
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.gguf
+
+# Benchmark and experiment outputs.
+/results/
+/ray_results/
+/logs/
+reports/spotserve/runs/
+reports/spotserve/generated/
+
+# Local Docker/env overrides.
+docker-compose.override.yml
+.env.*
+!.env.example
+!.env.sample

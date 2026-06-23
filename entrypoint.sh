@@ -27,16 +27,23 @@ DEFAULT_RAY_NUM_CPUS=20
 DEFAULT_RAY_HEAD_ADDRESS="sllm_head:6379"
 DEFAULT_STORAGE_PATH="/models"
 
-# Source conda
-source /opt/conda/etc/profile.d/conda.sh
+activate_venv() {
+  local venv_path="$1"
+  if [ ! -f "$venv_path/bin/activate" ]; then
+    echo "Virtual environment not found: $venv_path"
+    exit 1
+  fi
+  # shellcheck disable=SC1091
+  source "$venv_path/bin/activate"
+}
 
 # Function to initialize the head node
 initialize_head_node() {
   echo "Initializing head node..."
 
   # Activate head environment
-  echo "Activating head conda environment..."
-  conda activate head
+  echo "Activating head virtual environment..."
+  activate_venv /opt/venvs/head
 
   RAY_PORT="${RAY_PORT:-$DEFAULT_RAY_PORT}"
   RAY_RESOURCES="${RAY_RESOURCES:-$DEFAULT_RAY_RESOURCES_HEAD}"
@@ -67,8 +74,8 @@ initialize_worker_node() {
   echo "Initializing worker node..."
 
   # Activate worker environment
-  echo "Activating worker conda environment..."
-  conda activate worker
+  echo "Activating worker virtual environment..."
+  activate_venv /opt/venvs/worker
 
   # Start the worker
   RAY_HEAD_ADDRESS="${RAY_HEAD_ADDRESS:-$DEFAULT_RAY_HEAD_ADDRESS}"

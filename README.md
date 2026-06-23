@@ -112,19 +112,32 @@ export MODEL_FOLDER=/path/to/models
 docker compose up -d
 
 # Wait for the cluster to be ready
-docker logs -f sllm_head
+# docker logs -f sllm_head
+# Verify the cluster is ready
+docker compose exec -T sllm_head /opt/venvs/head/bin/ray status
+docker compose exec -T sllm_head /opt/venvs/head/bin/sllm status
 ```
 
 ### Deploy a Model
 
 ```bash
-docker exec sllm_head /opt/conda/envs/head/bin/sllm deploy --model Qwen/Qwen3-0.6B --backend transformers
+# docker exec sllm_head /opt/conda/envs/head/bin/sllm deploy --model Qwen/Qwen3-0.6B --backend transformers
+
+docker exec sllm_head /opt/venvs/head/bin/sllm deploy --model Qwen/Qwen3-0.6B --backend transformers
 ```
 
 ### Query the Model
 
 ```bash
-curl http://127.0.0.1:8343/v1/chat/completions \
+# curl http://127.0.0.1:8343/v1/chat/completions \
+#   -H "Content-Type: application/json" \
+#   -d '{
+#     "model": "Qwen/Qwen3-0.6B",
+#     "messages": [{"role": "user", "content": "What is ServerlessLLM?"}],
+#     "temperature": 0.7
+#   }'
+
+curl http://127.0.0.1:8344/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "Qwen/Qwen3-0.6B",
