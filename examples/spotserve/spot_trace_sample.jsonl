@@ -1,0 +1,4 @@
+{"time": 5.0, "event": "preempt", "node_id": "0"}
+{"time": 12.0, "event": "recover", "node_id": "0"}
+{"time": 20.0, "event": "preempt", "instance_id": "example-model_instance-1"}
+{"time": 30.0, "event": "dead", "node_id": "0"}

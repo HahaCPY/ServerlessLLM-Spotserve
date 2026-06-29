@@ -15,8 +15,20 @@
 #  see the license for the specific language governing permissions and         #
 #  limitations under the license.                                              #
 # ---------------------------------------------------------------------------- #
-from .dummy_backend import DummyBackend
-from .transformers_backend import TransformersBackend
-from .vllm_backend import VllmBackend
-
 __all__ = ["DummyBackend", "VllmBackend", "TransformersBackend"]
+
+
+def __getattr__(name):
+    if name == "DummyBackend":
+        from .dummy_backend import DummyBackend
+
+        return DummyBackend
+    if name == "TransformersBackend":
+        from .transformers_backend import TransformersBackend
+
+        return TransformersBackend
+    if name == "VllmBackend":
+        from .vllm_backend import VllmBackend
+
+        return VllmBackend
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

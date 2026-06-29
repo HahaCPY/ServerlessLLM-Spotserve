@@ -16,7 +16,8 @@
 #  limitations under the license.                                              #
 # ---------------------------------------------------------------------------- #
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
 from typing import List, Optional
 
 import ray
@@ -50,6 +51,15 @@ def get_worker_nodes():
     return worker_node_info
 
 
+class InstanceState(str, Enum):
+    STARTING = "starting"
+    READY = "ready"
+    BUSY = "busy"
+    DRAINING = "draining"
+    PREEMPTING = "preempting"
+    DEAD = "dead"
+
+
 @dataclass
 class InstanceStatus:
     instance_id: str
@@ -58,6 +68,7 @@ class InstanceStatus:
     concurrency: int
 
     model_name: Optional[str] = None
+    state: Optional[str] = None
     num_current_tokens: Optional[int] = None
     resuming_latency: Optional[float] = None
 
@@ -72,24 +83,66 @@ class InstanceHandle:
     backend_instance: Optional[ray.actor.ActorHandle] = None
     ready: bool = False
     concurrency: int = 0
+    state: InstanceState = InstanceState.STARTING
 
-    lock: asyncio.Lock = asyncio.Lock()
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    def _can_accept_request_locked(self, num_requests: int = 1) -> bool:
+        if num_requests <= 0:
+            return self.concurrency + num_requests >= 0
+        if not self.ready:
+            return False
+        if self.state in {
+            InstanceState.STARTING,
+            InstanceState.DRAINING,
+            InstanceState.PREEMPTING,
+            InstanceState.DEAD,
+        }:
+            return False
+        return self.concurrency + num_requests <= self.max_queue_length
+
+    async def can_accept_request(self, num_requests: int = 1) -> bool:
+        async with self.lock:
+            return self._can_accept_request_locked(num_requests)
 
     async def add_requests(self, num_requests: int = 1):
         async with self.lock:
-            if not self.ready:
-                return False
-            if (
-                self.concurrency + num_requests > self.max_queue_length
-                or self.concurrency + num_requests < 0
-            ):
+            if not self._can_accept_request_locked(num_requests):
                 return False
             self.concurrency += num_requests
             return True
 
     async def check_request_queue(self):
+        return await self.can_accept_request(1)
+
+    async def mark_ready(self, node_id: Optional[str] = None):
         async with self.lock:
-            return self.concurrency + 1 <= self.max_queue_length
+            if node_id is not None:
+                self.node_id = node_id
+            if self.state in {
+                InstanceState.DRAINING,
+                InstanceState.PREEMPTING,
+                InstanceState.DEAD,
+            }:
+                return False
+            self.ready = True
+            self.state = InstanceState.READY
+            return True
+
+    async def mark_draining(self):
+        async with self.lock:
+            self.ready = False
+            self.state = InstanceState.DRAINING
+
+    async def mark_preempting(self):
+        async with self.lock:
+            self.ready = False
+            self.state = InstanceState.PREEMPTING
+
+    async def mark_dead(self):
+        async with self.lock:
+            self.ready = False
+            self.state = InstanceState.DEAD
 
     async def get_status(self):
         async with self.lock:
@@ -98,4 +151,5 @@ class InstanceHandle:
                 self.node_id,
                 self.num_gpu,
                 self.concurrency,
+                state=self.state.value,
             )

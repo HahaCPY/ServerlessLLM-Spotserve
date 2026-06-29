@@ -29,15 +29,15 @@ def start_instance(
 ):
     logger.info(f"Starting instance {instance_id} with backend {backend}")
     if backend == "vllm":
-        from sllm.backends import VllmBackend
+        from sllm.backends.vllm_backend import VllmBackend
 
         model_backend_cls = VllmBackend
     elif backend == "dummy":
-        from sllm.backends import DummyBackend
+        from sllm.backends.dummy_backend import DummyBackend
 
         model_backend_cls = DummyBackend
     elif backend == "transformers":
-        from sllm.backends import TransformersBackend
+        from sllm.backends.transformers_backend import TransformersBackend
 
         model_backend_cls = TransformersBackend
     else:

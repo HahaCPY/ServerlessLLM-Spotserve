@@ -44,7 +44,7 @@ def start_server(
         # Initialize Ray if not already initialized
         if not ray.is_initialized():
             click.echo("[ℹ] Initializing Ray...")
-            ray.init()
+            ray.init(namespace="sllm")
         else:
             click.echo("[ℹ] Ray already initialized")
 

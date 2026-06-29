@@ -1,0 +1,5 @@
+{"time": 0.0, "request_id": "burst-0001", "messages": [{"role": "user", "content": "Define SpotServe-style recovery."}], "max_tokens": 64, "temperature": 0.7}
+{"time": 0.0, "request_id": "burst-0002", "messages": [{"role": "user", "content": "Explain worker drain policy."}], "max_tokens": 64, "temperature": 0.7}
+{"time": 0.0, "request_id": "burst-0003", "messages": [{"role": "user", "content": "Why should preempting workers stop receiving new requests?"}], "max_tokens": 64, "temperature": 0.7}
+{"time": 1.0, "request_id": "burst-0004", "messages": [{"role": "user", "content": "How should benchmark reports present recovery policies?"}], "max_tokens": 64, "temperature": 0.7}
+{"time": 1.0, "request_id": "burst-0005", "messages": [{"role": "user", "content": "What metrics matter for preemption experiments?"}], "max_tokens": 64, "temperature": 0.7}

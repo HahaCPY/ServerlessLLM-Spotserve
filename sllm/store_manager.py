@@ -365,6 +365,14 @@ class StoreManager:
             logger.info(f"Registering new {model_name}")
 
             backend = model_config.get("backend", None)
+            if backend == "dummy":
+                self.model_info[model_name] = 0
+                logger.info(
+                    f"{model_name} registered as dummy backend; "
+                    "skipping model download and store registration"
+                )
+                return
+
             pretrained_model_name_or_path = backend_config.get(
                 "pretrained_model_name_or_path", None
             )

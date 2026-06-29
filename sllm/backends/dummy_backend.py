@@ -25,7 +25,15 @@ from sllm.logger import init_logger
 
 
 class DummyBackend(SllmBackend):
-    def __init__(self, backend_config: Optional[Dict[str, Any]] = None) -> None:
+    def __init__(
+        self,
+        model_name: str = "dummy-model",
+        backend_config: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if isinstance(model_name, dict) and backend_config is None:
+            backend_config = model_name
+            model_name = "dummy-model"
+        self.model_name = model_name
         self.backend_config = backend_config
 
     def init_backend(self) -> None:
@@ -96,6 +104,35 @@ class DummyBackend(SllmBackend):
         }
 
         return response
+
+    async def encode(self, request_data):
+        model_name = request_data.get("model", "dummy-model")
+        input_data = request_data.get("input", "")
+        if isinstance(input_data, str):
+            inputs = [input_data]
+        else:
+            inputs = list(input_data)
+
+        data = []
+        for index, item in enumerate(inputs):
+            token_count = len(str(item).split())
+            data.append(
+                {
+                    "object": "embedding",
+                    "index": index,
+                    "embedding": [float(token_count), 0.0, 1.0],
+                }
+            )
+
+        return {
+            "object": "list",
+            "model": model_name,
+            "data": data,
+            "usage": {
+                "prompt_tokens": sum(len(str(item).split()) for item in inputs),
+                "total_tokens": sum(len(str(item).split()) for item in inputs),
+            },
+        }
 
     async def shutdown(self):
         pass

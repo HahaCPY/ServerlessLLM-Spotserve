@@ -1,0 +1,22 @@
+{
+  "model": "Qwen/Qwen3-0.6B",
+  "backend": "vllm",
+  "num_gpus": 1,
+  "auto_scaling_config": {
+    "metric": "concurrency",
+    "target": 1,
+    "min_instances": 1,
+    "max_instances": 2,
+    "keep_alive": 0
+  },
+  "backend_config": {
+    "pretrained_model_name_or_path": "Qwen/Qwen3-0.6B",
+    "torch_dtype": "float16",
+    "trace_debug": true
+  },
+  "router_config": {
+    "recovery_policy": "generated_token_replay",
+    "max_retries": 2,
+    "metrics_path": "results/spotserve/vllm-spot-metrics.jsonl"
+  }
+}

@@ -143,16 +143,24 @@ class SllmController:
             error_message = e.args[0]
             raise RuntimeError(f"{error_message}")
         # TODO: put resource requirements in model_config
+        default_num_cpus = 0 if backend == "dummy" else 1
         resource_requirements = {
-            "num_cpus": 1,
+            "num_cpus": model_config.get("num_cpus", default_num_cpus),
             "num_gpus": model_config.get("num_gpus", 0),
         }
-        request_router = self.router_cls.options(
-            name=model_name,
-            namespace="models",
-            num_cpus=1,
-            resources={"control_node": 0.1},
-        ).remote(
+        default_router_num_cpus = 0 if backend == "dummy" else 1
+        router_num_cpus = model_config.get(
+            "router_num_cpus", default_router_num_cpus
+        )
+        router_options = {
+            "name": model_name,
+            "namespace": "models",
+            "num_cpus": router_num_cpus,
+        }
+        if backend != "dummy":
+            router_options["resources"] = {"control_node": 0.1}
+
+        request_router = self.router_cls.options(**router_options).remote(
             model_name,
             resource_requirements,
             backend,
@@ -249,6 +257,71 @@ class SllmController:
                 request_router = self.request_routers[model_name]
             await request_router.update.remote(auto_scaling_config)
         # TODO: update other config (if possible)
+
+    # Controller 層負責把 preemption event 分發給各個 model 的 router。
+    async def handle_preemption(
+        self,
+        node_id: Optional[str] = None,
+        instance_id: Optional[str] = None,
+        model_name: Optional[str] = None,
+    ):
+        if node_id is None and instance_id is None:
+            raise ValueError("Preemption event requires node_id or instance_id")
+
+        async with self.metadata_lock:
+            if model_name is not None:
+                if model_name not in self.request_routers:
+                    raise ValueError(f"Model {model_name} not found")
+                target_routers = {model_name: self.request_routers[model_name]}
+            else:
+                target_routers = dict(self.request_routers)
+
+        results = {}
+        for target_model, request_router in target_routers.items():
+            try:
+                results[target_model] = await (
+                    request_router.handle_preemption.remote(
+                        node_id=node_id, instance_id=instance_id
+                    )
+                )
+            except Exception as e:
+                logger.error(
+                    f"Failed to handle preemption for model {target_model}: {e}"
+                )
+                results[target_model] = {"error": str(e)}
+        return results
+
+    async def handle_instance_dead(
+        self,
+        node_id: Optional[str] = None,
+        instance_id: Optional[str] = None,
+        model_name: Optional[str] = None,
+    ):
+        if node_id is None and instance_id is None:
+            raise ValueError("Dead event requires node_id or instance_id")
+
+        async with self.metadata_lock:
+            if model_name is not None:
+                if model_name not in self.request_routers:
+                    raise ValueError(f"Model {model_name} not found")
+                target_routers = {model_name: self.request_routers[model_name]}
+            else:
+                target_routers = dict(self.request_routers)
+
+        results = {}
+        for target_model, request_router in target_routers.items():
+            try:
+                results[target_model] = await (
+                    request_router.handle_dead.remote(
+                        node_id=node_id, instance_id=instance_id
+                    )
+                )
+            except Exception as e:
+                logger.error(
+                    f"Failed to handle dead event for model {target_model}: {e}"
+                )
+                results[target_model] = {"error": str(e)}
+        return results
 
     async def exists(self, model_name: str):
         async with self.metadata_lock:

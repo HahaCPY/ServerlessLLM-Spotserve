@@ -79,6 +79,7 @@ COPY sllm/ft_backends /app/sllm/ft_backends
 COPY sllm/cli /app/sllm/cli
 COPY sllm/routers /app/sllm/routers
 COPY sllm/schedulers /app/sllm/schedulers
+COPY sllm/spot /app/sllm/spot
 COPY sllm/*.py /app/sllm/
 COPY README.md /app/
 RUN conda run -n build python setup.py bdist_wheel

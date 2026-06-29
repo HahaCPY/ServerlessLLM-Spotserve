@@ -1,0 +1,32 @@
+{
+  "endpoint": "http://127.0.0.1:8344/v1/chat/completions",
+  "output_dir": "results/spotserve",
+  "runs": [
+    {
+      "name": "dummy-no-preemption",
+      "model": "dummy-none",
+      "backend": "dummy",
+      "policy": "none",
+      "workload": "benchmarks/spotserve/workloads/smoke.jsonl",
+      "trace": null
+    },
+    {
+      "name": "dummy-naive-retry",
+      "model": "dummy-naive-retry",
+      "backend": "dummy",
+      "policy": "naive_retry",
+      "max_retries": 2,
+      "workload": "benchmarks/spotserve/workloads/smoke.jsonl",
+      "trace": "examples/spotserve/spot_trace_sample.jsonl"
+    },
+    {
+      "name": "dummy-token-replay",
+      "model": "dummy-token-replay",
+      "backend": "dummy",
+      "policy": "generated_token_replay",
+      "max_retries": 2,
+      "workload": "benchmarks/spotserve/workloads/smoke.jsonl",
+      "trace": "examples/spotserve/spot_trace_sample.jsonl"
+    }
+  ]
+}
