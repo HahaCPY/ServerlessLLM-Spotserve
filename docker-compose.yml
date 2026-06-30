@@ -34,6 +34,8 @@ services:
       dockerfile: Dockerfile
     image: docker.io/serverlessllm/sllm:latest
     container_name: sllm_worker_0
+    devices:
+      - "nvidia.com/gpu=all"
     deploy:
       resources:
         reservations:
@@ -45,6 +47,8 @@ services:
       - WORKER_ID=0
       - STORAGE_PATH=/models
       - MODE=WORKER
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - OMP_NUM_THREADS=1
       - MKL_NUM_THREADS=1
       - OPENBLAS_NUM_THREADS=1

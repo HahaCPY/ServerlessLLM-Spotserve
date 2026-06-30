@@ -111,6 +111,32 @@ def matching_router_request_metrics(
     )
 
 
+def metrics_in_request_window(
+    metric_rows: List[Dict[str, Any]], request_rows: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    if not request_rows:
+        return []
+
+    first_sent = min(
+        (float(row.get("sent_at", 0.0)) for row in request_rows),
+        default=0.0,
+    )
+    last_done = max(
+        (float(row.get("completed_at", 0.0)) for row in request_rows),
+        default=0.0,
+    )
+    if not first_sent or not last_done:
+        return []
+
+    window_start = first_sent - 5.0
+    window_end = last_done + 5.0
+    return [
+        row
+        for row in metric_rows
+        if window_start <= float(row.get("timestamp", 0.0)) <= window_end
+    ]
+
+
 def summarize_router_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     failed_attempts_total = sum(
         int(row.get("failed_attempts", 0) or 0) for row in rows
@@ -155,6 +181,25 @@ def summarize_router_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def summarize_instance_state_metrics(
+    rows: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    instance_rows = [
+        row for row in rows if row.get("type") == "instance_state"
+    ]
+
+    def count_to(state: str) -> int:
+        return sum(1 for row in instance_rows if row.get("to") == state)
+
+    return {
+        "instance_state_rows": len(instance_rows),
+        "instances_marked_preempting": count_to("preempting"),
+        "instances_marked_ready": count_to("ready"),
+        "instances_marked_dead": count_to("dead"),
+        "instances_marked_draining": count_to("draining"),
+    }
+
+
 def analyze_run(run_dir: Path) -> Dict[str, Any]:
     metadata_path = run_dir / "run_metadata.json"
     metadata = (
@@ -170,9 +215,15 @@ def analyze_run(run_dir: Path) -> Dict[str, Any]:
         run_dir,
     )
     router_request_rows = []
+    router_metric_rows = []
+    router_metric_rows_in_window = []
     if router_metrics_path is not None:
+        router_metric_rows = read_jsonl(router_metrics_path)
+        router_metric_rows_in_window = metrics_in_request_window(
+            router_metric_rows, request_rows
+        )
         router_request_rows = matching_router_request_metrics(
-            read_jsonl(router_metrics_path), request_rows
+            router_metric_rows_in_window, request_rows
         )
         if router_request_rows:
             with (run_dir / "router_request_metrics.jsonl").open(
@@ -192,6 +243,7 @@ def analyze_run(run_dir: Path) -> Dict[str, Any]:
         ),
         **summarize_requests(request_rows),
         **summarize_router_metrics(router_request_rows),
+        **summarize_instance_state_metrics(router_metric_rows_in_window),
     }
     (run_dir / "summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True),

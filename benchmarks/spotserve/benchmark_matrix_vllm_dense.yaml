@@ -1,0 +1,44 @@
+{
+  "endpoint": "http://127.0.0.1:8344/v1/chat/completions",
+  "output_dir": "results/spotserve_vllm_dense",
+  "runs": [
+    {
+      "name": "vllm-dense-no-preemption",
+      "model": "vllm-dense-baseline",
+      "backend": "vllm",
+      "policy": "none",
+      "workload": "benchmarks/spotserve/workloads/vllm_dense_trace.jsonl",
+      "trace": null,
+      "router_metrics_path": "/tmp/spotserve-work/results/spotserve_vllm_dense/vllm-dense-baseline-router.jsonl"
+    },
+    {
+      "name": "vllm-dense-preemption-none",
+      "model": "vllm-dense-none",
+      "backend": "vllm",
+      "policy": "none",
+      "workload": "benchmarks/spotserve/workloads/vllm_dense_trace.jsonl",
+      "trace": "examples/spotserve/spot_trace_vllm_dense_none.jsonl",
+      "router_metrics_path": "/tmp/spotserve-work/results/spotserve_vllm_dense/vllm-dense-none-router.jsonl"
+    },
+    {
+      "name": "vllm-dense-naive-retry",
+      "model": "vllm-dense-naive-retry",
+      "backend": "vllm",
+      "policy": "naive_retry",
+      "max_retries": 2,
+      "workload": "benchmarks/spotserve/workloads/vllm_dense_trace.jsonl",
+      "trace": "examples/spotserve/spot_trace_vllm_dense_naive_retry.jsonl",
+      "router_metrics_path": "/tmp/spotserve-work/results/spotserve_vllm_dense/vllm-dense-naive-retry-router.jsonl"
+    },
+    {
+      "name": "vllm-dense-token-replay",
+      "model": "vllm-dense-token-replay",
+      "backend": "vllm",
+      "policy": "generated_token_replay",
+      "max_retries": 2,
+      "workload": "benchmarks/spotserve/workloads/vllm_dense_trace.jsonl",
+      "trace": "examples/spotserve/spot_trace_vllm_dense_token_replay.jsonl",
+      "router_metrics_path": "/tmp/spotserve-work/results/spotserve_vllm_dense/vllm-dense-token-replay-router.jsonl"
+    }
+  ]
+}

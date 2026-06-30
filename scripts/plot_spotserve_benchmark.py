@@ -93,6 +93,19 @@ def render_report(run_dir: Path) -> None:
     replay_succeeded = int(
         summary.get("replay_succeeded_requests", 0) or 0
     )
+    instance_state_rows = int(summary.get("instance_state_rows", 0) or 0)
+    instances_marked_preempting = int(
+        summary.get("instances_marked_preempting", 0) or 0
+    )
+    instances_marked_ready = int(
+        summary.get("instances_marked_ready", 0) or 0
+    )
+    instances_marked_dead = int(
+        summary.get("instances_marked_dead", 0) or 0
+    )
+    instances_marked_draining = int(
+        summary.get("instances_marked_draining", 0) or 0
+    )
 
     html_report = f"""<!doctype html>
 <html lang="en">
@@ -158,6 +171,20 @@ def render_report(run_dir: Path) -> None:
     </tr>
   </table>
 
+  <h2>Instance State Metrics</h2>
+  <table class="summary">
+    <tr>
+      <th>Instance Events</th><th>Preempting</th><th>Ready</th><th>Dead</th><th>Draining</th>
+    </tr>
+    <tr>
+      <td>{instance_state_rows}</td>
+      <td>{instances_marked_preempting}</td>
+      <td>{instances_marked_ready}</td>
+      <td>{instances_marked_dead}</td>
+      <td>{instances_marked_draining}</td>
+    </tr>
+  </table>
+
   <div class="card">
     <h2>Key Metrics</h2>
     {svg_bar("Success rate (%)", success_rate, max_bar, color)}
@@ -197,6 +224,12 @@ def render_report(run_dir: Path) -> None:
 | Router Metrics Rows | Triggered Requests | Failed Attempts | Retry Count | Recovered Tokens | Fallbacks | Replay Succeeded |
 |---:|---:|---:|---:|---:|---:|---:|
 | {summary.get("router_metrics_rows", 0)} | {recovery_triggered} | {failed_attempts} | {retry_count} | {recovered_tokens} | {recovery_fallbacks} | {replay_succeeded} |
+
+## Instance State Metrics
+
+| Instance Events | Preempting | Ready | Dead | Draining |
+|---:|---:|---:|---:|---:|
+| {instance_state_rows} | {instances_marked_preempting} | {instances_marked_ready} | {instances_marked_dead} | {instances_marked_draining} |
 
 Open `report.html` for the visual report.
 """

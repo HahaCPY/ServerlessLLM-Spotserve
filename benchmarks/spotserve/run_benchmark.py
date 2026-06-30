@@ -18,6 +18,11 @@ class TraceProcess(NamedTuple):
     log_path: Path
 
 
+class TraceTask(NamedTuple):
+    task: asyncio.Task
+    log_path: Path
+
+
 def load_config(path: Path) -> Dict[str, Any]:
     text = path.read_text(encoding="utf-8")
     try:
@@ -200,7 +205,7 @@ async def send_workload(
     return await asyncio.gather(*tasks)
 
 
-def start_trace_replayer(
+def start_ray_trace_replayer(
     trace_path: Optional[str],
     speedup: float,
     log_path: Path,
@@ -243,6 +248,109 @@ def start_trace_replayer(
     return TraceProcess(process=process, log_file=log_file, log_path=log_path)
 
 
+async def replay_trace_over_http(
+    trace_path: str,
+    speedup: float,
+    endpoint: str,
+    log_path: Path,
+    timeout_s: float,
+) -> None:
+    from sllm.spot.trace_reader import load_spot_trace
+
+    if speedup <= 0:
+        raise ValueError("speedup must be positive")
+
+    events = load_spot_trace(trace_path)
+    spot_endpoint = f"{base_url_from_chat_endpoint(endpoint)}/spot/event"
+    replay_started_at = time.monotonic()
+    last_event_time = 0.0
+
+    with log_path.open("w", encoding="utf-8") as log_file:
+        log_file.write(
+            "HTTP trace replay started: "
+            f"trace={trace_path}, events={len(events)}, endpoint={spot_endpoint}\n"
+        )
+        log_file.flush()
+        for event in events:
+            sleep_time = max(event.time - last_event_time, 0.0) / speedup
+            if sleep_time > 0:
+                await asyncio.sleep(sleep_time)
+            payload = {
+                "event": event.event,
+                "node_id": event.node_id,
+                "instance_id": event.instance_id,
+                "model_name": event.model_name,
+            }
+            log_file.write(f"Replaying spot event: {payload}\n")
+            log_file.flush()
+            result = await asyncio.to_thread(
+                post_json, spot_endpoint, payload, timeout_s
+            )
+            log_file.write(f"Spot event result: {json.dumps(result)}\n")
+            log_file.flush()
+            if not result.get("success"):
+                raise RuntimeError(
+                    f"Spot event replay failed for {payload}: "
+                    f"{result.get('response')}"
+                )
+            last_event_time = event.time
+        log_file.write(
+            "HTTP trace replay finished: "
+            f"elapsed_s={time.monotonic() - replay_started_at:.3f}\n"
+        )
+
+
+def start_http_trace_replayer(
+    trace_path: Optional[str],
+    speedup: float,
+    endpoint: str,
+    log_path: Path,
+    timeout_s: float,
+) -> Optional[TraceTask]:
+    if not trace_path:
+        return None
+    task = asyncio.create_task(
+        replay_trace_over_http(
+            trace_path=trace_path,
+            speedup=speedup,
+            endpoint=endpoint,
+            log_path=log_path,
+            timeout_s=timeout_s,
+        )
+    )
+    return TraceTask(task=task, log_path=log_path)
+
+
+async def wait_trace_replayer(trace_replayer) -> None:
+    if trace_replayer is None:
+        return
+    if isinstance(trace_replayer, TraceProcess):
+        try:
+            trace_replayer.process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            trace_replayer.process.terminate()
+            trace_replayer.process.wait(timeout=5)
+        finally:
+            trace_replayer.log_file.close()
+        if trace_replayer.process.returncode not in (0, None):
+            print(
+                "[benchmark trace warning] Trace replayer exited with "
+                f"code {trace_replayer.process.returncode}; see "
+                f"{trace_replayer.log_path}",
+                file=sys.stderr,
+            )
+        return
+
+    try:
+        await trace_replayer.task
+    except Exception as exc:
+        print(
+            "[benchmark trace warning] HTTP trace replayer failed: "
+            f"{exc}; see {trace_replayer.log_path}",
+            file=sys.stderr,
+        )
+
+
 def write_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
     with path.open("w", encoding="utf-8") as jsonl_file:
         for row in rows:
@@ -259,6 +367,7 @@ async def run_one(
     ray_address: str = "auto",
     ray_namespace: str = "sllm",
     controller_name: str = "controller",
+    trace_transport: str = "http",
 ) -> Path:
     run_id = (
         f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_"
@@ -279,36 +388,31 @@ async def run_one(
     )
 
     workload = load_jsonl(Path(run_config["workload"]))
-    trace_process = None
+    trace_replayer = None
     if not skip_trace:
-        trace_process = start_trace_replayer(
-            run_config.get("trace"),
-            speedup,
-            run_dir / "trace_replayer.log",
-            ray_address=ray_address,
-            ray_namespace=ray_namespace,
-            controller_name=controller_name,
-        )
+        if trace_transport == "ray":
+            trace_replayer = start_ray_trace_replayer(
+                run_config.get("trace"),
+                speedup,
+                run_dir / "trace_replayer.log",
+                ray_address=ray_address,
+                ray_namespace=ray_namespace,
+                controller_name=controller_name,
+            )
+        else:
+            trace_replayer = start_http_trace_replayer(
+                run_config.get("trace"),
+                speedup,
+                endpoint,
+                run_dir / "trace_replayer.log",
+                request_timeout_s,
+            )
     try:
         rows = await send_workload(
             endpoint, run_config["model"], workload, request_timeout_s
         )
     finally:
-        if trace_process is not None:
-            try:
-                trace_process.process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                trace_process.process.terminate()
-                trace_process.process.wait(timeout=5)
-            finally:
-                trace_process.log_file.close()
-            if trace_process.process.returncode not in (0, None):
-                print(
-                    "[benchmark trace warning] Trace replayer exited with "
-                    f"code {trace_process.process.returncode}; see "
-                    f"{trace_process.log_path}",
-                    file=sys.stderr,
-                )
+        await wait_trace_replayer(trace_replayer)
 
     for row in rows:
         row["policy"] = run_config.get("policy", "none")
@@ -340,6 +444,7 @@ async def main_async(args):
                 ray_address=args.ray_address,
                 ray_namespace=args.ray_namespace,
                 controller_name=args.controller_name,
+                trace_transport=args.trace_transport,
             )
         )
 
@@ -371,6 +476,16 @@ async def main_async(args):
                     f"fallbacks="
                     f"{summary.get('recovery_fallback_count', 0)}"
                 )
+            instance_suffix = ""
+            if int(summary.get("instance_state_rows", 0) or 0) > 0:
+                instance_suffix = (
+                    f", instance_events="
+                    f"{summary.get('instance_state_rows', 0)}, "
+                    f"preempting="
+                    f"{summary.get('instances_marked_preempting', 0)}, "
+                    f"ready={summary.get('instances_marked_ready', 0)}, "
+                    f"dead={summary.get('instances_marked_dead', 0)}"
+                )
             print(
                 "  "
                 f"{summary['run_name']}: "
@@ -378,6 +493,7 @@ async def main_async(args):
                 f"success_rate={summary['success_rate']:.2%}, "
                 f"p95={summary['latency_p95_ms']:.2f}ms"
                 f"{recovery_suffix}"
+                f"{instance_suffix}"
             )
         if all(summary["successes"] == 0 for summary in summaries):
             print(
@@ -398,7 +514,16 @@ def main():
     parser.add_argument(
         "--skip-trace",
         action="store_true",
-        help="Do not start the Ray trace replayer subprocess",
+        help="Do not replay spot trace events",
+    )
+    parser.add_argument(
+        "--trace-transport",
+        choices=["http", "ray"],
+        default="http",
+        help=(
+            "How to replay spot traces. The default HTTP mode posts events "
+            "to the SLLM API and avoids starting an extra Ray driver."
+        ),
     )
     parser.add_argument(
         "--ray-address",

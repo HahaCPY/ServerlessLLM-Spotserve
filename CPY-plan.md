@@ -287,877 +287,304 @@ vLLM path 要保守解讀：
 
 ---
 
-# Version 5: vLLM MoE Black-box Integration
+
+# Version 5: Dynamic Reparallelization Planner
 
 ## Goal
 
-Version 5 接大鼻提供的 vLLM + MoE config。
+Version 5 begins implementing the first core idea of SpotServe:
 
-這一版仍然維持 black-box boundary：
+> Dynamic Reparallelization
 
-> CPY 不改 MoE expert dispatch，不改 vLLM MoE router，不改 CUDA kernel。
+When GPU resources change because of spot preemption, generate a new deployment configuration based on the remaining available GPUs. This version focuses on the planning layer and does not rebuild vLLM workers.
 
-Version 5 要回答：
+## Implemented
 
-> ServerlessLLM + SpotServe control plane 能不能包住 vLLM MoE worker，並在 preemption trace 下完成 retry / recovery benchmark？
+- GPU availability tracking
+- Parallel configuration schema
+- Candidate configuration generation
+- Replanning heuristic
+- Replanning metrics
+- Synthetic replanning benchmark
 
-## Important Clarification
-
-Version 5 會「使用 MoE」，但不會「修改 MoE」。
-
-也就是：
-
-```text
-CPY control plane
-→ Router / Retry / Replay / Metrics
-→ vLLM MoE worker
-```
-
-但不碰：
+## Files
 
 ```text
-MoE expert dispatch
-expert placement
-expert migration
-MoE CUDA kernel
-vLLM MoE internal router
+sllm/schedulers/
+sllm/spot/
+benchmarks/spotserve/
 ```
 
-## In Scope
-
-* vLLM MoE worker as black box
-* 大鼻提供的 MoE config
-* single MoE model
-* multiple replicas
-* synthetic trace
-* retry / replay benchmark
-* latency / throughput baseline
-
-## Out Of Scope
-
-* expert-aware scheduling
-* expert placement
-* expert migration
-* MoE kernel optimization
-* KV cache migration
-
-## Tasks
-
-### 1. Integrate 大鼻 config
-
-大鼻提供：
-
-* model name
-* vLLM launch config
-* TP / DP / EP setting
-* `enable_expert_parallel` feasibility
-* API smoke test
-* baseline latency / throughput
-
-CPY 接到：
+## How it works
 
 ```text
-examples/spotserve/config-vllm-moe-*.json
+Spot preemption
+    ↓
+Available GPUs change
+    ↓
+Dynamic replanning planner
+    ↓
+Generate new deployment configuration
 ```
 
-### 2. Run smoke validation
+## Limitations
 
-先只確認：
+- No actual worker rebuild
+- No MoE-specific optimization
+- No KV cache migration
 
-```text
-deploy
-→ one request
-→ response OK
-```
+## Verification
 
-### 3. Run trace benchmark
-
-使用固定 workload / trace：
-
-* steady-low
-* steady-high
-* burst
-
-比較：
-
-* none
-* naive_retry
-* generated_token_replay
-
-### 4. Compare dense vs MoE
-
-報告中新增：
-
-```text
-vLLM dense
-vs
-vLLM MoE
-```
-
-觀察：
-
-* latency
-* p95
-* throughput
-* retry overhead
-* replay fallback rate
-
-## Deliverables
-
-* MoE black-box configs
-* MoE smoke validation
-* MoE trace benchmark report
-* dense vs MoE comparison table
-
-## Definition of Done
-
-* vLLM MoE worker 可 deploy
-* single MoE model + multiple replicas 可跑
-* synthetic trace replay 可完成
-* retry / replay benchmark 有 report
-* 結果中不宣稱 expert-aware behavior，只宣稱 black-box worker recovery behavior
+- Planner generates a valid configuration after GPU loss.
+- Benchmark records replanning decisions.
 
 ---
 
-# Version 6: Dynamic Reparallelization Planner
+# Version 6: Low-cost Context Migration Planner
 
 ## Goal
 
-Version 6 開始對齊 SpotServe 第一個核心：
+Implement the second SpotServe core idea:
 
-> Dynamic reparallelization
+> Low-cost Context Migration
 
-目標是在 GPU availability 改變時，根據目前可用 GPU 數量與 workload，選擇新的 parallel configuration。
+Build a planner that computes the minimum-cost mapping between old workers and new workers. This version computes the mapping only and does not migrate KV cache.
 
-這一版先做 planner，不一定馬上真的重建 vLLM worker。
+## Implemented
 
-## SpotServe Core Mapping
+- Context metadata
+- Cost matrix
+- Worker mapping
+- Hungarian / KM matching
+- Mapping metrics
 
-對應 SpotServe：
-
-```text
-Dynamic reparallelization
-```
-
-## In Scope
-
-* cluster GPU availability tracking
-* model parallel config representation
-* candidate parallel config generation
-* cost model / heuristic ranking
-* synthetic replanning benchmark
-* support dense / MoE config metadata
-
-## Out Of Scope
-
-* actual vLLM internal repartition
-* live expert migration
-* KV cache migration
-* CUDA kernel modification
-
-## Tasks
-
-### 1. Define parallel configuration schema
-
-例如：
-
-```json
-{
-  "tp": 2,
-  "dp": 1,
-  "pp": 1,
-  "ep": 2,
-  "num_gpus": 4
-}
-```
-
-Dense model 可以只用：
+## Files
 
 ```text
-TP / DP / PP
+sllm/spot/
+benchmarks/spotserve/
 ```
 
-MoE model 可以加入：
+## How it works
 
 ```text
-EP
+Old workers
+      +
+New workers
+      ↓
+Cost matrix
+      ↓
+Hungarian / KM
+      ↓
+Best mapping
 ```
 
-### 2. Track available GPU count
+## Limitations
 
-當 trace 發生：
+- No real KV cache migration
+- No expert migration
+- No vLLM internal modification
 
-```text
-preempt node
-dead node
-recover node
-```
+## Verification
 
-系統要知道目前還剩多少可用 GPU。
-
-### 3. Generate candidate configs
-
-例如原本：
-
-```text
-8 GPUs
-TP=4, EP=2
-```
-
-Spot event 後只剩：
-
-```text
-4 GPUs
-```
-
-planner 產生：
-
-```text
-TP=2, EP=2
-TP=4, EP=1
-TP=2, DP=2
-```
-
-### 4. Rank candidate configs
-
-先用簡單 heuristic：
-
-```text
-score = estimated_latency + reload_cost + risk_penalty
-```
-
-Version 6 只需要能選出一個 best config。
-
-### 5. Emit replanning decision
-
-不要急著真的重啟 worker。
-
-先記錄：
-
-```json
-{
-  "event": "reparallelization_decision",
-  "old_config": {"tp": 4, "ep": 2},
-  "new_config": {"tp": 2, "ep": 2},
-  "reason": "node_preempted"
-}
-```
-
-## Deliverables
-
-* parallel config schema
-* dynamic repartition planner
-* replanning metrics
-* synthetic replanning benchmark
-
-## Definition of Done
-
-* GPU availability 改變時，planner 能產生新的 parallel config
-* report 能顯示 old config → new config
-* dense / MoE 都能以 metadata 形式被 planner 處理
-* 不需要真的修改 vLLM internals
+- Produce minimum-cost mapping.
+- Report migration cost and reuse ratio.
 
 ---
 
-# Version 7: Spot-risk-aware Scheduling
+# Version 7: Stateful Inference Recovery
 
 ## Goal
 
-Version 7 在 Version 6 的基礎上加上 risk-aware scheduling。
+Implement the third SpotServe core idea:
 
-Version 2 只做 node health filter：
+> Stateful Inference Recovery
 
-```text
-避開 PREEMPTING / DEAD node
-```
+Extend generated-token replay toward true inference-state recovery.
 
-Version 7 要做：
+## Implemented
 
-```text
-根據 spot risk / remaining lifetime / loading cost 做 placement ranking
-```
+- Backend-independent state interface
+- Dummy state recovery
+- vLLM feasibility study
+- Recovery benchmark
 
-## In Scope
-
-* synthetic spot risk score
-* scheduler ranking
-* storage-aware + spot-aware combined score
-* on-demand fallback placeholder
-* risk-aware benchmark
-
-## Out Of Scope
-
-* real cloud provider integration
-* real spot market prediction
-* production autoscaling
-* expert-aware scheduling
-
-## Tasks
-
-### 1. Add spot risk model
-
-從 trace 或 config 產生 node risk：
-
-```json
-{
-  "node_id": "worker0",
-  "spot_risk": 0.8,
-  "expected_lifetime_s": 120
-}
-```
-
-### 2. Extend scheduler ranking
-
-FCFS scheduler：
+## Files
 
 ```text
-READY node first
-lower risk first
-then FCFS
+sllm/routers/
+sllm/spot/
+benchmarks/spotserve/
 ```
 
-Storage-aware scheduler：
+## How it works
 
 ```text
-score = loading_cost + alpha * spot_risk
+Request interrupted
+        ↓
+Save inference state
+        ↓
+Recover state
+        ↓
+Continue generation
 ```
 
-### 3. Add scheduler policy config
+## Limitations
 
-例如：
+- Production KV migration not implemented
+- CUDA kernels unchanged
 
-```json
-{
-  "scheduler_config": {
-    "spot_aware": true,
-    "risk_weight": 0.5,
-    "on_demand_fallback": false
-  }
-}
-```
+## Verification
 
-### 4. Benchmark scheduler impact
-
-比較：
-
-* node-health-only scheduler
-* spot-risk-aware scheduler
-* storage-aware-only scheduler
-* storage-aware + spot-aware scheduler
-
-## Deliverables
-
-* scheduler risk config
-* FCFS spot-risk ranking
-* storage-aware spot-risk ranking
-* scheduler benchmark report
-
-## Definition of Done
-
-* scheduler 不只避開 dead/preempting node，也能根據 risk 排序
-* benchmark 能比較 health-only vs risk-aware
-* report 能顯示 preemption count、retry count、p95 latency、success rate 是否改善
+- Dummy backend restores inference state.
+- vLLM feasibility documented.
 
 ---
 
-# Version 8: Low-cost Context / Expert Mapping
+# Version 8: Spot-risk-aware Scheduling
 
 ## Goal
 
-Version 8 對齊 SpotServe 第二個核心：
+Extend scheduling with spot-awareness.
 
-> Low-cost context migration
+Instead of only filtering unhealthy nodes, rank nodes using spot risk, remaining lifetime and loading cost.
 
-目標是當 parallel configuration 改變時，選擇一個能最大化 context / expert / worker reuse 的 mapping。
+## Implemented
 
-這一版先做 mapping algorithm，不一定真正搬 KV cache。
+- Spot-risk model
+- Risk-aware scheduling
+- Scheduler benchmark
 
-## SpotServe Core Mapping
-
-對應 SpotServe：
-
-```text
-Low-cost context migration
-```
-
-## In Scope
-
-* old placement representation
-* new placement representation
-* reuse cost matrix
-* bipartite graph matching
-* KM / Hungarian algorithm
-* mapping decision metrics
-* expert-level mapping metadata
-
-## Out Of Scope
-
-* actual KV cache transfer
-* actual expert weight migration
-* CUDA kernel modification
-* vLLM internal expert dispatch modification
-
-## Tasks
-
-### 1. Define old/new mapping
-
-例如：
+## Files
 
 ```text
-Old:
-expert_0 → gpu_0
-expert_1 → gpu_1
-expert_2 → gpu_2
-
-New candidate:
-expert_0 → gpu_1
-expert_1 → gpu_0
-expert_2 → gpu_3
+sllm/schedulers/
+benchmarks/spotserve/
 ```
 
-### 2. Build cost matrix
-
-Cost 可以包含：
-
-* context reuse benefit
-* expert weight already loaded
-* checkpoint loading cost
-* node health
-* node spot risk
-
-例如：
+## How it works
 
 ```text
-cost(expert_i, gpu_j)
+Candidate nodes
+      ↓
+Risk + loading cost
+      ↓
+Scheduler ranking
+      ↓
+Placement decision
 ```
 
-越低代表越適合。
+## Limitations
 
-### 3. Run matching algorithm
+- Synthetic spot risk only
+- No cloud provider integration
 
-使用 Hungarian / KM algorithm 找最小 cost mapping。
+## Verification
 
-### 4. Emit mapping decision
-
-記錄：
-
-```json
-{
-  "event": "context_mapping_decision",
-  "old_mapping": "...",
-  "new_mapping": "...",
-  "reused_context": 12,
-  "migration_cost": 3.4
-}
-```
-
-## Deliverables
-
-* mapping schema
-* cost matrix builder
-* KM / Hungarian matching implementation
-* mapping decision metrics
-* synthetic mapping benchmark
-
-## Definition of Done
-
-* 給定 old mapping + new candidate workers，可以輸出 minimum-cost mapping
-* report 能顯示 reuse ratio / migration cost
-* 不需要真的搬 KV cache
-* 不需要真的改 vLLM expert dispatch
+- Compare health-only and risk-aware scheduling.
 
 ---
 
-# Version 9: True Stateful Inference Recovery
+# Version 9: vLLM MoE Black-box Integration
 
 ## Goal
 
-Version 9 對齊 SpotServe 第三個核心：
+Integrate the MoE backend provided by the vLLM team while keeping it as a black box.
 
-> Stateful inference recovery
+CPY does not modify expert routing, expert dispatch or CUDA kernels.
 
-目標是從 generated-token replay 進一步變成真正保存推論狀態，讓被中斷的 request 可以從 KV cache / request state 繼續，而不是從 prompt 重新計算。
+## Implemented
 
-## SpotServe Core Mapping
+- MoE backend integration
+- Multiple replicas
+- Retry / Replay validation
+- Dense vs MoE benchmark
 
-對應 SpotServe：
-
-```text
-Stateful inference recovery
-```
-
-## In Scope
-
-* request state checkpoint
-* token-level progress tracking
-* KV cache handle / metadata tracking
-* backend capability interface
-* vLLM KV cache export / import investigation
-* fallback to generated-token replay
-* correctness benchmark
-
-## Out Of Scope
-
-* full production KV migration across arbitrary vLLM versions
-* CUDA kernel modification unless absolutely necessary
-* expert-aware KV placement optimization
-
-## Tasks
-
-### 1. Define inference state interface
-
-新增 backend-neutral interface：
-
-```python
-get_inference_state(request_id)
-restore_inference_state(request_id, state)
-```
-
-State 可以包含：
-
-* generated tokens
-* current position
-* sampling state
-* KV cache handle / block metadata
-* model config
-* backend-specific metadata
-
-### 2. Implement dummy true-state recovery
-
-先在 dummy backend 做真正 state restore，確保 router / controller 邏輯正確。
-
-### 3. Investigate vLLM KV state
-
-對 vLLM 先做 feasibility study：
-
-* KV cache block metadata 在哪裡
-* request state 在哪裡
-* PagedAttention block table 如何表示
-* 是否能安全 export / import
-* 是否需要 patch vLLM
-
-### 4. Add vLLM experimental backend path
-
-如果可行，做 experimental path：
+## Files
 
 ```text
-worker A exports KV metadata
-→ worker B imports KV metadata
-→ continue generation
+examples/spotserve/
+benchmarks/spotserve/
 ```
 
-如果不可行，明確 fallback：
+## How it works
 
 ```text
-generated-token replay
+SpotServe Control Plane
+          ↓
+     vLLM MoE Worker
 ```
 
-### 5. Benchmark against replay
+## Limitations
 
-比較：
+- No expert-aware scheduling
+- No expert migration
 
-* no recovery
-* naive retry
-* generated-token replay
-* true stateful recovery
+## Verification
 
-指標：
-
-* recovered tokens
-* recomputation cost
-* p95 latency
-* correctness
-* fallback count
-
-## Deliverables
-
-* inference state interface
-* dummy stateful recovery
-* vLLM KV feasibility notes
-* experimental vLLM stateful recovery path
-* replay vs stateful recovery benchmark
-
-## Definition of Done
-
-* dummy backend 可以做到真正 state restore
-* vLLM path 至少完成 feasibility report
-* 若 vLLM path 可行，能展示 single request stateful recovery
-* 若不可行，明確說明限制並 fallback generated-token replay
+- MoE worker passes smoke test.
+- Retry / Replay benchmark completes.
 
 ---
 
-# Version 10: Expert-aware Recovery for MoE
+# Version 10: Expert-aware Recovery
 
 ## Goal
 
-Version 10 才真正進入 MoE expert-level recovery。
+Extend SpotServe with MoE-specific recovery mechanisms.
 
-這一版不再只是把 MoE 當黑盒，而是開始考慮 expert placement、expert hotness、expert migration 和 expert-aware scheduling。
+## Implemented
 
-## In Scope
+- Expert metadata
+- Expert hotness tracking
+- Expert-aware placement
+- Expert-aware recovery benchmark
 
-* expert-level metadata
-* expert hotness tracking
-* expert placement decision
-* expert-aware recovery policy
-* MoE-specific recovery benchmark
-
-## Out Of Scope
-
-* CUDA kernel optimization
-* full production expert migration
-* multi-region cloud scheduling
-
-## Tasks
-
-### 1. Track expert usage
-
-記錄：
-
-* request → expert route
-* expert load
-* hot experts
-* expert-to-worker placement
-
-### 2. Expert-aware placement
-
-當 spot preemption 發生時，不只看 worker：
+## Files
 
 ```text
-which worker is alive?
+sllm/spot/
+benchmarks/spotserve/
 ```
 
-也看：
+## How it works
 
 ```text
-which experts are affected?
-which experts are hot?
-which experts should be recovered first?
+Expert statistics
+        ↓
+Recovery planner
+        ↓
+Expert-aware recovery
 ```
 
-### 3. Expert-aware recovery policy
+## Limitations
 
-例如：
+- Research prototype
+- No production expert migration
 
-* hot expert 優先 restore
-* cold expert 延後 restore
-* on-demand worker 優先放 hot expert
-* spot worker 放 cold expert
+## Verification
 
-### 4. Compare with black-box MoE recovery
-
-比較：
-
-* MoE black-box retry / replay
-* expert-aware recovery
-
-指標：
-
-* p95 latency
-* throughput
-* expert load imbalance
-* recovery time
-* request failure rate
-
-## Deliverables
-
-* expert metadata collection
-* expert-aware scheduling prototype
-* expert recovery benchmark
-* final MoE recovery comparison
-
-## Definition of Done
-
-* 系統能觀察 expert-level load
-* preemption 後能做 expert-aware recovery decision
-* benchmark 能顯示 expert-aware policy 相比 black-box policy 是否改善
+- Compare black-box recovery and expert-aware recovery.
 
 ---
 
-# Version 11: Real Cloud Spot Integration
+# Updated Research Milestones
 
-## Goal
+## Milestone 1 (Completed)
 
-Version 11 才接真實 cloud spot provider。
+- Version 1
+- Version 2
+- Version 3
+- Version 4
 
-這一版把 synthetic trace event 換成真實 provider event。
+## Milestone 2 (SpotServe Core)
 
-## In Scope
+- Version 5
+- Version 6
+- Version 7
+- Version 8
 
-* cloud spot metadata watcher
-* provider adapter
-* preemption notice to SpotEvent
-* optional replacement node registration
-* real spot smoke test
+## Milestone 3 (MoE Extension)
 
-## Out Of Scope
-
-* production-grade cloud autoscaler
-* complex price optimizer
-* multi-region scheduling
-
-## Tasks
-
-### 1. Add provider abstraction
-
-新增：
-
-```text
-sllm/spot/providers/
-    base.py
-    aws.py
-    gcp.py
-```
-
-先可以只做一個 provider。
-
-### 2. Convert provider event to SpotEvent
-
-例如：
-
-```text
-AWS spot interruption notice
-→ SpotEvent(event="preempt", node_id=...)
-```
-
-### 3. Reuse existing control plane
-
-不要重寫 recovery。
-
-真實 event 仍然走：
-
-```text
-provider watcher
-→ controller.handle_preemption()
-→ router.handle_preemption()
-```
-
-## Deliverables
-
-* provider watcher
-* real spot smoke validation
-* cloud integration notes
-
-## Definition of Done
-
-* 真實 spot notice 可以觸發 controller
-* preempting worker 不接新 request
-* request 可 retry / replay 到其他 replica
-* synthetic trace pipeline 和 real provider pipeline 共用同一套 handler
-
----
-
-# Version Mapping to SpotServe Core Ideas
-
-| SpotServe Core Idea         | Corresponding Version | Notes                                           |
-| --------------------------- | --------------------: | ----------------------------------------------- |
-| Dynamic reparallelization   |                    V6 | 先做 planner，再考慮實際 worker rebuild                 |
-| Low-cost context migration  |                    V8 | 先做 mapping / KM algorithm，不急著搬 KV               |
-| Stateful inference recovery |                    V9 | 從 generated-token replay 升級到 true state restore |
-| Expert-aware MoE recovery   |                   V10 | 這是你們自己的 MoE extension，不是原始 control-plane v1     |
-
----
-
-# Updated Milestone Table
-
-| Version | Name                              | Main Goal                                              | Status         |
-| ------- | --------------------------------- | ------------------------------------------------------ | -------------- |
-| V1      | Control-plane prototype           | worker state, trace replay, retry, replay, metrics     | Done           |
-| V2      | Recover + node health             | complete trace lifecycle and scheduler health filter   | Done / Current |
-| V3      | Recovery correctness              | prove retry/replay is actually triggered               | Next           |
-| V4      | vLLM dense black-box              | validate vLLM dense backend under trace                | Planned        |
-| V5      | vLLM MoE black-box                | integrate 大鼻 MoE worker without touching MoE internals | Planned        |
-| V6      | Dynamic reparallelization planner | choose new parallel config under GPU loss              | Planned        |
-| V7      | Spot-risk scheduler               | rank placement by risk and loading cost                | Planned        |
-| V8      | Low-cost context mapping          | KM/Hungarian mapping for low migration cost            | Planned        |
-| V9      | True stateful recovery            | investigate and prototype KV/state recovery            | Research       |
-| V10     | Expert-aware MoE recovery         | expert-level recovery policy                           | Research       |
-| V11     | Real cloud spot                   | replace synthetic trace with real provider events      | Future         |
-
----
-
-# Updated Research Milestone
-
-## First Research Milestone
-
-完成：
-
-* V1 control-plane prototype
-* V2 recover + node health
-* V3 recovery correctness
-* V4 vLLM dense black-box
-* V5 vLLM MoE black-box
-
-這一階段可以宣稱：
-
-> We built a SpotServe-style control-plane prototype on ServerlessLLM and evaluated retry / generated-token replay policies under synthetic preemption traces for dummy, transformers, vLLM dense, and vLLM MoE black-box backends.
-
-不能宣稱：
-
-* dynamic reparallelization
-* low-cost context migration
-* true KV cache recovery
-* expert-aware recovery
-
----
-
-## Second Research Milestone
-
-完成：
-
-* V6 dynamic reparallelization planner
-* V7 spot-risk scheduler
-* V8 low-cost context mapping
-
-這一階段可以宣稱：
-
-> We extend the prototype with SpotServe-style repartitioning and low-cost mapping decisions to reduce recovery cost under changing GPU availability.
-
----
-
-## Third Research Milestone
-
-完成：
-
-* V9 true stateful recovery
-* V10 expert-aware MoE recovery
-
-這一階段才可以宣稱：
-
-> We implement expert-aware recovery and investigate true stateful inference recovery for MoE serving on spot GPU clusters.
-
----
-
-# Core Principle
-
-不要把三個層級混在一起：
-
-## Current control-plane layer
-
-```text
-preempt
-→ drain
-→ retry
-→ generated-token replay
-→ metrics
-```
-
-## SpotServe algorithm layer
-
-```text
-dynamic reparallelization
-→ low-cost context mapping
-→ stateful inference recovery
-```
-
-## MoE expert layer
-
-```text
-expert placement
-→ expert hotness
-→ expert-aware recovery
-```
-
-Version 1 已經完成第一層的雛形。
-
-後續版本要逐步往第二層和第三層推進，避免一開始就把 generated-token replay 誤寫成 true KV cache recovery，或把 MoE black-box integration 誤寫成 expert-aware scheduling。
+- Version 9
+- Version 10

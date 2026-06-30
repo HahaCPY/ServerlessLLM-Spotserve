@@ -1,0 +1,30 @@
+{
+  "model": "vllm-dense-naive-retry",
+  "backend": "vllm",
+  "router_num_cpus": 0,
+  "num_cpus": 1,
+  "num_gpus": 1,
+  "auto_scaling_config": {
+    "metric": "concurrency",
+    "target": 4,
+    "min_instances": 1,
+    "max_instances": 1,
+    "keep_alive": 60
+  },
+  "backend_config": {
+    "pretrained_model_name_or_path": "Qwen/Qwen3-0.6B",
+    "torch_dtype": "float16",
+    "gpu_memory_utilization": 0.35,
+    "max_model_len": 2048,
+    "max_num_seqs": 4,
+    "enforce_eager": true,
+    "enable_prefix_caching": false,
+    "trace_debug": true
+  },
+  "router_config": {
+    "recovery_policy": "naive_retry",
+    "max_retries": 2,
+    "count_preempting_toward_capacity": true,
+    "metrics_path": "/tmp/spotserve-work/results/spotserve_vllm_dense/vllm-dense-naive-retry-router.jsonl"
+  }
+}

@@ -311,10 +311,14 @@ class VllmBackend(SllmBackend):
         ongoing_results: List[RequestOutput] = [
             result for result in results if isinstance(result, RequestOutput)
         ]
-        tokens: List[List[int]] = [
-            result.prompt_token_ids + result.outputs[0].token_ids
-            for result in ongoing_results
-        ]
+        tokens: List[List[int]] = []
+        for result in ongoing_results:
+            if not result.outputs:
+                continue
+            prompt_tokens = list(result.prompt_token_ids or [])
+            output_tokens = list(result.outputs[0].token_ids or [])
+            if prompt_tokens or output_tokens:
+                tokens.append(prompt_tokens + output_tokens)
         return tokens
 
     async def resume_kv_cache(self, request_datas: List[List[int]]) -> None:

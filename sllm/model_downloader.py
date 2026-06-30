@@ -187,7 +187,7 @@ class VllmModelDownloader:
             else:
                 # download from huggingface
                 input_dir = snapshot_download(
-                    model_name,
+                    pretrained_model_name_or_path,
                     cache_dir=cache_dir.name,
                     allow_patterns=[
                         "*.safetensors",

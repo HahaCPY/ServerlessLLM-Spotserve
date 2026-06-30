@@ -67,6 +67,26 @@ On head-only dummy setups, avoid deploying both standard and correctness dummy
 model sets at the same time; the extra Ray actors can exceed the container
 thread limit.
 
+For vLLM dense black-box validation, deploy the dense configs and run the
+dedicated matrix:
+
+```bash
+export MODEL_FOLDER=$PWD/model
+scripts/prepare_spotserve.sh --deploy-set vllm-dense
+
+python benchmarks/spotserve/run_benchmark.py \
+  --config benchmarks/spotserve/benchmark_matrix_vllm_dense.yaml \
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \
+  --request-timeout 120 \
+  --ray-address auto \
+  --ray-namespace sllm
+```
+
+The vLLM dense matrix validates control-plane behavior around synthetic
+preemption with a black-box vLLM worker. Treat generated-token replay as
+best-effort prompt-token replay, not true KV cache recovery. Trace runs also
+surface instance-state event counts in the summary and report.
+
 If old results contain `{"error": "timed out"}` or
 `{"error": "Internal Server Error"}`, treat those runs as invalid setup
 failures, not as recovery-policy results.

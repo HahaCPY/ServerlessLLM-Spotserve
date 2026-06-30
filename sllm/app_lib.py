@@ -113,6 +113,54 @@ def create_app() -> FastAPI:
 
         return {"status": f"deleted model {model_name}"}
 
+    @app.post("/spot/event")
+    async def spot_event_handler(request: Request):
+        body = await request.json()
+        event = body.get("event")
+        if event not in {"preempt", "recover", "dead"}:
+            raise HTTPException(
+                status_code=400, detail=f"Unsupported spot event: {event}"
+            )
+
+        node_id = body.get("node_id")
+        instance_id = body.get("instance_id")
+        model_name = body.get("model_name")
+        if node_id is None and instance_id is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Spot event requires node_id or instance_id",
+            )
+
+        controller = ray.get_actor("controller")
+        if not controller:
+            raise HTTPException(
+                status_code=500, detail="Controller not initialized"
+            )
+
+        try:
+            if event == "preempt":
+                result = await controller.handle_preemption.remote(
+                    node_id=node_id,
+                    instance_id=instance_id,
+                    model_name=model_name,
+                )
+            elif event == "recover":
+                result = await controller.handle_recover.remote(
+                    node_id=node_id,
+                    instance_id=instance_id,
+                    model_name=model_name,
+                )
+            else:
+                result = await controller.handle_instance_dead.remote(
+                    node_id=node_id,
+                    instance_id=instance_id,
+                    model_name=model_name,
+                )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+        return {"status": "ok", "result": result}
+
     async def inference_handler(request: Request, action: str):
         body = await request.json()
         model_name = body.get("model")

@@ -85,6 +85,9 @@ class RoundRobinRouter(SllmRouter):
             router_config.get("recovery_policy", RecoveryPolicy.NONE.value)
         )
         self.max_retries = int(router_config.get("max_retries", 0))
+        self.count_preempting_toward_capacity = bool(
+            router_config.get("count_preempting_toward_capacity", False)
+        )
         metrics_path = router_config.get("metrics_path") or os.getenv(
             "SLLM_SPOT_METRICS_PATH"
         )
@@ -452,11 +455,14 @@ class RoundRobinRouter(SllmRouter):
 
     async def _counts_toward_capacity(self, instance: InstanceHandle) -> bool:
         async with instance.lock:
-            return instance.state in {
+            capacity_states = {
                 InstanceState.STARTING,
                 InstanceState.READY,
                 InstanceState.BUSY,
             }
+            if self.count_preempting_toward_capacity:
+                capacity_states.add(InstanceState.PREEMPTING)
+            return instance.state in capacity_states
 
     async def _call_backend(
         self,

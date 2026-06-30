@@ -1,0 +1,2 @@
+{"time": 5.0, "event": "preempt", "node_id": "0", "model_name": "vllm-dense-naive-retry"}
+{"time": 12.0, "event": "recover", "node_id": "0", "model_name": "vllm-dense-naive-retry"}
