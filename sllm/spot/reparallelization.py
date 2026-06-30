@@ -1,0 +1,253 @@
+from dataclasses import dataclass
+from typing import Any, Dict, List, Mapping, Optional
+
+
+READY = "ready"
+PREEMPTING = "preempting"
+DEAD = "dead"
+
+
+@dataclass(frozen=True)
+class GpuAvailability:
+    total_gpus: int
+    available_gpus: int
+    unavailable_gpus: int
+    ready_nodes: List[str]
+    preempting_nodes: List[str]
+    dead_nodes: List[str]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "total_gpus": self.total_gpus,
+            "available_gpus": self.available_gpus,
+            "unavailable_gpus": self.unavailable_gpus,
+            "ready_nodes": list(self.ready_nodes),
+            "preempting_nodes": list(self.preempting_nodes),
+            "dead_nodes": list(self.dead_nodes),
+        }
+
+
+@dataclass(frozen=True)
+class ParallelConfig:
+    tensor_parallel_size: int
+    pipeline_parallel_size: int
+    data_parallel_size: int
+    total_gpus: int
+    unused_gpus: int
+    score: float
+    reason: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "tensor_parallel_size": self.tensor_parallel_size,
+            "pipeline_parallel_size": self.pipeline_parallel_size,
+            "data_parallel_size": self.data_parallel_size,
+            "total_gpus": self.total_gpus,
+            "unused_gpus": self.unused_gpus,
+            "score": self.score,
+            "reason": self.reason,
+        }
+
+
+def _gpu_count(node_info: Mapping[str, Any]) -> int:
+    return int(node_info.get("total_gpu", node_info.get("GPU", 0)) or 0)
+
+
+def apply_spot_event_to_worker_nodes(
+    worker_nodes: Mapping[str, Mapping[str, Any]],
+    event: str,
+    node_id: Optional[str] = None,
+) -> Dict[str, Dict[str, Any]]:
+    nodes = {str(key): dict(value) for key, value in worker_nodes.items()}
+    if node_id is None:
+        return nodes
+    node = nodes.setdefault(
+        str(node_id),
+        {
+            "ray_node_id": None,
+            "address": None,
+            "free_gpu": 0,
+            "total_gpu": 0,
+        },
+    )
+    if event == "preempt":
+        node["state"] = PREEMPTING
+    elif event == "recover":
+        node["state"] = READY
+    elif event == "dead":
+        node["state"] = DEAD
+    return nodes
+
+
+def summarize_gpu_availability(
+    worker_nodes: Mapping[str, Mapping[str, Any]]
+) -> GpuAvailability:
+    total_gpus = 0
+    available_gpus = 0
+    ready_nodes: List[str] = []
+    preempting_nodes: List[str] = []
+    dead_nodes: List[str] = []
+
+    for node_id, node_info in sorted(worker_nodes.items()):
+        state = node_info.get("state", READY)
+        node_gpus = _gpu_count(node_info)
+        total_gpus += node_gpus
+        if state == READY:
+            available_gpus += node_gpus
+            ready_nodes.append(str(node_id))
+        elif state == PREEMPTING:
+            preempting_nodes.append(str(node_id))
+        elif state == DEAD:
+            dead_nodes.append(str(node_id))
+
+    return GpuAvailability(
+        total_gpus=total_gpus,
+        available_gpus=available_gpus,
+        unavailable_gpus=max(total_gpus - available_gpus, 0),
+        ready_nodes=ready_nodes,
+        preempting_nodes=preempting_nodes,
+        dead_nodes=dead_nodes,
+    )
+
+
+def _positive_int(config: Mapping[str, Any], key: str, default: int) -> int:
+    value = int(config.get(key, default) or default)
+    return max(value, 1)
+
+
+def generate_parallel_candidates(
+    available_gpus: int,
+    planner_config: Optional[Mapping[str, Any]] = None,
+) -> List[ParallelConfig]:
+    if available_gpus <= 0:
+        return []
+    planner_config = planner_config or {}
+    max_tensor_parallel_size = min(
+        _positive_int(
+            planner_config, "max_tensor_parallel_size", available_gpus
+        ),
+        available_gpus,
+    )
+    max_pipeline_parallel_size = min(
+        _positive_int(
+            planner_config, "max_pipeline_parallel_size", available_gpus
+        ),
+        available_gpus,
+    )
+    min_data_parallel_size = _positive_int(
+        planner_config, "min_data_parallel_size", 1
+    )
+    target_replica_gpus = _positive_int(
+        planner_config, "target_replica_gpus", 1
+    )
+
+    candidates: List[ParallelConfig] = []
+    for tensor_parallel_size in range(1, max_tensor_parallel_size + 1):
+        for pipeline_parallel_size in range(1, max_pipeline_parallel_size + 1):
+            replica_gpus = tensor_parallel_size * pipeline_parallel_size
+            if replica_gpus > available_gpus:
+                continue
+            data_parallel_size = available_gpus // replica_gpus
+            if data_parallel_size < min_data_parallel_size:
+                continue
+            total_gpus = replica_gpus * data_parallel_size
+            unused_gpus = available_gpus - total_gpus
+            replica_distance = abs(replica_gpus - target_replica_gpus)
+            score = (
+                total_gpus * 10000
+                + data_parallel_size * 100
+                - replica_distance * 1000
+                - unused_gpus
+            )
+            candidates.append(
+                ParallelConfig(
+                    tensor_parallel_size=tensor_parallel_size,
+                    pipeline_parallel_size=pipeline_parallel_size,
+                    data_parallel_size=data_parallel_size,
+                    total_gpus=total_gpus,
+                    unused_gpus=unused_gpus,
+                    score=float(score),
+                    reason=(
+                        "max_gpu_utilization_then_replica_count_"
+                        "then_current_replica_shape"
+                    ),
+                )
+            )
+
+    return sorted(
+        candidates,
+        key=lambda candidate: (
+            candidate.score,
+            candidate.data_parallel_size,
+            candidate.tensor_parallel_size,
+            -candidate.pipeline_parallel_size,
+            -candidate.unused_gpus,
+        ),
+        reverse=True,
+    )
+
+
+def plan_dynamic_reparallelization(
+    model_name: str,
+    worker_nodes: Mapping[str, Mapping[str, Any]],
+    model_config: Optional[Mapping[str, Any]] = None,
+    planner_config: Optional[Mapping[str, Any]] = None,
+    event: Optional[str] = None,
+    node_id: Optional[str] = None,
+    instance_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    model_config = model_config or {}
+    planner_config = dict(planner_config or {})
+    if "target_replica_gpus" not in planner_config:
+        planner_config["target_replica_gpus"] = max(
+            int(
+                planner_config.get("model_gpu_requirement")
+                or model_config.get("num_gpus", 1)
+                or 1
+            ),
+            1,
+        )
+
+    availability = summarize_gpu_availability(worker_nodes)
+    candidates = generate_parallel_candidates(
+        availability.available_gpus, planner_config
+    )
+    selected = candidates[0] if candidates else None
+    action = "reparallelize" if selected is not None else "no_capacity"
+
+    decision = {
+        "model": model_name,
+        "event": event,
+        "node_id": node_id,
+        "instance_id": instance_id,
+        "action": action,
+        "candidate_count": len(candidates),
+        "availability": availability.to_dict(),
+        "selected_config": selected.to_dict() if selected else None,
+        "top_candidates": [
+            candidate.to_dict() for candidate in candidates[:5]
+        ],
+    }
+    if selected is not None:
+        decision.update(
+            {
+                "selected_total_gpus": selected.total_gpus,
+                "selected_tensor_parallel_size": (
+                    selected.tensor_parallel_size
+                ),
+                "selected_pipeline_parallel_size": (
+                    selected.pipeline_parallel_size
+                ),
+                "selected_data_parallel_size": selected.data_parallel_size,
+            }
+        )
+    else:
+        decision.update(
+            {
+                "selected_total_gpus": 0,
+                "selected_tensor_parallel_size": 0,
+                "selected_pipeline_parallel_size": 0,
+                "selected_data_parallel_size": 0,
+            }
+        )
+    return decision

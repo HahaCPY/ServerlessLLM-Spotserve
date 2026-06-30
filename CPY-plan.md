@@ -288,17 +288,97 @@ vLLM path 要保守解讀：
 ---
 
 
-# Version 5: Dynamic Reparallelization Planner
+
+# Version 5: vLLM MoE Black-box Integration
 
 ## Goal
 
-Version 5 begins implementing the first core idea of SpotServe:
+Version 5 integrates the vLLM MoE backend provided by the vLLM side while keeping it as a black-box service.
+
+This version answers:
+
+> Can the existing SpotServe-style control plane operate correctly when the backend is changed from a dense model to a MoE model?
+
+The objective is integration rather than MoE optimization.
+
+## In Scope
+
+- vLLM MoE backend
+- single MoE model
+- multiple replicas
+- synthetic SpotServe trace
+- retry policy
+- generated-token replay
+- benchmark comparison
+
+## Out Of Scope
+
+- expert routing
+- expert dispatch
+- CUDA kernels
+- expert-aware scheduling
+- expert migration
+
+## Tasks
+
+### 1. Integrate vLLM MoE backend
+
+Deploy a MoE model through ServerlessLLM using the configuration provided by the vLLM team.
+
+### 2. Validate SpotServe pipeline
+
+Verify:
+
+```text
+Spot Trace
+→ Controller
+→ Router
+→ vLLM MoE Worker
+→ Retry / Replay
+→ Metrics
+→ Report
+```
+
+### 3. Benchmark
+
+Compare:
+
+- dense model
+- MoE model
+
+under:
+
+- none
+- naive retry
+- generated-token replay
+
+## Deliverables
+
+- vLLM MoE deployment
+- MoE benchmark matrix
+- Dense vs MoE report
+- Smoke validation
+
+## Definition of Done
+
+- MoE model deploys successfully.
+- Spot trace replays successfully.
+- Retry / Replay work with MoE backend.
+- Benchmark completes successfully.
+
+---
+
+# Version 6: Dynamic Reparallelization Planner
+
+## Goal
+
+Implement the first core idea of SpotServe:
 
 > Dynamic Reparallelization
 
-When GPU resources change because of spot preemption, generate a new deployment configuration based on the remaining available GPUs. This version focuses on the planning layer and does not rebuild vLLM workers.
+Generate a new deployment configuration after GPU resources change because of spot preemption.
 
-## Implemented
+## In Scope
 
 - GPU availability tracking
 - Parallel configuration schema
@@ -307,223 +387,106 @@ When GPU resources change because of spot preemption, generate a new deployment 
 - Replanning metrics
 - Synthetic replanning benchmark
 
-## Files
+## Out Of Scope
 
-```text
-sllm/schedulers/
-sllm/spot/
-benchmarks/spotserve/
-```
+- MoE optimization
+- CUDA kernels
+- KV cache migration
 
-## How it works
+## Definition of Done
 
-```text
-Spot preemption
-    ↓
-Available GPUs change
-    ↓
-Dynamic replanning planner
-    ↓
-Generate new deployment configuration
-```
-
-## Limitations
-
-- No actual worker rebuild
-- No MoE-specific optimization
-- No KV cache migration
-
-## Verification
-
-- Planner generates a valid configuration after GPU loss.
+- Planner generates a new deployment configuration.
 - Benchmark records replanning decisions.
 
 ---
 
-# Version 6: Low-cost Context Migration Planner
+# Version 7: Low-cost Context Migration Planner
 
 ## Goal
 
-Implement the second SpotServe core idea:
+Implement the second core idea of SpotServe:
 
 > Low-cost Context Migration
 
-Build a planner that computes the minimum-cost mapping between old workers and new workers. This version computes the mapping only and does not migrate KV cache.
+Compute the minimum-cost mapping between old workers and new workers without implementing true KV cache migration.
 
-## Implemented
+## In Scope
 
 - Context metadata
 - Cost matrix
 - Worker mapping
-- Hungarian / KM matching
-- Mapping metrics
+- Hungarian / KM algorithm
+- Migration metrics
 
-## Files
+## Out Of Scope
 
-```text
-sllm/spot/
-benchmarks/spotserve/
-```
+- True KV cache migration
+- Expert migration
+- vLLM internals
 
-## How it works
-
-```text
-Old workers
-      +
-New workers
-      ↓
-Cost matrix
-      ↓
-Hungarian / KM
-      ↓
-Best mapping
-```
-
-## Limitations
-
-- No real KV cache migration
-- No expert migration
-- No vLLM internal modification
-
-## Verification
+## Definition of Done
 
 - Produce minimum-cost mapping.
 - Report migration cost and reuse ratio.
 
 ---
 
-# Version 7: Stateful Inference Recovery
+# Version 8: Stateful Inference Recovery
 
 ## Goal
 
-Implement the third SpotServe core idea:
+Implement the third core idea of SpotServe:
 
 > Stateful Inference Recovery
 
 Extend generated-token replay toward true inference-state recovery.
 
-## Implemented
+## In Scope
 
 - Backend-independent state interface
 - Dummy state recovery
 - vLLM feasibility study
 - Recovery benchmark
 
-## Files
+## Out Of Scope
 
-```text
-sllm/routers/
-sllm/spot/
-benchmarks/spotserve/
-```
+- Production KV migration
+- CUDA optimization
 
-## How it works
-
-```text
-Request interrupted
-        ↓
-Save inference state
-        ↓
-Recover state
-        ↓
-Continue generation
-```
-
-## Limitations
-
-- Production KV migration not implemented
-- CUDA kernels unchanged
-
-## Verification
+## Definition of Done
 
 - Dummy backend restores inference state.
 - vLLM feasibility documented.
 
 ---
 
-# Version 8: Spot-risk-aware Scheduling
+# Version 9: Spot-risk-aware Scheduling
 
 ## Goal
 
-Extend scheduling with spot-awareness.
+Extend scheduling with spot awareness by considering:
 
-Instead of only filtering unhealthy nodes, rank nodes using spot risk, remaining lifetime and loading cost.
+- Spot risk
+- Remaining lifetime
+- Loading cost
 
-## Implemented
+instead of only filtering unhealthy nodes.
+
+## In Scope
 
 - Spot-risk model
-- Risk-aware scheduling
+- Risk-aware scheduler
 - Scheduler benchmark
 
-## Files
+## Out Of Scope
 
-```text
-sllm/schedulers/
-benchmarks/spotserve/
-```
+- Real cloud provider
+- Autoscaling
+- MoE scheduling
 
-## How it works
-
-```text
-Candidate nodes
-      ↓
-Risk + loading cost
-      ↓
-Scheduler ranking
-      ↓
-Placement decision
-```
-
-## Limitations
-
-- Synthetic spot risk only
-- No cloud provider integration
-
-## Verification
+## Definition of Done
 
 - Compare health-only and risk-aware scheduling.
-
----
-
-# Version 9: vLLM MoE Black-box Integration
-
-## Goal
-
-Integrate the MoE backend provided by the vLLM team while keeping it as a black box.
-
-CPY does not modify expert routing, expert dispatch or CUDA kernels.
-
-## Implemented
-
-- MoE backend integration
-- Multiple replicas
-- Retry / Replay validation
-- Dense vs MoE benchmark
-
-## Files
-
-```text
-examples/spotserve/
-benchmarks/spotserve/
-```
-
-## How it works
-
-```text
-SpotServe Control Plane
-          ↓
-     vLLM MoE Worker
-```
-
-## Limitations
-
-- No expert-aware scheduling
-- No expert migration
-
-## Verification
-
-- MoE worker passes smoke test.
-- Retry / Replay benchmark completes.
 
 ---
 
@@ -533,36 +496,18 @@ SpotServe Control Plane
 
 Extend SpotServe with MoE-specific recovery mechanisms.
 
-## Implemented
+## In Scope
 
 - Expert metadata
-- Expert hotness tracking
+- Expert hotness
 - Expert-aware placement
 - Expert-aware recovery benchmark
 
-## Files
+## Out Of Scope
 
-```text
-sllm/spot/
-benchmarks/spotserve/
-```
+- Production expert migration
 
-## How it works
-
-```text
-Expert statistics
-        ↓
-Recovery planner
-        ↓
-Expert-aware recovery
-```
-
-## Limitations
-
-- Research prototype
-- No production expert migration
-
-## Verification
+## Definition of Done
 
 - Compare black-box recovery and expert-aware recovery.
 
@@ -577,14 +522,17 @@ Expert-aware recovery
 - Version 3
 - Version 4
 
-## Milestone 2 (SpotServe Core)
+## Milestone 2 (MoE Integration)
 
 - Version 5
+
+## Milestone 3 (SpotServe Core)
+
 - Version 6
 - Version 7
 - Version 8
-
-## Milestone 3 (MoE Extension)
-
 - Version 9
+
+## Milestone 4 (Research Extension)
+
 - Version 10

@@ -1,0 +1,15 @@
+{
+  "endpoint": "http://127.0.0.1:8344/v1/chat/completions",
+  "output_dir": "results/spotserve_reparallelization",
+  "runs": [
+    {
+      "name": "dummy-reparallelization-planner",
+      "model": "dummy-reparallelization",
+      "backend": "dummy",
+      "policy": "none",
+      "workload": "benchmarks/spotserve/workloads/smoke.jsonl",
+      "trace": "examples/spotserve/spot_trace_reparallelization.jsonl",
+      "router_metrics_path": "results/spotserve_reparallelization/dummy-reparallelization-router.jsonl"
+    }
+  ]
+}

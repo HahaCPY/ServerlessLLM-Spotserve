@@ -1,0 +1,43 @@
+{
+  "model": "dummy-reparallelization",
+  "backend": "dummy",
+  "router_num_cpus": 0,
+  "num_cpus": 0,
+  "num_gpus": 0,
+  "auto_scaling_config": {
+    "metric": "concurrency",
+    "target": 1,
+    "min_instances": 1,
+    "max_instances": 2,
+    "keep_alive": 0
+  },
+  "backend_config": {},
+  "router_config": {
+    "recovery_policy": "none",
+    "max_retries": 0,
+    "enable_reparallelization": true,
+    "metrics_path": "results/spotserve_reparallelization/dummy-reparallelization-router.jsonl",
+    "reparallelization_config": {
+      "model_gpu_requirement": 2,
+      "max_tensor_parallel_size": 4,
+      "max_pipeline_parallel_size": 2,
+      "min_data_parallel_size": 1,
+      "synthetic_worker_nodes": {
+        "0": {
+          "ray_node_id": "synthetic-node-0",
+          "address": "synthetic-0",
+          "free_gpu": 2,
+          "total_gpu": 2,
+          "state": "ready"
+        },
+        "1": {
+          "ray_node_id": "synthetic-node-1",
+          "address": "synthetic-1",
+          "free_gpu": 2,
+          "total_gpu": 2,
+          "state": "ready"
+        }
+      }
+    }
+  }
+}
