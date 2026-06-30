@@ -29,13 +29,14 @@ async def _dispatch_event(controller, event: SpotEvent):
             instance_id=event.instance_id,
             model_name=event.model_name,
         )
+    if event.event == "recover":
+        return await controller.handle_recover.remote(
+            node_id=event.node_id,
+            instance_id=event.instance_id,
+            model_name=event.model_name,
+        )
 
-    logger.info(
-        "Spot event %s is parsed but not dispatched in v1: %s",
-        event.event,
-        event,
-    )
-    return {"event": event.event, "dispatched": False}
+    raise ValueError(f"Unsupported spot event: {event.event}")
 
 
 async def replay_trace(

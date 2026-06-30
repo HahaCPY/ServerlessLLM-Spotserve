@@ -268,6 +268,12 @@ class SllmController:
         if node_id is None and instance_id is None:
             raise ValueError("Preemption event requires node_id or instance_id")
 
+        if node_id is not None:
+            try:
+                await self.scheduler.mark_node_preempting.remote(node_id)
+            except Exception as e:
+                logger.error(f"Failed to mark scheduler node preempting: {e}")
+
         async with self.metadata_lock:
             if model_name is not None:
                 if model_name not in self.request_routers:
@@ -291,6 +297,44 @@ class SllmController:
                 results[target_model] = {"error": str(e)}
         return results
 
+    async def handle_recover(
+        self,
+        node_id: Optional[str] = None,
+        instance_id: Optional[str] = None,
+        model_name: Optional[str] = None,
+    ):
+        if node_id is None and instance_id is None:
+            raise ValueError("Recover event requires node_id or instance_id")
+
+        if node_id is not None:
+            try:
+                await self.scheduler.mark_node_recovered.remote(node_id)
+            except Exception as e:
+                logger.error(f"Failed to mark scheduler node recovered: {e}")
+
+        async with self.metadata_lock:
+            if model_name is not None:
+                if model_name not in self.request_routers:
+                    raise ValueError(f"Model {model_name} not found")
+                target_routers = {model_name: self.request_routers[model_name]}
+            else:
+                target_routers = dict(self.request_routers)
+
+        results = {}
+        for target_model, request_router in target_routers.items():
+            try:
+                results[target_model] = await (
+                    request_router.handle_recover.remote(
+                        node_id=node_id, instance_id=instance_id
+                    )
+                )
+            except Exception as e:
+                logger.error(
+                    f"Failed to handle recover for model {target_model}: {e}"
+                )
+                results[target_model] = {"error": str(e)}
+        return results
+
     async def handle_instance_dead(
         self,
         node_id: Optional[str] = None,
@@ -299,6 +343,12 @@ class SllmController:
     ):
         if node_id is None and instance_id is None:
             raise ValueError("Dead event requires node_id or instance_id")
+
+        if node_id is not None:
+            try:
+                await self.scheduler.mark_node_dead.remote(node_id)
+            except Exception as e:
+                logger.error(f"Failed to mark scheduler node dead: {e}")
 
         async with self.metadata_lock:
             if model_name is not None:

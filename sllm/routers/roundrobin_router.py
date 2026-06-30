@@ -313,6 +313,48 @@ class RoundRobinRouter(SllmRouter):
     async def mark_instance_preempting(self, instance_id: str):
         return await self.handle_preemption(instance_id=instance_id)
 
+    async def handle_recover(
+        self,
+        node_id: Optional[str] = None,
+        instance_id: Optional[str] = None,
+    ):
+        matches = await self._matching_inference_instances(
+            node_id=node_id, instance_id=instance_id
+        )
+        recovered_instances = []
+        for instance in matches:
+            from_state = instance.state.value
+            recovered = await instance.mark_recovered()
+            if not recovered:
+                logger.info(
+                    f"Skipping recover for instance {instance.instance_id} "
+                    f"in state {from_state}"
+                )
+                continue
+            self._emit_metric(
+                make_instance_state_event(
+                    model=self.model_name,
+                    instance_id=instance.instance_id,
+                    node_id=instance.node_id,
+                    from_state=from_state,
+                    to_state=instance.state.value,
+                    reason="trace_recover",
+                )
+            )
+            recovered_instances.append(instance.instance_id)
+            logger.info(
+                f"Recovered instance {instance.instance_id} "
+                f"for model {self.model_name}"
+            )
+        return {
+            "model": self.model_name,
+            "event": "recover",
+            "instances": recovered_instances,
+        }
+
+    async def mark_instance_recovered(self, instance_id: str):
+        return await self.handle_recover(instance_id=instance_id)
+
     async def handle_dead(
         self,
         node_id: Optional[str] = None,

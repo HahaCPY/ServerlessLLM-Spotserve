@@ -25,7 +25,7 @@ import ray
 
 from sllm.logger import init_logger
 
-from ..utils import InstanceStatus
+from ..utils import InstanceStatus, NodeState
 from .fcfs_scheduler import FcfsScheduler
 
 logger = init_logger(__name__)
@@ -220,6 +220,12 @@ class StorageAwareScheduler(FcfsScheduler):
         logger.info(f"Checking model {model_name}")
         for node_id, node_info in worker_nodes.items():
             logger.info(f"Checking node {node_id}, node info: {node_info}")
+            if not self._node_is_ready(node_info):
+                logger.info(
+                    f"Skipping node {node_id} in state "
+                    f"{node_info.get('state', NodeState.READY.value)}"
+                )
+                continue
             if node_id not in store_info:
                 logger.error(f"Node {node_id} not found in store info")
                 continue

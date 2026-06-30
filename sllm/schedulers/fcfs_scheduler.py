@@ -21,7 +21,7 @@ import time
 from typing import Mapping, Optional
 
 from sllm.logger import init_logger
-from sllm.utils import get_worker_nodes
+from sllm.utils import NodeState, get_worker_nodes
 
 from .scheduler_utils import SllmScheduler
 
@@ -44,6 +44,46 @@ class FcfsScheduler(SllmScheduler):
 
         self.running_lock = asyncio.Lock()
         self.running = False
+
+    def _ensure_node_metadata(self, node_info: Mapping) -> dict:
+        updated_node_info = dict(node_info)
+        updated_node_info.setdefault("state", NodeState.READY.value)
+        return updated_node_info
+
+    def _node_is_ready(self, node_info: Mapping) -> bool:
+        return node_info.get("state", NodeState.READY.value) == NodeState.READY.value
+
+    async def mark_node_preempting(self, node_id: str):
+        return await self._mark_node_state(node_id, NodeState.PREEMPTING)
+
+    async def mark_node_recovered(self, node_id: str):
+        return await self._mark_node_state(node_id, NodeState.READY)
+
+    async def mark_node_dead(self, node_id: str):
+        return await self._mark_node_state(node_id, NodeState.DEAD)
+
+    async def _mark_node_state(self, node_id: str, state: NodeState):
+        async with self.metadata_lock:
+            if node_id not in self.worker_nodes:
+                self.worker_nodes[node_id] = {
+                    "ray_node_id": None,
+                    "address": None,
+                    "free_gpu": 0,
+                    "total_gpu": 0,
+                }
+            from_state = self.worker_nodes[node_id].get(
+                "state", NodeState.READY.value
+            )
+            self.worker_nodes[node_id]["state"] = state.value
+            logger.info(
+                f"Marked scheduler node {node_id} "
+                f"{from_state} -> {state.value}"
+            )
+            return {
+                "node_id": node_id,
+                "from": from_state,
+                "to": state.value,
+            }
 
     async def start(self) -> None:
         async with self.running_lock:
@@ -145,6 +185,12 @@ class FcfsScheduler(SllmScheduler):
                 ) in loading_requests:
                     allocated = False
                     for node_id, node_info in worker_nodes.items():
+                        if not self._node_is_ready(node_info):
+                            logger.info(
+                                f"Skipping node {node_id} in state "
+                                f"{node_info.get('state')}"
+                            )
+                            continue
                         if node_info["free_gpu"] >= num_gpus:
                             async with self.queue_lock:
                                 # allocation_result was set
@@ -183,11 +229,19 @@ class FcfsScheduler(SllmScheduler):
             updated_worker_nodes = copy.deepcopy(self.worker_nodes)
         for node_id, node_info in worker_nodes.items():
             if node_id not in updated_worker_nodes:
-                updated_worker_nodes[node_id] = copy.deepcopy(node_info)
+                updated_worker_nodes[node_id] = self._ensure_node_metadata(
+                    copy.deepcopy(node_info)
+                )
+            else:
+                current_state = updated_worker_nodes[node_id].get(
+                    "state", NodeState.READY.value
+                )
+                updated_worker_nodes[node_id].update(copy.deepcopy(node_info))
+                updated_worker_nodes[node_id]["state"] = current_state
         async with self.metadata_lock:
             self.worker_nodes = updated_worker_nodes
 
-        return updated_worker_nodes
+        return copy.deepcopy(updated_worker_nodes)
 
     # TODO: implement a dedicated class to manage worker nodes
     async def _update_worker_nodes(self, worker_nodes) -> None:
@@ -197,7 +251,13 @@ class FcfsScheduler(SllmScheduler):
             if node_id not in updated_worker_nodes:
                 logger.error(f"Node {node_id} not found")
                 continue
-            updated_worker_nodes[node_id] = copy.deepcopy(node_info)
+            current_state = updated_worker_nodes[node_id].get(
+                "state", NodeState.READY.value
+            )
+            updated_worker_nodes[node_id] = self._ensure_node_metadata(
+                copy.deepcopy(node_info)
+            )
+            updated_worker_nodes[node_id]["state"] = current_state
         async with self.metadata_lock:
             self.worker_nodes = updated_worker_nodes
         logger.info(f"Worker nodes updated: {updated_worker_nodes}")

@@ -21,6 +21,7 @@ import click
 from sllm.cli._cli_utils import (
     delete_model,
     deploy_model,
+    replay_trace,
     show_status,
     start_server,
 )
@@ -161,6 +162,37 @@ def start(host, port, enable_storage_aware, enable_migration):
 def status():
     """Show all deployed models."""
     show_status()
+
+
+@cli.command("replay-trace")
+@click.option("--trace", required=True, help="Path to a JSONL spot trace")
+@click.option("--speedup", type=float, default=1.0, help="Trace replay speedup")
+@click.option(
+    "--ray-address",
+    default="auto",
+    help="Ray address used to connect to the running SLLM cluster",
+)
+@click.option(
+    "--ray-namespace",
+    default="sllm",
+    help="Ray namespace containing the controller actor",
+)
+@click.option(
+    "--controller-name",
+    default="controller",
+    help="Ray actor name for the SLLM controller",
+)
+def replay_trace_command(
+    trace, speedup, ray_address, ray_namespace, controller_name
+):
+    """Replay synthetic SpotServe preempt/recover/dead events."""
+    replay_trace(
+        trace=trace,
+        speedup=speedup,
+        ray_address=ray_address,
+        ray_namespace=ray_namespace,
+        controller_name=controller_name,
+    )
 
 
 if __name__ == "__main__":

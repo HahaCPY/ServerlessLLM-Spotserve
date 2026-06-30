@@ -52,7 +52,7 @@ def _event_from_dict(raw_event: dict, source: str) -> SpotEvent:
 def load_spot_trace(trace_path: str | Path) -> List[SpotEvent]:
     path = Path(trace_path)
     if path.suffix != ".jsonl":
-        raise ValueError("Only JSONL spot traces are supported in v1")
+        raise ValueError("Only JSONL spot traces are supported")
 
     events: List[SpotEvent] = []
     with path.open("r", encoding="utf-8") as trace_file:

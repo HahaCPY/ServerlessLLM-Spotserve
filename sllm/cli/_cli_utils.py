@@ -85,6 +85,34 @@ def start_server(
         sys.exit(1)
 
 
+def replay_trace(
+    trace,
+    speedup=1.0,
+    ray_address="auto",
+    ray_namespace="sllm",
+    controller_name="controller",
+):
+    """Replay a synthetic SpotServe trace against the running controller."""
+    command = [
+        sys.executable,
+        "-m",
+        "sllm.spot.preemption_simulator",
+        "--trace",
+        trace,
+        "--speedup",
+        str(speedup),
+        "--ray-address",
+        ray_address,
+        "--ray-namespace",
+        ray_namespace,
+        "--controller-name",
+        controller_name,
+    ]
+    completed = subprocess.run(command, check=False)
+    if completed.returncode != 0:
+        sys.exit(completed.returncode)
+
+
 # ----------------------------- DEPLOY COMMAND ----------------------------- #
 def read_config(config_path: str) -> dict:
     try:

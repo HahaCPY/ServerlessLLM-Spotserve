@@ -15,7 +15,15 @@ Trace events:
 
 - `preempt`: mark matching worker instances as `PREEMPTING`.
 - `dead`: mark matching worker instances as `DEAD`.
-- `recover`: parsed in v1, but not dispatched yet.
+- `recover`: restore matching `PREEMPTING` instances to `READY`.
+
+The CLI wrapper can also replay the same trace:
+
+```bash
+sllm replay-trace \
+  --trace examples/spotserve/spot_trace_sample.jsonl \
+  --speedup 10
+```
 
 ## Router Config
 

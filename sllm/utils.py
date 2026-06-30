@@ -60,6 +60,12 @@ class InstanceState(str, Enum):
     DEAD = "dead"
 
 
+class NodeState(str, Enum):
+    READY = "ready"
+    PREEMPTING = "preempting"
+    DEAD = "dead"
+
+
 @dataclass
 class InstanceStatus:
     instance_id: str
@@ -143,6 +149,14 @@ class InstanceHandle:
         async with self.lock:
             self.ready = False
             self.state = InstanceState.DEAD
+
+    async def mark_recovered(self):
+        async with self.lock:
+            if self.state != InstanceState.PREEMPTING:
+                return False
+            self.ready = True
+            self.state = InstanceState.READY
+            return True
 
     async def get_status(self):
         async with self.lock:
