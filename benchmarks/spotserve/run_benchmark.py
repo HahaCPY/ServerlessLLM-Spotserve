@@ -360,12 +360,24 @@ async def main_async(args):
     if summaries:
         print("\nBenchmark summary:")
         for summary in summaries:
+            recovery_suffix = ""
+            if int(summary.get("router_metrics_rows", 0) or 0) > 0:
+                recovery_suffix = (
+                    f", failed_attempts="
+                    f"{summary.get('failed_attempts_total', 0)}, "
+                    f"retries={summary.get('retry_count_total', 0)}, "
+                    f"recovered_tokens="
+                    f"{summary.get('recovered_tokens_total', 0)}, "
+                    f"fallbacks="
+                    f"{summary.get('recovery_fallback_count', 0)}"
+                )
             print(
                 "  "
                 f"{summary['run_name']}: "
                 f"successes={summary['successes']}/{summary['requests']}, "
                 f"success_rate={summary['success_rate']:.2%}, "
                 f"p95={summary['latency_p95_ms']:.2f}ms"
+                f"{recovery_suffix}"
             )
         if all(summary["successes"] == 0 for summary in summaries):
             print(

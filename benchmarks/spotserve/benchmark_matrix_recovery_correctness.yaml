@@ -1,0 +1,35 @@
+{
+  "endpoint": "http://127.0.0.1:8344/v1/chat/completions",
+  "output_dir": "results/spotserve_recovery_correctness",
+  "runs": [
+    {
+      "name": "dummy-correctness-none",
+      "model": "dummy-correctness-none",
+      "backend": "dummy",
+      "policy": "none",
+      "workload": "benchmarks/spotserve/workloads/recovery_correctness.jsonl",
+      "trace": null,
+      "router_metrics_path": "/tmp/spotserve-work/results/spotserve/dummy-correctness-none-router.jsonl"
+    },
+    {
+      "name": "dummy-correctness-naive-retry",
+      "model": "dummy-correctness-naive-retry",
+      "backend": "dummy",
+      "policy": "naive_retry",
+      "max_retries": 2,
+      "workload": "benchmarks/spotserve/workloads/recovery_correctness.jsonl",
+      "trace": null,
+      "router_metrics_path": "/tmp/spotserve-work/results/spotserve/dummy-correctness-naive-retry-router.jsonl"
+    },
+    {
+      "name": "dummy-correctness-token-replay",
+      "model": "dummy-correctness-token-replay",
+      "backend": "dummy",
+      "policy": "generated_token_replay",
+      "max_retries": 2,
+      "workload": "benchmarks/spotserve/workloads/recovery_correctness.jsonl",
+      "trace": null,
+      "router_metrics_path": "/tmp/spotserve-work/results/spotserve/dummy-correctness-token-replay-router.jsonl"
+    }
+  ]
+}

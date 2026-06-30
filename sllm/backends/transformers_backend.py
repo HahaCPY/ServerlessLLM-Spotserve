@@ -54,6 +54,27 @@ class InferenceStatus(BaseStreamer):
         super().__init__()
         self.status = status
         self.intermediate = []
+        self.forced_failure = None
+
+    def configure_forced_failure(
+        self,
+        failure_mode: Optional[str],
+        fail_after_tokens: Optional[int],
+        prompt_tokens: int,
+        no_current_tokens: bool = False,
+    ):
+        if not failure_mode or fail_after_tokens is None:
+            self.forced_failure = None
+            return
+        self.forced_failure = {
+            "mode": failure_mode.lower(),
+            "after": int(fail_after_tokens),
+            "prompt_tokens": int(prompt_tokens),
+            "no_current_tokens": bool(no_current_tokens),
+        }
+
+    def clear_forced_failure(self):
+        self.forced_failure = None
 
     def put(self, value):
         value = value.tolist()
@@ -67,6 +88,22 @@ class InferenceStatus(BaseStreamer):
         logger.warning(f"Intermediate output: {self.intermediate}")
         if self.status == BackendStatus.DELETING:
             raise DeletingException("Backend is deleting")
+        if self.forced_failure and self.intermediate:
+            prompt_tokens = int(self.forced_failure["prompt_tokens"])
+            generated_tokens = max(0, len(self.intermediate[0]) - prompt_tokens)
+            if generated_tokens >= int(self.forced_failure["after"]):
+                mode = self.forced_failure["mode"]
+                if self.forced_failure["no_current_tokens"]:
+                    self.intermediate = []
+                self.clear_forced_failure()
+                if mode in {"preempt", "preempted", "preemption"}:
+                    raise DeletingException(
+                        "Forced transformers backend preemption"
+                    )
+                raise RuntimeError(
+                    "Forced transformers backend failure after "
+                    f"{generated_tokens} tokens"
+                )
 
     def end(self):
         logger.error("Inference completed")
@@ -77,6 +114,7 @@ class InferenceStatus(BaseStreamer):
     def delete(self):
         logger.info("Deleting intermediate output")
         self.intermediate = []
+        self.clear_forced_failure()
 
 
 class TransformersBackend(SllmBackend):
@@ -97,6 +135,7 @@ class TransformersBackend(SllmBackend):
         self.model = None
         self.tokenizer = None
         self.past_key_values = None
+        self._forced_failures_seen = set()
 
     def convert_str_to_json(self, json_str):
         try:
@@ -166,6 +205,43 @@ class TransformersBackend(SllmBackend):
             truncation=True,
             return_tensors="pt",
         ).to("cuda:0")
+
+    def _force_failure_key(self, request_data: Dict[str, Any]) -> str:
+        failure_mode = request_data.get("force_failure") or request_data.get(
+            "force_backend_failure"
+        )
+        request_id = request_data.get("request_id") or f"anonymous-{id(request_data)}"
+        return f"{self.model_name}:{request_id}:{failure_mode}"
+
+    def _configure_forced_failure(
+        self, request_data: Dict[str, Any], prompt_tokens: int
+    ) -> None:
+        failure_mode = request_data.get("force_failure") or request_data.get(
+            "force_backend_failure"
+        )
+        fail_after_tokens = request_data.get("force_fail_after_tokens")
+        if fail_after_tokens is None:
+            fail_after_tokens = request_data.get("force_preempt_after_tokens")
+        if not failure_mode or fail_after_tokens is None:
+            self.inf_status.configure_forced_failure(None, None, prompt_tokens)
+            return
+
+        failure_key = self._force_failure_key(request_data)
+        force_once = request_data.get("force_fail_once", True)
+        if force_once and failure_key in self._forced_failures_seen:
+            self.inf_status.configure_forced_failure(None, None, prompt_tokens)
+            return
+        if force_once:
+            self._forced_failures_seen.add(failure_key)
+
+        self.inf_status.configure_forced_failure(
+            failure_mode,
+            int(fail_after_tokens),
+            prompt_tokens,
+            no_current_tokens=request_data.get(
+                "force_no_current_tokens", False
+            ),
+        )
 
     def encode(self, request_data: Optional[Dict[str, Any]]):
         with self.status_lock:
@@ -273,6 +349,7 @@ class TransformersBackend(SllmBackend):
 
         inputs = self._tokenize(prompt)
         prompt_tokens = inputs.input_ids.shape[1]
+        self._configure_forced_failure(request_data, prompt_tokens)
 
         # Generate response
         try:
@@ -286,9 +363,14 @@ class TransformersBackend(SllmBackend):
             output_tokens = self.inf_status.get()
             self.inf_status.delete()
             return {
+                "error": "Transformers backend was preempted during generation",
                 "preempted": "True",
                 "current_output": output_tokens,
-                "completed_tokens": len(output_tokens[0]) - prompt_tokens,
+                "completed_tokens": (
+                    max(0, len(output_tokens[0]) - prompt_tokens)
+                    if output_tokens
+                    else 0
+                ),
             }
         except Exception as e:
             logger.error(f"Failed to generate response: {e}")
@@ -449,6 +531,7 @@ class TransformersBackend(SllmBackend):
 
         inputs = self._tokenize(prompt)
         prompt_tokens = inputs.input_ids.shape[1]
+        self._configure_forced_failure(request_data, prompt_tokens)
 
         # Generate response
         try:

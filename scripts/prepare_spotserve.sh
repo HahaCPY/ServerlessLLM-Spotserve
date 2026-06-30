@@ -12,6 +12,7 @@ Options:
   --skip-build       Do not run "docker compose build sllm_head"
   --skip-recreate    Do not recreate the sllm_head container
   --skip-deploy      Copy artifacts but do not deploy dummy models
+  --deploy-set SET   Models to deploy: standard, correctness, or all. Default: standard
   -h, --help         Show this help
 
 Environment overrides:
@@ -25,6 +26,7 @@ EOF
 SKIP_BUILD=0
 SKIP_RECREATE=0
 SKIP_DEPLOY=0
+DEPLOY_SET="${SPOTSERVE_DEPLOY_SET:-standard}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -39,6 +41,14 @@ while [[ $# -gt 0 ]]; do
     --skip-deploy)
       SKIP_DEPLOY=1
       shift
+      ;;
+    --deploy-set)
+      DEPLOY_SET="${2:-}"
+      if [[ "$DEPLOY_SET" != "standard" && "$DEPLOY_SET" != "correctness" && "$DEPLOY_SET" != "all" ]]; then
+        echo "--deploy-set must be one of: standard, correctness, all" >&2
+        exit 2
+      fi
+      shift 2
       ;;
     -h|--help)
       usage
@@ -132,14 +142,29 @@ podman cp examples/spotserve/. "${CONTAINER}:${WORKDIR_IN_CONTAINER}/examples/sp
 podman cp scripts/. "${CONTAINER}:${WORKDIR_IN_CONTAINER}/scripts"
 
 if [[ "$SKIP_DEPLOY" -eq 0 ]]; then
-  log "Deploying dummy SpotServe policies"
+  log "Deploying dummy SpotServe policies (${DEPLOY_SET})"
+  STANDARD_CONFIGS=(
+    "examples/spotserve/config-dummy-none.json"
+    "examples/spotserve/config-dummy-naive-retry.json"
+    "examples/spotserve/config-dummy-token-replay.json"
+  )
+  CORRECTNESS_CONFIGS=(
+    "examples/spotserve/config-dummy-correctness-none.json"
+    "examples/spotserve/config-dummy-correctness-naive-retry.json"
+    "examples/spotserve/config-dummy-correctness-token-replay.json"
+  )
+  DEPLOY_CONFIGS=()
+  if [[ "$DEPLOY_SET" == "standard" || "$DEPLOY_SET" == "all" ]]; then
+    DEPLOY_CONFIGS+=("${STANDARD_CONFIGS[@]}")
+  fi
+  if [[ "$DEPLOY_SET" == "correctness" || "$DEPLOY_SET" == "all" ]]; then
+    DEPLOY_CONFIGS+=("${CORRECTNESS_CONFIGS[@]}")
+  fi
+
   podman exec "$CONTAINER" bash -lc "
     set -euo pipefail
     cd '$WORKDIR_IN_CONTAINER'
-    for config in \
-      examples/spotserve/config-dummy-none.json \
-      examples/spotserve/config-dummy-naive-retry.json \
-      examples/spotserve/config-dummy-token-replay.json
+    for config in ${DEPLOY_CONFIGS[*]}
     do
       for attempt in \$(seq 1 30); do
         if '$HEAD_SLLM' deploy --config \"\$config\"; then
@@ -171,5 +196,16 @@ ${HEAD_PYTHON} benchmarks/spotserve/run_benchmark.py \\
   --request-timeout 30 \\
   --ray-address auto \\
   --ray-namespace sllm
+'
+
+Run the recovery-correctness benchmark with:
+
+podman exec ${CONTAINER} bash -lc '
+cd ${WORKDIR_IN_CONTAINER} &&
+${HEAD_PYTHON} benchmarks/spotserve/run_benchmark.py \\
+  --config benchmarks/spotserve/benchmark_matrix_recovery_correctness.yaml \\
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \\
+  --request-timeout 30 \\
+  --skip-trace
 '
 EOF

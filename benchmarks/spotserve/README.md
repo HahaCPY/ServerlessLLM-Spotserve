@@ -46,6 +46,27 @@ python benchmarks/spotserve/run_benchmark.py \
 For longer experiments, change `benchmark_matrix.yaml` to use
 `steady_low.jsonl`, `steady_high.jsonl`, or `burst.jsonl`.
 
+For recovery correctness validation, deploy the `dummy-correctness-*` configs
+and run:
+
+```bash
+scripts/prepare_spotserve.sh --deploy-set correctness
+
+python benchmarks/spotserve/run_benchmark.py \
+  --config benchmarks/spotserve/benchmark_matrix_recovery_correctness.yaml \
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \
+  --request-timeout 30 \
+  --skip-trace
+```
+
+This matrix forces mid-generation failures and reports request-level
+`failed_attempts`, `retry_count`, `recovered_tokens`, and `recovery_fallback`
+from router metrics.
+
+On head-only dummy setups, avoid deploying both standard and correctness dummy
+model sets at the same time; the extra Ray actors can exceed the container
+thread limit.
+
 If old results contain `{"error": "timed out"}` or
 `{"error": "Internal Server Error"}`, treat those runs as invalid setup
 failures, not as recovery-policy results.
@@ -72,3 +93,4 @@ Each run writes:
 - `summary.csv`
 - `report.html`
 - `report.md`
+- `router_request_metrics.jsonl` when matching router metrics are available

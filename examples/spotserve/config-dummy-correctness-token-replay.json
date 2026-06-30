@@ -1,0 +1,20 @@
+{
+  "model": "dummy-correctness-token-replay",
+  "backend": "dummy",
+  "router_num_cpus": 0,
+  "num_cpus": 0,
+  "num_gpus": 0,
+  "auto_scaling_config": {
+    "metric": "concurrency",
+    "target": 1,
+    "min_instances": 2,
+    "max_instances": 3,
+    "keep_alive": 60
+  },
+  "backend_config": {},
+  "router_config": {
+    "recovery_policy": "generated_token_replay",
+    "max_retries": 2,
+    "metrics_path": "/tmp/spotserve-work/results/spotserve/dummy-correctness-token-replay-router.jsonl"
+  }
+}

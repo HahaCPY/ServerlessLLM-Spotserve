@@ -83,6 +83,16 @@ def render_report(run_dir: Path) -> None:
     p95 = float(summary.get("latency_p95_ms", 0.0))
     p99 = float(summary.get("latency_p99_ms", 0.0))
     max_bar = max(success_rate, throughput, p95, p99, 1.0)
+    failed_attempts = int(summary.get("failed_attempts_total", 0) or 0)
+    retry_count = int(summary.get("retry_count_total", 0) or 0)
+    recovered_tokens = int(summary.get("recovered_tokens_total", 0) or 0)
+    recovery_fallbacks = int(summary.get("recovery_fallback_count", 0) or 0)
+    recovery_triggered = int(
+        summary.get("recovery_triggered_requests", 0) or 0
+    )
+    replay_succeeded = int(
+        summary.get("replay_succeeded_requests", 0) or 0
+    )
 
     html_report = f"""<!doctype html>
 <html lang="en">
@@ -132,6 +142,22 @@ def render_report(run_dir: Path) -> None:
     </tr>
   </table>
 
+  <h2>Recovery Correctness</h2>
+  <table class="summary">
+    <tr>
+      <th>Router Metrics Rows</th><th>Triggered Requests</th><th>Failed Attempts</th><th>Retry Count</th><th>Recovered Tokens</th><th>Fallbacks</th><th>Replay Succeeded</th>
+    </tr>
+    <tr>
+      <td>{summary.get("router_metrics_rows", 0)}</td>
+      <td>{recovery_triggered}</td>
+      <td>{failed_attempts}</td>
+      <td>{retry_count}</td>
+      <td>{recovered_tokens}</td>
+      <td>{recovery_fallbacks}</td>
+      <td>{replay_succeeded}</td>
+    </tr>
+  </table>
+
   <div class="card">
     <h2>Key Metrics</h2>
     {svg_bar("Success rate (%)", success_rate, max_bar, color)}
@@ -165,6 +191,12 @@ def render_report(run_dir: Path) -> None:
 | Requests | Success Rate | P50 | P95 | P99 | Throughput |
 |---:|---:|---:|---:|---:|---:|
 | {summary.get("requests", 0)} | {success_rate:.2f}% | {float(summary.get("latency_p50_ms", 0.0)):.2f} ms | {p95:.2f} ms | {p99:.2f} ms | {throughput:.2f} req/s |
+
+## Recovery Correctness
+
+| Router Metrics Rows | Triggered Requests | Failed Attempts | Retry Count | Recovered Tokens | Fallbacks | Replay Succeeded |
+|---:|---:|---:|---:|---:|---:|---:|
+| {summary.get("router_metrics_rows", 0)} | {recovery_triggered} | {failed_attempts} | {retry_count} | {recovered_tokens} | {recovery_fallbacks} | {replay_succeeded} |
 
 Open `report.html` for the visual report.
 """
