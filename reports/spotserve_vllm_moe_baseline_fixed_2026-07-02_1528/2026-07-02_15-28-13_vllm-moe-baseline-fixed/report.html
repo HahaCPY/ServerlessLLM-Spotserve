@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>SpotServe Benchmark Report</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 32px; color: #111827; }
+    h1, h2 { margin-bottom: 8px; }
+    .meta, .summary { border-collapse: collapse; margin: 16px 0 28px; min-width: 760px; }
+    th, td { border-bottom: 1px solid #e5e7eb; padding: 8px 10px; text-align: left; }
+    th { background: #f9fafb; }
+    .card { margin: 24px 0; max-width: 880px; }
+    .bar-row { display: grid; grid-template-columns: 180px 540px 90px; align-items: center; gap: 10px; margin: 8px 0; }
+    .bar-label { color: #374151; }
+    .bar-value { font-variant-numeric: tabular-nums; }
+    .chart { background: #fff; border: 1px solid #e5e7eb; border-radius: 6px; }
+    code { background: #f3f4f6; padding: 2px 5px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <h1>SpotServe Benchmark Report</h1>
+  <p>Run: <code>2026-07-02_15-28-13_vllm-moe-baseline-fixed</code></p>
+
+  <h2>Run Metadata</h2>
+  <table class="meta">
+    <tr><th>Policy</th><td>none</td></tr>
+    <tr><th>Backend</th><td>vllm</td></tr>
+    <tr><th>Model</th><td>vllm-moe-baseline</td></tr>
+    <tr><th>Trace</th><td>None</td></tr>
+    <tr><th>Workload</th><td>benchmarks/spotserve/workloads/vllm_moe_trace.jsonl</td></tr>
+    <tr><th>Git Commit</th><td>None</td></tr>
+  </table>
+
+  <h2>Summary</h2>
+  <table class="summary">
+    <tr>
+      <th>Requests</th><th>Success Rate</th><th>P50</th><th>P95</th><th>P99</th><th>Throughput</th>
+    </tr>
+    <tr>
+      <td>6</td>
+      <td>100.00%</td>
+      <td>1668.80 ms</td>
+      <td>2187.66 ms</td>
+      <td>2187.66 ms</td>
+      <td>0.19 req/s</td>
+    </tr>
+  </table>
+
+  <h2>Recovery Correctness</h2>
+  <table class="summary">
+    <tr>
+      <th>Router Metrics Rows</th><th>Triggered Requests</th><th>Failed Attempts</th><th>Retry Count</th><th>Recovered Tokens</th><th>Fallbacks</th><th>Replay Succeeded</th>
+    </tr>
+    <tr>
+      <td>0</td>
+      <td>0</td>
+      <td>0</td>
+      <td>0</td>
+      <td>0</td>
+      <td>0</td>
+      <td>0</td>
+    </tr>
+  </table>
+
+  <h2>Instance State Metrics</h2>
+  <table class="summary">
+    <tr>
+      <th>Instance Events</th><th>Preempting</th><th>Ready</th><th>Dead</th><th>Draining</th>
+    </tr>
+    <tr>
+      <td>0</td>
+      <td>0</td>
+      <td>0</td>
+      <td>0</td>
+      <td>0</td>
+    </tr>
+  </table>
+
+  <div class="card">
+    <h2>Key Metrics</h2>
+    
+    <div class="bar-row">
+      <div class="bar-label">Success rate (%)</div>
+      <svg width="520" height="22" role="img" aria-label="Success rate (%)">
+        <rect x="0" y="3" width="520" height="16" rx="3" fill="#e5e7eb"/>
+        <rect x="0" y="3" width="23" height="16" rx="3" fill="#7a7a7a"/>
+      </svg>
+      <div class="bar-value">100.00</div>
+    </div>
+    
+    
+    <div class="bar-row">
+      <div class="bar-label">Throughput (req/s)</div>
+      <svg width="520" height="22" role="img" aria-label="Throughput (req/s)">
+        <rect x="0" y="3" width="520" height="16" rx="3" fill="#e5e7eb"/>
+        <rect x="0" y="3" width="0" height="16" rx="3" fill="#7a7a7a"/>
+      </svg>
+      <div class="bar-value">0.19</div>
+    </div>
+    
+    
+    <div class="bar-row">
+      <div class="bar-label">P95 latency (ms)</div>
+      <svg width="520" height="22" role="img" aria-label="P95 latency (ms)">
+        <rect x="0" y="3" width="520" height="16" rx="3" fill="#e5e7eb"/>
+        <rect x="0" y="3" width="520" height="16" rx="3" fill="#9333ea"/>
+      </svg>
+      <div class="bar-value">2187.66</div>
+    </div>
+    
+    
+    <div class="bar-row">
+      <div class="bar-label">P99 latency (ms)</div>
+      <svg width="520" height="22" role="img" aria-label="P99 latency (ms)">
+        <rect x="0" y="3" width="520" height="16" rx="3" fill="#e5e7eb"/>
+        <rect x="0" y="3" width="520" height="16" rx="3" fill="#be123c"/>
+      </svg>
+      <div class="bar-value">2187.66</div>
+    </div>
+    
+  </div>
+
+  <div class="card">
+    <h2>Latency CDF</h2>
+    
+    <svg class="chart" width="720" height="260" role="img" aria-label="Latency CDF">
+      <line x1="40" y1="230" x2="700" y2="230" stroke="#6b7280"/>
+      <line x1="40" y1="20" x2="40" y2="230" stroke="#6b7280"/>
+      <polyline fill="none" stroke="#2563eb" stroke-width="3" points="384.6,230.0 543.3,190.0 543.5,150.0 544.3,110.0 544.7,70.0 700.0,30.0"/>
+      <text x="40" y="252" fill="#374151">0 ms</text>
+      <text x="600" y="252" fill="#374151">2187.7 ms</text>
+      <text x="8" y="24" fill="#374151">CDF</text>
+    </svg>
+    
+  </div>
+</body>
+</html>

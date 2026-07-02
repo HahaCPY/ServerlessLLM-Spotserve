@@ -1,0 +1,48 @@
+{
+  "endpoint": "http://127.0.0.1:8345/v1/chat/completions",
+  "output_dir": "results/spotserve_vllm_moe",
+  "runs": [
+    {
+      "name": "vllm-moe-no-preemption",
+      "model": "vllm-moe-baseline",
+      "backend": "vllm",
+      "model_family": "moe",
+      "policy": "none",
+      "workload": "benchmarks/spotserve/workloads/vllm_moe_trace.jsonl",
+      "trace": null,
+      "router_metrics_path": "/tmp/spotserve-work/results/spotserve_vllm_moe/vllm-moe-baseline-router.jsonl"
+    },
+    {
+      "name": "vllm-moe-preemption-none",
+      "model": "vllm-moe-none",
+      "backend": "vllm",
+      "model_family": "moe",
+      "policy": "none",
+      "workload": "benchmarks/spotserve/workloads/vllm_moe_trace.jsonl",
+      "trace": "examples/spotserve/spot_trace_vllm_moe_none.jsonl",
+      "router_metrics_path": "/tmp/spotserve-work/results/spotserve_vllm_moe/vllm-moe-none-router.jsonl"
+    },
+    {
+      "name": "vllm-moe-naive-retry",
+      "model": "vllm-moe-naive-retry",
+      "backend": "vllm",
+      "model_family": "moe",
+      "policy": "naive_retry",
+      "max_retries": 2,
+      "workload": "benchmarks/spotserve/workloads/vllm_moe_trace.jsonl",
+      "trace": "examples/spotserve/spot_trace_vllm_moe_naive_retry.jsonl",
+      "router_metrics_path": "/tmp/spotserve-work/results/spotserve_vllm_moe/vllm-moe-naive-retry-router.jsonl"
+    },
+    {
+      "name": "vllm-moe-token-replay",
+      "model": "vllm-moe-token-replay",
+      "backend": "vllm",
+      "model_family": "moe",
+      "policy": "generated_token_replay",
+      "max_retries": 2,
+      "workload": "benchmarks/spotserve/workloads/vllm_moe_trace.jsonl",
+      "trace": "examples/spotserve/spot_trace_vllm_moe_token_replay.jsonl",
+      "router_metrics_path": "/tmp/spotserve-work/results/spotserve_vllm_moe/vllm-moe-token-replay-router.jsonl"
+    }
+  ]
+}

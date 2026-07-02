@@ -22,7 +22,7 @@ Then run the benchmark:
 ```bash
 python benchmarks/spotserve/run_benchmark.py \
   --config benchmarks/spotserve/benchmark_matrix.yaml \
-  --endpoint http://127.0.0.1:8344/v1/chat/completions
+  --endpoint http://127.0.0.1:8345/v1/chat/completions
 ```
 
 The default matrix uses `workloads/smoke.jsonl` and a 15-second request timeout
@@ -38,7 +38,7 @@ trace replay first:
 ```bash
 python benchmarks/spotserve/run_benchmark.py \
   --config benchmarks/spotserve/benchmark_matrix.yaml \
-  --endpoint http://127.0.0.1:8344/v1/chat/completions \
+  --endpoint http://127.0.0.1:8345/v1/chat/completions \
   --skip-trace \
   --request-timeout 5
 ```
@@ -54,7 +54,7 @@ scripts/prepare_spotserve.sh --deploy-set correctness
 
 python benchmarks/spotserve/run_benchmark.py \
   --config benchmarks/spotserve/benchmark_matrix_recovery_correctness.yaml \
-  --endpoint http://127.0.0.1:8343/v1/chat/completions \
+  --endpoint http://127.0.0.1:8345/v1/chat/completions \
   --request-timeout 30 \
   --skip-trace
 ```
@@ -76,7 +76,7 @@ scripts/prepare_spotserve.sh --deploy-set vllm-dense
 
 python benchmarks/spotserve/run_benchmark.py \
   --config benchmarks/spotserve/benchmark_matrix_vllm_dense.yaml \
-  --endpoint http://127.0.0.1:8343/v1/chat/completions \
+  --endpoint http://127.0.0.1:8345/v1/chat/completions \
   --request-timeout 120 \
   --ray-address auto \
   --ray-namespace sllm
@@ -86,6 +86,51 @@ The vLLM dense matrix validates control-plane behavior around synthetic
 preemption with a black-box vLLM worker. Treat generated-token replay as
 best-effort prompt-token replay, not true KV cache recovery. Trace runs also
 surface instance-state event counts in the summary and report.
+
+For vLLM MoE black-box validation, deploy the MoE configs and run the MoE
+matrix:
+
+```bash
+export MODEL_FOLDER=$PWD/model
+export SPOTSERVE_VLLM_MOE_MODEL=Qwen/Qwen1.5-MoE-A2.7B
+export SPOTSERVE_VLLM_MOE_LOAD_FORMAT=auto
+scripts/prepare_spotserve.sh --deploy-set vllm-moe
+
+python benchmarks/spotserve/run_benchmark.py \
+  --config benchmarks/spotserve/benchmark_matrix_vllm_moe.yaml \
+  --endpoint http://127.0.0.1:8345/v1/chat/completions \
+  --request-timeout 180 \
+  --ray-address auto \
+  --ray-namespace sllm
+```
+
+If the vLLM team provides a local snapshot or different load format, keep the
+SpotServe model aliases unchanged and override only the backend target:
+
+```bash
+export SPOTSERVE_VLLM_MOE_MODEL=/models/hf/qwen3-moe
+export SPOTSERVE_VLLM_MOE_LOAD_FORMAT=auto
+export SPOTSERVE_VLLM_MOE_TP=2
+scripts/prepare_spotserve.sh --deploy-set vllm-moe
+```
+
+To produce a dense-vs-MoE report under `none`, `naive_retry`, and
+`generated_token_replay`, deploy both vLLM sets and run the combined matrix:
+
+```bash
+scripts/prepare_spotserve.sh --deploy-set vllm-blackbox
+
+python benchmarks/spotserve/run_benchmark.py \
+  --config benchmarks/spotserve/benchmark_matrix_vllm_dense_vs_moe.yaml \
+  --endpoint http://127.0.0.1:8345/v1/chat/completions \
+  --request-timeout 180 \
+  --ray-address auto \
+  --ray-namespace sllm
+```
+
+The MoE path intentionally treats vLLM as a black box. `load_format` is set so
+ServerlessLLM skips SLLM-store conversion and lets vLLM load the MoE model
+directly from the provided Hugging Face id or local path.
 
 If old results contain `{"error": "timed out"}` or
 `{"error": "Internal Server Error"}`, treat those runs as invalid setup

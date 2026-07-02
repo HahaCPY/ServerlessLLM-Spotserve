@@ -16,15 +16,22 @@ services:
       - NUMEXPR_NUM_THREADS=1
       - RAYON_NUM_THREADS=1
       - TOKENIZERS_PARALLELISM=false
+      - RAY_TEMP_DIR=/raytmp/head
+      - RAY_ADDRESS=127.0.0.1:6379
+      - HF_HOME=/hf-cache
+      - HF_HUB_DISABLE_XET=1
     ports:
       # - "6379:6379"    # Redis port
       - "6380:6379"
-      # - "8343:8343"  
-      - "8344:8343"    # ServerlessLLM port
+      - "8345:8343"    # ServerlessLLM port, host:container
     shm_size: "10gb"
-    pids_limit: 8192
+    pids_limit: 32768
     networks:
       - sllm_network
+    volumes:
+      - ./entrypoint.sh:/app/entrypoint.sh:ro
+      - /tmp/sllm-ray/head:/raytmp/head
+      - /tmp/sllm-hf-cache:/hf-cache
     command: []
 
   # Worker Node 0
@@ -55,12 +62,18 @@ services:
       - NUMEXPR_NUM_THREADS=1
       - RAYON_NUM_THREADS=1
       - TOKENIZERS_PARALLELISM=false
+      - RAY_TEMP_DIR=/raytmp/worker
+      - HF_HOME=/hf-cache
+      - HF_HUB_DISABLE_XET=1
     shm_size: "10gb"
-    pids_limit: 8192
+    pids_limit: 32768
     networks:
       - sllm_network
     volumes:
       - ${MODEL_FOLDER}:/models
+      - ./entrypoint.sh:/app/entrypoint.sh:ro
+      - /tmp/sllm-ray/worker:/raytmp/worker
+      - /tmp/sllm-hf-cache:/hf-cache
     command: ["--mem-pool-size", "4GB", "--registration-required", "true"] # Customize the memory pool size here
 
 networks:

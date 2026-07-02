@@ -51,6 +51,9 @@ initialize_head_node() {
 
   # Construct the command
   CMD="ray start --head --port=$RAY_PORT --resources='$RAY_RESOURCES' --num-cpus=$RAY_NUM_CPUS"
+  if [ ! -z "$RAY_TEMP_DIR" ]; then
+    CMD="$CMD --temp-dir=$RAY_TEMP_DIR"
+  fi
 
   # Add node IP if specified
   if [ ! -z "$RAY_NODE_IP" ]; then
@@ -89,6 +92,9 @@ initialize_worker_node() {
 
   # Construct the command
   CMD="ray start --address=$RAY_HEAD_ADDRESS --resources='$RAY_RESOURCES'"
+  if [ ! -z "$RAY_TEMP_DIR" ]; then
+    CMD="$CMD --temp-dir=$RAY_TEMP_DIR"
+  fi
 
   # Add node IP if specified
   if [ ! -z "$RAY_NODE_IP" ]; then

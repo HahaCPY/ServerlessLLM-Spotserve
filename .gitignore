@@ -253,6 +253,7 @@ Temporary Items
 /results/
 /ray_results/
 /logs/
+/.spotserve-tmp/
 reports/spotserve/runs/
 reports/spotserve/generated/
 

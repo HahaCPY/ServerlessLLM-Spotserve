@@ -14,7 +14,7 @@ preemption-aware serving:
 - preemption, recovery, and dead-node dispatch
 - retry and generated-token replay policies
 - request-level recovery metrics
-- dummy, transformers, and vLLM dense validation paths
+- dummy, transformers, vLLM dense, and vLLM MoE validation paths
 - benchmark and report generation
 
 Generated-token replay in this branch is best-effort prompt/token replay. It is
@@ -29,7 +29,7 @@ not true KV cache migration.
 | Recovery correctness validation | Done | Forced dummy failures prove retry/replay metrics are actually triggered. |
 | vLLM dense black-box integration | Done | Dense vLLM models deploy and run under synthetic traces. |
 | Dynamic reparallelization planner | Prototype | Planner code and synthetic config exist; it does not rebuild workers online. |
-| vLLM MoE black-box integration | Planned | See `CPY-plan.md` for the current roadmap. |
+| vLLM MoE black-box integration | Done | MoE configs, benchmark matrices, and reports validate vLLM as a black-box backend. |
 
 Detailed notes live in:
 
@@ -38,6 +38,7 @@ Detailed notes live in:
 - `docs/spotserve-version3.md`
 - `docs/spotserve-version4.md`
 - `docs/spotserve-version5.md`
+- `docs/spotserve-version5-vllm-moe.md`
 - `CPY-plan.md`
 
 ## Layout
@@ -166,6 +167,54 @@ failed_attempts=0, retries=0, recovered_tokens=0, fallbacks=0
 That means the trace changed routing and instance state without killing an
 in-flight vLLM generation. Use the recovery correctness benchmark above when
 you need forced mid-generation failure evidence.
+
+## vLLM MoE Black-box Benchmark
+
+The vLLM MoE path validates the same SpotServe-style control plane against a
+single MoE model served by vLLM as a black box.
+
+Prepare:
+
+```bash
+export MODEL_FOLDER=$PWD/model
+export SPOTSERVE_VLLM_MOE_MODEL=Qwen/Qwen1.5-MoE-A2.7B
+export SPOTSERVE_VLLM_MOE_LOAD_FORMAT=auto
+export SPOTSERVE_VLLM_MOE_TP=1
+scripts/prepare_spotserve.sh --deploy-set vllm-moe
+```
+
+Run the MoE-only matrix:
+
+```bash
+podman exec sllm_head bash -lc '
+cd /tmp/spotserve-work &&
+/opt/venvs/head/bin/python benchmarks/spotserve/run_benchmark.py \
+  --config benchmarks/spotserve/benchmark_matrix_vllm_moe.yaml \
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \
+  --request-timeout 180 \
+  --ray-address auto \
+  --ray-namespace sllm
+'
+```
+
+Run the dense-vs-MoE comparison:
+
+```bash
+scripts/prepare_spotserve.sh --deploy-set vllm-blackbox
+
+podman exec sllm_head bash -lc '
+cd /tmp/spotserve-work &&
+/opt/venvs/head/bin/python benchmarks/spotserve/run_benchmark.py \
+  --config benchmarks/spotserve/benchmark_matrix_vllm_dense_vs_moe.yaml \
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \
+  --request-timeout 180 \
+  --ray-address auto \
+  --ray-namespace sllm
+'
+```
+
+The MoE path intentionally does not implement expert routing, expert migration,
+or MoE-specific recovery optimization.
 
 ## Dynamic Reparallelization Planner Prototype
 
@@ -317,7 +366,6 @@ python -m pytest tests/spotserve_test/test_reparallelization_planner.py
 
 The active roadmap is in `CPY-plan.md`. Near-term work focuses on:
 
-- vLLM MoE black-box integration
 - dynamic reparallelization beyond planning-only output
 - low-cost context migration planning
 - stateful inference recovery

@@ -1,0 +1,32 @@
+[
+  {
+    "backend": "vllm",
+    "failed_attempts_total": 0,
+    "failures": 0,
+    "instance_state_rows": 0,
+    "instances_marked_dead": 0,
+    "instances_marked_draining": 0,
+    "instances_marked_preempting": 0,
+    "instances_marked_ready": 0,
+    "latency_avg_ms": 1668.5043573379517,
+    "latency_p50_ms": 1668.7960624694824,
+    "latency_p95_ms": 2187.655210494995,
+    "latency_p99_ms": 2187.655210494995,
+    "model": "vllm-moe-baseline",
+    "policy": "none",
+    "recovered_tokens_total": 0,
+    "recovery_fallback_count": 0,
+    "recovery_triggered_requests": 0,
+    "replay_not_needed_requests": 0,
+    "replay_succeeded_requests": 0,
+    "requests": 6,
+    "retry_count_total": 0,
+    "router_metrics_path": "/tmp/spotserve-work/results/spotserve_vllm_moe_baseline_fixed/vllm-moe-baseline-router.jsonl",
+    "router_metrics_rows": 0,
+    "run_dir": "results/spotserve_vllm_moe_baseline_fixed/2026-07-02_15-28-13_vllm-moe-baseline-fixed",
+    "run_name": "vllm-moe-baseline-fixed",
+    "success_rate": 1.0,
+    "successes": 6,
+    "throughput_req_s": 0.1866164281386617
+  }
+]

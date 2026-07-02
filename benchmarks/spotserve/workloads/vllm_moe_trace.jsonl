@@ -1,0 +1,6 @@
+{"time": 0.0, "request_id": "vllm-moe-trace-001", "messages": [{"role": "user", "content": "Answer in one short sentence: what is a mixture-of-experts language model?"}], "max_tokens": 32, "temperature": 0.0}
+{"time": 2.0, "request_id": "vllm-moe-trace-002", "messages": [{"role": "user", "content": "Answer in one short sentence: why retry failed requests?"}], "max_tokens": 32, "temperature": 0.0}
+{"time": 6.0, "request_id": "vllm-moe-trace-003", "messages": [{"role": "user", "content": "Answer in one short sentence: what should a router do during preemption?"}], "max_tokens": 32, "temperature": 0.0}
+{"time": 13.0, "request_id": "vllm-moe-trace-004", "messages": [{"role": "user", "content": "Answer in one short sentence: what does recovery mean for serving?"}], "max_tokens": 32, "temperature": 0.0}
+{"time": 21.0, "request_id": "vllm-moe-trace-005", "messages": [{"role": "user", "content": "Answer in one short sentence: what is generated-token replay?"}], "max_tokens": 32, "temperature": 0.0}
+{"time": 31.0, "request_id": "vllm-moe-trace-006", "messages": [{"role": "user", "content": "Answer in one short sentence: what is black-box integration?"}], "max_tokens": 32, "temperature": 0.0}

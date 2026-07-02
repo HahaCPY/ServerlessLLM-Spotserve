@@ -36,6 +36,10 @@ from sllm_store.client import SllmStoreClient
 logger = init_logger(__name__)
 
 
+def _is_direct_vllm_load(backend: str, backend_config: Mapping) -> bool:
+    return backend == "vllm" and backend_config.get("load_format") is not None
+
+
 class SllmLocalStore:
     def __init__(
         self,
@@ -370,6 +374,13 @@ class StoreManager:
                 logger.info(
                     f"{model_name} registered as dummy backend; "
                     "skipping model download and store registration"
+                )
+                return
+            if _is_direct_vllm_load(backend, backend_config):
+                self.model_info[model_name] = 0
+                logger.info(
+                    f"{model_name} registered as direct vLLM backend; "
+                    "skipping ServerlessLLM store download and registration"
                 )
                 return
 
