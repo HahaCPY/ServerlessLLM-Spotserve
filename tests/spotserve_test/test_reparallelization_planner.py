@@ -1,4 +1,5 @@
 from sllm.spot.reparallelization import (
+    ParallelPlan,
     apply_spot_event_to_worker_nodes,
     generate_parallel_candidates,
     plan_dynamic_reparallelization,
@@ -82,3 +83,42 @@ def test_dynamic_reparallelization_plan_after_gpu_loss():
     assert decision["availability"]["available_gpus"] == 2
     assert decision["selected_total_gpus"] == 2
     assert decision["selected_data_parallel_size"] == 1
+    assert decision["parallel_plan"] == {
+        "model_name": "dummy-reparallelization",
+        "backend": "unknown",
+        "tensor_parallel_size": 2,
+        "data_parallel_size": 1,
+        "pipeline_parallel_size": 1,
+        "expert_parallel_size": 1,
+        "num_replicas": 1,
+        "num_gpus": 2,
+        "target_nodes": ["1"],
+        "reason": "preempt_replan",
+    }
+
+
+def test_parallel_plan_shared_interface_serializes_to_dict():
+    plan = ParallelPlan(
+        model_name="moe-model",
+        backend="vllm",
+        tensor_parallel_size=2,
+        data_parallel_size=4,
+        expert_parallel_size=2,
+        num_replicas=4,
+        num_gpus=8,
+        target_nodes=["node-a", "node-b"],
+        reason="spot_preempt",
+    )
+
+    assert plan.to_dict() == {
+        "model_name": "moe-model",
+        "backend": "vllm",
+        "tensor_parallel_size": 2,
+        "data_parallel_size": 4,
+        "pipeline_parallel_size": 1,
+        "expert_parallel_size": 2,
+        "num_replicas": 4,
+        "num_gpus": 8,
+        "target_nodes": ["node-a", "node-b"],
+        "reason": "spot_preempt",
+    }

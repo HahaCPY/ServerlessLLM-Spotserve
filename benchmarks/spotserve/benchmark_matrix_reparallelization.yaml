@@ -9,7 +9,7 @@
       "policy": "none",
       "workload": "benchmarks/spotserve/workloads/smoke.jsonl",
       "trace": "examples/spotserve/spot_trace_reparallelization.jsonl",
-      "router_metrics_path": "results/spotserve_reparallelization/dummy-reparallelization-router.jsonl"
+      "router_metrics_path": "/tmp/spotserve-work/results/spotserve_reparallelization/dummy-reparallelization-router.jsonl"
     }
   ]
 }

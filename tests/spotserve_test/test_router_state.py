@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from sllm.routers.roundrobin_router import RoundRobinRouter
@@ -185,3 +187,53 @@ async def test_router_recovers_matching_preempting_instances():
     assert other.state == InstanceState.READY
     assert await target.can_accept_request()
     assert await other.can_accept_request()
+
+
+@pytest.mark.asyncio
+async def test_router_records_reparallelization_decision(tmp_path):
+    metrics_path = tmp_path / "router-metrics.jsonl"
+    router = RoundRobinRouter(
+        model_name="test-model",
+        resource_requirements={"num_cpus": 1, "num_gpus": 2},
+        backend="dummy",
+        backend_config={},
+        router_config={
+            "metrics_path": str(metrics_path),
+            "enable_reparallelization": True,
+            "reparallelization_config": {
+                "model_gpu_requirement": 2,
+                "max_tensor_parallel_size": 4,
+                "max_pipeline_parallel_size": 2,
+                "synthetic_worker_nodes": {
+                    "0": {
+                        "ray_node_id": "node-0",
+                        "address": "10.0.0.1",
+                        "free_gpu": 2,
+                        "total_gpu": 2,
+                        "state": "ready",
+                    },
+                    "1": {
+                        "ray_node_id": "node-1",
+                        "address": "10.0.0.2",
+                        "free_gpu": 2,
+                        "total_gpu": 2,
+                        "state": "ready",
+                    },
+                },
+            },
+        },
+    )
+
+    result = await router.handle_preemption(node_id="0")
+
+    replanning = result["reparallelization"]
+    assert replanning["action"] == "reparallelize"
+    assert replanning["parallel_plan"]["backend"] == "dummy"
+    assert replanning["parallel_plan"]["target_nodes"] == ["1"]
+
+    rows = [
+        json.loads(line)
+        for line in metrics_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert rows[-1]["type"] == "reparallelization"
+    assert rows[-1]["parallel_plan"] == replanning["parallel_plan"]

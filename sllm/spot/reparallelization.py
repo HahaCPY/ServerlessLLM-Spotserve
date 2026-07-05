@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional
 
 
@@ -24,6 +24,34 @@ class GpuAvailability:
             "ready_nodes": list(self.ready_nodes),
             "preempting_nodes": list(self.preempting_nodes),
             "dead_nodes": list(self.dead_nodes),
+        }
+
+
+@dataclass(frozen=True)
+class ParallelPlan:
+    model_name: str
+    backend: str
+    tensor_parallel_size: int
+    data_parallel_size: int
+    pipeline_parallel_size: int = 1
+    expert_parallel_size: int = 1
+    num_replicas: int = 1
+    num_gpus: int = 1
+    target_nodes: List[str] = field(default_factory=list)
+    reason: str = "replan"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "model_name": self.model_name,
+            "backend": self.backend,
+            "tensor_parallel_size": self.tensor_parallel_size,
+            "data_parallel_size": self.data_parallel_size,
+            "pipeline_parallel_size": self.pipeline_parallel_size,
+            "expert_parallel_size": self.expert_parallel_size,
+            "num_replicas": self.num_replicas,
+            "num_gpus": self.num_gpus,
+            "target_nodes": list(self.target_nodes),
+            "reason": self.reason,
         }
 
 
@@ -187,6 +215,58 @@ def generate_parallel_candidates(
     )
 
 
+def select_target_nodes(
+    worker_nodes: Mapping[str, Mapping[str, Any]],
+    required_gpus: int,
+) -> List[str]:
+    if required_gpus <= 0:
+        return []
+
+    selected_nodes: List[str] = []
+    selected_gpus = 0
+    ready_nodes = []
+    for node_id, node_info in worker_nodes.items():
+        if node_info.get("state", READY) != READY:
+            continue
+        ready_nodes.append((str(node_id), _gpu_count(node_info)))
+
+    ready_nodes.sort(key=lambda item: (-item[1], item[0]))
+    for node_id, node_gpus in ready_nodes:
+        if node_gpus <= 0:
+            continue
+        selected_nodes.append(node_id)
+        selected_gpus += node_gpus
+        if selected_gpus >= required_gpus:
+            break
+
+    if selected_gpus < required_gpus:
+        return []
+    return selected_nodes
+
+
+def build_parallel_plan(
+    model_name: str,
+    backend: str,
+    parallel_config: ParallelConfig,
+    worker_nodes: Mapping[str, Mapping[str, Any]],
+    reason: str = "replan",
+) -> ParallelPlan:
+    return ParallelPlan(
+        model_name=model_name,
+        backend=backend,
+        tensor_parallel_size=parallel_config.tensor_parallel_size,
+        data_parallel_size=parallel_config.data_parallel_size,
+        pipeline_parallel_size=parallel_config.pipeline_parallel_size,
+        expert_parallel_size=1,
+        num_replicas=parallel_config.data_parallel_size,
+        num_gpus=parallel_config.total_gpus,
+        target_nodes=select_target_nodes(
+            worker_nodes, parallel_config.total_gpus
+        ),
+        reason=reason,
+    )
+
+
 def plan_dynamic_reparallelization(
     model_name: str,
     worker_nodes: Mapping[str, Mapping[str, Any]],
@@ -195,8 +275,10 @@ def plan_dynamic_reparallelization(
     event: Optional[str] = None,
     node_id: Optional[str] = None,
     instance_id: Optional[str] = None,
+    backend: Optional[str] = None,
 ) -> Dict[str, Any]:
     model_config = model_config or {}
+    backend_name = str(backend or model_config.get("backend", "unknown"))
     planner_config = dict(planner_config or {})
     if "target_replica_gpus" not in planner_config:
         planner_config["target_replica_gpus"] = max(
@@ -213,16 +295,29 @@ def plan_dynamic_reparallelization(
         availability.available_gpus, planner_config
     )
     selected = candidates[0] if candidates else None
+    parallel_plan = (
+        build_parallel_plan(
+            model_name=model_name,
+            backend=backend_name,
+            parallel_config=selected,
+            worker_nodes=worker_nodes,
+            reason=f"{event or 'manual'}_replan",
+        )
+        if selected
+        else None
+    )
     action = "reparallelize" if selected is not None else "no_capacity"
 
     decision = {
         "model": model_name,
+        "backend": backend_name,
         "event": event,
         "node_id": node_id,
         "instance_id": instance_id,
         "action": action,
         "candidate_count": len(candidates),
         "availability": availability.to_dict(),
+        "parallel_plan": parallel_plan.to_dict() if parallel_plan else None,
         "selected_config": selected.to_dict() if selected else None,
         "top_candidates": [
             candidate.to_dict() for candidate in candidates[:5]

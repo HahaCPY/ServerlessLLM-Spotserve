@@ -32,9 +32,15 @@ from sllm.logger import init_logger
 from sllm.spot.metrics import (
     JsonlMetricsWriter,
     make_instance_state_event,
+    make_replanning_event,
     make_request_event,
 )
 from sllm.spot.recovery_policy import RecoveryPolicy, normalize_policy
+from sllm.spot.reparallelization import (
+    READY,
+    apply_spot_event_to_worker_nodes,
+    plan_dynamic_reparallelization,
+)
 
 from ..utils import InstanceHandle, InstanceState
 from .router_utils import SllmRouter
@@ -88,6 +94,19 @@ class RoundRobinRouter(SllmRouter):
         self.count_preempting_toward_capacity = bool(
             router_config.get("count_preempting_toward_capacity", False)
         )
+        self.enable_reparallelization = bool(
+            router_config.get("enable_reparallelization", False)
+        )
+        self.reparallelization_config = dict(
+            router_config.get("reparallelization_config", {})
+        )
+        synthetic_worker_nodes = self.reparallelization_config.get(
+            "synthetic_worker_nodes", {}
+        )
+        self.reparallelization_worker_nodes = {
+            str(node_id): dict(node_info)
+            for node_id, node_info in synthetic_worker_nodes.items()
+        }
         metrics_path = router_config.get("metrics_path") or os.getenv(
             "SLLM_SPOT_METRICS_PATH"
         )
@@ -239,6 +258,114 @@ class RoundRobinRouter(SllmRouter):
         except Exception as e:
             logger.error(f"Failed to emit metric: {e}")
 
+    def _spot_target_node_ids(
+        self,
+        node_id: Optional[str],
+        matches: List[InstanceHandle],
+    ) -> List[str]:
+        if node_id is not None:
+            return [str(node_id)]
+
+        target_node_ids = []
+        seen = set()
+        for instance in matches:
+            if instance.node_id is None:
+                continue
+            target_node_id = str(instance.node_id)
+            if target_node_id in seen:
+                continue
+            seen.add(target_node_id)
+            target_node_ids.append(target_node_id)
+        return target_node_ids
+
+    async def _snapshot_reparallelization_worker_nodes(self):
+        if self.reparallelization_worker_nodes:
+            return {
+                node_id: dict(node_info)
+                for node_id, node_info in (
+                    self.reparallelization_worker_nodes.items()
+                )
+            }
+
+        async with self.instance_management_lock:
+            instances = (
+                list(self.starting_inference_instances.values())
+                + list(self.ready_inference_instances.values())
+                + list(self.deleting_inference_instances.values())
+            )
+
+        worker_nodes = {}
+        for instance in instances:
+            if instance.node_id is None:
+                continue
+            node_id = str(instance.node_id)
+            node_info = worker_nodes.setdefault(
+                node_id,
+                {
+                    "ray_node_id": None,
+                    "address": node_id,
+                    "free_gpu": 0,
+                    "total_gpu": 0,
+                    "state": READY,
+                },
+            )
+            node_info["total_gpu"] += int(instance.num_gpu or 0)
+            if instance.state == InstanceState.PREEMPTING:
+                node_info["state"] = InstanceState.PREEMPTING.value
+            elif instance.state == InstanceState.DEAD:
+                node_info["state"] = InstanceState.DEAD.value
+            elif node_info["state"] == READY:
+                node_info["state"] = instance.state.value
+        return worker_nodes
+
+    async def _replan_after_spot_event(
+        self,
+        event: str,
+        node_id: Optional[str],
+        instance_id: Optional[str],
+        matches: List[InstanceHandle],
+    ):
+        if not self.enable_reparallelization:
+            return None
+
+        worker_nodes = await self._snapshot_reparallelization_worker_nodes()
+        target_node_ids = self._spot_target_node_ids(node_id, matches)
+        for target_node_id in target_node_ids:
+            worker_nodes = apply_spot_event_to_worker_nodes(
+                worker_nodes,
+                event,
+                target_node_id,
+            )
+        self.reparallelization_worker_nodes = worker_nodes
+
+        model_config = {
+            "backend": self.backend,
+            "num_gpus": self.resource_requirements.get("num_gpus", 1),
+        }
+        decision = plan_dynamic_reparallelization(
+            model_name=self.model_name,
+            worker_nodes=worker_nodes,
+            model_config=model_config,
+            planner_config=self.reparallelization_config,
+            event=event,
+            node_id=node_id,
+            instance_id=instance_id,
+            backend=self.backend,
+        )
+        self._emit_metric(
+            make_replanning_event(
+                model=self.model_name,
+                event=event,
+                node_id=node_id,
+                instance_id=instance_id,
+                decision=decision,
+            )
+        )
+        logger.info(
+            f"Reparallelization decision for {self.model_name}: {decision}"
+        )
+        return decision
+
     async def _set_instance_state(
         self, instance: InstanceHandle, state: InstanceState, reason: str
     ):
@@ -307,10 +434,17 @@ class RoundRobinRouter(SllmRouter):
                 f"Marked instance {instance.instance_id} as preempting "
                 f"for model {self.model_name}"
             )
+        replanning = await self._replan_after_spot_event(
+            event="preempt",
+            node_id=node_id,
+            instance_id=instance_id,
+            matches=matches,
+        )
         return {
             "model": self.model_name,
             "event": "preempt",
             "instances": marked_instances,
+            "reparallelization": replanning,
         }
 
     async def mark_instance_preempting(self, instance_id: str):
@@ -349,10 +483,17 @@ class RoundRobinRouter(SllmRouter):
                 f"Recovered instance {instance.instance_id} "
                 f"for model {self.model_name}"
             )
+        replanning = await self._replan_after_spot_event(
+            event="recover",
+            node_id=node_id,
+            instance_id=instance_id,
+            matches=matches,
+        )
         return {
             "model": self.model_name,
             "event": "recover",
             "instances": recovered_instances,
+            "reparallelization": replanning,
         }
 
     async def mark_instance_recovered(self, instance_id: str):
@@ -376,10 +517,17 @@ class RoundRobinRouter(SllmRouter):
                 f"Marked instance {instance.instance_id} as dead "
                 f"for model {self.model_name}"
             )
+        replanning = await self._replan_after_spot_event(
+            event="dead",
+            node_id=node_id,
+            instance_id=instance_id,
+            matches=matches,
+        )
         return {
             "model": self.model_name,
             "event": "dead",
             "instances": marked_instances,
+            "reparallelization": replanning,
         }
 
     async def mark_instance_dead(self, instance_id: str):

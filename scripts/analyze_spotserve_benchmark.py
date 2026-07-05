@@ -200,6 +200,32 @@ def summarize_instance_state_metrics(
     }
 
 
+def summarize_replanning_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    replanning_rows = [
+        row for row in rows if row.get("type") == "reparallelization"
+    ]
+    no_capacity_count = sum(
+        1 for row in replanning_rows if row.get("action") == "no_capacity"
+    )
+    selected_total_gpus = [
+        int(row.get("selected_total_gpus", 0) or 0)
+        for row in replanning_rows
+    ]
+    latest_plan = (
+        replanning_rows[-1].get("parallel_plan") if replanning_rows else None
+    )
+    return {
+        "replanning_events": len(replanning_rows),
+        "replanning_no_capacity_events": no_capacity_count,
+        "replanning_max_selected_gpus": (
+            max(selected_total_gpus) if selected_total_gpus else 0
+        ),
+        "replanning_latest_plan": (
+            json.dumps(latest_plan, sort_keys=True) if latest_plan else ""
+        ),
+    }
+
+
 def analyze_run(run_dir: Path) -> Dict[str, Any]:
     metadata_path = run_dir / "run_metadata.json"
     metadata = (
@@ -244,6 +270,7 @@ def analyze_run(run_dir: Path) -> Dict[str, Any]:
         **summarize_requests(request_rows),
         **summarize_router_metrics(router_request_rows),
         **summarize_instance_state_metrics(router_metric_rows_in_window),
+        **summarize_replanning_metrics(router_metric_rows_in_window),
     }
     (run_dir / "summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True),

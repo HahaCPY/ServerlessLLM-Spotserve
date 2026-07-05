@@ -16,7 +16,7 @@
     "recovery_policy": "none",
     "max_retries": 0,
     "enable_reparallelization": true,
-    "metrics_path": "results/spotserve_reparallelization/dummy-reparallelization-router.jsonl",
+    "metrics_path": "/tmp/spotserve-work/results/spotserve_reparallelization/dummy-reparallelization-router.jsonl",
     "reparallelization_config": {
       "model_gpu_requirement": 2,
       "max_tensor_parallel_size": 4,

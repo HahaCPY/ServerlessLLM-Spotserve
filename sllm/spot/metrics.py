@@ -39,6 +39,43 @@ def make_instance_state_event(
     }
 
 
+def make_replanning_event(
+    model: str,
+    event: str,
+    decision: Dict[str, Any],
+    node_id: Optional[str] = None,
+    instance_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    parallel_plan = decision.get("parallel_plan") or {}
+    return {
+        "type": "reparallelization",
+        "model": model,
+        "event": event,
+        "node_id": node_id,
+        "instance_id": instance_id,
+        "action": decision.get("action"),
+        "available_gpus": decision.get("availability", {}).get(
+            "available_gpus", 0
+        ),
+        "unavailable_gpus": decision.get("availability", {}).get(
+            "unavailable_gpus", 0
+        ),
+        "candidate_count": decision.get("candidate_count", 0),
+        "selected_total_gpus": decision.get("selected_total_gpus", 0),
+        "selected_tensor_parallel_size": decision.get(
+            "selected_tensor_parallel_size", 0
+        ),
+        "selected_pipeline_parallel_size": decision.get(
+            "selected_pipeline_parallel_size", 0
+        ),
+        "selected_data_parallel_size": decision.get(
+            "selected_data_parallel_size", 0
+        ),
+        "target_nodes": parallel_plan.get("target_nodes", []),
+        "parallel_plan": parallel_plan or None,
+    }
+
+
 def make_request_event(
     request_id: str,
     model: str,
