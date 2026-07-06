@@ -1,0 +1,22 @@
+{
+  "model": "dummy-correctness-stateful-recovery",
+  "backend": "dummy",
+  "router_num_cpus": 0,
+  "num_cpus": 0,
+  "num_gpus": 0,
+  "auto_scaling_config": {
+    "metric": "concurrency",
+    "target": 1,
+    "min_instances": 2,
+    "max_instances": 3,
+    "keep_alive": 60
+  },
+  "backend_config": {
+    "supports_state_restore": true
+  },
+  "router_config": {
+    "recovery_policy": "stateful_recovery",
+    "max_retries": 2,
+    "metrics_path": "/tmp/spotserve-work/results/spotserve/dummy-correctness-stateful-recovery-router.jsonl"
+  }
+}

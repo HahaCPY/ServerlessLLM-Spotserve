@@ -600,3 +600,168 @@ MigrationPlan
 context_migration metrics
 estimated reuse ratio
 ```
+
+---
+
+# Version 8 Backend State Restore Contract
+
+CPY 已經可以先做 stateful recovery control flow：
+
+```text
+request failure / preemption
+-> export InferenceState
+-> decide restore_state / fallback_token_replay / retry
+-> restore state on target backend when supported
+-> state_recovery metrics
+```
+
+大鼻在 V8 不需要決定 recovery policy。大鼻要提供的是：
+
+```text
+backend 能不能 export inference state
+backend 能不能 restore inference state
+exported state 到底包含哪些 vLLM/KV metadata
+```
+
+CPY policy 會根據 backend 回答做：
+
+```text
+supports_state_restore=true  -> try restore_state
+supports_state_restore=false -> fallback generated-token replay / retry
+```
+
+## CPY V8 Interface
+
+CPY 會使用：
+
+```python
+@dataclass(frozen=True)
+class InferenceState:
+    request_id: str | None
+    instance_id: str = ""
+    node_id: str = ""
+    backend: str = ""
+    model_name: str = ""
+    tokens: list[int] = field(default_factory=list)
+    completed_tokens: int = 0
+    state_kind: str = "token_snapshot"
+    supports_restore: bool = False
+    metadata: dict[str, Any] = field(default_factory=dict)
+```
+
+```python
+@dataclass(frozen=True)
+class StateRecoveryPlan:
+    request_id: str | None
+    action: str
+    source_instance_id: str = ""
+    target_instance_id: str = ""
+    recovered_tokens: int = 0
+    state_kind: str = ""
+    fallback_policy: str = ""
+    reason: str = "stateful_recovery"
+```
+
+CPY owns:
+
+```text
+sllm/spot/stateful_recovery.py
+sllm/routers/roundrobin_router.py
+```
+
+## Backend Hooks 大鼻要接
+
+Base backend 已經有 conservative default：
+
+```python
+async def supports_state_restore(self) -> bool:
+    return False
+
+async def export_inference_state(
+    self,
+    request_data: dict | None = None,
+    current_output: list[list[int]] | None = None,
+    completed_tokens: int | None = None,
+) -> dict:
+    ...
+
+async def restore_inference_state(
+    self,
+    state: dict,
+    request_data: dict | None = None,
+) -> dict:
+    ...
+```
+
+大鼻要在 vLLM backend 補真實版本。第一版如果做不到真 KV restore，請明確保持：
+
+```text
+supports_state_restore = false
+state_kind = "token_snapshot"
+```
+
+這樣 CPY 會 fallback，不會假裝有 true stateful recovery。
+
+## vLLM State Metadata 建議
+
+如果 vLLM 能 expose KV/cache metadata，`InferenceState.metadata` 可以包含：
+
+```json
+{
+  "prompt_token_count": 128,
+  "generated_token_count": 32,
+  "kv_block_count": 10,
+  "block_ids": [],
+  "block_table": {},
+  "cache_engine": "vllm",
+  "can_restore_same_node": false,
+  "can_restore_cross_node": false
+}
+```
+
+第一版可以保守：
+
+```json
+{
+  "tokens": [1, 2, 3],
+  "completed_tokens": 3,
+  "state_kind": "token_snapshot",
+  "supports_restore": false,
+  "metadata": {
+    "reason": "vllm_kv_restore_not_available"
+  }
+}
+```
+
+## V8 Backend Questions 大鼻需要確認
+
+- vLLM 是否能列出 active request ids？
+- request 是否能對應到 prompt token ids + generated token ids？
+- request 是否能對應到 KV block table？
+- KV block ids expose 後是否安全，不會被 scheduler 改動後失效？
+- restore 是否只能 same node？
+- cross node restore 是否需要 serialize / transfer KV blocks？
+- restore 後 request id 要沿用舊 id，還是新 id binding old state？
+- preemption 發生時，state export 還有多少時間可以完成？
+- MoE 下 expert/routing state 是否也需要被保存？
+
+## V8 Definition Of Done For 大鼻
+
+大鼻 V8 metadata / runtime 部分完成時，應該滿足：
+
+- `VllmBackend.supports_state_restore()` 回答真實 capability。
+- `export_inference_state()` 至少能回傳 request id、tokens、completed tokens。
+- 如果不能真 KV restore，`supports_restore=false`。
+- 如果能真 KV restore，metadata 需說清楚 block ids / block table / node
+  限制。
+- `restore_inference_state()` 回傳 `{ "restored": true }` 之前，必須真的讓
+  後續 generation 從 state 接續。
+- backend 不實作 CPY policy decision，不實作 matching，不改 scheduler。
+
+CPY 會根據這些 hooks 產生：
+
+```text
+StateRecoveryPlan
+state_recovery metrics
+fallback generated-token replay / retry
+```

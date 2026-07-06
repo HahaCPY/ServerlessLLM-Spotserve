@@ -38,6 +38,7 @@ class DummyBackend(SllmBackend):
         self.model_name = model_name
         self.backend_config = backend_config
         self.current_tokens: List[List[int]] = []
+        self.restored_states: Dict[str, Dict[str, Any]] = {}
 
     def init_backend(self) -> None:
         # sleep to simulate model latency
@@ -61,8 +62,46 @@ class DummyBackend(SllmBackend):
             return [int(token) for token in input_tokens]
         return []
 
+    def _request_id(self, request_data: Dict[str, Any]) -> str:
+        return str(
+            request_data.get("request_id") or f"anonymous-{id(request_data)}"
+        )
+
+    def _tokens_from_state(self, state: Dict[str, Any]) -> List[int]:
+        tokens = state.get("tokens") or []
+        if tokens and isinstance(tokens[0], list):
+            return [int(token) for token in tokens[0]]
+        return [int(token) for token in tokens]
+
+    def _apply_restored_state(
+        self, request_data: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        if "input_tokens" in request_data:
+            return request_data
+
+        request_id = self._request_id(request_data)
+        restored_state = self.restored_states.pop(request_id, None)
+        if not restored_state:
+            return request_data
+
+        tokens = self._tokens_from_state(restored_state)
+        if not tokens:
+            return request_data
+
+        restored_request = dict(request_data)
+        restored_request["input_tokens"] = tokens
+        completed_tokens = int(
+            restored_state.get("completed_tokens", len(tokens)) or 0
+        )
+        if completed_tokens and "max_tokens" in restored_request:
+            restored_request["max_tokens"] = max(
+                1,
+                int(restored_request["max_tokens"]) - completed_tokens,
+            )
+        return restored_request
+
     def _forced_failure_key(self, request_data: Dict[str, Any]) -> str:
-        request_id = request_data.get("request_id") or f"anonymous-{id(request_data)}"
+        request_id = self._request_id(request_data)
         failure_mode = request_data.get("force_failure") or request_data.get(
             "force_backend_failure"
         )
@@ -123,6 +162,7 @@ class DummyBackend(SllmBackend):
         )
 
     async def generate(self, request_data):
+        request_data = self._apply_restored_state(request_data)
         model_name = request_data.get("model", "dummy-model")
         messages = request_data.get("messages", [])
         # temperature = request_data.get("temperature", 0.7)
@@ -240,3 +280,65 @@ class DummyBackend(SllmBackend):
     async def resume_kv_cache(self, request_datas):
         self.current_tokens = request_datas or []
         return True
+
+    async def supports_state_restore(self):
+        return bool(self.backend_config.get("supports_state_restore", True))
+
+    async def export_inference_state(
+        self,
+        request_data: Optional[Dict[str, Any]] = None,
+        current_output: Optional[List[List[int]]] = None,
+        completed_tokens: Optional[int] = None,
+    ):
+        request_data = request_data or {}
+        token_sequences = current_output or self.current_tokens or []
+        tokens = token_sequences[0] if token_sequences else []
+        completed = (
+            int(completed_tokens)
+            if completed_tokens is not None
+            else len(tokens)
+        )
+        return {
+            "request_id": request_data.get("request_id"),
+            "backend": "dummy",
+            "model_name": self.model_name,
+            "tokens": [int(token) for token in tokens],
+            "completed_tokens": max(0, completed),
+            "state_kind": "dummy_token_state",
+            "supports_restore": await self.supports_state_restore(),
+            "metadata": {
+                "token_count": len(tokens),
+                "source": "dummy_backend",
+            },
+        }
+
+    async def restore_inference_state(
+        self,
+        state: Dict[str, Any],
+        request_data: Optional[Dict[str, Any]] = None,
+    ):
+        if not await self.supports_state_restore():
+            return {
+                "restored": False,
+                "reason": "dummy_state_restore_disabled",
+            }
+
+        request_data = request_data or {}
+        tokens = self._tokens_from_state(state)
+        if not tokens:
+            return {"restored": False, "reason": "empty_state"}
+
+        request_id = state.get("request_id") or request_data.get("request_id")
+        if not request_id:
+            request_id = self._request_id(request_data)
+        self.restored_states[str(request_id)] = dict(state)
+        self.current_tokens = [tokens]
+        return {
+            "restored": True,
+            "request_id": request_id,
+            "tokens": tokens,
+            "completed_tokens": int(
+                state.get("completed_tokens", len(tokens)) or 0
+            ),
+            "state_kind": state.get("state_kind", "dummy_token_state"),
+        }

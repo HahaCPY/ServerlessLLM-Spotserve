@@ -169,6 +169,18 @@ def summarize_router_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         and int(row.get("recovered_tokens", 0) or 0) == 0
         and not bool(row.get("recovery_fallback", False))
     )
+    state_restore_attempts_total = sum(
+        int(row.get("state_restore_attempts", 0) or 0) for row in rows
+    )
+    state_restore_successes_total = sum(
+        int(row.get("state_restore_successes", 0) or 0) for row in rows
+    )
+    state_restore_fallback_count = sum(
+        1 for row in rows if bool(row.get("state_restore_fallback", False))
+    )
+    state_restored_tokens_total = sum(
+        int(row.get("state_restored_tokens", 0) or 0) for row in rows
+    )
     return {
         "router_metrics_rows": len(rows),
         "failed_attempts_total": failed_attempts_total,
@@ -178,6 +190,10 @@ def summarize_router_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "recovery_triggered_requests": recovery_triggered_requests,
         "replay_succeeded_requests": replay_succeeded_requests,
         "replay_not_needed_requests": replay_not_needed_requests,
+        "state_restore_attempts_total": state_restore_attempts_total,
+        "state_restore_successes_total": state_restore_successes_total,
+        "state_restore_fallback_count": state_restore_fallback_count,
+        "state_restored_tokens_total": state_restored_tokens_total,
     }
 
 
@@ -284,6 +300,29 @@ def summarize_context_migration_metrics(
     }
 
 
+def summarize_state_recovery_metrics(
+    rows: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    state_rows = [row for row in rows if row.get("type") == "state_recovery"]
+    restore_rows = [
+        row for row in state_rows if row.get("action") == "restore_state"
+    ]
+    fallback_rows = [row for row in state_rows if row.get("fallback_used")]
+    recovered_tokens = sum(
+        int(row.get("recovered_tokens", 0) or 0) for row in state_rows
+    )
+    latest_plan = state_rows[-1].get("plan") if state_rows else None
+    return {
+        "state_recovery_events": len(state_rows),
+        "state_recovery_restore_events": len(restore_rows),
+        "state_recovery_fallback_events": len(fallback_rows),
+        "state_recovery_recovered_tokens": recovered_tokens,
+        "state_recovery_latest_plan": (
+            json.dumps(latest_plan, sort_keys=True) if latest_plan else ""
+        ),
+    }
+
+
 def analyze_run(run_dir: Path) -> Dict[str, Any]:
     metadata_path = run_dir / "run_metadata.json"
     metadata = (
@@ -330,6 +369,7 @@ def analyze_run(run_dir: Path) -> Dict[str, Any]:
         **summarize_instance_state_metrics(router_metric_rows_in_window),
         **summarize_replanning_metrics(router_metric_rows_in_window),
         **summarize_context_migration_metrics(router_metric_rows_in_window),
+        **summarize_state_recovery_metrics(router_metric_rows_in_window),
     }
     (run_dir / "summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True),

@@ -34,12 +34,17 @@ from sllm.spot.metrics import (
     make_instance_state_event,
     make_replanning_event,
     make_request_event,
+    make_state_recovery_event,
 )
 from sllm.spot.recovery_policy import RecoveryPolicy, normalize_policy
 from sllm.spot.reparallelization import (
     READY,
     apply_spot_event_to_worker_nodes,
     plan_dynamic_reparallelization,
+)
+from sllm.spot.stateful_recovery import (
+    InferenceState,
+    plan_stateful_recovery,
 )
 
 from ..utils import InstanceHandle, InstanceState
@@ -147,6 +152,7 @@ class RoundRobinRouter(SllmRouter):
         self.lora_lock = asyncio.Lock()
 
         self.recovery_tokens_by_instance: Dict[str, List[List[int]]] = {}
+        self.recovery_state_by_instance: Dict[str, Dict[str, Any]] = {}
         self.auto_scaler = None
         logger.info(f"Created new handler for model {self.model_name}")
 
@@ -413,6 +419,77 @@ class RoundRobinRouter(SllmRouter):
         self.recovery_tokens_by_instance[instance.instance_id] = tokens
         return tokens
 
+    async def _capture_inference_state(
+        self,
+        instance: InstanceHandle,
+        request_data: Optional[dict] = None,
+        current_output: Optional[List[List[int]]] = None,
+        completed_tokens: Optional[int] = None,
+    ) -> Optional[InferenceState]:
+        if instance.backend_instance is None:
+            return None
+
+        try:
+            payload = await self._call_backend_method(
+                instance.backend_instance,
+                "export_inference_state",
+                request_data=request_data or {},
+                current_output=current_output,
+                completed_tokens=completed_tokens,
+            )
+        except Exception as e:
+            logger.info(
+                f"Could not export inference state from "
+                f"{instance.instance_id}: {e}"
+            )
+            tokens = current_output or await self._capture_current_tokens(
+                instance
+            )
+            if not tokens:
+                return None
+            payload = {
+                "request_id": (
+                    request_data.get("request_id") if request_data else None
+                ),
+                "tokens": tokens[0],
+                "completed_tokens": completed_tokens or len(tokens[0]),
+                "state_kind": "token_snapshot",
+                "supports_restore": False,
+            }
+
+        if not isinstance(payload, dict):
+            return None
+
+        payload = dict(payload)
+        payload.setdefault("instance_id", instance.instance_id)
+        payload.setdefault("node_id", instance.node_id or "")
+        payload.setdefault("backend", self.backend)
+        payload.setdefault("model_name", self.model_name)
+
+        state = InferenceState.from_dict(payload)
+        if not state.tokens and current_output:
+            state = InferenceState.from_tokens(
+                tokens=current_output[0],
+                request_id=(
+                    request_data.get("request_id") if request_data else None
+                ),
+                instance_id=instance.instance_id,
+                node_id=instance.node_id or "",
+                backend=self.backend,
+                model_name=self.model_name,
+                completed_tokens=completed_tokens,
+                state_kind="token_snapshot",
+                supports_restore=False,
+            )
+        if not state.tokens:
+            return None
+
+        self.recovery_state_by_instance[instance.instance_id] = state.to_dict()
+        self.recovery_tokens_by_instance[instance.instance_id] = [
+            list(state.tokens)
+        ]
+        return state
+
     # Router 裡面真正把 instance 標記成 PREEMPTING
     # 把某些 worker 標記成 PREEMPTING，讓 router 停止送新的 request 給它們。
     async def handle_preemption(
@@ -601,6 +678,116 @@ class RoundRobinRouter(SllmRouter):
             )
         return replay_request
 
+    def _build_stateful_restore_request(
+        self, request_data: dict, state: InferenceState
+    ) -> dict:
+        restore_request = copy.deepcopy(request_data)
+        if state.tokens:
+            restore_request["input_tokens"] = list(state.tokens)
+        completed_tokens = state.completed_tokens
+        if completed_tokens and "max_tokens" in restore_request:
+            restore_request["max_tokens"] = max(
+                1,
+                int(restore_request["max_tokens"]) - int(completed_tokens),
+            )
+        return restore_request
+
+    async def _backend_supports_state_restore(
+        self, instance: InstanceHandle
+    ) -> bool:
+        if instance.backend_instance is None:
+            return False
+        try:
+            return bool(
+                await self._call_backend_method(
+                    instance.backend_instance,
+                    "supports_state_restore",
+                )
+            )
+        except Exception as e:
+            logger.info(
+                f"Could not check state restore support on "
+                f"{instance.instance_id}: {e}"
+            )
+            return False
+
+    async def _restore_inference_state(
+        self,
+        instance: InstanceHandle,
+        state: InferenceState,
+        request_data: dict,
+    ) -> bool:
+        if instance.backend_instance is None:
+            return False
+        try:
+            result = await self._call_backend_method(
+                instance.backend_instance,
+                "restore_inference_state",
+                state=state.to_dict(),
+                request_data=request_data,
+            )
+        except Exception as e:
+            logger.info(
+                f"State restore failed on {instance.instance_id}: {e}"
+            )
+            return False
+        return isinstance(result, dict) and bool(result.get("restored"))
+
+    async def _prepare_stateful_recovery(
+        self,
+        request_id: str,
+        source_instance_id: str,
+        target_instance: InstanceHandle,
+        state: Optional[InferenceState],
+        request_data: dict,
+    ) -> Tuple[
+        Optional[InferenceState],
+        Optional[List[List[int]]],
+        Dict[str, int],
+        bool,
+    ]:
+        counters = {
+            "state_restore_attempts": 0,
+            "state_restore_successes": 0,
+            "state_restored_tokens": 0,
+        }
+        if state is None:
+            return None, None, counters, False
+
+        restore_supported = await self._backend_supports_state_restore(
+            target_instance
+        )
+        decision = plan_stateful_recovery(
+            request_id=request_id,
+            source_instance_id=source_instance_id,
+            target_instance_id=target_instance.instance_id,
+            state=state,
+            restore_supported=restore_supported,
+        )
+        self._emit_metric(
+            make_state_recovery_event(
+                model=self.model_name,
+                request_id=request_id,
+                decision=decision.to_dict(),
+                source_instance_id=source_instance_id,
+                target_instance_id=target_instance.instance_id,
+            )
+        )
+
+        if decision.action == "restore_state":
+            counters["state_restore_attempts"] = 1
+            restored = await self._restore_inference_state(
+                target_instance, state, request_data
+            )
+            if restored:
+                counters["state_restore_successes"] = 1
+                counters["state_restored_tokens"] = decision.recovered_tokens
+                return state, None, counters, False
+
+        if state.tokens:
+            return None, [list(state.tokens)], counters, True
+        return None, None, counters, True
+
     async def _counts_toward_capacity(self, instance: InstanceHandle) -> bool:
         async with instance.lock:
             capacity_states = {
@@ -618,11 +805,17 @@ class RoundRobinRouter(SllmRouter):
         request_data: dict,
         action: str,
         replay_tokens: Optional[List[List[int]]] = None,
+        state_snapshot: Optional[InferenceState] = None,
     ):
         await self._ensure_lora_adapter(instance, request_data)
-        backend_request = self._build_token_replay_request(
-            request_data, replay_tokens
-        )
+        if state_snapshot is not None:
+            backend_request = self._build_stateful_restore_request(
+                request_data, state_snapshot
+            )
+        else:
+            backend_request = self._build_token_replay_request(
+                request_data, replay_tokens
+            )
 
         if (
             action == "generate"
@@ -712,6 +905,12 @@ class RoundRobinRouter(SllmRouter):
         recovered_tokens = 0
         recovery_fallback = False
         replay_tokens = None
+        recovery_state: Optional[InferenceState] = None
+        recovery_state_source_instance_id = ""
+        state_restore_attempts = 0
+        state_restore_successes = 0
+        state_restore_fallback = False
+        state_restored_tokens = 0
 
         async with self.request_count_lock:
             self.request_count += 1
@@ -732,11 +931,51 @@ class RoundRobinRouter(SllmRouter):
                         f"{request_data}, type: {type(request_data)}, "
                         f"attempt: {attempts}"
                     )
+                    state_snapshot = None
+                    if (
+                        self.recovery_policy
+                        == RecoveryPolicy.STATEFUL_RECOVERY
+                        and recovery_state is not None
+                    ):
+                        (
+                            state_snapshot,
+                            replay_tokens,
+                            state_counters,
+                            used_fallback,
+                        ) = await self._prepare_stateful_recovery(
+                            request_id=request_id,
+                            source_instance_id=(
+                                recovery_state_source_instance_id
+                            ),
+                            target_instance=instance,
+                            state=recovery_state,
+                            request_data=request_data,
+                        )
+                        state_restore_attempts += state_counters[
+                            "state_restore_attempts"
+                        ]
+                        state_restore_successes += state_counters[
+                            "state_restore_successes"
+                        ]
+                        restored_tokens = state_counters[
+                            "state_restored_tokens"
+                        ]
+                        state_restored_tokens += restored_tokens
+                        recovered_tokens += restored_tokens
+                        if used_fallback:
+                            state_restore_fallback = True
+                            recovery_fallback = True
+                            recovered_tokens += self._count_recovered_tokens(
+                                replay_tokens,
+                                recovery_state.completed_tokens,
+                            )
+
                     result = await self._call_backend(
                         instance,
                         request_data,
                         action,
                         replay_tokens=replay_tokens,
+                        state_snapshot=state_snapshot,
                     )
                     logger.info("Finished processing request")
 
@@ -755,6 +994,16 @@ class RoundRobinRouter(SllmRouter):
                                 failed_attempts=failed_attempts,
                                 recovered_tokens=recovered_tokens,
                                 recovery_fallback=recovery_fallback,
+                                state_restore_attempts=(
+                                    state_restore_attempts
+                                ),
+                                state_restore_successes=(
+                                    state_restore_successes
+                                ),
+                                state_restore_fallback=(
+                                    state_restore_fallback
+                                ),
+                                state_restored_tokens=state_restored_tokens,
                             )
                         )
                         return result
@@ -770,6 +1019,19 @@ class RoundRobinRouter(SllmRouter):
                             result
                         )
                         completed_tokens = result.get("completed_tokens", 0)
+                        if (
+                            self.recovery_policy
+                            == RecoveryPolicy.STATEFUL_RECOVERY
+                        ):
+                            recovery_state = (
+                                await self._capture_inference_state(
+                                    instance,
+                                    request_data=request_data,
+                                    current_output=replay_tokens,
+                                    completed_tokens=completed_tokens,
+                                )
+                            )
+                            recovery_state_source_instance_id = instance_id
                         if completed_tokens:
                             request_data["_completed_tokens"] = (
                                 completed_tokens
@@ -778,6 +1040,18 @@ class RoundRobinRouter(SllmRouter):
                         replay_tokens = (
                             self.recovery_tokens_by_instance.get(instance_id)
                         )
+                        if (
+                            self.recovery_policy
+                            == RecoveryPolicy.STATEFUL_RECOVERY
+                        ):
+                            recovery_state = (
+                                await self._capture_inference_state(
+                                    instance,
+                                    request_data=request_data,
+                                    current_output=replay_tokens,
+                                )
+                            )
+                            recovery_state_source_instance_id = instance_id
 
                     if (
                         self.recovery_policy
@@ -807,13 +1081,26 @@ class RoundRobinRouter(SllmRouter):
                                 failed_attempts=failed_attempts,
                                 recovered_tokens=recovered_tokens,
                                 recovery_fallback=recovery_fallback,
+                                state_restore_attempts=(
+                                    state_restore_attempts
+                                ),
+                                state_restore_successes=(
+                                    state_restore_successes
+                                ),
+                                state_restore_fallback=(
+                                    state_restore_fallback
+                                ),
+                                state_restored_tokens=state_restored_tokens,
                             )
                         )
                         return result
 
                     if (
                         self.recovery_policy
-                        != RecoveryPolicy.GENERATED_TOKEN_REPLAY
+                        not in {
+                            RecoveryPolicy.GENERATED_TOKEN_REPLAY,
+                            RecoveryPolicy.STATEFUL_RECOVERY,
+                        }
                     ):
                         replay_tokens = None
 
@@ -827,6 +1114,10 @@ class RoundRobinRouter(SllmRouter):
                             latency_ms=(time.time() - request_start) * 1000,
                             retry_count=attempts - 1,
                             failed_attempts=failed_attempts,
+                            state_restore_attempts=state_restore_attempts,
+                            state_restore_successes=state_restore_successes,
+                            state_restore_fallback=state_restore_fallback,
+                            state_restored_tokens=state_restored_tokens,
                         )
                     )
                     return {"error": str(e)}
@@ -834,9 +1125,26 @@ class RoundRobinRouter(SllmRouter):
                     failed_attempts += 1
                     logger.error(f"Request attempt failed: {e}")
                     if instance is not None:
-                        replay_tokens = await self._capture_current_tokens(
-                            instance
-                        )
+                        if (
+                            self.recovery_policy
+                            == RecoveryPolicy.STATEFUL_RECOVERY
+                        ):
+                            recovery_state = (
+                                await self._capture_inference_state(
+                                    instance,
+                                    request_data=request_data,
+                                )
+                            )
+                            recovery_state_source_instance_id = instance_id
+                            replay_tokens = (
+                                [list(recovery_state.tokens)]
+                                if recovery_state
+                                else []
+                            )
+                        else:
+                            replay_tokens = await self._capture_current_tokens(
+                                instance
+                            )
                         await self._set_instance_state(
                             instance,
                             InstanceState.DEAD,
@@ -870,13 +1178,26 @@ class RoundRobinRouter(SllmRouter):
                                 failed_attempts=failed_attempts,
                                 recovered_tokens=recovered_tokens,
                                 recovery_fallback=recovery_fallback,
+                                state_restore_attempts=(
+                                    state_restore_attempts
+                                ),
+                                state_restore_successes=(
+                                    state_restore_successes
+                                ),
+                                state_restore_fallback=(
+                                    state_restore_fallback
+                                ),
+                                state_restored_tokens=state_restored_tokens,
                             )
                         )
                         return {"error": str(e)}
 
                     if (
                         self.recovery_policy
-                        != RecoveryPolicy.GENERATED_TOKEN_REPLAY
+                        not in {
+                            RecoveryPolicy.GENERATED_TOKEN_REPLAY,
+                            RecoveryPolicy.STATEFUL_RECOVERY,
+                        }
                     ):
                         replay_tokens = None
                 finally:

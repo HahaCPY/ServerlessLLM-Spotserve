@@ -11,6 +11,9 @@ def test_normalize_policy_accepts_supported_values():
         normalize_policy("generated_token_replay")
         == RecoveryPolicy.GENERATED_TOKEN_REPLAY
     )
+    assert normalize_policy("stateful_recovery") == (
+        RecoveryPolicy.STATEFUL_RECOVERY
+    )
 
 
 def test_normalize_policy_rejects_unknown_value():

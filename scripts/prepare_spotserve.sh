@@ -300,6 +300,7 @@ if [[ "$SKIP_DEPLOY" -eq 0 ]]; then
     "examples/spotserve/config-dummy-correctness-none.json"
     "examples/spotserve/config-dummy-correctness-naive-retry.json"
     "examples/spotserve/config-dummy-correctness-token-replay.json"
+    "examples/spotserve/config-dummy-correctness-stateful-recovery.json"
   )
   VLLM_DENSE_CONFIGS=(
     "examples/spotserve/config-vllm-dense-baseline.json"

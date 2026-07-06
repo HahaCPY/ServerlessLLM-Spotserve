@@ -61,3 +61,33 @@ class SllmBackend(ABC):
     @abstractmethod
     async def resume_kv_cache(self, request_datas: List[List[int]]) -> None:
         pass
+
+    async def supports_state_restore(self) -> bool:
+        return False
+
+    async def export_inference_state(
+        self,
+        request_data: Optional[Dict[str, Any]] = None,
+        current_output: Optional[List[List[int]]] = None,
+        completed_tokens: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        return {
+            "request_id": (
+                request_data.get("request_id") if request_data else None
+            ),
+            "tokens": [],
+            "completed_tokens": completed_tokens or 0,
+            "supports_restore": False,
+            "state_kind": "unsupported",
+            "metadata": {"reason": "backend_state_restore_unsupported"},
+        }
+
+    async def restore_inference_state(
+        self,
+        state: Dict[str, Any],
+        request_data: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        return {
+            "restored": False,
+            "reason": "backend_state_restore_unsupported",
+        }

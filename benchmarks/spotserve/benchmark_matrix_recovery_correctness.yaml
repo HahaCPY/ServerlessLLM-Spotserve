@@ -30,6 +30,16 @@
       "workload": "benchmarks/spotserve/workloads/recovery_correctness.jsonl",
       "trace": null,
       "router_metrics_path": "/tmp/spotserve-work/results/spotserve/dummy-correctness-token-replay-router.jsonl"
+    },
+    {
+      "name": "dummy-correctness-stateful-recovery",
+      "model": "dummy-correctness-stateful-recovery",
+      "backend": "dummy",
+      "policy": "stateful_recovery",
+      "max_retries": 2,
+      "workload": "benchmarks/spotserve/workloads/recovery_correctness.jsonl",
+      "trace": null,
+      "router_metrics_path": "/tmp/spotserve-work/results/spotserve/dummy-correctness-stateful-recovery-router.jsonl"
     }
   ]
 }

@@ -39,10 +39,13 @@ Use `router_config.recovery_policy` to choose behavior:
 }
 ```
 
-Supported first-version policies:
+Supported policies:
 
 - `none`
 - `naive_retry`
 - `generated_token_replay`
+- `stateful_recovery`
 
 `generated_token_replay` is best-effort and is not true KV cache migration.
+`stateful_recovery` first tries backend state restore. If the backend does not
+support restore, the router falls back to generated-token replay / retry.

@@ -61,7 +61,9 @@ python benchmarks/spotserve/run_benchmark.py \
 
 This matrix forces mid-generation failures and reports request-level
 `failed_attempts`, `retry_count`, `recovered_tokens`, and `recovery_fallback`
-from router metrics.
+from router metrics. It also includes `dummy-correctness-stateful-recovery`,
+which reports `state_restore_attempts_total`,
+`state_restore_successes_total`, and `state_restored_tokens_total`.
 
 On head-only dummy setups, avoid deploying both standard and correctness dummy
 model sets at the same time; the extra Ray actors can exceed the container

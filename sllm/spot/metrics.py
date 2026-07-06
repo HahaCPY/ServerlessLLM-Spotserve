@@ -103,6 +103,34 @@ def make_context_migration_event(
     }
 
 
+def make_state_recovery_event(
+    model: str,
+    request_id: str,
+    decision: Dict[str, Any],
+    source_instance_id: Optional[str] = None,
+    target_instance_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    plan = decision.get("plan") or {}
+    return {
+        "type": "state_recovery",
+        "model": model,
+        "request_id": request_id,
+        "action": decision.get("action"),
+        "source_instance_id": (
+            source_instance_id or plan.get("source_instance_id")
+        ),
+        "target_instance_id": (
+            target_instance_id or plan.get("target_instance_id")
+        ),
+        "state_available": decision.get("state_available", False),
+        "restore_supported": decision.get("restore_supported", False),
+        "fallback_used": decision.get("fallback_used", False),
+        "recovered_tokens": decision.get("recovered_tokens", 0),
+        "reason": decision.get("reason"),
+        "plan": plan or None,
+    }
+
+
 def make_request_event(
     request_id: str,
     model: str,
@@ -113,6 +141,10 @@ def make_request_event(
     failed_attempts: int = 0,
     recovered_tokens: int = 0,
     recovery_fallback: bool = False,
+    state_restore_attempts: int = 0,
+    state_restore_successes: int = 0,
+    state_restore_fallback: bool = False,
+    state_restored_tokens: int = 0,
 ) -> Dict[str, Any]:
     return {
         "type": "request",
@@ -125,4 +157,8 @@ def make_request_event(
         "failed_attempts": failed_attempts,
         "recovered_tokens": recovered_tokens,
         "recovery_fallback": recovery_fallback,
+        "state_restore_attempts": state_restore_attempts,
+        "state_restore_successes": state_restore_successes,
+        "state_restore_fallback": state_restore_fallback,
+        "state_restored_tokens": state_restored_tokens,
     }

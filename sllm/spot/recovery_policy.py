@@ -5,6 +5,7 @@ class RecoveryPolicy(str, Enum):
     NONE = "none"
     NAIVE_RETRY = "naive_retry"
     GENERATED_TOKEN_REPLAY = "generated_token_replay"
+    STATEFUL_RECOVERY = "stateful_recovery"
 
 
 def normalize_policy(policy: str | RecoveryPolicy | None) -> RecoveryPolicy:

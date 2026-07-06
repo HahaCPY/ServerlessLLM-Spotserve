@@ -9,6 +9,7 @@ POLICY_COLORS = {
     "none": "#7a7a7a",
     "naive_retry": "#2563eb",
     "generated_token_replay": "#16a34a",
+    "stateful_recovery": "#0891b2",
     "fallback": "#f97316",
     "failure": "#dc2626",
 }
@@ -92,6 +93,27 @@ def render_report(run_dir: Path) -> None:
     )
     replay_succeeded = int(
         summary.get("replay_succeeded_requests", 0) or 0
+    )
+    state_restore_attempts = int(
+        summary.get("state_restore_attempts_total", 0) or 0
+    )
+    state_restore_successes = int(
+        summary.get("state_restore_successes_total", 0) or 0
+    )
+    state_restore_fallbacks = int(
+        summary.get("state_restore_fallback_count", 0) or 0
+    )
+    state_restored_tokens = int(
+        summary.get("state_restored_tokens_total", 0) or 0
+    )
+    state_recovery_events = int(
+        summary.get("state_recovery_events", 0) or 0
+    )
+    state_recovery_restore_events = int(
+        summary.get("state_recovery_restore_events", 0) or 0
+    )
+    state_recovery_fallback_events = int(
+        summary.get("state_recovery_fallback_events", 0) or 0
     )
     instance_state_rows = int(summary.get("instance_state_rows", 0) or 0)
     instances_marked_preempting = int(
@@ -189,6 +211,22 @@ def render_report(run_dir: Path) -> None:
     </tr>
   </table>
 
+  <h2>Stateful Recovery Metrics</h2>
+  <table class="summary">
+    <tr>
+      <th>State Events</th><th>Restore Events</th><th>Fallback Events</th><th>Restore Attempts</th><th>Restore Successes</th><th>Restore Fallbacks</th><th>State Restored Tokens</th>
+    </tr>
+    <tr>
+      <td>{state_recovery_events}</td>
+      <td>{state_recovery_restore_events}</td>
+      <td>{state_recovery_fallback_events}</td>
+      <td>{state_restore_attempts}</td>
+      <td>{state_restore_successes}</td>
+      <td>{state_restore_fallbacks}</td>
+      <td>{state_restored_tokens}</td>
+    </tr>
+  </table>
+
   <h2>Instance State Metrics</h2>
   <table class="summary">
     <tr>
@@ -257,6 +295,12 @@ def render_report(run_dir: Path) -> None:
 | Router Metrics Rows | Triggered Requests | Failed Attempts | Retry Count | Recovered Tokens | Fallbacks | Replay Succeeded |
 |---:|---:|---:|---:|---:|---:|---:|
 | {summary.get("router_metrics_rows", 0)} | {recovery_triggered} | {failed_attempts} | {retry_count} | {recovered_tokens} | {recovery_fallbacks} | {replay_succeeded} |
+
+## Stateful Recovery Metrics
+
+| State Events | Restore Events | Fallback Events | Restore Attempts | Restore Successes | Restore Fallbacks | State Restored Tokens |
+|---:|---:|---:|---:|---:|---:|---:|
+| {state_recovery_events} | {state_recovery_restore_events} | {state_recovery_fallback_events} | {state_restore_attempts} | {state_restore_successes} | {state_restore_fallbacks} | {state_restored_tokens} |
 
 ## Instance State Metrics
 
