@@ -1,0 +1,63 @@
+{
+  "model": "context-migration-synthetic",
+  "planner_config": {
+    "base_migration_cost": 1.0,
+    "context_block_transfer_cost": 4.0,
+    "cross_node_block_reuse_ratio": 0.0,
+    "cross_node_penalty": 10.0,
+    "cross_node_token_reuse_ratio": 0.0,
+    "same_node_block_reuse_ratio": 1.0,
+    "same_node_token_reuse_ratio": 1.0,
+    "token_transfer_cost": 1.0,
+    "unmatched_penalty": 1000000.0
+  },
+  "sources": [
+    {
+      "context_blocks": 8,
+      "instance_id": "old-a",
+      "node_id": "node-0",
+      "num_tokens": 128,
+      "request_id": "req-a"
+    },
+    {
+      "context_blocks": 6,
+      "instance_id": "old-b",
+      "node_id": "node-1",
+      "num_tokens": 96,
+      "request_id": "req-b"
+    },
+    {
+      "context_blocks": 4,
+      "instance_id": "old-c",
+      "node_id": "node-1",
+      "num_tokens": 64,
+      "request_id": "req-c",
+      "reusable_blocks_by_target": {
+        "new-c": 3
+      },
+      "reusable_tokens_by_target": {
+        "new-c": 48
+      }
+    }
+  ],
+  "targets": [
+    {
+      "capacity": 1,
+      "instance_id": "new-a",
+      "node_id": "node-0",
+      "warmup_cost": 0.5
+    },
+    {
+      "capacity": 1,
+      "instance_id": "new-b",
+      "node_id": "node-1",
+      "warmup_cost": 0.5
+    },
+    {
+      "capacity": 1,
+      "instance_id": "new-c",
+      "node_id": "node-2",
+      "warmup_cost": 2.0
+    }
+  ]
+}

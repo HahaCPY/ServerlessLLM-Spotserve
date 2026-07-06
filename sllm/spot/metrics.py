@@ -76,6 +76,33 @@ def make_replanning_event(
     }
 
 
+def make_context_migration_event(
+    model: str,
+    decision: Dict[str, Any],
+    reason: Optional[str] = None,
+) -> Dict[str, Any]:
+    plans = decision.get("plans", [])
+    return {
+        "type": "context_migration",
+        "model": model,
+        "action": decision.get("action"),
+        "reason": reason,
+        "migration_plan_count": len(plans),
+        "unassigned_context_count": len(
+            decision.get("unassigned_contexts", [])
+        ),
+        "total_estimated_cost": decision.get("total_estimated_cost", 0.0),
+        "total_reusable_tokens": decision.get("total_reusable_tokens", 0),
+        "total_context_tokens": decision.get("total_context_tokens", 0),
+        "total_reusable_context_blocks": decision.get(
+            "total_reusable_context_blocks", 0
+        ),
+        "total_context_blocks": decision.get("total_context_blocks", 0),
+        "reuse_ratio": decision.get("reuse_ratio", 0.0),
+        "plans": plans,
+    }
+
+
 def make_request_event(
     request_id: str,
     model: str,

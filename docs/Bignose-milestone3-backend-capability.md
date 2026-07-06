@@ -1,4 +1,4 @@
-# Milestone 3 Backend Capability Handoff
+# Milestone 3 Backend Capability and Metadata Handoff
 
 這份文件是給大鼻的 backend-side 工作說明。
 
@@ -18,6 +18,8 @@ spot event
 backend / vLLM / MoE runtime
 -> BackendCapability
 -> tell planner which ParallelPlan is executable
+-> runtime context metadata
+-> tell migration planner which context can be reused
 ```
 
 重點是：大鼻不需要決定「要選哪個 plan」。大鼻只需要告訴 CPY：
@@ -27,6 +29,16 @@ backend / vLLM / MoE runtime
 ```
 
 CPY 仍然負責根據 spot event 和 GPU availability 選 plan。
+
+Milestone 3 目前分兩條 backend contract：
+
+```text
+V6 Dynamic Reparallelization:
+  BackendCapability tells CPY which ParallelPlan is executable.
+
+V7 Low-cost Context Migration:
+  Context metadata tells CPY which request context can be reused.
+```
 
 ## Ownership
 
@@ -355,3 +367,236 @@ state export/restore = false
 
 第一版可以全部保守回答。重點是先把 contract 接起來，讓 CPY planner 可以
 filter legal plans。
+
+---
+
+# Version 7 Backend Metadata Contract
+
+CPY 已經可以先做 low-cost context migration planner：
+
+```text
+context metadata
+-> cost matrix
+-> fixed-warmup-cost assignment
+-> MigrationPlan
+-> migration metrics
+```
+
+大鼻在 V7 不需要做 matching。大鼻要提供的是：
+
+```text
+每個 request / instance 目前有哪些 context 可以 reuse
+reuse 的 token / block 數量是多少
+backend 能不能 export / restore state
+```
+
+CPY planner 會用這些 metadata 做：
+
+```text
+old instance -> new instance
+```
+
+的 minimum-cost mapping。
+
+`MigrationTarget.warmup_cost` 是 target-level fixed cost。也就是同一個
+target 如果接兩個 request，只算一次 warmup，不是每個 assignment 都算一次。
+因此 CPY V7 在 `warmup_cost > 0` 時不是純 Hungarian/KM；它會解帶有 target
+fixed opening cost 的 assignment。
+CPY 輸出的 `cost_matrix` 是 marginal source-to-target cost；fixed warmup 會
+反映在每個 `MigrationPlan.estimated_cost` 和 `total_estimated_cost`。
+
+## CPY V7 Interface
+
+CPY 會使用這些資料結構：
+
+```python
+@dataclass(frozen=True)
+class ContextMetadata:
+    request_id: str | None
+    instance_id: str
+    node_id: str
+    num_tokens: int = 0
+    context_blocks: int = 0
+    reusable_tokens_by_target: Mapping[str, int] = field(default_factory=dict)
+    reusable_blocks_by_target: Mapping[str, int] = field(default_factory=dict)
+```
+
+```python
+@dataclass(frozen=True)
+class MigrationTarget:
+    instance_id: str
+    node_id: str
+    capacity: int = 1
+    warmup_cost: float = 0.0
+```
+
+```python
+@dataclass(frozen=True)
+class MigrationPlan:
+    request_id: str | None
+    old_instance_id: str
+    new_instance_id: str
+    old_node_id: str
+    new_node_id: str
+    estimated_cost: float
+    reusable_tokens: int = 0
+    reusable_context_blocks: int = 0
+    reason: str = "low_cost_mapping"
+```
+
+CPY owns:
+
+```text
+sllm/spot/context_migration.py
+```
+
+大鼻只需要讓 backend 能提供 `ContextMetadata` 的真實資料。
+
+## What 大鼻 Should Provide For V7
+
+建議新增 backend metadata helper：
+
+```text
+sllm/backends/vllm_context_metadata.py
+```
+
+第一版可以長這樣：
+
+```python
+from typing import Any, Mapping
+
+
+def get_vllm_context_metadata(
+    model_name: str,
+    instance_id: str,
+    node_id: str,
+    runtime_metadata: Mapping[str, Any],
+) -> dict:
+    return {
+        "request_id": runtime_metadata.get("request_id"),
+        "instance_id": instance_id,
+        "node_id": node_id,
+        "num_tokens": runtime_metadata.get("num_tokens", 0),
+        "context_blocks": runtime_metadata.get("context_blocks", 0),
+        "reusable_tokens_by_target": (
+            runtime_metadata.get("reusable_tokens_by_target", {})
+        ),
+        "reusable_blocks_by_target": (
+            runtime_metadata.get("reusable_blocks_by_target", {})
+        ),
+    }
+```
+
+第一版可以很保守：
+
+```text
+num_tokens = known generated/prompt token count if available
+context_blocks = 0 if backend cannot expose KV blocks yet
+reusable_* = empty dict if backend cannot prove reuse
+```
+
+如果 vLLM 只能提供 token ids，不能提供 KV blocks，請明確表示：
+
+```text
+context_blocks = 0
+supports_state_export = false
+supports_state_restore = false
+```
+
+這樣 CPY planner 仍可做 token-level estimated mapping，但不會假裝已經有
+KV migration。
+
+## Reuse Metadata Meaning
+
+`reusable_tokens_by_target` 和 `reusable_blocks_by_target` 的 key 可以先用：
+
+```text
+target instance_id
+```
+
+或：
+
+```text
+target node_id
+```
+
+例如：
+
+```json
+{
+  "request_id": "req-1",
+  "instance_id": "old-vllm-0",
+  "node_id": "node-0",
+  "num_tokens": 512,
+  "context_blocks": 32,
+  "reusable_tokens_by_target": {
+    "new-vllm-0": 512,
+    "node-0": 512
+  },
+  "reusable_blocks_by_target": {
+    "new-vllm-0": 32,
+    "node-0": 32
+  }
+}
+```
+
+意思是：
+
+```text
+如果搬到 new-vllm-0 或 node-0，可以 reuse 512 tokens / 32 blocks。
+```
+
+如果大鼻不知道 target-specific reuse，先留空：
+
+```json
+"reusable_tokens_by_target": {},
+"reusable_blocks_by_target": {}
+```
+
+CPY planner 會用 conservative default 估算。
+
+## V7 Backend Questions 大鼻需要確認
+
+- vLLM runtime 是否能列出目前 active request ids？
+- 每個 request 是否能拿到 prompt tokens + generated tokens？
+- 每個 request 是否能知道 KV cache block count？
+- block id / block table 是否能安全 expose？
+- 同 node restore 是否能 reuse GPU KV blocks？
+- cross node restore 是否只能 token replay？
+- vLLM 是否有 state export hook？
+- vLLM 是否有 state restore hook？
+- MoE request 是否需要 expert metadata 才能正確估 reuse？
+
+如果答案是不確定，第一版請保守填：
+
+```text
+supports_state_export = false
+supports_state_restore = false
+context_blocks = 0
+reusable_blocks_by_target = {}
+```
+
+## V7 Definition Of Done For 大鼻
+
+大鼻 V7 metadata 部分完成時，應該滿足：
+
+- backend helper can return context metadata for vLLM instances.
+- metadata includes request id, instance id, node id, token count if available.
+- KV block fields are present, even if conservative zero.
+- state export / restore capability is explicit.
+- no matching algorithm is implemented in backend code.
+- no CPY router/scheduler/controller main-flow changes are required.
+
+CPY 會把這些 metadata 接進：
+
+```text
+sllm/spot/context_migration.py
+```
+
+並產生：
+
+```text
+MigrationPlan
+context_migration metrics
+estimated reuse ratio
+```

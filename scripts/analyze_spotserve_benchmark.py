@@ -226,6 +226,64 @@ def summarize_replanning_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def summarize_context_migration_metrics(
+    rows: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    migration_rows = [
+        row for row in rows if row.get("type") == "context_migration"
+    ]
+    total_plan_count = sum(
+        int(row.get("migration_plan_count", 0) or 0)
+        for row in migration_rows
+    )
+    total_unassigned = sum(
+        int(row.get("unassigned_context_count", 0) or 0)
+        for row in migration_rows
+    )
+    total_estimated_cost = sum(
+        float(row.get("total_estimated_cost", 0.0) or 0.0)
+        for row in migration_rows
+    )
+    total_reusable_tokens = sum(
+        int(row.get("total_reusable_tokens", 0) or 0)
+        for row in migration_rows
+    )
+    total_context_tokens = sum(
+        int(row.get("total_context_tokens", 0) or 0)
+        for row in migration_rows
+    )
+    total_reusable_blocks = sum(
+        int(row.get("total_reusable_context_blocks", 0) or 0)
+        for row in migration_rows
+    )
+    total_context_blocks = sum(
+        int(row.get("total_context_blocks", 0) or 0)
+        for row in migration_rows
+    )
+    reuse_denominator = total_context_blocks or total_context_tokens
+    reuse_numerator = (
+        total_reusable_blocks if total_context_blocks else total_reusable_tokens
+    )
+    latest_plans = migration_rows[-1].get("plans", []) if migration_rows else []
+    return {
+        "context_migration_events": len(migration_rows),
+        "context_migration_plan_count": total_plan_count,
+        "context_migration_unassigned_count": total_unassigned,
+        "context_migration_total_estimated_cost": total_estimated_cost,
+        "context_migration_avg_estimated_cost": (
+            total_estimated_cost / total_plan_count if total_plan_count else 0.0
+        ),
+        "context_migration_reusable_tokens": total_reusable_tokens,
+        "context_migration_reusable_context_blocks": total_reusable_blocks,
+        "context_migration_reuse_ratio": (
+            reuse_numerator / reuse_denominator if reuse_denominator else 0.0
+        ),
+        "context_migration_latest_plans": (
+            json.dumps(latest_plans, sort_keys=True) if latest_plans else ""
+        ),
+    }
+
+
 def analyze_run(run_dir: Path) -> Dict[str, Any]:
     metadata_path = run_dir / "run_metadata.json"
     metadata = (
@@ -271,6 +329,7 @@ def analyze_run(run_dir: Path) -> Dict[str, Any]:
         **summarize_router_metrics(router_request_rows),
         **summarize_instance_state_metrics(router_metric_rows_in_window),
         **summarize_replanning_metrics(router_metric_rows_in_window),
+        **summarize_context_migration_metrics(router_metric_rows_in_window),
     }
     (run_dir / "summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True),

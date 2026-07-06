@@ -106,6 +106,24 @@ def render_report(run_dir: Path) -> None:
     instances_marked_draining = int(
         summary.get("instances_marked_draining", 0) or 0
     )
+    migration_events = int(
+        summary.get("context_migration_events", 0) or 0
+    )
+    migration_plan_count = int(
+        summary.get("context_migration_plan_count", 0) or 0
+    )
+    migration_unassigned_count = int(
+        summary.get("context_migration_unassigned_count", 0) or 0
+    )
+    migration_total_cost = float(
+        summary.get("context_migration_total_estimated_cost", 0.0) or 0.0
+    )
+    migration_avg_cost = float(
+        summary.get("context_migration_avg_estimated_cost", 0.0) or 0.0
+    )
+    migration_reuse_ratio = float(
+        summary.get("context_migration_reuse_ratio", 0.0) or 0.0
+    )
 
     html_report = f"""<!doctype html>
 <html lang="en">
@@ -185,6 +203,21 @@ def render_report(run_dir: Path) -> None:
     </tr>
   </table>
 
+  <h2>Context Migration Metrics</h2>
+  <table class="summary">
+    <tr>
+      <th>Migration Events</th><th>Plans</th><th>Unassigned</th><th>Total Estimated Cost</th><th>Avg Cost</th><th>Reuse Ratio</th>
+    </tr>
+    <tr>
+      <td>{migration_events}</td>
+      <td>{migration_plan_count}</td>
+      <td>{migration_unassigned_count}</td>
+      <td>{migration_total_cost:.2f}</td>
+      <td>{migration_avg_cost:.2f}</td>
+      <td>{migration_reuse_ratio:.2%}</td>
+    </tr>
+  </table>
+
   <div class="card">
     <h2>Key Metrics</h2>
     {svg_bar("Success rate (%)", success_rate, max_bar, color)}
@@ -230,6 +263,12 @@ def render_report(run_dir: Path) -> None:
 | Instance Events | Preempting | Ready | Dead | Draining |
 |---:|---:|---:|---:|---:|
 | {instance_state_rows} | {instances_marked_preempting} | {instances_marked_ready} | {instances_marked_dead} | {instances_marked_draining} |
+
+## Context Migration Metrics
+
+| Migration Events | Plans | Unassigned | Total Estimated Cost | Avg Cost | Reuse Ratio |
+|---:|---:|---:|---:|---:|---:|
+| {migration_events} | {migration_plan_count} | {migration_unassigned_count} | {migration_total_cost:.2f} | {migration_avg_cost:.2f} | {migration_reuse_ratio:.2%} |
 
 Open `report.html` for the visual report.
 """
