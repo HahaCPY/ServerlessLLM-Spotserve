@@ -8,6 +8,12 @@ from .context_migration import (
 )
 from .recovery_policy import RecoveryPolicy, normalize_policy
 from .reparallelization import ParallelPlan, plan_dynamic_reparallelization
+from .risk_aware_scheduling import (
+    NodeRiskScore,
+    SchedulingDecision,
+    plan_risk_aware_scheduling,
+    rank_nodes_by_spot_risk,
+)
 from .stateful_recovery import (
     InferenceState,
     StateRecoveryDecision,
@@ -22,8 +28,10 @@ __all__ = [
     "MigrationDecision",
     "MigrationPlan",
     "MigrationTarget",
+    "NodeRiskScore",
     "ParallelPlan",
     "RecoveryPolicy",
+    "SchedulingDecision",
     "SpotEvent",
     "StateRecoveryDecision",
     "StateRecoveryPlan",
@@ -32,5 +40,7 @@ __all__ = [
     "plan_low_cost_migration",
     "plan_low_cost_migration_from_dict",
     "plan_dynamic_reparallelization",
+    "plan_risk_aware_scheduling",
     "plan_stateful_recovery",
+    "rank_nodes_by_spot_risk",
 ]

@@ -69,6 +69,18 @@ On head-only dummy setups, avoid deploying both standard and correctness dummy
 model sets at the same time; the extra Ray actors can exceed the container
 thread limit.
 
+For risk-aware scheduling validation, run the synthetic scheduler benchmark.
+This does not require a deployed model:
+
+```bash
+python scripts/run_scheduler_benchmark.py \
+  --input benchmarks/spotserve/risk_aware_scheduling_synthetic.json \
+  --output-dir /tmp/spotserve_risk_aware_scheduling_test
+```
+
+This compares health-only node selection against risk-aware ranking over
+synthetic `spot_risk`, `remaining_lifetime_s`, and `loading_cost` metadata.
+
 For vLLM dense black-box validation, deploy the dense configs and run the
 dedicated matrix:
 

@@ -1,0 +1,73 @@
+{
+  "policies": [
+    "health_only",
+    "risk_aware"
+  ],
+  "scheduler_config": {
+    "risk_weight": 1.0,
+    "lifetime_weight": 0.8,
+    "loading_cost_weight": 0.6,
+    "free_gpu_weight": 0.05,
+    "max_remaining_lifetime_s": 3600,
+    "max_loading_cost": 60
+  },
+  "worker_nodes": {
+    "node-0": {
+      "ray_node_id": "synthetic-node-0",
+      "address": "10.0.0.1",
+      "free_gpu": 2,
+      "total_gpu": 2,
+      "state": "ready",
+      "spot_risk": 0.9,
+      "remaining_lifetime_s": 300,
+      "loading_cost": 5
+    },
+    "node-1": {
+      "ray_node_id": "synthetic-node-1",
+      "address": "10.0.0.2",
+      "free_gpu": 2,
+      "total_gpu": 2,
+      "state": "ready",
+      "spot_risk": 0.1,
+      "remaining_lifetime_s": 3200,
+      "loading_cost": 15
+    },
+    "node-2": {
+      "ray_node_id": "synthetic-node-2",
+      "address": "10.0.0.3",
+      "free_gpu": 2,
+      "total_gpu": 2,
+      "state": "ready",
+      "spot_risk": 0.25,
+      "remaining_lifetime_s": 2600,
+      "loading_cost": 8
+    },
+    "node-3": {
+      "ray_node_id": "synthetic-node-3",
+      "address": "10.0.0.4",
+      "free_gpu": 2,
+      "total_gpu": 2,
+      "state": "preempting",
+      "spot_risk": 0.0,
+      "remaining_lifetime_s": 3600,
+      "loading_cost": 1
+    }
+  },
+  "requests": [
+    {
+      "request_id": "sched-0001",
+      "model": "scheduler-risk-model-a",
+      "num_gpus": 1
+    },
+    {
+      "request_id": "sched-0002",
+      "model": "scheduler-risk-model-b",
+      "num_gpus": 1
+    },
+    {
+      "request_id": "sched-0003",
+      "model": "scheduler-risk-model-c",
+      "num_gpus": 1
+    }
+  ]
+}

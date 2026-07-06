@@ -765,3 +765,127 @@ StateRecoveryPlan
 state_recovery metrics
 fallback generated-token replay / retry
 ```
+
+---
+
+# Version 9 Backend Runtime Metadata Contract
+
+CPY 已經可以做 spot-risk-aware scheduling：
+
+```text
+worker node metadata
+-> risk score
+-> ranked ready nodes
+-> allocation decision
+```
+
+大鼻在 V9 不需要寫 scheduler。大鼻要提供的是：
+
+```text
+model loading cost
+model resource profile
+GPU usage / free capacity
+optional spot risk / remaining lifetime metadata
+```
+
+CPY scheduler 會根據這些資料排序 node。
+
+## CPY V9 Interface
+
+CPY 使用：
+
+```python
+@dataclass(frozen=True)
+class NodeRiskScore:
+    node_id: str
+    state: str
+    free_gpu: int
+    total_gpu: int
+    spot_risk: float
+    remaining_lifetime_s: float
+    loading_cost: float
+    score: float
+    reason: str = "risk_aware_ranking"
+```
+
+```python
+@dataclass(frozen=True)
+class SchedulingDecision:
+    action: str
+    model_name: str
+    requested_gpus: int
+    selected_node_id: str | None
+    candidates: list[NodeRiskScore]
+    reason: str = "risk_aware_scheduling"
+```
+
+CPY owns:
+
+```text
+sllm/spot/risk_aware_scheduling.py
+sllm/schedulers/fcfs_scheduler.py
+```
+
+## Metadata 大鼻可以提供
+
+Node-level metadata:
+
+```json
+{
+  "node_id": "node-0",
+  "free_gpu": 2,
+  "total_gpu": 4,
+  "spot_risk": 0.25,
+  "remaining_lifetime_s": 1800,
+  "loading_cost": 12.5
+}
+```
+
+Model-level metadata:
+
+```json
+{
+  "model_name": "vllm-moe",
+  "num_gpus": 2,
+  "estimated_load_time_s": 20.0,
+  "gpu_memory_required_gb": 40.0
+}
+```
+
+第一版可以保守：
+
+```text
+spot_risk = 0.0 if unknown
+remaining_lifetime_s = default_remaining_lifetime_s
+loading_cost = measured/estimated model load time if available, else 0
+```
+
+如果大鼻不能提供 spot provider risk，CPY 仍可用 synthetic risk metadata 做
+benchmark，不會阻塞 Version 9 CPY side。
+
+## V9 Backend Questions 大鼻需要確認
+
+- vLLM backend 是否能 expose model load time？
+- 每個 model / config 的 GPU memory requirement 是否可估？
+- backend 是否能回報目前 GPU usage / capacity？
+- node metadata 是否能攜帶 spot risk 或 remaining lifetime？
+- 如果沒有 cloud provider，是否用 static synthetic risk config？
+- MoE model loading cost 是否跟 dense model 不同，需要獨立 profile？
+
+## V9 Definition Of Done For 大鼻
+
+大鼻 V9 metadata 部分完成時，應該滿足：
+
+- model resource profile 可以被 CPY scheduler 讀取。
+- loading cost 有 conservative estimate。
+- GPU usage / free capacity metadata 是最新或明確標註 stale。
+- spot risk / remaining lifetime 如果不可用，要明確留空或用 default。
+- backend 不做 scheduler ranking，不改 CPY policy decision。
+
+CPY 會根據這些 metadata 產生：
+
+```text
+SchedulingDecision
+risk_aware_scheduling metrics
+health-only vs risk-aware benchmark comparison
+```

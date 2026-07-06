@@ -323,6 +323,47 @@ def summarize_state_recovery_metrics(
     }
 
 
+def summarize_risk_aware_scheduling_metrics(
+    rows: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    scheduling_rows = [
+        row for row in rows if row.get("type") == "risk_aware_scheduling"
+    ]
+    selected_risks = [
+        float(row.get("selected_spot_risk", 0.0) or 0.0)
+        for row in scheduling_rows
+    ]
+    selected_scores = [
+        float(row.get("selected_score", 0.0) or 0.0)
+        for row in scheduling_rows
+    ]
+    latest_decision = (
+        scheduling_rows[-1].get("decision") if scheduling_rows else None
+    )
+    return {
+        "risk_scheduling_events": len(scheduling_rows),
+        "risk_scheduling_allocations": sum(
+            1 for row in scheduling_rows if row.get("action") == "allocate"
+        ),
+        "risk_scheduling_avg_selected_risk": (
+            mean(selected_risks) if selected_risks else 0.0
+        ),
+        "risk_scheduling_avg_selected_score": (
+            mean(selected_scores) if selected_scores else 0.0
+        ),
+        "risk_scheduling_latest_node": (
+            scheduling_rows[-1].get("selected_node_id")
+            if scheduling_rows
+            else ""
+        ),
+        "risk_scheduling_latest_decision": (
+            json.dumps(latest_decision, sort_keys=True)
+            if latest_decision
+            else ""
+        ),
+    }
+
+
 def analyze_run(run_dir: Path) -> Dict[str, Any]:
     metadata_path = run_dir / "run_metadata.json"
     metadata = (
@@ -370,6 +411,9 @@ def analyze_run(run_dir: Path) -> Dict[str, Any]:
         **summarize_replanning_metrics(router_metric_rows_in_window),
         **summarize_context_migration_metrics(router_metric_rows_in_window),
         **summarize_state_recovery_metrics(router_metric_rows_in_window),
+        **summarize_risk_aware_scheduling_metrics(
+            router_metric_rows_in_window
+        ),
     }
     (run_dir / "summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True),

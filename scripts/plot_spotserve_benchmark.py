@@ -146,6 +146,21 @@ def render_report(run_dir: Path) -> None:
     migration_reuse_ratio = float(
         summary.get("context_migration_reuse_ratio", 0.0) or 0.0
     )
+    risk_scheduling_events = int(
+        summary.get("risk_scheduling_events", 0) or 0
+    )
+    risk_scheduling_allocations = int(
+        summary.get("risk_scheduling_allocations", 0) or 0
+    )
+    risk_scheduling_avg_selected_risk = float(
+        summary.get("risk_scheduling_avg_selected_risk", 0.0) or 0.0
+    )
+    risk_scheduling_avg_selected_score = float(
+        summary.get("risk_scheduling_avg_selected_score", 0.0) or 0.0
+    )
+    risk_scheduling_latest_node = str(
+        summary.get("risk_scheduling_latest_node", "") or ""
+    )
 
     html_report = f"""<!doctype html>
 <html lang="en">
@@ -256,6 +271,20 @@ def render_report(run_dir: Path) -> None:
     </tr>
   </table>
 
+  <h2>Risk-aware Scheduling Metrics</h2>
+  <table class="summary">
+    <tr>
+      <th>Scheduling Events</th><th>Allocations</th><th>Avg Selected Risk</th><th>Avg Selected Score</th><th>Latest Node</th>
+    </tr>
+    <tr>
+      <td>{risk_scheduling_events}</td>
+      <td>{risk_scheduling_allocations}</td>
+      <td>{risk_scheduling_avg_selected_risk:.3f}</td>
+      <td>{risk_scheduling_avg_selected_score:.3f}</td>
+      <td>{html.escape(risk_scheduling_latest_node)}</td>
+    </tr>
+  </table>
+
   <div class="card">
     <h2>Key Metrics</h2>
     {svg_bar("Success rate (%)", success_rate, max_bar, color)}
@@ -313,6 +342,12 @@ def render_report(run_dir: Path) -> None:
 | Migration Events | Plans | Unassigned | Total Estimated Cost | Avg Cost | Reuse Ratio |
 |---:|---:|---:|---:|---:|---:|
 | {migration_events} | {migration_plan_count} | {migration_unassigned_count} | {migration_total_cost:.2f} | {migration_avg_cost:.2f} | {migration_reuse_ratio:.2%} |
+
+## Risk-aware Scheduling Metrics
+
+| Scheduling Events | Allocations | Avg Selected Risk | Avg Selected Score | Latest Node |
+|---:|---:|---:|---:|---|
+| {risk_scheduling_events} | {risk_scheduling_allocations} | {risk_scheduling_avg_selected_risk:.3f} | {risk_scheduling_avg_selected_score:.3f} | `{risk_scheduling_latest_node}` |
 
 Open `report.html` for the visual report.
 """

@@ -21,6 +21,11 @@ import time
 from typing import Mapping, Optional
 
 from sllm.logger import init_logger
+from sllm.spot.metrics import (
+    JsonlMetricsWriter,
+    make_risk_aware_scheduling_event,
+)
+from sllm.spot.risk_aware_scheduling import plan_risk_aware_scheduling
 from sllm.utils import NodeState, get_worker_nodes
 
 from .scheduler_utils import SllmScheduler
@@ -31,7 +36,15 @@ logger = init_logger(__name__)
 class FcfsScheduler(SllmScheduler):
     def __init__(self, scheduler_config: Optional[Mapping] = None):
         super().__init__()
-        self.scheduler_config = scheduler_config
+        self.scheduler_config = dict(scheduler_config or {})
+        self.enable_spot_risk_aware = bool(
+            self.scheduler_config.get("enable_spot_risk_aware", False)
+        )
+        self.latest_scheduling_decision = None
+        metrics_path = self.scheduler_config.get("metrics_path")
+        self.metrics_writer = (
+            JsonlMetricsWriter(metrics_path) if metrics_path else None
+        )
 
         self.queue_lock = asyncio.Lock()
         self.model_loading_queues = {}
@@ -45,13 +58,90 @@ class FcfsScheduler(SllmScheduler):
         self.running_lock = asyncio.Lock()
         self.running = False
 
-    def _ensure_node_metadata(self, node_info: Mapping) -> dict:
+    def _ensure_node_metadata(
+        self,
+        node_info: Mapping,
+        node_id: Optional[str] = None,
+    ) -> dict:
         updated_node_info = dict(node_info)
         updated_node_info.setdefault("state", NodeState.READY.value)
+        configured_node_id = str(
+            node_id if node_id is not None else updated_node_info.get("node_id", "")
+        )
+        if configured_node_id:
+            updated_node_info.update(
+                self._configured_node_risk(configured_node_id)
+            )
         return updated_node_info
 
     def _node_is_ready(self, node_info: Mapping) -> bool:
         return node_info.get("state", NodeState.READY.value) == NodeState.READY.value
+
+    def _emit_metric(self, event: dict):
+        if self.metrics_writer is None:
+            return
+        try:
+            self.metrics_writer.emit(event)
+        except Exception as e:
+            logger.error(f"Failed to emit scheduler metric: {e}")
+
+    def _configured_node_risk(self, node_id: str) -> dict:
+        node_risk = self.scheduler_config.get("node_risk", {}) or {}
+        return dict(node_risk.get(str(node_id), {}) or {})
+
+    def _preserve_spot_metadata(
+        self,
+        updated_node_info: dict,
+        previous_node_info: Mapping,
+        node_id: str,
+    ) -> dict:
+        for key in (
+            "spot_risk",
+            "risk_score",
+            "preemption_risk",
+            "remaining_lifetime_s",
+            "expected_remaining_lifetime_s",
+            "loading_cost",
+            "model_loading_cost",
+            "load_cost",
+        ):
+            if key in previous_node_info:
+                updated_node_info[key] = previous_node_info[key]
+        updated_node_info.update(self._configured_node_risk(str(node_id)))
+        return updated_node_info
+
+    def _ordered_candidate_nodes(
+        self,
+        model_name: str,
+        num_gpus: int,
+        worker_nodes: Mapping,
+    ):
+        if not self.enable_spot_risk_aware:
+            return list(worker_nodes.items())
+
+        decision = plan_risk_aware_scheduling(
+            model_name=model_name,
+            worker_nodes=worker_nodes,
+            requested_gpus=num_gpus,
+            scheduler_config=self.scheduler_config,
+        )
+        self.latest_scheduling_decision = decision.to_dict()
+        self._emit_metric(
+            make_risk_aware_scheduling_event(
+                model=model_name,
+                policy="risk_aware",
+                decision=self.latest_scheduling_decision,
+            )
+        )
+        ranked = [
+            (candidate.node_id, worker_nodes[candidate.node_id])
+            for candidate in decision.candidates
+        ]
+        logger.info(
+            f"Risk-aware scheduling decision for {model_name}: "
+            f"{self.latest_scheduling_decision}"
+        )
+        return ranked
 
     async def mark_node_preempting(self, node_id: str):
         return await self._mark_node_state(node_id, NodeState.PREEMPTING)
@@ -61,6 +151,26 @@ class FcfsScheduler(SllmScheduler):
 
     async def mark_node_dead(self, node_id: str):
         return await self._mark_node_state(node_id, NodeState.DEAD)
+
+    async def update_node_risk(self, node_id: str, risk_metadata: Mapping):
+        async with self.metadata_lock:
+            if node_id not in self.worker_nodes:
+                self.worker_nodes[node_id] = {
+                    "ray_node_id": None,
+                    "address": None,
+                    "free_gpu": 0,
+                    "total_gpu": 0,
+                    "state": NodeState.READY.value,
+                }
+            self.worker_nodes[node_id].update(dict(risk_metadata))
+            logger.info(
+                f"Updated scheduler risk metadata for node {node_id}: "
+                f"{risk_metadata}"
+            )
+            return {
+                "node_id": node_id,
+                "risk_metadata": dict(risk_metadata),
+            }
 
     async def _mark_node_state(self, node_id: str, state: NodeState):
         async with self.metadata_lock:
@@ -184,7 +294,11 @@ class FcfsScheduler(SllmScheduler):
                     allocation_result,
                 ) in loading_requests:
                     allocated = False
-                    for node_id, node_info in worker_nodes.items():
+                    for node_id, node_info in self._ordered_candidate_nodes(
+                        model_name,
+                        num_gpus,
+                        worker_nodes,
+                    ):
                         if not self._node_is_ready(node_info):
                             logger.info(
                                 f"Skipping node {node_id} in state "
@@ -230,7 +344,8 @@ class FcfsScheduler(SllmScheduler):
         for node_id, node_info in worker_nodes.items():
             if node_id not in updated_worker_nodes:
                 updated_worker_nodes[node_id] = self._ensure_node_metadata(
-                    copy.deepcopy(node_info)
+                    copy.deepcopy(node_info),
+                    node_id=node_id,
                 )
             else:
                 current_state = updated_worker_nodes[node_id].get(
@@ -238,6 +353,11 @@ class FcfsScheduler(SllmScheduler):
                 )
                 updated_worker_nodes[node_id].update(copy.deepcopy(node_info))
                 updated_worker_nodes[node_id]["state"] = current_state
+                updated_worker_nodes[node_id] = self._preserve_spot_metadata(
+                    updated_worker_nodes[node_id],
+                    self.worker_nodes[node_id],
+                    node_id,
+                )
         async with self.metadata_lock:
             self.worker_nodes = updated_worker_nodes
 
@@ -255,9 +375,15 @@ class FcfsScheduler(SllmScheduler):
                 "state", NodeState.READY.value
             )
             updated_worker_nodes[node_id] = self._ensure_node_metadata(
-                copy.deepcopy(node_info)
+                copy.deepcopy(node_info),
+                node_id=node_id,
             )
             updated_worker_nodes[node_id]["state"] = current_state
+            updated_worker_nodes[node_id] = self._preserve_spot_metadata(
+                updated_worker_nodes[node_id],
+                self.worker_nodes[node_id],
+                node_id,
+            )
         async with self.metadata_lock:
             self.worker_nodes = updated_worker_nodes
         logger.info(f"Worker nodes updated: {updated_worker_nodes}")

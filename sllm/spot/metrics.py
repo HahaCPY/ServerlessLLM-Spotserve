@@ -131,6 +131,31 @@ def make_state_recovery_event(
     }
 
 
+def make_risk_aware_scheduling_event(
+    model: str,
+    policy: str,
+    decision: Dict[str, Any],
+) -> Dict[str, Any]:
+    candidates = decision.get("candidates", [])
+    selected = candidates[0] if candidates else {}
+    return {
+        "type": "risk_aware_scheduling",
+        "model": model,
+        "policy": policy,
+        "action": decision.get("action"),
+        "requested_gpus": decision.get("requested_gpus", 0),
+        "selected_node_id": decision.get("selected_node_id"),
+        "candidate_count": len(candidates),
+        "selected_score": selected.get("score", 0.0),
+        "selected_spot_risk": selected.get("spot_risk", 0.0),
+        "selected_remaining_lifetime_s": selected.get(
+            "remaining_lifetime_s", 0.0
+        ),
+        "selected_loading_cost": selected.get("loading_cost", 0.0),
+        "decision": decision,
+    }
+
+
 def make_request_event(
     request_id: str,
     model: str,

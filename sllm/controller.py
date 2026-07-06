@@ -86,13 +86,11 @@ class SllmController:
         else:
             self.router_cls = ray.remote(RoundRobinRouter)
 
+        scheduler_config = dict(self.config.get("scheduler_config", {}) or {})
+        scheduler_config["enable_migration"] = enable_migration
         self.scheduler = ray_scheduler_cls.options(
             name="model_loading_scheduler", resources={"control_node": 0.1}
-        ).remote(
-            scheduler_config={
-                "enable_migration": enable_migration,
-            }
-        )
+        ).remote(scheduler_config=scheduler_config)
         self.scheduler.start.remote()
 
     async def register(self, model_config):
