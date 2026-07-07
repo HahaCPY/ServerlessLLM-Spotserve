@@ -92,15 +92,20 @@ MoE vLLM 這邊使用已驗證的 allowlist。現在可宣告的 config 是：
 | 2 | 2 | 1 | 1 | 4 | `verified_vllm_moe_config` |
 | 2 | 1 | 1 | 2 | 2 | `verified_vllm_moe_config` |
 | 2 | 2 | 1 | 2 | 4 | `verified_vllm_moe_config` |
+| 1 | 4 | 1 | 1 | 4 | `verified_vllm_moe_config` |
+| 1 | 4 | 1 | 2 | 4 | `verified_vllm_moe_config` |
+| 2 | 1 | 2 | 1 | 4 | `verified_vllm_moe_config` |
+| 2 | 1 | 2 | 2 | 4 | `verified_vllm_moe_config` |
 
-這裡的 `DP=2` 表示 SLLM control plane 的兩個 replicas，不是單一 vLLM
-engine 內部的 DP resharding。對應到 `ParallelPlan` 時：
+這裡的 `DP=N` 表示 SLLM control plane 的 N 個 replicas，不是單一 vLLM
+engine 內部的 DP resharding。`PP=2` 則是已用 vLLM pipeline parallel 實測過的
+4-GPU config。對應到 `ParallelPlan` 時：
 
 ```text
 data_parallel_size = DP
 num_replicas = DP
-num_gpus = TP * DP
-pipeline_parallel_size = 1
+num_gpus = TP * DP * PP
+pipeline_parallel_size = PP
 ```
 
 這裡的 `EP=2` 是 CPY planner 看到的 capability metadata。vLLM backend config
@@ -324,16 +329,20 @@ MoE vLLM path 則需要另外產生 verified allowlist：
 
 ```python
 VLLM_MOE_SUPPORTED_SHAPES = (
-    {"tensor_parallel_size": 4, "data_parallel_size": 1, "expert_parallel_size": 1},
-    {"tensor_parallel_size": 4, "data_parallel_size": 1, "expert_parallel_size": 2},
-    {"tensor_parallel_size": 2, "data_parallel_size": 1, "expert_parallel_size": 1},
-    {"tensor_parallel_size": 2, "data_parallel_size": 2, "expert_parallel_size": 1},
-    {"tensor_parallel_size": 2, "data_parallel_size": 1, "expert_parallel_size": 2},
-    {"tensor_parallel_size": 2, "data_parallel_size": 2, "expert_parallel_size": 2},
+    {"tensor_parallel_size": 4, "data_parallel_size": 1, "pipeline_parallel_size": 1, "expert_parallel_size": 1},
+    {"tensor_parallel_size": 4, "data_parallel_size": 1, "pipeline_parallel_size": 1, "expert_parallel_size": 2},
+    {"tensor_parallel_size": 2, "data_parallel_size": 1, "pipeline_parallel_size": 1, "expert_parallel_size": 1},
+    {"tensor_parallel_size": 2, "data_parallel_size": 2, "pipeline_parallel_size": 1, "expert_parallel_size": 1},
+    {"tensor_parallel_size": 2, "data_parallel_size": 1, "pipeline_parallel_size": 1, "expert_parallel_size": 2},
+    {"tensor_parallel_size": 2, "data_parallel_size": 2, "pipeline_parallel_size": 1, "expert_parallel_size": 2},
+    {"tensor_parallel_size": 1, "data_parallel_size": 4, "pipeline_parallel_size": 1, "expert_parallel_size": 1},
+    {"tensor_parallel_size": 1, "data_parallel_size": 4, "pipeline_parallel_size": 1, "expert_parallel_size": 2},
+    {"tensor_parallel_size": 2, "data_parallel_size": 1, "pipeline_parallel_size": 2, "expert_parallel_size": 1},
+    {"tensor_parallel_size": 2, "data_parallel_size": 1, "pipeline_parallel_size": 2, "expert_parallel_size": 2},
 )
 ```
 
-如果未來實測更多 MoE config，例如 `TP=1`、`TP=4, DP=2` 或更大的
+如果未來實測更多 MoE config，例如 `TP=4, DP=2` 或更大的
 expert parallel setting，再把那些 config 加進 allowlist。CPY planner 只應該
 選 `supported_configs` 裡出現的 plan。
 
@@ -438,6 +447,10 @@ def test_vllm_moe_capability_reports_verified_allowlist():
         (2, 2, 1, 1, 4),
         (2, 1, 1, 2, 2),
         (2, 2, 1, 2, 4),
+        (1, 4, 1, 1, 4),
+        (1, 4, 1, 2, 4),
+        (2, 1, 2, 1, 4),
+        (2, 1, 2, 2, 4),
     }
 ```
 
@@ -497,7 +510,7 @@ allowlist。也就是 config 看起來像 MoE 時，`supported_configs` 應該�
 
 - vLLM dense 是否只支援 `tensor_parallel_size`，還是能明確表示 DP？
 - vLLM MoE expert parallel 目前已可用於 allowlist 中的 EP=2 config；是否能 expose 更細的 expert metadata 仍需確認。
-- vLLM MoE 是否還有更多可驗證 config，例如 `TP=1`、`TP=4, DP=2` 或更大的 EP？
+- vLLM MoE 是否還有更多可驗證 config，例如 `TP=4, DP=2` 或更大的 EP？
 - state export / state restore 是否有任何可用 hook？
 - `num_gpus` 應該以 ServerlessLLM top-level `num_gpus` 為準，還是以
   `backend_config.tensor_parallel_size` 為準？
@@ -886,6 +899,44 @@ state_kind = "token_snapshot"
 
 這樣 CPY 會 fallback，不會假裝有 true stateful recovery。
 
+V8 backend-side 第一版新增：
+
+```text
+sllm/backends/vllm_state_metadata.py
+```
+
+helper 會產生 CPY `InferenceState.from_dict()` 可讀的 payload：
+
+```text
+request_id
+instance_id
+node_id
+backend = vllm
+model_name
+tokens
+completed_tokens
+state_kind = token_snapshot
+supports_restore = false
+metadata.cache_engine = vllm
+metadata.can_restore_same_node = false
+metadata.can_restore_cross_node = false
+metadata.reason = vllm_kv_restore_not_available
+```
+
+`VllmBackend.export_inference_state()` 可以先從 `current_output` 或
+`get_current_tokens()` 取得 token snapshot。`VllmBackend.restore_inference_state()`
+第一版必須保守回：
+
+```json
+{
+  "restored": false,
+  "reason": "vllm_kv_restore_not_available"
+}
+```
+
+也就是說，V8 第一版只讓 CPY 有明確 token snapshot 可以做 fallback token
+replay；不宣告真 KV restore。
+
 ## vLLM State Metadata 建議
 
 如果 vLLM 能 expose KV/cache metadata，`InferenceState.metadata` 可以包含：
@@ -941,6 +992,14 @@ state_kind = "token_snapshot"
 - `restore_inference_state()` 回傳 `{ "restored": true }` 之前，必須真的讓
   後續 generation 從 state 接續。
 - backend 不實作 CPY policy decision，不實作 matching，不改 scheduler。
+- unit tests cover vLLM token snapshot payload and compatibility with
+  `InferenceState.from_dict()`.
+
+建議測試：
+
+```text
+tests/spotserve_test/test_vllm_state_metadata.py
+```
 
 CPY 會根據這些 hooks 產生：
 
@@ -1047,6 +1106,52 @@ loading_cost = measured/estimated model load time if available, else 0
 如果大鼻不能提供 spot provider risk，CPY 仍可用 synthetic risk metadata 做
 benchmark，不會阻塞 Version 9 CPY side。
 
+V9 backend-side 第一版新增：
+
+```text
+sllm/backends/vllm_runtime_metadata.py
+```
+
+它提供兩種 helper：
+
+```text
+get_vllm_model_resource_profile(...)
+get_vllm_runtime_metadata(...)
+```
+
+model resource profile 會回傳：
+
+```text
+model_name
+backend = vllm
+num_gpus = TP * PP * DP
+tensor_parallel_size
+pipeline_parallel_size
+data_parallel_size
+expert_parallel_enabled
+estimated_load_time_s
+gpu_memory_required_gb
+gpu_memory_utilization
+max_model_len
+max_num_seqs
+```
+
+runtime metadata 會回傳 CPY risk-aware scheduler 可讀的欄位：
+
+```text
+node_id
+free_gpu
+total_gpu
+spot_risk
+remaining_lifetime_s
+loading_cost
+```
+
+`VllmBackend.init_backend()` 可以記錄 engine load time，並讓
+`VllmBackend.get_runtime_metadata()` 回傳 conservative runtime metadata。
+如果 backend 不知道 GPU free capacity 或 spot risk，先回 `0` 或空 metadata，
+不要自行做 ranking。
+
 ## V9 Backend Questions 大鼻需要確認
 
 - vLLM backend 是否能 expose model load time？
@@ -1065,6 +1170,14 @@ benchmark，不會阻塞 Version 9 CPY side。
 - GPU usage / free capacity metadata 是最新或明確標註 stale。
 - spot risk / remaining lifetime 如果不可用，要明確留空或用 default。
 - backend 不做 scheduler ranking，不改 CPY policy decision。
+- unit tests cover vLLM resource profile and risk-aware scheduler compatible
+  runtime metadata.
+
+建議測試：
+
+```text
+tests/spotserve_test/test_vllm_runtime_metadata.py
+```
 
 CPY 會根據這些 metadata 產生：
 

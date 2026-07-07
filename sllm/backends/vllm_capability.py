@@ -24,31 +24,61 @@ VLLM_MOE_SUPPORTED_SHAPES = (
     {
         "tensor_parallel_size": 4,
         "data_parallel_size": 1,
+        "pipeline_parallel_size": 1,
         "expert_parallel_size": 1,
     },
     {
         "tensor_parallel_size": 4,
         "data_parallel_size": 1,
+        "pipeline_parallel_size": 1,
         "expert_parallel_size": 2,
     },
     {
         "tensor_parallel_size": 2,
         "data_parallel_size": 1,
+        "pipeline_parallel_size": 1,
         "expert_parallel_size": 1,
     },
     {
         "tensor_parallel_size": 2,
         "data_parallel_size": 2,
+        "pipeline_parallel_size": 1,
         "expert_parallel_size": 1,
     },
     {
         "tensor_parallel_size": 2,
         "data_parallel_size": 1,
+        "pipeline_parallel_size": 1,
         "expert_parallel_size": 2,
     },
     {
         "tensor_parallel_size": 2,
         "data_parallel_size": 2,
+        "pipeline_parallel_size": 1,
+        "expert_parallel_size": 2,
+    },
+    {
+        "tensor_parallel_size": 1,
+        "data_parallel_size": 4,
+        "pipeline_parallel_size": 1,
+        "expert_parallel_size": 1,
+    },
+    {
+        "tensor_parallel_size": 1,
+        "data_parallel_size": 4,
+        "pipeline_parallel_size": 1,
+        "expert_parallel_size": 2,
+    },
+    {
+        "tensor_parallel_size": 2,
+        "data_parallel_size": 1,
+        "pipeline_parallel_size": 2,
+        "expert_parallel_size": 1,
+    },
+    {
+        "tensor_parallel_size": 2,
+        "data_parallel_size": 1,
+        "pipeline_parallel_size": 2,
         "expert_parallel_size": 2,
     },
 )
@@ -75,18 +105,23 @@ def _make_plan(
     model_name: str,
     tensor_parallel_size: int,
     data_parallel_size: int,
+    pipeline_parallel_size: int,
     expert_parallel_size: int,
     reason: str,
     num_gpus: Optional[int] = None,
 ) -> ParallelPlan:
     if num_gpus is None:
-        num_gpus = tensor_parallel_size * data_parallel_size
+        num_gpus = (
+            tensor_parallel_size
+            * data_parallel_size
+            * pipeline_parallel_size
+        )
     return ParallelPlan(
         model_name=model_name,
         backend="vllm",
         tensor_parallel_size=tensor_parallel_size,
         data_parallel_size=data_parallel_size,
-        pipeline_parallel_size=1,
+        pipeline_parallel_size=pipeline_parallel_size,
         expert_parallel_size=expert_parallel_size,
         num_replicas=data_parallel_size,
         num_gpus=num_gpus,
@@ -110,6 +145,7 @@ def get_vllm_capability(
                 model_name=model_name,
                 tensor_parallel_size=shape["tensor_parallel_size"],
                 data_parallel_size=shape["data_parallel_size"],
+                pipeline_parallel_size=shape["pipeline_parallel_size"],
                 expert_parallel_size=shape["expert_parallel_size"],
                 reason="verified_vllm_moe_config",
             )
@@ -121,6 +157,7 @@ def get_vllm_capability(
                 model_name=model_name,
                 tensor_parallel_size=tensor_parallel_size,
                 data_parallel_size=1,
+                pipeline_parallel_size=1,
                 expert_parallel_size=1,
                 reason="current_vllm_config",
                 num_gpus=max(configured_num_gpus, tensor_parallel_size),

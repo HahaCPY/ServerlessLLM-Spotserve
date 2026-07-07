@@ -53,6 +53,8 @@ from sllm.backends.backend_utils import (
     SllmBackend,
 )
 from sllm.backends.vllm_context_metadata import get_vllm_context_metadata
+from sllm.backends.vllm_runtime_metadata import get_vllm_runtime_metadata
+from sllm.backends.vllm_state_metadata import get_vllm_inference_state
 
 logger = logging.getLogger("ray")
 
@@ -209,12 +211,15 @@ class VllmBackend(SllmBackend):
         self.engine_args = AsyncEngineArgs(**filtered_engine_config)
 
         self.engine = None
+        self.model_load_time_s = 0.0
 
     async def init_backend(self) -> None:
         async with self.status_lock:
             if self.status != BackendStatus.UNINITIALIZED:
                 return
+            started_at = time.monotonic()
             self.engine = AsyncLLMEngine.from_engine_args(self.engine_args)
+            self.model_load_time_s = time.monotonic() - started_at
             self.status = BackendStatus.RUNNING
 
     async def generate(self, request_data: Dict[str, Any]):
@@ -370,6 +375,50 @@ class VllmBackend(SllmBackend):
         ]
         tasks = [self.generate(inputs) for inputs in constructed_inputs]
         await asyncio.gather(*tasks)
+
+    async def supports_state_restore(self) -> bool:
+        return False
+
+    async def export_inference_state(
+        self,
+        request_data: Optional[Dict[str, Any]] = None,
+        current_output: Optional[List[List[int]]] = None,
+        completed_tokens: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        if current_output is None:
+            current_output = await self.get_current_tokens()
+        return get_vllm_inference_state(
+            model_name=self.model_name,
+            request_data=request_data,
+            current_output=current_output,
+            completed_tokens=completed_tokens,
+        )
+
+    async def restore_inference_state(
+        self,
+        state: Dict[str, Any],
+        request_data: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        return {
+            "restored": False,
+            "reason": "vllm_kv_restore_not_available",
+            "state_kind": state.get("state_kind", "token_snapshot"),
+        }
+
+    async def get_runtime_metadata(
+        self,
+        instance_id: str = "",
+        node_id: str = "",
+    ) -> Dict[str, Any]:
+        return get_vllm_runtime_metadata(
+            model_name=self.model_name,
+            backend_config=self.backend_config,
+            instance_id=instance_id,
+            node_id=node_id,
+            runtime_metadata={
+                "load_time_s": self.model_load_time_s,
+            },
+        )
 
     async def encode(self, request_data: Dict[str, Any]):
         async with self.status_lock:

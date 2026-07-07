@@ -69,6 +69,17 @@ class SllmBackend(ABC):
     ) -> List[Dict[str, Any]]:
         return []
 
+    async def get_runtime_metadata(
+        self,
+        instance_id: str = "",
+        node_id: str = "",
+    ) -> Dict[str, Any]:
+        return {
+            "instance_id": instance_id,
+            "node_id": node_id,
+            "metadata": {},
+        }
+
     async def supports_state_restore(self) -> bool:
         return False
 

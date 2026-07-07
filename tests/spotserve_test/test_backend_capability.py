@@ -72,6 +72,10 @@ def test_vllm_moe_capability_advertises_verified_shapes():
         (2, 2, 1, 1, 4, 2, "verified_vllm_moe_config"),
         (2, 1, 1, 2, 2, 1, "verified_vllm_moe_config"),
         (2, 2, 1, 2, 4, 2, "verified_vllm_moe_config"),
+        (1, 4, 1, 1, 4, 4, "verified_vllm_moe_config"),
+        (1, 4, 1, 2, 4, 4, "verified_vllm_moe_config"),
+        (2, 1, 2, 1, 4, 1, "verified_vllm_moe_config"),
+        (2, 1, 2, 2, 4, 1, "verified_vllm_moe_config"),
     }
 
 
