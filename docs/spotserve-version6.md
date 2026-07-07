@@ -33,7 +33,6 @@ Out of scope:
 
 - vLLM internal repartitioning
 - MoE expert placement optimization
-- backend capability validation
 - CUDA kernels
 - KV cache migration
 - request-state migration
@@ -339,8 +338,9 @@ The router tests cover:
 ## Interpretation
 
 Version 6 proves that ServerlessLLM can make a new deployment decision after
-spot GPU availability changes. It does not prove that a backend can execute the
-selected plan.
+spot GPU availability changes. When backend capability metadata is available,
+the planner now filters replanning candidates through `BackendCapability` before
+accepting a plan.
 
 For vLLM / MoE integration, backend work still needs to confirm:
 
@@ -349,8 +349,15 @@ For vLLM / MoE integration, backend work still needs to confirm:
 - whether state export and restore are supported
 - whether a selected `ParallelPlan` is legal for a specific backend
 
-That later backend contract should be represented by `BackendCapability` and
-used to filter planner candidates before a plan is accepted.
+That backend contract is represented by:
+
+```text
+sllm/backends/capability.py
+sllm/backends/vllm_capability.py
+```
+
+If a backend advertises supported configs and none fit the available GPUs, the
+planner returns `no_capacity` instead of falling back to an unconstrained plan.
 
 ## Definition Of Done
 
@@ -362,3 +369,4 @@ Version 6 is complete when:
 - replanning metrics are written to JSONL
 - benchmark summaries include replanning fields
 - tests validate the planner and router metric path
+- backend capability configs are respected when available

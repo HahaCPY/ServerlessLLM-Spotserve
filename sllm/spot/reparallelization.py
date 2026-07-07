@@ -64,12 +64,14 @@ class ParallelConfig:
     unused_gpus: int
     score: float
     reason: str
+    expert_parallel_size: int = 1
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "tensor_parallel_size": self.tensor_parallel_size,
             "pipeline_parallel_size": self.pipeline_parallel_size,
             "data_parallel_size": self.data_parallel_size,
+            "expert_parallel_size": self.expert_parallel_size,
             "total_gpus": self.total_gpus,
             "unused_gpus": self.unused_gpus,
             "score": self.score,
@@ -192,6 +194,7 @@ def generate_parallel_candidates(
                     tensor_parallel_size=tensor_parallel_size,
                     pipeline_parallel_size=pipeline_parallel_size,
                     data_parallel_size=data_parallel_size,
+                    expert_parallel_size=1,
                     total_gpus=total_gpus,
                     unused_gpus=unused_gpus,
                     score=float(score),
@@ -244,6 +247,128 @@ def select_target_nodes(
     return selected_nodes
 
 
+def _candidate_score(
+    total_gpus: int,
+    data_parallel_size: int,
+    replica_gpus: int,
+    target_replica_gpus: int,
+    unused_gpus: int,
+) -> float:
+    replica_distance = abs(replica_gpus - target_replica_gpus)
+    return float(
+        total_gpus * 10000
+        + data_parallel_size * 100
+        - replica_distance * 1000
+        - unused_gpus
+    )
+
+
+def _supported_config_candidates(
+    backend_capability: Any,
+    available_gpus: int,
+    worker_nodes: Mapping[str, Mapping[str, Any]],
+    planner_config: Mapping[str, Any],
+) -> List[ParallelConfig]:
+    supported_configs = getattr(
+        backend_capability,
+        "supported_configs",
+        None,
+    )
+    if supported_configs is None and isinstance(backend_capability, Mapping):
+        supported_configs = backend_capability.get("supported_configs")
+    if not supported_configs:
+        return []
+
+    target_replica_gpus = _positive_int(
+        planner_config, "target_replica_gpus", 1
+    )
+    candidates: List[ParallelConfig] = []
+    for plan in supported_configs:
+        if isinstance(plan, Mapping):
+            tensor_parallel_size = int(
+                plan.get("tensor_parallel_size", 1) or 1
+            )
+            pipeline_parallel_size = int(
+                plan.get("pipeline_parallel_size", 1) or 1
+            )
+            data_parallel_size = int(plan.get("data_parallel_size", 1) or 1)
+            expert_parallel_size = int(
+                plan.get("expert_parallel_size", 1) or 1
+            )
+            total_gpus = int(plan.get("num_gpus", 1) or 1)
+            reason = str(plan.get("reason", "backend_capability"))
+        else:
+            tensor_parallel_size = int(plan.tensor_parallel_size)
+            pipeline_parallel_size = int(plan.pipeline_parallel_size)
+            data_parallel_size = int(plan.data_parallel_size)
+            expert_parallel_size = int(plan.expert_parallel_size)
+            total_gpus = int(plan.num_gpus)
+            reason = str(plan.reason)
+
+        if total_gpus > available_gpus:
+            continue
+        if not select_target_nodes(worker_nodes, total_gpus):
+            continue
+        replica_gpus = tensor_parallel_size * pipeline_parallel_size
+        unused_gpus = available_gpus - total_gpus
+        candidates.append(
+            ParallelConfig(
+                tensor_parallel_size=tensor_parallel_size,
+                pipeline_parallel_size=pipeline_parallel_size,
+                data_parallel_size=data_parallel_size,
+                expert_parallel_size=expert_parallel_size,
+                total_gpus=total_gpus,
+                unused_gpus=unused_gpus,
+                score=_candidate_score(
+                    total_gpus=total_gpus,
+                    data_parallel_size=data_parallel_size,
+                    replica_gpus=replica_gpus,
+                    target_replica_gpus=target_replica_gpus,
+                    unused_gpus=unused_gpus,
+                ),
+                reason=reason,
+            )
+        )
+
+    return sorted(
+        candidates,
+        key=lambda candidate: (
+            candidate.score,
+            candidate.data_parallel_size,
+            candidate.tensor_parallel_size,
+            candidate.expert_parallel_size,
+            -candidate.pipeline_parallel_size,
+            -candidate.unused_gpus,
+        ),
+        reverse=True,
+    )
+
+
+def _has_supported_configs(backend_capability: Any) -> bool:
+    supported_configs = getattr(
+        backend_capability,
+        "supported_configs",
+        None,
+    )
+    if supported_configs is None and isinstance(backend_capability, Mapping):
+        supported_configs = backend_capability.get("supported_configs")
+    return bool(supported_configs)
+
+
+def _get_backend_capability(model_config: Mapping[str, Any]):
+    configured_capability = model_config.get("backend_capability")
+    if configured_capability is not None:
+        return configured_capability
+    try:
+        from sllm.backends.capability import get_backend_capability
+    except Exception:
+        return None
+    try:
+        return get_backend_capability(model_config)
+    except Exception:
+        return None
+
+
 def build_parallel_plan(
     model_name: str,
     backend: str,
@@ -257,7 +382,7 @@ def build_parallel_plan(
         tensor_parallel_size=parallel_config.tensor_parallel_size,
         data_parallel_size=parallel_config.data_parallel_size,
         pipeline_parallel_size=parallel_config.pipeline_parallel_size,
-        expert_parallel_size=1,
+        expert_parallel_size=parallel_config.expert_parallel_size,
         num_replicas=parallel_config.data_parallel_size,
         num_gpus=parallel_config.total_gpus,
         target_nodes=select_target_nodes(
@@ -291,9 +416,20 @@ def plan_dynamic_reparallelization(
         )
 
     availability = summarize_gpu_availability(worker_nodes)
-    candidates = generate_parallel_candidates(
-        availability.available_gpus, planner_config
+    backend_capability = _get_backend_capability(model_config)
+    has_backend_capability_configs = _has_supported_configs(
+        backend_capability
     )
+    candidates = _supported_config_candidates(
+        backend_capability=backend_capability,
+        available_gpus=availability.available_gpus,
+        worker_nodes=worker_nodes,
+        planner_config=planner_config,
+    )
+    if not candidates and not has_backend_capability_configs:
+        candidates = generate_parallel_candidates(
+            availability.available_gpus, planner_config
+        )
     selected = candidates[0] if candidates else None
     parallel_plan = (
         build_parallel_plan(

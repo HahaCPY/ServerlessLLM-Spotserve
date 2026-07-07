@@ -97,6 +97,66 @@ def test_dynamic_reparallelization_plan_after_gpu_loss():
     }
 
 
+def test_reparallelization_respects_backend_capability_supported_shape():
+    decision = plan_dynamic_reparallelization(
+        model_name="qwen3-dense",
+        worker_nodes={
+            "0": {
+                "ray_node_id": "node-0",
+                "address": "10.0.0.1",
+                "free_gpu": 4,
+                "total_gpu": 4,
+                "state": "ready",
+            }
+        },
+        model_config={
+            "model": "qwen3-dense",
+            "backend": "vllm",
+            "num_gpus": 4,
+            "backend_config": {
+                "tensor_parallel_size": 2,
+            },
+        },
+        event="manual",
+        backend="vllm",
+    )
+
+    assert decision["action"] == "reparallelize"
+    assert decision["parallel_plan"]["tensor_parallel_size"] == 2
+    assert decision["parallel_plan"]["data_parallel_size"] == 1
+    assert decision["parallel_plan"]["num_gpus"] == 4
+    assert decision["selected_config"]["reason"] == "current_vllm_config"
+
+
+def test_reparallelization_does_not_fallback_when_capability_has_no_capacity():
+    decision = plan_dynamic_reparallelization(
+        model_name="qwen3-dense",
+        worker_nodes={
+            "0": {
+                "ray_node_id": "node-0",
+                "address": "10.0.0.1",
+                "free_gpu": 2,
+                "total_gpu": 2,
+                "state": "ready",
+            }
+        },
+        model_config={
+            "model": "qwen3-dense",
+            "backend": "vllm",
+            "num_gpus": 4,
+            "backend_config": {
+                "tensor_parallel_size": 2,
+            },
+        },
+        event="manual",
+        backend="vllm",
+    )
+
+    assert decision["action"] == "no_capacity"
+    assert decision["parallel_plan"] is None
+    assert decision["candidate_count"] == 0
+
+
 def test_parallel_plan_shared_interface_serializes_to_dict():
     plan = ParallelPlan(
         model_name="moe-model",
