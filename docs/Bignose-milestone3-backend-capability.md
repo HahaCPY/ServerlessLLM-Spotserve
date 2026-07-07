@@ -40,6 +40,106 @@ V7 Low-cost Context Migration:
   Context metadata tells CPY which request context can be reused.
 ```
 
+## V6 Backend Capability
+
+V6 這邊要完成的是 backend capability contract。CPY planner 仍然負責根據
+spot event 和 GPU availability 選 plan；大鼻負責提供 backend 對某個 model
+實際可執行的 `ParallelPlan` allowlist。
+
+V6 的資料流是：
+
+```text
+model config
+-> get_backend_capability(model_config)
+-> BackendCapability.supported_configs
+-> CPY planner filters illegal ParallelPlan
+```
+
+這裡的原則是：只宣告已知可跑的 config。不要因為 vLLM 或 MoE 理論上可能支援
+某種 parallel mode，就讓 planner 選到還沒驗證過的 plan。
+
+### V6 Dense vLLM Config
+
+dense vLLM 第一版保持保守，只宣告目前 config 已經設定的 TP shape：
+
+```text
+TP = backend_config.tensor_parallel_size
+DP = 1
+PP = 1
+EP = 1
+num_replicas = 1
+num_gpus = max(model_config.num_gpus, TP)
+reason = current_vllm_config
+```
+
+這代表：
+
+```text
+vLLM can execute the currently configured TP shape.
+SLLM control plane can still represent DP by launching replicas.
+PP / EP are not claimed for dense vLLM in this first V6 contract.
+```
+
+### V6 MoE vLLM Config
+
+MoE vLLM 這邊使用已驗證的 allowlist。現在可宣告的 config 是：
+
+| TP | DP | PP | EP | num_gpus | reason |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 4 | 1 | 1 | 1 | 4 | `verified_vllm_moe_config` |
+| 4 | 1 | 1 | 2 | 4 | `verified_vllm_moe_config` |
+| 2 | 1 | 1 | 1 | 2 | `verified_vllm_moe_config` |
+| 2 | 2 | 1 | 1 | 4 | `verified_vllm_moe_config` |
+| 2 | 1 | 1 | 2 | 2 | `verified_vllm_moe_config` |
+| 2 | 2 | 1 | 2 | 4 | `verified_vllm_moe_config` |
+
+這裡的 `DP=2` 表示 SLLM control plane 的兩個 replicas，不是單一 vLLM
+engine 內部的 DP resharding。對應到 `ParallelPlan` 時：
+
+```text
+data_parallel_size = DP
+num_replicas = DP
+num_gpus = TP * DP
+pipeline_parallel_size = 1
+```
+
+這裡的 `EP=2` 是 CPY planner 看到的 capability metadata。vLLM backend config
+實際開 expert parallel 的欄位是：
+
+```json
+{
+  "enable_expert_parallel": true
+}
+```
+
+也就是：
+
+```text
+enable_expert_parallel = false -> expert_parallel_size = 1
+enable_expert_parallel = true  -> expert_parallel_size = 2
+```
+
+MoE 判斷第一版可以先用 config 裡的 model name / model path 判斷，例如：
+
+```text
+model contains "moe"
+or backend_config.pretrained_model_name_or_path contains "moe"
+```
+
+目前 MoE capability 可以宣告：
+
+```text
+supports_tp = True
+supports_dp = True
+supports_ep = True
+supports_state_export = False
+supports_state_restore = False
+max_num_gpus = 4
+```
+
+`supports_ep=True` 只表示 allowlist 裡有已驗證的 EP config，不表示所有 TP / DP
+組合都可以任意打開 EP。
+
 ## Ownership
 
 大鼻主要碰這些檔案：
@@ -114,9 +214,11 @@ sllm/backends/backend_utils.py
 
 但比較推薦獨立檔案，避免 `backend_utils.py` 變成雜物區。
 
-## Minimal Implementation
+## V6 Implementation
 
 第一版請先保守，不要假裝 vLLM 已經支援所有 dynamic TP / DP / EP。
+dense vLLM 只宣告目前設定中的 TP shape；MoE vLLM 只宣告上面列出的
+verified allowlist。
 
 建議新增：
 
@@ -159,6 +261,8 @@ def get_backend_capability(
 ```
 
 ### `sllm/backends/vllm_capability.py`
+
+最小 dense vLLM path 可以長這樣：
 
 ```python
 from typing import Any, Mapping
@@ -209,43 +313,29 @@ def get_vllm_capability(
 這版的意思是：
 
 ```text
-vLLM supports exactly the currently configured TP shape.
+dense vLLM supports exactly the currently configured TP shape.
 SLLM control plane can represent DP as replicas.
-EP/state restore are not claimed yet.
+EP/state restore are not claimed for dense vLLM yet.
 ```
 
 這樣是安全的，因為 planner 不會選到 backend 沒承諾能跑的 config。
 
-## MoE Follow-up
+MoE vLLM path 則需要另外產生 verified allowlist：
 
-如果要支援 MoE capability，可以再新增：
-
-```text
-sllm/backends/vllm_moe_capability.py
+```python
+VLLM_MOE_SUPPORTED_SHAPES = (
+    {"tensor_parallel_size": 4, "data_parallel_size": 1, "expert_parallel_size": 1},
+    {"tensor_parallel_size": 4, "data_parallel_size": 1, "expert_parallel_size": 2},
+    {"tensor_parallel_size": 2, "data_parallel_size": 1, "expert_parallel_size": 1},
+    {"tensor_parallel_size": 2, "data_parallel_size": 2, "expert_parallel_size": 1},
+    {"tensor_parallel_size": 2, "data_parallel_size": 1, "expert_parallel_size": 2},
+    {"tensor_parallel_size": 2, "data_parallel_size": 2, "expert_parallel_size": 2},
+)
 ```
 
-它可以先從 config 判斷：
-
-```text
-backend = vllm
-model path / model id looks like MoE
-trust_remote_code = true
-tensor_parallel_size = N
-```
-
-但第一版仍然建議保守：
-
-```text
-supports_ep = False
-expert_parallel_size = 1
-```
-
-等大鼻確認 vLLM runtime 真的能提供 expert parallel 或 expert metadata，再打開：
-
-```text
-supports_ep = True
-supported_configs includes expert_parallel_size > 1
-```
+如果未來實測更多 MoE config，例如 `TP=1`、`TP=4, DP=2` 或更大的
+expert parallel setting，再把那些 config 加進 allowlist。CPY planner 只應該
+選 `supported_configs` 裡出現的 plan。
 
 ## What CPY Will Consume
 
@@ -288,12 +378,12 @@ tests/spotserve_test/test_backend_capability.py
 第一版測這些即可：
 
 ```python
-def test_vllm_capability_reports_current_tp_config():
+def test_dense_vllm_capability_reports_current_tp_config():
     capability = get_backend_capability(
         {
-            "model": "vllm-moe-none",
+            "model": "vllm-dense",
             "backend": "vllm",
-            "num_gpus": 2,
+            "num_gpus": 4,
             "backend_config": {
                 "tensor_parallel_size": 2,
             },
@@ -308,13 +398,53 @@ def test_vllm_capability_reports_current_tp_config():
     assert capability.supports_state_export is False
     assert capability.supports_state_restore is False
     assert capability.supported_configs[0].tensor_parallel_size == 2
-    assert capability.supported_configs[0].num_gpus == 2
+    assert capability.supported_configs[0].num_gpus == 4
 ```
 
-也要測 default：
+MoE path 要測 verified allowlist：
+
+```python
+def test_vllm_moe_capability_reports_verified_allowlist():
+    capability = get_backend_capability(
+        {
+            "model": "vllm-moe",
+            "backend": "vllm",
+            "num_gpus": 1,
+            "backend_config": {
+                "pretrained_model_name_or_path": "Qwen/Qwen1.5-MoE-A2.7B",
+                "tensor_parallel_size": 1,
+                "trust_remote_code": True,
+            },
+        }
+    )
+
+    configs = {
+        (
+            plan.tensor_parallel_size,
+            plan.data_parallel_size,
+            plan.pipeline_parallel_size,
+            plan.expert_parallel_size,
+            plan.num_gpus,
+        )
+        for plan in capability.supported_configs
+    }
+
+    assert capability.supports_ep is True
+    assert capability.max_num_gpus == 4
+    assert configs == {
+        (4, 1, 1, 1, 4),
+        (4, 1, 1, 2, 4),
+        (2, 1, 1, 1, 2),
+        (2, 2, 1, 1, 4),
+        (2, 1, 1, 2, 2),
+        (2, 2, 1, 2, 4),
+    }
+```
+
+也要測 dense default：
 
 ```text
-backend_config 沒有 tensor_parallel_size 時，預設 TP=1。
+backend_config 沒有 tensor_parallel_size 時，預設 TP = model_config.num_gpus。
 ```
 
 ## Config Contract
@@ -325,9 +455,10 @@ backend_config 沒有 tensor_parallel_size 時，預設 TP=1。
 model
 backend
 num_gpus
+backend_config.pretrained_model_name_or_path
 backend_config.tensor_parallel_size
 backend_config.pipeline_parallel_size
-backend_config.expert_parallel_size
+backend_config.enable_expert_parallel
 backend_config.supports_state_export
 backend_config.supports_state_restore
 ```
@@ -337,9 +468,14 @@ backend_config.supports_state_restore
 ```text
 tensor_parallel_size = 1
 pipeline_parallel_size = 1
-expert_parallel_size = 1
+enable_expert_parallel = false
+expert_parallel_size = 1 in ParallelPlan metadata
 state export/restore = false
 ```
+
+MoE V6 第一版不從 arbitrary config 自動推導所有合法 shape，而是使用 verified
+allowlist。也就是 config 看起來像 MoE 時，`supported_configs` 應該回傳上面
+列出的 TP/DP/EP 組合；如果 planner 產生其他組合，CPY 要 filter 掉。
 
 ## Definition Of Done
 
@@ -349,8 +485,10 @@ state export/restore = false
 - `get_backend_capability(model_config)` exists.
 - vLLM model config can return a conservative capability.
 - `supported_configs` contains at least the current configured vLLM shape.
-- EP and state restore are false unless大鼻已確認 backend 真的支援。
-- unit tests cover vLLM TP config and default TP=1.
+- MoE vLLM returns the verified TP/DP/EP allowlist.
+- EP is true only for MoE allowlist configs that were verified.
+- state export / restore are false unless大鼻已確認 backend 真的支援。
+- unit tests cover dense vLLM TP config, dense default TP behavior, and MoE allowlist.
 - no CPY router/scheduler/controller main-flow changes are required.
 
 ## Open Questions For 大鼻
@@ -358,8 +496,8 @@ state export/restore = false
 請大鼻確認以下問題，確認後再更新 capability：
 
 - vLLM dense 是否只支援 `tensor_parallel_size`，還是能明確表示 DP？
-- vLLM MoE 是否能 expose expert metadata？
-- vLLM MoE 是否有可用的 expert parallel config？
+- vLLM MoE expert parallel 目前已可用於 allowlist 中的 EP=2 config；是否能 expose 更細的 expert metadata 仍需確認。
+- vLLM MoE 是否還有更多可驗證 config，例如 `TP=1`、`TP=4, DP=2` 或更大的 EP？
 - state export / state restore 是否有任何可用 hook？
 - `num_gpus` 應該以 ServerlessLLM top-level `num_gpus` 為準，還是以
   `backend_config.tensor_parallel_size` 為準？
@@ -454,13 +592,14 @@ sllm/spot/context_migration.py
 
 ## What 大鼻 Should Provide For V7
 
-建議新增 backend metadata helper：
+新增 backend metadata helper：
 
 ```text
 sllm/backends/vllm_context_metadata.py
 ```
 
-第一版可以長這樣：
+第一版 helper 負責把 vLLM runtime metadata 正規化成 CPY 可讀的
+`ContextMetadata` payload：
 
 ```python
 from typing import Any, Mapping
@@ -487,6 +626,30 @@ def get_vllm_context_metadata(
     }
 ```
 
+同時可以在 backend base class 補保守 hook：
+
+```python
+async def get_context_metadata(
+    self,
+    instance_id: str = "",
+    node_id: str = "",
+) -> list[dict]:
+    return []
+```
+
+vLLM backend 則可以用目前 request trace 裡的 `RequestOutput` 產生 token-level
+metadata：
+
+```text
+request_id = RequestOutput.request_id
+num_tokens = len(prompt_token_ids + output_token_ids)
+context_blocks = 0
+reusable_tokens_by_target = {}
+reusable_blocks_by_target = {}
+supports_state_export = false
+supports_state_restore = false
+```
+
 第一版可以很保守：
 
 ```text
@@ -505,6 +668,10 @@ supports_state_restore = false
 
 這樣 CPY planner 仍可做 token-level estimated mapping，但不會假裝已經有
 KV migration。
+
+這裡要注意：V7 backend hook 只提供 metadata，不做 matching，也不決定要把
+request 搬去哪個 target。matching 仍然由 CPY 的
+`sllm/spot/context_migration.py` 負責。
 
 ## Reuse Metadata Meaning
 
@@ -584,8 +751,25 @@ reusable_blocks_by_target = {}
 - metadata includes request id, instance id, node id, token count if available.
 - KV block fields are present, even if conservative zero.
 - state export / restore capability is explicit.
+- `VllmBackend.get_context_metadata()` can return conservative token-level
+  metadata from active request traces.
 - no matching algorithm is implemented in backend code.
 - no CPY router/scheduler/controller main-flow changes are required.
+
+建議測試：
+
+```text
+tests/spotserve_test/test_vllm_context_metadata.py
+```
+
+至少覆蓋：
+
+```text
+tokens -> num_tokens
+prompt_tokens + output_tokens -> num_tokens
+explicit reusable_*_by_target maps are preserved
+payload can be parsed by ContextMetadata.from_dict()
+```
 
 CPY 會把這些 metadata 接進：
 

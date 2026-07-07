@@ -52,6 +52,7 @@ from sllm.backends.backend_utils import (
     BackendStatus,
     SllmBackend,
 )
+from sllm.backends.vllm_context_metadata import get_vllm_context_metadata
 
 logger = logging.getLogger("ray")
 
@@ -158,6 +159,7 @@ class VllmBackend(SllmBackend):
         if backend_config is None:
             raise ValueError("Backend config is missing")
 
+        self.model_name = model
         self.status: BackendStatus = BackendStatus.UNINITIALIZED
         self.status_lock = asyncio.Lock()
         self.backend_config = backend_config
@@ -320,6 +322,40 @@ class VllmBackend(SllmBackend):
             if prompt_tokens or output_tokens:
                 tokens.append(prompt_tokens + output_tokens)
         return tokens
+
+    async def get_context_metadata(
+        self,
+        instance_id: str = "",
+        node_id: str = "",
+    ) -> List[Dict[str, Any]]:
+        async with self.status_lock:
+            if self.status != BackendStatus.RUNNING:
+                return []
+
+        results = await self.request_trace.return_all_results()
+        ongoing_results: List[RequestOutput] = [
+            result for result in results if isinstance(result, RequestOutput)
+        ]
+
+        metadata: List[Dict[str, Any]] = []
+        for result in ongoing_results:
+            if not result.outputs:
+                continue
+            prompt_tokens = list(result.prompt_token_ids or [])
+            output_tokens = list(result.outputs[0].token_ids or [])
+            tokens = prompt_tokens + output_tokens
+            metadata.append(
+                get_vllm_context_metadata(
+                    model_name=self.model_name,
+                    instance_id=instance_id or self.model_name,
+                    node_id=node_id,
+                    runtime_metadata={
+                        "request_id": result.request_id,
+                        "tokens": tokens,
+                    },
+                )
+            )
+        return metadata
 
     async def resume_kv_cache(self, request_datas: List[List[int]]) -> None:
         async with self.status_lock:

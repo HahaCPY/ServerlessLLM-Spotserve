@@ -1,0 +1,13 @@
+{
+  "backend": "vllm",
+  "endpoint": "http://127.0.0.1:8343/v1/chat/completions",
+  "git_commit": null,
+  "model": "vllm-moe-baseline",
+  "model_family": "moe",
+  "name": "vllm-moe-tp2-baseline",
+  "policy": "none",
+  "router_metrics_path": "/tmp/spotserve-work/results/spotserve_vllm_moe_tp2_baseline/vllm-moe-baseline-router.jsonl",
+  "started_at": "2026-07-02T16:06:03.138301",
+  "trace": null,
+  "workload": "benchmarks/spotserve/workloads/vllm_moe_trace.jsonl"
+}

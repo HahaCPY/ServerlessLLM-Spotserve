@@ -62,6 +62,13 @@ class SllmBackend(ABC):
     async def resume_kv_cache(self, request_datas: List[List[int]]) -> None:
         pass
 
+    async def get_context_metadata(
+        self,
+        instance_id: str = "",
+        node_id: str = "",
+    ) -> List[Dict[str, Any]]:
+        return []
+
     async def supports_state_restore(self) -> bool:
         return False
 

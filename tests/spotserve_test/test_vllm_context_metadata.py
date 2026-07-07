@@ -1,0 +1,77 @@
+from sllm.backends.vllm_context_metadata import get_vllm_context_metadata
+from sllm.spot.context_migration import ContextMetadata
+
+
+def test_vllm_context_metadata_reports_token_count_from_tokens():
+    metadata = get_vllm_context_metadata(
+        model_name="vllm-moe",
+        instance_id="old-vllm-0",
+        node_id="node-0",
+        runtime_metadata={
+            "request_id": "req-1",
+            "tokens": [1, 2, 3, 4],
+        },
+    )
+
+    assert metadata["request_id"] == "req-1"
+    assert metadata["instance_id"] == "old-vllm-0"
+    assert metadata["node_id"] == "node-0"
+    assert metadata["model_name"] == "vllm-moe"
+    assert metadata["backend"] == "vllm"
+    assert metadata["num_tokens"] == 4
+    assert metadata["context_blocks"] == 0
+    assert metadata["reusable_tokens_by_target"] == {}
+    assert metadata["reusable_blocks_by_target"] == {}
+    assert metadata["supports_state_export"] is False
+    assert metadata["supports_state_restore"] is False
+
+    context = ContextMetadata.from_dict(metadata)
+    assert context.num_tokens == 4
+    assert context.context_blocks == 0
+
+
+def test_vllm_context_metadata_preserves_explicit_reuse_maps():
+    metadata = get_vllm_context_metadata(
+        model_name="vllm-moe",
+        instance_id="old-vllm-0",
+        node_id="node-0",
+        runtime_metadata={
+            "request_id": "req-1",
+            "num_tokens": 8,
+            "context_blocks": 2,
+            "reusable_tokens_by_target": {
+                "new-vllm-0": 8,
+                "node-0": 8,
+            },
+            "reusable_blocks_by_target": {
+                "new-vllm-0": 2,
+                "node-0": 2,
+            },
+        },
+    )
+
+    assert metadata["num_tokens"] == 8
+    assert metadata["context_blocks"] == 2
+    assert metadata["reusable_tokens_by_target"] == {
+        "new-vllm-0": 8,
+        "node-0": 8,
+    }
+    assert metadata["reusable_blocks_by_target"] == {
+        "new-vllm-0": 2,
+        "node-0": 2,
+    }
+
+
+def test_vllm_context_metadata_counts_prompt_and_output_tokens():
+    metadata = get_vllm_context_metadata(
+        model_name="vllm-dense",
+        instance_id="old-vllm-0",
+        node_id="node-0",
+        runtime_metadata={
+            "request_id": "req-2",
+            "prompt_tokens": [1, 2],
+            "output_tokens": [3, 4, 5],
+        },
+    )
+
+    assert metadata["num_tokens"] == 5
