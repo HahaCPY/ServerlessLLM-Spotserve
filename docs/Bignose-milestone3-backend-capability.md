@@ -682,6 +682,59 @@ supports_state_restore = false
 這樣 CPY planner 仍可做 token-level estimated mapping，但不會假裝已經有
 KV migration。
 
+### Current V7 Status And Remaining Backend Work
+
+目前大鼻提供的 `get_vllm_context_metadata()` schema 已經可以取代
+`benchmarks/spotserve/context_migration_synthetic.json` 裡的 `sources` 欄位：
+
+```text
+VllmBackend.get_context_metadata()
+-> ContextMetadata.from_dict()
+-> plan_low_cost_migration()
+```
+
+CPY router 也已經能在 spot preemption / dead-node live path 中呼叫
+`get_context_metadata()`，並用 READY instances 自動建立 migration targets。
+
+但這只代表 V7 的 live planning path 已接上。若要把 V7 算作完整完成，並且
+讓 live metadata 真正取代 synthetic benchmark 裡的 rich context data，大鼻
+還需要補齊下列資料：
+
+```text
+request_id: active request id, stable across export / restore / replay
+num_tokens: prompt + generated token count for the active request
+context_blocks: active KV cache block count for that request
+reusable_tokens_by_target: tokens reusable on each target instance/node
+reusable_blocks_by_target: KV blocks reusable on each target instance/node
+supports_state_export: whether backend can export real request/KV state
+supports_state_restore: whether backend can restore real request/KV state
+```
+
+其中最重要的是：
+
+```text
+context_blocks
+reusable_blocks_by_target
+reusable_tokens_by_target
+```
+
+現在的保守 vLLM hook 主要能提供 token-level metadata。若
+`context_blocks = 0` 且 `reusable_* = {}`，CPY planner 可以跑，但 cost /
+reuse ratio 只能算保守估計，不能宣稱已經完成真正 low-cost KV context
+migration，也不能拿來公平比較「V7 比 naive 快多少」。
+
+大鼻不需要實作 matching algorithm，也不需要決定 target。大鼻只需要把上述
+metadata 從 vLLM runtime / scheduler / block manager 裡 expose 出來。CPY 會
+負責：
+
+```text
+target selection
+capacity handling
+warmup cost
+minimum-cost assignment
+context_migration metrics
+```
+
 這裡要注意：V7 backend hook 只提供 metadata，不做 matching，也不決定要把
 request 搬去哪個 target。matching 仍然由 CPY 的
 `sllm/spot/context_migration.py` 負責。
@@ -763,9 +816,15 @@ reusable_blocks_by_target = {}
 - backend helper can return context metadata for vLLM instances.
 - metadata includes request id, instance id, node id, token count if available.
 - KV block fields are present, even if conservative zero.
+- complete V7 requires non-zero real `context_blocks` when KV blocks exist.
+- complete V7 requires real target-specific `reusable_tokens_by_target` and
+  `reusable_blocks_by_target`, or an explicit explanation that reuse is not
+  available for that target/backend.
 - state export / restore capability is explicit.
 - `VllmBackend.get_context_metadata()` can return conservative token-level
   metadata from active request traces.
+- live metadata can replace synthetic `sources` input without losing token,
+  block, or reuse information needed by the planner.
 - no matching algorithm is implemented in backend code.
 - no CPY router/scheduler/controller main-flow changes are required.
 

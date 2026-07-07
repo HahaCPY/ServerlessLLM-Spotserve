@@ -31,10 +31,16 @@ from sllm.inference_instance import start_instance
 from sllm.logger import init_logger
 from sllm.spot.metrics import (
     JsonlMetricsWriter,
+    make_context_migration_event,
     make_instance_state_event,
     make_replanning_event,
     make_request_event,
     make_state_recovery_event,
+)
+from sllm.spot.context_migration import (
+    ContextMetadata,
+    MigrationTarget,
+    plan_low_cost_migration,
 )
 from sllm.spot.recovery_policy import RecoveryPolicy, normalize_policy
 from sllm.spot.reparallelization import (
@@ -104,6 +110,12 @@ class RoundRobinRouter(SllmRouter):
         )
         self.reparallelization_config = dict(
             router_config.get("reparallelization_config", {})
+        )
+        self.enable_context_migration = bool(
+            router_config.get("enable_context_migration", False)
+        )
+        self.context_migration_config = dict(
+            router_config.get("context_migration_config", {})
         )
         synthetic_worker_nodes = self.reparallelization_config.get(
             "synthetic_worker_nodes", {}
@@ -490,6 +502,159 @@ class RoundRobinRouter(SllmRouter):
         ]
         return state
 
+    async def _capture_context_metadata(
+        self,
+        instance: InstanceHandle,
+    ) -> List[ContextMetadata]:
+        if instance.backend_instance is None:
+            return []
+
+        try:
+            rows = await self._call_backend_method(
+                instance.backend_instance,
+                "get_context_metadata",
+                instance_id=instance.instance_id,
+                node_id=instance.node_id or "",
+            )
+        except Exception as e:
+            logger.info(
+                f"Could not capture context metadata from "
+                f"{instance.instance_id}: {e}"
+            )
+            return []
+
+        if isinstance(rows, dict):
+            rows = rows.get("contexts", [])
+        if not rows:
+            return []
+
+        contexts = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            payload = dict(row)
+            payload.setdefault("instance_id", instance.instance_id)
+            payload.setdefault("node_id", instance.node_id or "")
+            try:
+                contexts.append(ContextMetadata.from_dict(payload))
+            except Exception as e:
+                logger.info(
+                    f"Skipping invalid context metadata from "
+                    f"{instance.instance_id}: {e}"
+                )
+        return contexts
+
+    async def _context_migration_sources(
+        self, matches: List[InstanceHandle]
+    ) -> List[ContextMetadata]:
+        sources: List[ContextMetadata] = []
+        for instance in matches:
+            sources.extend(await self._capture_context_metadata(instance))
+        return sources
+
+    def _context_migration_target_capacity(
+        self,
+        instance: InstanceHandle,
+    ) -> int:
+        configured_capacity = self.context_migration_config.get(
+            "target_capacity"
+        )
+        if configured_capacity is not None:
+            return max(0, int(configured_capacity))
+        return max(0, int(instance.max_queue_length) - int(instance.concurrency))
+
+    def _context_migration_target_warmup_cost(
+        self,
+        instance: InstanceHandle,
+    ) -> float:
+        warmup_by_instance = self.context_migration_config.get(
+            "warmup_cost_by_instance", {}
+        ) or {}
+        if instance.instance_id in warmup_by_instance:
+            return max(0.0, float(warmup_by_instance[instance.instance_id]))
+
+        warmup_by_node = self.context_migration_config.get(
+            "warmup_cost_by_node", {}
+        ) or {}
+        if (
+            instance.node_id is not None
+            and str(instance.node_id) in warmup_by_node
+        ):
+            return max(0.0, float(warmup_by_node[str(instance.node_id)]))
+
+        return max(
+            0.0,
+            float(
+                self.context_migration_config.get(
+                    "default_target_warmup_cost",
+                    self.context_migration_config.get("target_warmup_cost", 0.0),
+                )
+                or 0.0
+            ),
+        )
+
+    async def _context_migration_targets(
+        self,
+        source_instance_ids: set[str],
+    ) -> List[MigrationTarget]:
+        async with self.instance_management_lock:
+            instances = list(self.ready_inference_instances.values())
+
+        targets = []
+        for instance in instances:
+            if instance.instance_id in source_instance_ids:
+                continue
+            if instance.state != InstanceState.READY or not instance.ready:
+                continue
+            capacity = self._context_migration_target_capacity(instance)
+            if capacity <= 0:
+                continue
+            targets.append(
+                MigrationTarget(
+                    instance_id=instance.instance_id,
+                    node_id=str(instance.node_id or ""),
+                    capacity=capacity,
+                    warmup_cost=self._context_migration_target_warmup_cost(
+                        instance
+                    ),
+                )
+            )
+        return targets
+
+    async def _plan_context_migration_after_spot_event(
+        self,
+        event: str,
+        matches: List[InstanceHandle],
+    ):
+        if not self.enable_context_migration:
+            return None
+
+        sources = await self._context_migration_sources(matches)
+        source_instance_ids = {instance.instance_id for instance in matches}
+        targets = await self._context_migration_targets(source_instance_ids)
+        planner_config = dict(
+            self.context_migration_config.get(
+                "planner_config", self.context_migration_config
+            )
+        )
+        decision = plan_low_cost_migration(
+            sources=sources,
+            targets=targets,
+            planner_config=planner_config,
+        ).to_dict()
+
+        self._emit_metric(
+            make_context_migration_event(
+                model=self.model_name,
+                decision=decision,
+                reason=f"{event}_spot_event",
+            )
+        )
+        logger.info(
+            f"Context migration decision for {self.model_name}: {decision}"
+        )
+        return decision
+
     # Router 裡面真正把 instance 標記成 PREEMPTING
     # 把某些 worker 標記成 PREEMPTING，讓 router 停止送新的 request 給它們。
     async def handle_preemption(
@@ -517,11 +682,16 @@ class RoundRobinRouter(SllmRouter):
             instance_id=instance_id,
             matches=matches,
         )
+        context_migration = await self._plan_context_migration_after_spot_event(
+            event="preempt",
+            matches=matches,
+        )
         return {
             "model": self.model_name,
             "event": "preempt",
             "instances": marked_instances,
             "reparallelization": replanning,
+            "context_migration": context_migration,
         }
 
     async def mark_instance_preempting(self, instance_id: str):
@@ -600,11 +770,16 @@ class RoundRobinRouter(SllmRouter):
             instance_id=instance_id,
             matches=matches,
         )
+        context_migration = await self._plan_context_migration_after_spot_event(
+            event="dead",
+            matches=matches,
+        )
         return {
             "model": self.model_name,
             "event": "dead",
             "instances": marked_instances,
             "reparallelization": replanning,
+            "context_migration": context_migration,
         }
 
     async def mark_instance_dead(self, instance_id: str):

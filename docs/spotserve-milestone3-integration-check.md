@@ -10,7 +10,7 @@ metadata contracts added for Milestone 3.
 | Area | Backend metadata status | CPY integration status | Result |
 |---|---|---|---|
 | V6 Dynamic Reparallelization | `BackendCapability` and vLLM capability helpers exist | Planner now filters candidates through backend supported configs | Integrated |
-| V7 Context Migration | vLLM context metadata helper and backend hook exist | Planner accepts the metadata schema; live router migration path is not wired yet | Schema integrated, runtime path pending |
+| V7 Context Migration | vLLM context metadata helper and backend hook exist | Router now collects live context metadata on spot events and feeds the planner | Integrated planning path |
 | V8 Stateful Recovery | vLLM state metadata helper and backend hook exist | Router calls backend state hooks and falls back when restore is unsupported | Integrated with conservative vLLM fallback |
 | V9 Risk-aware Scheduling | vLLM runtime metadata/resource profile helper exists | Scheduler can consume risk/loading metadata from config/synthetic node metadata | Planner integrated, live runtime feed pending |
 
@@ -72,6 +72,7 @@ CPY files:
 
 ```text
 sllm/spot/context_migration.py
+sllm/routers/roundrobin_router.py
 scripts/run_context_migration_benchmark.py
 ```
 
@@ -81,14 +82,20 @@ Status:
   `ContextMetadata.from_dict()`.
 - `VllmBackend.get_context_metadata()` exists and returns token-level context
   metadata for ongoing vLLM requests.
+- `RoundRobinRouter` can opt into `enable_context_migration`.
+- On `handle_preemption()` and `handle_dead()`, the router calls
+  `get_context_metadata(instance_id, node_id)` on affected backend instances.
+- The router builds `MigrationTarget` entries from READY inference instances,
+  calls `plan_low_cost_migration()`, emits a `context_migration` metric, and
+  returns the decision in the spot-event response.
 - Synthetic context migration benchmark still uses
   `benchmarks/spotserve/context_migration_synthetic.json`.
 
 Remaining integration gap:
 
-The live router / controller does not yet call `get_context_metadata()` and feed
-it into `plan_low_cost_migration()`. Therefore V7 is schema-integrated, but
-live vLLM context migration planning is still pending.
+This is still a planning path. It chooses where contexts should migrate, but
+does not execute true KV cache export, transfer, restore, or production request
+resume.
 
 Synthetic validation:
 
@@ -186,10 +193,12 @@ python -m py_compile \
   sllm/backends/vllm_state_metadata.py \
   sllm/backends/vllm_runtime_metadata.py \
   sllm/backends/vllm_backend.py \
+  sllm/routers/roundrobin_router.py \
   sllm/spot/reparallelization.py \
   sllm/spot/context_migration.py \
   sllm/spot/stateful_recovery.py \
   sllm/spot/risk_aware_scheduling.py \
+  tests/spotserve_test/test_router_state.py \
   scripts/run_context_migration_benchmark.py \
   scripts/run_scheduler_benchmark.py \
   scripts/analyze_spotserve_benchmark.py \
@@ -220,22 +229,30 @@ context migration planner
 risk-aware scheduling planner
 ```
 
+Direct router smoke validation was also run for V7 live planning:
+
+```text
+handle_preemption()
+-> fake backend get_context_metadata()
+-> context_migration action=migrate
+-> context_migration metric row emitted
+```
+
 `pytest` is not installed in the host environment, so pytest-native tests that
 import `pytest` were not run through pytest in this check.
 
 ## Next Integration Work
 
-1. Wire live V7:
-   collect `VllmBackend.get_context_metadata()` from active instances and feed
-   it to `plan_low_cost_migration()`.
-
-2. Wire live V9 metadata feed:
+1. Wire live V9 metadata feed:
    decide whether scheduler gets node risk/loading metadata from config,
    controller, backend actors, or a lightweight metadata registry.
 
-3. Run container benchmarks:
+2. Run container benchmarks:
    - V6 reparallelization benchmark
    - V8 recovery correctness benchmark
    - V7/V9 synthetic benchmarks inside `sllm_head`
+
+3. Add the true backend V7 executor:
+   KV cache export, transfer, restore, and request resume.
 
 4. Only after these pass, move to Version 10 expert-aware recovery.

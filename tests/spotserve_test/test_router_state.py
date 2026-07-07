@@ -6,6 +6,28 @@ from sllm.routers.roundrobin_router import RoundRobinRouter
 from sllm.utils import InstanceHandle, InstanceState
 
 
+class FakeContextBackend:
+    async def get_current_tokens(self):
+        return []
+
+    async def get_context_metadata(
+        self,
+        instance_id: str = "",
+        node_id: str = "",
+    ):
+        return [
+            {
+                "request_id": "request-live-0",
+                "instance_id": instance_id,
+                "node_id": node_id,
+                "num_tokens": 8,
+                "context_blocks": 2,
+                "reusable_tokens_by_target": {"instance-target": 6},
+                "reusable_blocks_by_target": {"instance-target": 2},
+            }
+        ]
+
+
 @pytest.mark.asyncio
 async def test_preempting_instance_cannot_accept_new_requests():
     instance = InstanceHandle(
@@ -237,3 +259,62 @@ async def test_router_records_reparallelization_decision(tmp_path):
     ]
     assert rows[-1]["type"] == "reparallelization"
     assert rows[-1]["parallel_plan"] == replanning["parallel_plan"]
+
+
+@pytest.mark.asyncio
+async def test_router_plans_live_context_migration_on_preemption(tmp_path):
+    metrics_path = tmp_path / "router-metrics.jsonl"
+    router = RoundRobinRouter(
+        model_name="test-model",
+        resource_requirements={"num_cpus": 1, "num_gpus": 0},
+        backend="dummy",
+        backend_config={},
+        router_config={
+            "metrics_path": str(metrics_path),
+            "enable_context_migration": True,
+            "context_migration_config": {
+                "target_warmup_cost": 1.0,
+                "planner_config": {
+                    "cross_node_penalty": 0.0,
+                },
+            },
+        },
+    )
+    source = InstanceHandle(
+        instance_id="instance-source",
+        max_queue_length=1,
+        num_gpu=0,
+        backend_instance=FakeContextBackend(),
+    )
+    target = InstanceHandle(
+        instance_id="instance-target",
+        max_queue_length=1,
+        num_gpu=0,
+    )
+    await source.mark_ready(node_id="node-source")
+    await target.mark_ready(node_id="node-target")
+
+    router.ready_inference_instances[source.instance_id] = source
+    router.ready_inference_instances[target.instance_id] = target
+
+    result = await router.handle_preemption(node_id="node-source")
+
+    decision = result["context_migration"]
+    assert decision["action"] == "migrate"
+    assert len(decision["plans"]) == 1
+    assert decision["plans"][0]["old_instance_id"] == "instance-source"
+    assert decision["plans"][0]["new_instance_id"] == "instance-target"
+    assert decision["plans"][0]["reusable_tokens"] == 6
+    assert decision["plans"][0]["reusable_context_blocks"] == 2
+
+    rows = [
+        json.loads(line)
+        for line in metrics_path.read_text(encoding="utf-8").splitlines()
+    ]
+    context_rows = [
+        row for row in rows if row["type"] == "context_migration"
+    ]
+    assert len(context_rows) == 1
+    assert context_rows[0]["action"] == "migrate"
+    assert context_rows[0]["migration_plan_count"] == 1
+    assert context_rows[0]["plans"][0]["new_instance_id"] == "instance-target"

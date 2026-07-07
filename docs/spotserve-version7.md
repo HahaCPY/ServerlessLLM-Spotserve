@@ -28,6 +28,7 @@ Implemented:
 - context migration metrics
 - benchmark analyzer/report fields for migration metrics
 - synthetic context migration benchmark script and input
+- live router spot-event planning path
 
 Out of scope:
 
@@ -190,6 +191,71 @@ context_migration_reuse_ratio
 context_migration_latest_plans
 ```
 
+## Live Router Path
+
+File:
+
+```text
+sllm/routers/roundrobin_router.py
+```
+
+The router can now opt into live V7 planning with:
+
+```json
+{
+  "router_config": {
+    "enable_context_migration": true,
+    "context_migration_config": {
+      "target_warmup_cost": 1.0,
+      "planner_config": {
+        "cross_node_penalty": 10.0
+      }
+    }
+  }
+}
+```
+
+When a spot preemption or dead-node event is handled, the router:
+
+```text
+affected backend instances
+-> get_context_metadata(instance_id, node_id)
+-> ContextMetadata
+-> READY inference instances as MigrationTarget
+-> plan_low_cost_migration()
+-> context_migration metric
+-> context_migration decision in event response
+```
+
+Target capacity defaults to:
+
+```text
+instance.max_queue_length - instance.concurrency
+```
+
+It can be overridden for test or synthetic runs with:
+
+```json
+{
+  "context_migration_config": {
+    "target_capacity": 2
+  }
+}
+```
+
+Warmup cost is configured per target, not per assignment. The router accepts:
+
+```text
+warmup_cost_by_instance[instance_id]
+warmup_cost_by_node[node_id]
+default_target_warmup_cost
+target_warmup_cost
+```
+
+This live path is still planning-only. It does not move KV cache bytes or resume
+production requests by itself. The backend/runtime still needs a true KV export,
+transfer, and restore executor before V7 can claim real serving-latency gains.
+
 ## Synthetic Benchmark
 
 Files:
@@ -239,8 +305,10 @@ The backend handoff is documented in:
 docs/Bignose-milestone3-backend-capability.md
 ```
 
-Once that metadata exists, CPY can replace synthetic context input with real
-vLLM/MoE context metadata without changing the assignment algorithm.
+Because backend context metadata now exists, CPY can feed real vLLM/MoE context
+metadata into the planner without changing the assignment algorithm. The live
+router path performs that planner integration for spot preemption and dead-node
+events.
 
 ## Definition Of Done
 
@@ -253,5 +321,7 @@ Version 7 CPY side is complete when:
 - unassigned contexts are reported.
 - migration metrics are emitted and summarized.
 - synthetic benchmark can produce a migration plan and summary.
+- router spot-event path can collect live backend context metadata and return a
+  context migration decision.
 - tests validate cost, assignment, target capacity, per-target warmup,
-  unassigned contexts, and metric shape.
+  unassigned contexts, live router planning, and metric shape.
