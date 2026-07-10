@@ -17,9 +17,11 @@
 # ---------------------------------------------------------------------------- #
 import asyncio
 import copy
+import inspect
 import time
-from typing import Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
+import ray
 from sllm.logger import init_logger
 from sllm.spot.metrics import (
     JsonlMetricsWriter,
@@ -39,6 +41,16 @@ class FcfsScheduler(SllmScheduler):
         self.scheduler_config = dict(scheduler_config or {})
         self.enable_spot_risk_aware = bool(
             self.scheduler_config.get("enable_spot_risk_aware", False)
+        )
+        self.enable_backend_runtime_metadata = bool(
+            self.scheduler_config.get("enable_backend_runtime_metadata", False)
+        )
+        self.runtime_metadata_timeout_s = max(
+            0.001,
+            float(
+                self.scheduler_config.get("runtime_metadata_timeout_s", 1.0)
+                or 1.0
+            ),
         )
         self.latest_scheduling_decision = None
         metrics_path = self.scheduler_config.get("metrics_path")
@@ -171,6 +183,127 @@ class FcfsScheduler(SllmScheduler):
                 "node_id": node_id,
                 "risk_metadata": dict(risk_metadata),
             }
+
+    async def _call_actor_method(
+        self,
+        actor: Any,
+        method_name: str,
+        **kwargs,
+    ):
+        method = getattr(actor, method_name)
+        remote = getattr(method, "remote", None)
+        if remote is not None:
+            result = remote(**kwargs)
+        else:
+            result = method(**kwargs)
+        if inspect.isawaitable(result):
+            return await asyncio.wait_for(
+                result,
+                timeout=self.runtime_metadata_timeout_s,
+            )
+        return result
+
+    async def _collect_backend_runtime_metadata(self) -> List[Dict[str, Any]]:
+        if not self.enable_backend_runtime_metadata:
+            return []
+
+        async with self.metadata_lock:
+            model_instances = copy.deepcopy(self.model_instance)
+
+        metadata_rows: List[Dict[str, Any]] = []
+        for instances in model_instances.values():
+            for instance_id, node_id in instances.items():
+                try:
+                    actor = ray.get_actor(str(instance_id))
+                    metadata = await self._call_actor_method(
+                        actor,
+                        "get_runtime_metadata",
+                        instance_id=str(instance_id),
+                        node_id=str(node_id),
+                    )
+                except Exception as e:
+                    logger.info(
+                        f"Could not collect runtime metadata from "
+                        f"{instance_id}: {e}"
+                    )
+                    continue
+                if not isinstance(metadata, Mapping):
+                    continue
+                payload = dict(metadata)
+                payload.setdefault("instance_id", str(instance_id))
+                payload.setdefault("node_id", str(node_id))
+                metadata_rows.append(payload)
+        return metadata_rows
+
+    def _merge_backend_runtime_metadata(
+        self,
+        worker_nodes: Mapping,
+        runtime_metadata_rows: List[Mapping[str, Any]],
+    ) -> dict:
+        updated_worker_nodes = copy.deepcopy(worker_nodes)
+        rows_by_node: Dict[str, List[Mapping[str, Any]]] = {}
+        for row in runtime_metadata_rows:
+            node_id = row.get("node_id")
+            if node_id is None:
+                continue
+            rows_by_node.setdefault(str(node_id), []).append(row)
+
+        for node_id, rows in rows_by_node.items():
+            if node_id not in updated_worker_nodes:
+                continue
+            node_info = updated_worker_nodes[node_id]
+            node_info["backend_runtime_metadata"] = [
+                dict(row) for row in rows
+            ]
+
+            resource_profiles = [
+                row.get("model_resource_profile")
+                for row in rows
+                if isinstance(row.get("model_resource_profile"), Mapping)
+            ]
+            if resource_profiles:
+                node_info["model_resource_profiles"] = [
+                    dict(profile) for profile in resource_profiles
+                ]
+
+            spot_risks = []
+            lifetimes = []
+            loading_costs = []
+            free_gpu_values = []
+            total_gpu_values = []
+            for row in rows:
+                try:
+                    if row.get("spot_risk") is not None:
+                        spot_risks.append(float(row["spot_risk"]))
+                    if row.get("remaining_lifetime_s") is not None:
+                        lifetimes.append(float(row["remaining_lifetime_s"]))
+                    if row.get("loading_cost") is not None:
+                        loading_costs.append(float(row["loading_cost"]))
+                    if row.get("free_gpu") is not None:
+                        free_gpu = int(row["free_gpu"])
+                        if free_gpu > 0:
+                            free_gpu_values.append(free_gpu)
+                    if row.get("total_gpu") is not None:
+                        total_gpu = int(row["total_gpu"])
+                        if total_gpu > 0:
+                            total_gpu_values.append(total_gpu)
+                except (TypeError, ValueError):
+                    continue
+
+            if spot_risks:
+                node_info["spot_risk"] = max(spot_risks)
+            if lifetimes:
+                node_info["remaining_lifetime_s"] = min(lifetimes)
+            if loading_costs:
+                node_info["loading_cost"] = max(loading_costs)
+            if free_gpu_values:
+                node_info["free_gpu"] = max(free_gpu_values)
+            if total_gpu_values:
+                node_info["total_gpu"] = max(total_gpu_values)
+
+            node_info.update(self._configured_node_risk(str(node_id)))
+
+        return updated_worker_nodes
 
     async def _mark_node_state(self, node_id: str, state: NodeState):
         async with self.metadata_lock:
@@ -358,6 +491,12 @@ class FcfsScheduler(SllmScheduler):
                     self.worker_nodes[node_id],
                     node_id,
                 )
+
+        runtime_metadata_rows = await self._collect_backend_runtime_metadata()
+        updated_worker_nodes = self._merge_backend_runtime_metadata(
+            updated_worker_nodes,
+            runtime_metadata_rows,
+        )
         async with self.metadata_lock:
             self.worker_nodes = updated_worker_nodes
 

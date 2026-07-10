@@ -12,7 +12,8 @@ worker node metadata
 ```
 
 This version does not integrate a real cloud spot provider. Risk metadata can
-come from config or synthetic benchmark input.
+come from config, synthetic benchmark input, or running backend actor runtime
+metadata.
 
 ## Scope
 
@@ -22,6 +23,8 @@ Implemented:
 - `SchedulingDecision`
 - risk-aware node ranking
 - opt-in FCFS scheduler ranking with `enable_spot_risk_aware`
+- opt-in backend actor runtime metadata query with
+  `enable_backend_runtime_metadata`
 - scheduler risk metadata preservation across worker-node refreshes
 - controller pass-through for `scheduler_config`
 - synthetic health-only vs risk-aware scheduler benchmark
@@ -88,6 +91,8 @@ Risk-aware ranking is opt-in:
 {
   "scheduler_config": {
     "enable_spot_risk_aware": true,
+    "enable_backend_runtime_metadata": true,
+    "runtime_metadata_timeout_s": 1.0,
     "metrics_path": "results/spotserve/scheduler-risk.jsonl",
     "risk_weight": 1.0,
     "lifetime_weight": 0.8,
@@ -105,6 +110,43 @@ Risk-aware ranking is opt-in:
 ```
 
 When disabled, the FCFS scheduler keeps the old health-only behavior.
+
+## Live Backend Runtime Metadata
+
+File:
+
+```text
+sllm/schedulers/fcfs_scheduler.py
+```
+
+When `enable_backend_runtime_metadata=true`, the scheduler refresh path uses
+currently allocated model instances to query backend actors:
+
+```text
+model_instance[model_name][instance_id] -> node_id
+ray.get_actor(instance_id)
+-> get_runtime_metadata(instance_id, node_id)
+-> merge metadata into worker node info
+-> node_risk_score()
+```
+
+The merge is conservative across multiple instances on the same node:
+
+```text
+spot_risk: max observed risk
+remaining_lifetime_s: min observed lifetime
+loading_cost: max observed loading cost
+model_resource_profiles: preserved as a list
+backend_runtime_metadata: preserved as raw rows
+```
+
+Configured `scheduler_config.node_risk[node_id]` still takes precedence. This
+keeps synthetic/config benchmarks reproducible while allowing live backend
+metadata to fill in missing fields.
+
+If an actor is missing, stale, or does not implement `get_runtime_metadata()`,
+the scheduler logs the miss and continues with Ray worker-node metadata plus
+configured defaults.
 
 ## Benchmark
 
@@ -189,6 +231,9 @@ optional spot risk / lifetime estimate if available
 If those fields are unavailable, CPY can still run with conservative defaults
 or synthetic metadata.
 
+The scheduler can now consume those backend fields directly from running backend
+actors when `enable_backend_runtime_metadata=true`.
+
 ## Definition Of Done
 
 Version 9 CPY side is complete when:
@@ -196,6 +241,7 @@ Version 9 CPY side is complete when:
 - risk-aware score and ranking are implemented.
 - unhealthy nodes are still filtered out.
 - scheduler can opt into risk-aware ranking.
+- scheduler can opt into backend actor `get_runtime_metadata()` refresh.
 - health-only and risk-aware synthetic benchmark can be compared.
 - metrics/report fields expose selected risk and latest decision.
 - backend handoff is documented without claiming a real cloud risk predictor.

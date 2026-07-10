@@ -12,7 +12,7 @@ metadata contracts added for Milestone 3.
 | V6 Dynamic Reparallelization | `BackendCapability` and vLLM capability helpers exist | Planner now filters candidates through backend supported configs | Integrated |
 | V7 Context Migration | vLLM context metadata helper and backend hook exist | Router now collects live context metadata on spot events and feeds the planner | Integrated planning path |
 | V8 Stateful Recovery | vLLM state metadata helper and backend hook exist | Router calls backend state hooks and falls back when restore is unsupported | Integrated with conservative vLLM fallback |
-| V9 Risk-aware Scheduling | vLLM runtime metadata/resource profile helper exists | Scheduler can consume risk/loading metadata from config/synthetic node metadata | Planner integrated, live runtime feed pending |
+| V9 Risk-aware Scheduling | vLLM runtime metadata/resource profile helper exists | Scheduler can consume config/synthetic metadata and opt into backend actor runtime metadata | Integrated planning path |
 
 ## V6 Check
 
@@ -168,11 +168,18 @@ Status:
 - `node_risk_score()` accepts that metadata shape.
 - FCFS scheduler can opt into risk-aware ranking via
   `scheduler_config.enable_spot_risk_aware`.
+- FCFS scheduler can opt into live backend actor metadata refresh via
+  `scheduler_config.enable_backend_runtime_metadata`.
+- The scheduler queries `ray.get_actor(instance_id).get_runtime_metadata()`
+  for allocated instances, merges metadata into worker-node info, and then
+  feeds the result to `node_risk_score()`.
 
 Remaining integration gap:
 
-The live scheduler currently consumes configured/synthetic node risk metadata.
-It does not yet query running backend actors for `get_runtime_metadata()`.
+There is still no real cloud spot provider integration or production risk
+prediction model. Backend actor metadata can expose loading cost and resource
+profile today; spot risk / lifetime remain conservative defaults unless a
+provider or config supplies them.
 
 Synthetic validation:
 
@@ -194,11 +201,13 @@ python -m py_compile \
   sllm/backends/vllm_runtime_metadata.py \
   sllm/backends/vllm_backend.py \
   sllm/routers/roundrobin_router.py \
+  sllm/schedulers/fcfs_scheduler.py \
   sllm/spot/reparallelization.py \
   sllm/spot/context_migration.py \
   sllm/spot/stateful_recovery.py \
   sllm/spot/risk_aware_scheduling.py \
   tests/spotserve_test/test_router_state.py \
+  tests/spotserve_test/test_scheduler_node_health.py \
   scripts/run_context_migration_benchmark.py \
   scripts/run_scheduler_benchmark.py \
   scripts/analyze_spotserve_benchmark.py \
@@ -238,21 +247,29 @@ handle_preemption()
 -> context_migration metric row emitted
 ```
 
+Direct scheduler smoke validation was also run for V9 live metadata:
+
+```text
+fake backend actors
+-> get_runtime_metadata()
+-> merge into worker node info
+-> risk-aware ranking selects lower-risk node
+```
+
 `pytest` is not installed in the host environment, so pytest-native tests that
 import `pytest` were not run through pytest in this check.
 
 ## Next Integration Work
 
-1. Wire live V9 metadata feed:
-   decide whether scheduler gets node risk/loading metadata from config,
-   controller, backend actors, or a lightweight metadata registry.
-
-2. Run container benchmarks:
+1. Run container benchmarks:
    - V6 reparallelization benchmark
    - V8 recovery correctness benchmark
    - V7/V9 synthetic benchmarks inside `sllm_head`
 
-3. Add the true backend V7 executor:
+2. Add the true backend V7 executor:
    KV cache export, transfer, restore, and request resume.
+
+3. Add a real spot provider / lifetime feed if the project needs production
+   risk values rather than synthetic/config metadata.
 
 4. Only after these pass, move to Version 10 expert-aware recovery.

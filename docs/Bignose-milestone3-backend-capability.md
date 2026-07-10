@@ -1211,6 +1211,42 @@ loading_cost
 如果 backend 不知道 GPU free capacity 或 spot risk，先回 `0` 或空 metadata，
 不要自行做 ranking。
 
+CPY scheduler 現在可以 opt in live backend metadata refresh：
+
+```json
+{
+  "scheduler_config": {
+    "enable_spot_risk_aware": true,
+    "enable_backend_runtime_metadata": true,
+    "runtime_metadata_timeout_s": 1.0
+  }
+}
+```
+
+live path 會做：
+
+```text
+model_instance[model_name][instance_id] -> node_id
+ray.get_actor(instance_id)
+-> VllmBackend.get_runtime_metadata(instance_id, node_id)
+-> merge into worker node metadata
+-> node_risk_score()
+```
+
+大鼻仍然不需要實作 scheduler ranking。大鼻只要讓 backend actor 的
+`get_runtime_metadata()` 回傳準確或明確保守的欄位即可。多個 instance 在同一
+node 時，CPY 會用保守聚合：
+
+```text
+spot_risk = max(values)
+remaining_lifetime_s = min(values)
+loading_cost = max(values)
+```
+
+如果沒有 cloud provider，`spot_risk` / `remaining_lifetime_s` 可以繼續由
+`scheduler_config.node_risk` 或 synthetic benchmark 提供；backend metadata
+主要先提供 loading cost 和 model resource profile。
+
 ## V9 Backend Questions 大鼻需要確認
 
 - vLLM backend 是否能 expose model load time？
