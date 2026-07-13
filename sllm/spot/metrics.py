@@ -100,6 +100,7 @@ def make_context_migration_event(
         "total_context_blocks": decision.get("total_context_blocks", 0),
         "reuse_ratio": decision.get("reuse_ratio", 0.0),
         "plans": plans,
+        "kv_cache_migration": decision.get("kv_cache_migration"),
     }
 
 

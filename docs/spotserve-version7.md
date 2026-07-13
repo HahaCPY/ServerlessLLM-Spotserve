@@ -190,6 +190,10 @@ context_migration_reusable_tokens
 context_migration_reusable_context_blocks
 context_migration_reuse_ratio
 context_migration_latest_plans
+kv_cache_migration_attempts
+kv_cache_migration_successes
+kv_cache_migration_tokens
+kv_cache_migration_latest
 ```
 
 ## Live Router Path
@@ -206,6 +210,7 @@ The router can now opt into live V7 planning with:
 {
   "router_config": {
     "enable_context_migration": true,
+    "enable_kv_cache_migration": true,
     "context_migration_config": {
       "target_warmup_cost": 1.0,
       "planner_config": {
@@ -224,6 +229,7 @@ affected backend instances
 -> ContextMetadata
 -> READY inference instances as MigrationTarget
 -> plan_low_cost_migration()
+-> optional target resume_kv_cache() cache warmup
 -> context_migration metric
 -> context_migration decision in event response
 ```
@@ -253,9 +259,24 @@ default_target_warmup_cost
 target_warmup_cost
 ```
 
-This live path is still planning-only. It does not move KV cache bytes or resume
-production requests by itself. The backend/runtime still needs a true KV export,
-transfer, and restore executor before V7 can claim real serving-latency gains.
+By default this live path is planning-only. It does not move KV cache bytes or
+resume production requests by itself. The backend/runtime still needs a true KV
+export, transfer, and restore executor before V7 can claim real serving-latency
+gains.
+
+When `enable_kv_cache_migration=true`, the router also executes a conservative
+cache-warmup path after a migration plan is produced:
+
+```text
+source backend get_current_tokens()
+-> target backend resume_kv_cache(request_datas=tokens)
+-> kv_cache_migration result attached to context_migration decision/metric
+```
+
+For vLLM this uses the existing backend `resume_kv_cache()` hook, which
+replays/prefills token batches to warm target cache state. This is useful for
+control-plane validation and prefix/cache warmup, but it is not true vLLM KV
+block serialization, transfer, or request binding.
 
 ## Synthetic Benchmark
 

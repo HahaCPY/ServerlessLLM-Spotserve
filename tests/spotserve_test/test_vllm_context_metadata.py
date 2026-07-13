@@ -2,6 +2,11 @@ from sllm.backends.vllm_context_metadata import get_vllm_context_metadata
 from sllm.spot.context_migration import ContextMetadata
 
 
+class FakeKvTransferParams:
+    def __init__(self):
+        self.block_ids = [10, 11, 12]
+
+
 def test_vllm_context_metadata_reports_token_count_from_tokens():
     metadata = get_vllm_context_metadata(
         model_name="vllm-moe",
@@ -96,3 +101,33 @@ def test_vllm_context_metadata_preserves_backend_metadata():
         "prompt_token_count": 1,
         "generated_token_count": 2,
     }
+
+
+def test_vllm_context_metadata_counts_explicit_kv_blocks():
+    metadata = get_vllm_context_metadata(
+        model_name="vllm-dense",
+        instance_id="old-vllm-0",
+        node_id="node-0",
+        runtime_metadata={
+            "request_id": "req-4",
+            "tokens": [1, 2, 3],
+            "kv_block_count": 4,
+        },
+    )
+
+    assert metadata["context_blocks"] == 4
+
+
+def test_vllm_context_metadata_counts_kv_transfer_params_blocks():
+    metadata = get_vllm_context_metadata(
+        model_name="vllm-dense",
+        instance_id="old-vllm-0",
+        node_id="node-0",
+        runtime_metadata={
+            "request_id": "req-5",
+            "tokens": [1, 2, 3],
+            "kv_transfer_params": FakeKvTransferParams(),
+        },
+    )
+
+    assert metadata["context_blocks"] == 3

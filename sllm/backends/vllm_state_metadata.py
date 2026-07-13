@@ -16,6 +16,8 @@
 # ---------------------------------------------------------------------------- #
 from typing import Any, Dict, List, Mapping, Optional
 
+from sllm.backends.vllm_context_metadata import context_block_count_from_runtime
+
 
 def _token_list(value: Any) -> List[int]:
     if not value:
@@ -34,6 +36,37 @@ def _tokens_from_runtime(runtime_metadata: Mapping[str, Any]) -> List[int]:
     prompt_tokens = _token_list(runtime_metadata.get("prompt_tokens"))
     output_tokens = _token_list(runtime_metadata.get("output_tokens"))
     return prompt_tokens + output_tokens
+
+
+def _runtime_value(payload: Any, key: str) -> Any:
+    if isinstance(payload, Mapping):
+        return payload.get(key)
+    return getattr(payload, key, None)
+
+
+def _runtime_or_kv_value(runtime_metadata: Mapping[str, Any], key: str) -> Any:
+    value = _runtime_value(runtime_metadata, key)
+    if value is not None:
+        return value
+    kv_transfer_params = _runtime_value(runtime_metadata, "kv_transfer_params")
+    if kv_transfer_params is None:
+        return None
+    return _runtime_value(kv_transfer_params, key)
+
+
+def _runtime_list(runtime_metadata: Mapping[str, Any], *keys: str) -> List[Any]:
+    for key in keys:
+        value = _runtime_or_kv_value(runtime_metadata, key)
+        if isinstance(value, (list, tuple)):
+            return list(value)
+    return []
+
+
+def _runtime_dict(runtime_metadata: Mapping[str, Any], key: str) -> Dict[str, Any]:
+    value = _runtime_or_kv_value(runtime_metadata, key)
+    if isinstance(value, Mapping):
+        return dict(value)
+    return {}
 
 
 def get_vllm_inference_state(
@@ -76,13 +109,15 @@ def get_vllm_inference_state(
         "metadata": {
             "prompt_token_count": len(prompt_tokens),
             "generated_token_count": len(output_tokens),
-            "kv_block_count": int(
-                runtime_metadata.get("kv_block_count", 0) or 0
+            "kv_block_count": context_block_count_from_runtime(
+                runtime_metadata
             ),
-            "block_ids": list(runtime_metadata.get("block_ids", []) or []),
-            "block_table": dict(
-                runtime_metadata.get("block_table", {}) or {}
+            "block_ids": _runtime_list(
+                runtime_metadata,
+                "block_ids",
+                "kv_block_ids",
             ),
+            "block_table": _runtime_dict(runtime_metadata, "block_table"),
             "cache_engine": "vllm",
             "can_restore_same_node": False,
             "can_restore_cross_node": False,

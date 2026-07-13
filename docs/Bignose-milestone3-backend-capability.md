@@ -638,9 +638,7 @@ def get_vllm_context_metadata(
         "model_name": model_name,
         "backend": "vllm",
         "num_tokens": _token_count(runtime_metadata),
-        "context_blocks": _non_negative_int(
-            runtime_metadata.get("context_blocks", 0)
-        ),
+        "context_blocks": context_block_count_from_runtime(runtime_metadata),
         "reusable_tokens_by_target": (
             runtime_metadata.get("reusable_tokens_by_target", {})
         ),
@@ -816,8 +814,8 @@ MoE 目前不需要 expert metadata 才能做 token-level planning；若未來�
 MoE KV/expert-level reuse，才需要補 expert routing / expert-parallel state。
 
 所以現在 CPY planner 可以跑，但 cost / reuse ratio 是保守估計；不能宣稱已經
-完成真正 low-cost KV context migration，也不能拿來公平比較「V7 比 naive 快
-多少」。
+完成真正 low-cost KV block context migration，也不能拿來公平比較「V7 比
+naive 快多少」。
 
 大鼻不需要實作 matching algorithm，也不需要決定 target。大鼻只需要把上述
 metadata 從 vLLM runtime / scheduler / block manager 裡 expose 出來。CPY 會
@@ -834,6 +832,39 @@ context_migration metrics
 這裡要注意：V7 backend hook 只提供 metadata，不做 matching，也不決定要把
 request 搬去哪個 target。matching 仍然由 CPY 的
 `sllm/spot/context_migration.py` 負責。
+
+## CPY KV Cache Warmup Path
+
+CPY 已在 router live path 補上 opt-in KV cache warmup：
+
+```text
+router_config.enable_context_migration = true
+router_config.enable_kv_cache_migration = true
+
+spot preemption/dead event
+-> source backend get_context_metadata()
+-> CPY plan_low_cost_migration()
+-> source backend get_current_tokens()
+-> target backend resume_kv_cache(request_datas=tokens)
+-> context_migration.kv_cache_migration metric
+```
+
+這條路徑會用既有 `resume_kv_cache()` 在 target 做 token replay / prefix-cache
+warmup。它可以驗證 control plane 是否真的把 source tokens 送到 target
+backend，也會在 benchmark summary 產生：
+
+```text
+kv_cache_migration_attempts
+kv_cache_migration_successes
+kv_cache_migration_tokens
+kv_cache_migration_latest
+```
+
+但這仍然不是 true vLLM KV block serialization / transfer / request binding。
+目前 checkout 裡 `VllmBackend.supports_state_restore()` 仍然是 `False`，
+`restore_inference_state()` 仍回 `vllm_kv_restore_not_available`。等大鼻補上
+真正 restore hook 後，CPY 才能把 V8 stateful recovery 從 token replay
+fallback 升級成真正 KV restore。
 
 ## Reuse Metadata Meaning
 

@@ -248,10 +248,23 @@ replanning_latest_plan
 Files:
 
 ```text
+examples/spotserve/config-dummy-reparallelization-baseline.json
 examples/spotserve/config-dummy-reparallelization.json
+examples/spotserve/spot_trace_reparallelization_baseline.jsonl
 examples/spotserve/spot_trace_reparallelization.jsonl
 benchmarks/spotserve/benchmark_matrix_reparallelization.yaml
 ```
+
+The benchmark matrix includes two runs:
+
+```text
+dummy-reparallelization-baseline: enable_reparallelization=false
+dummy-reparallelization-planner:  enable_reparallelization=true
+```
+
+Both runs replay equivalent spot events against their own model names. The
+baseline is useful for validating control-plane overhead and confirming that
+replanning metrics only appear when the planner is enabled.
 
 The synthetic trace is:
 
@@ -273,14 +286,17 @@ Expected planner behavior:
 Prepare the SpotServe environment and copy benchmark artifacts:
 
 ```bash
-scripts/prepare_spotserve.sh --skip-deploy
+scripts/prepare_spotserve.sh --deploy-set reparallelization
 ```
 
-Then deploy the dummy replanning config:
+If the container is already running and you only need to deploy manually, deploy
+both configs:
 
 ```bash
 podman exec sllm_head bash -lc '
 cd /tmp/spotserve-work &&
+/opt/venvs/head/bin/sllm deploy \
+  --config examples/spotserve/config-dummy-reparallelization-baseline.json &&
 /opt/venvs/head/bin/sllm deploy \
   --config examples/spotserve/config-dummy-reparallelization.json
 '
@@ -301,6 +317,7 @@ cd /tmp/spotserve-work &&
 The matrix writes router metrics to:
 
 ```text
+/tmp/spotserve-work/results/spotserve_reparallelization/dummy-reparallelization-baseline-router.jsonl
 /tmp/spotserve-work/results/spotserve_reparallelization/dummy-reparallelization-router.jsonl
 ```
 
@@ -341,6 +358,18 @@ Version 6 proves that ServerlessLLM can make a new deployment decision after
 spot GPU availability changes. When backend capability metadata is available,
 the planner now filters replanning candidates through `BackendCapability` before
 accepting a plan.
+
+The dummy benchmark can compare baseline request latency against planner-enabled
+request latency, but it should not be reported as runtime reparallelization
+speedup. The dummy backend does not execute the selected `ParallelPlan`, so the
+meaningful V6 signals are:
+
+```text
+replanning_events
+replanning_latest_plan
+replanning_no_capacity_events
+replanning_max_selected_gpus
+```
 
 For vLLM / MoE integration, backend work still needs to confirm:
 

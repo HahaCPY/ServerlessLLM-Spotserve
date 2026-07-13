@@ -1,0 +1,21 @@
+{
+  "model": "dummy-reparallelization-baseline",
+  "backend": "dummy",
+  "router_num_cpus": 0,
+  "num_cpus": 0,
+  "num_gpus": 0,
+  "auto_scaling_config": {
+    "metric": "concurrency",
+    "target": 1,
+    "min_instances": 1,
+    "max_instances": 2,
+    "keep_alive": 0
+  },
+  "backend_config": {},
+  "router_config": {
+    "recovery_policy": "none",
+    "max_retries": 0,
+    "enable_reparallelization": false,
+    "metrics_path": "/tmp/spotserve-work/results/spotserve_reparallelization/dummy-reparallelization-baseline-router.jsonl"
+  }
+}

@@ -115,6 +115,35 @@ async def restore_inference_state(
 The base backend returns conservative unsupported values. This keeps vLLM and
 transformers safe until their real runtime hooks are implemented.
 
+## vLLM Metadata
+
+File:
+
+```text
+sllm/backends/vllm_state_metadata.py
+sllm/backends/vllm_backend.py
+```
+
+vLLM state export remains conservative:
+
+```text
+supports_restore = false
+state_kind = token_snapshot
+```
+
+However, when vLLM `RequestOutput` or `kv_transfer_params` exposes cache
+metadata, the exported state now preserves it for debugging/planning:
+
+```text
+metadata.kv_block_count
+metadata.block_ids
+metadata.block_table
+metadata.cache_engine = vllm
+```
+
+This does not make `restore_inference_state()` a true KV restore. It only means
+CPY no longer discards visible KV/cache metadata while falling back safely.
+
 ## Dummy Backend
 
 File:

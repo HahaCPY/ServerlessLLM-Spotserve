@@ -119,6 +119,37 @@ def process_embedding_output(
     return api_response
 
 
+def runtime_metadata_from_request_output(
+    result: RequestOutput,
+) -> Dict[str, Any]:
+    prompt_tokens = list(result.prompt_token_ids or [])
+    output_tokens = (
+        list(result.outputs[0].token_ids or []) if result.outputs else []
+    )
+    tokens = prompt_tokens + output_tokens
+    kv_transfer_params = getattr(result, "kv_transfer_params", None)
+    num_cached_tokens = getattr(result, "num_cached_tokens", None)
+
+    metadata: Dict[str, Any] = {
+        "prompt_token_count": len(prompt_tokens),
+        "generated_token_count": len(output_tokens),
+        "kv_transfer_params_available": kv_transfer_params is not None,
+    }
+    if num_cached_tokens is not None:
+        metadata["num_cached_tokens"] = int(num_cached_tokens)
+
+    runtime_metadata: Dict[str, Any] = {
+        "request_id": result.request_id,
+        "prompt_tokens": prompt_tokens,
+        "output_tokens": output_tokens,
+        "tokens": tokens,
+        "metadata": metadata,
+    }
+    if kv_transfer_params is not None:
+        runtime_metadata["kv_transfer_params"] = kv_transfer_params
+    return runtime_metadata
+
+
 class LLMEngineStatusDict:
     def __init__(self):
         self.status_dict: Dict[str, Union[RequestOutput, str]] = {}
@@ -346,24 +377,14 @@ class VllmBackend(SllmBackend):
         for result in ongoing_results:
             if not result.outputs:
                 continue
-            prompt_tokens = list(result.prompt_token_ids or [])
-            output_tokens = list(result.outputs[0].token_ids or [])
-            tokens = prompt_tokens + output_tokens
             metadata.append(
                 get_vllm_context_metadata(
                     model_name=self.model_name,
                     instance_id=instance_id or self.model_name,
                     node_id=node_id,
-                    runtime_metadata={
-                        "request_id": result.request_id,
-                        "prompt_tokens": prompt_tokens,
-                        "output_tokens": output_tokens,
-                        "tokens": tokens,
-                        "metadata": {
-                            "prompt_token_count": len(prompt_tokens),
-                            "generated_token_count": len(output_tokens),
-                        },
-                    },
+                    runtime_metadata=runtime_metadata_from_request_output(
+                        result
+                    ),
                 )
             )
         return metadata
@@ -391,13 +412,28 @@ class VllmBackend(SllmBackend):
         current_output: Optional[List[List[int]]] = None,
         completed_tokens: Optional[int] = None,
     ) -> Dict[str, Any]:
+        request_data = request_data or {}
+        request_id = request_data.get("request_id")
+        runtime_metadata: Dict[str, Any] = {}
+        results = await self.request_trace.return_all_results()
+        for result in results:
+            if not isinstance(result, RequestOutput):
+                continue
+            if request_id is not None and result.request_id != request_id:
+                continue
+            runtime_metadata = runtime_metadata_from_request_output(result)
+            break
         if current_output is None:
-            current_output = await self.get_current_tokens()
+            if runtime_metadata.get("tokens"):
+                current_output = [list(runtime_metadata["tokens"])]
+            else:
+                current_output = await self.get_current_tokens()
         return get_vllm_inference_state(
             model_name=self.model_name,
-            request_data=request_data,
+            request_data=request_data or {},
             current_output=current_output,
             completed_tokens=completed_tokens,
+            runtime_metadata=runtime_metadata,
         )
 
     async def restore_inference_state(

@@ -117,6 +117,17 @@ class RoundRobinRouter(SllmRouter):
         self.context_migration_config = dict(
             router_config.get("context_migration_config", {})
         )
+        self.enable_kv_cache_migration = bool(
+            router_config.get(
+                "enable_kv_cache_migration",
+                self.context_migration_config.get(
+                    "enable_kv_cache_migration",
+                    self.context_migration_config.get(
+                        "execute_kv_cache_migration", False
+                    ),
+                ),
+            )
+        )
         synthetic_worker_nodes = self.reparallelization_config.get(
             "synthetic_worker_nodes", {}
         )
@@ -621,6 +632,107 @@ class RoundRobinRouter(SllmRouter):
             )
         return targets
 
+    async def _execute_kv_cache_migration(
+        self,
+        decision: Dict[str, Any],
+        source_instances: List[InstanceHandle],
+    ):
+        if not self.enable_kv_cache_migration:
+            return None
+        if decision.get("action") != "migrate":
+            return {
+                "action": "skipped",
+                "reason": decision.get("action", "no_migration_plan"),
+            }
+
+        source_by_id = {
+            instance.instance_id: instance for instance in source_instances
+        }
+        async with self.instance_management_lock:
+            target_by_id = dict(self.ready_inference_instances)
+
+        attempted = 0
+        succeeded = 0
+        skipped = []
+        failures = []
+        total_tokens = 0
+        for plan in decision.get("plans", []):
+            source_id = plan.get("old_instance_id")
+            target_id = plan.get("new_instance_id")
+            source = source_by_id.get(source_id)
+            target = target_by_id.get(target_id)
+            if source is None or target is None:
+                skipped.append(
+                    {
+                        "source_instance_id": source_id,
+                        "target_instance_id": target_id,
+                        "reason": "missing_source_or_target",
+                    }
+                )
+                continue
+            if target.backend_instance is None:
+                skipped.append(
+                    {
+                        "source_instance_id": source_id,
+                        "target_instance_id": target_id,
+                        "reason": "target_backend_unavailable",
+                    }
+                )
+                continue
+
+            token_batches = self.recovery_tokens_by_instance.get(
+                source.instance_id
+            )
+            if not token_batches:
+                token_batches = await self._capture_current_tokens(source)
+            if not token_batches:
+                skipped.append(
+                    {
+                        "source_instance_id": source_id,
+                        "target_instance_id": target_id,
+                        "reason": "no_source_tokens",
+                    }
+                )
+                continue
+
+            attempted += 1
+            total_tokens += sum(len(tokens) for tokens in token_batches)
+            try:
+                result = await self._call_backend_method(
+                    target.backend_instance,
+                    "resume_kv_cache",
+                    request_datas=token_batches,
+                )
+            except Exception as e:
+                failures.append(
+                    {
+                        "source_instance_id": source_id,
+                        "target_instance_id": target_id,
+                        "reason": str(e),
+                    }
+                )
+                continue
+            if result is False:
+                failures.append(
+                    {
+                        "source_instance_id": source_id,
+                        "target_instance_id": target_id,
+                        "reason": "backend_returned_false",
+                    }
+                )
+                continue
+            succeeded += 1
+
+        return {
+            "action": "resume_kv_cache",
+            "attempted": attempted,
+            "succeeded": succeeded,
+            "skipped": skipped,
+            "failures": failures,
+            "total_tokens": total_tokens,
+            "reason": "target_cache_warmup",
+        }
+
     async def _plan_context_migration_after_spot_event(
         self,
         event: str,
@@ -642,6 +754,12 @@ class RoundRobinRouter(SllmRouter):
             targets=targets,
             planner_config=planner_config,
         ).to_dict()
+        kv_cache_migration = await self._execute_kv_cache_migration(
+            decision,
+            matches,
+        )
+        if kv_cache_migration is not None:
+            decision["kv_cache_migration"] = kv_cache_migration
 
         self._emit_metric(
             make_context_migration_event(
@@ -756,6 +874,7 @@ class RoundRobinRouter(SllmRouter):
         )
         marked_instances = []
         for instance in matches:
+            await self._capture_current_tokens(instance)
             await self._set_instance_state(
                 instance, InstanceState.DEAD, reason="trace_dead"
             )

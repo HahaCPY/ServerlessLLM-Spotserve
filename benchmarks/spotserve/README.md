@@ -69,6 +69,24 @@ On head-only dummy setups, avoid deploying both standard and correctness dummy
 model sets at the same time; the extra Ray actors can exceed the container
 thread limit.
 
+For dynamic reparallelization planner validation, deploy only the
+reparallelization configs and run:
+
+```bash
+scripts/prepare_spotserve.sh --deploy-set reparallelization
+
+python benchmarks/spotserve/run_benchmark.py \
+  --config benchmarks/spotserve/benchmark_matrix_reparallelization.yaml \
+  --endpoint http://127.0.0.1:8345/v1/chat/completions \
+  --request-timeout 30
+```
+
+This matrix includes a baseline model with `enable_reparallelization=false` and
+a planner model with `enable_reparallelization=true`. It validates replan
+metrics and control-plane overhead. It does not claim serving latency gains from
+runtime reconfiguration because the dummy backend does not execute a new
+parallel plan.
+
 For risk-aware scheduling validation, run the synthetic scheduler benchmark.
 This does not require a deployed model:
 

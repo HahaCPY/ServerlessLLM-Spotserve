@@ -12,8 +12,9 @@ Options:
   --skip-build       Do not run "docker compose build sllm_head"
   --skip-recreate    Do not recreate the sllm_head container
   --skip-deploy      Copy artifacts but do not deploy models
-  --deploy-set SET   Models to deploy: standard, correctness, vllm-dense,
-                     vllm-moe, vllm-blackbox, or all.
+  --deploy-set SET   Models to deploy: standard, correctness,
+                     reparallelization, vllm-dense, vllm-moe,
+                     vllm-blackbox, or all.
                      Default: standard. "all" can require substantial GPU capacity.
   -h, --help         Show this help
 
@@ -63,8 +64,8 @@ while [[ $# -gt 0 ]]; do
       ;;
     --deploy-set)
       DEPLOY_SET="${2:-}"
-      if [[ "$DEPLOY_SET" != "standard" && "$DEPLOY_SET" != "correctness" && "$DEPLOY_SET" != "vllm-dense" && "$DEPLOY_SET" != "vllm-moe" && "$DEPLOY_SET" != "vllm-blackbox" && "$DEPLOY_SET" != "all" ]]; then
-        echo "--deploy-set must be one of: standard, correctness, vllm-dense, vllm-moe, vllm-blackbox, all" >&2
+      if [[ "$DEPLOY_SET" != "standard" && "$DEPLOY_SET" != "correctness" && "$DEPLOY_SET" != "reparallelization" && "$DEPLOY_SET" != "vllm-dense" && "$DEPLOY_SET" != "vllm-moe" && "$DEPLOY_SET" != "vllm-blackbox" && "$DEPLOY_SET" != "all" ]]; then
+        echo "--deploy-set must be one of: standard, correctness, reparallelization, vllm-dense, vllm-moe, vllm-blackbox, all" >&2
         exit 2
       fi
       shift 2
@@ -302,6 +303,10 @@ if [[ "$SKIP_DEPLOY" -eq 0 ]]; then
     "examples/spotserve/config-dummy-correctness-token-replay.json"
     "examples/spotserve/config-dummy-correctness-stateful-recovery.json"
   )
+  REPARALLELIZATION_CONFIGS=(
+    "examples/spotserve/config-dummy-reparallelization-baseline.json"
+    "examples/spotserve/config-dummy-reparallelization.json"
+  )
   VLLM_DENSE_CONFIGS=(
     "examples/spotserve/config-vllm-dense-baseline.json"
     "examples/spotserve/config-vllm-dense-none.json"
@@ -320,6 +325,9 @@ if [[ "$SKIP_DEPLOY" -eq 0 ]]; then
   fi
   if [[ "$DEPLOY_SET" == "correctness" || "$DEPLOY_SET" == "all" ]]; then
     DEPLOY_CONFIGS+=("${CORRECTNESS_CONFIGS[@]}")
+  fi
+  if [[ "$DEPLOY_SET" == "reparallelization" || "$DEPLOY_SET" == "all" ]]; then
+    DEPLOY_CONFIGS+=("${REPARALLELIZATION_CONFIGS[@]}")
   fi
   if [[ "$DEPLOY_SET" == "vllm-dense" || "$DEPLOY_SET" == "vllm-blackbox" || "$DEPLOY_SET" == "all" ]]; then
     DEPLOY_CONFIGS+=("${VLLM_DENSE_CONFIGS[@]}")
@@ -380,6 +388,21 @@ ${HEAD_PYTHON} benchmarks/spotserve/run_benchmark.py \\
   --endpoint http://127.0.0.1:8343/v1/chat/completions \\
   --request-timeout 30 \\
   --skip-trace
+'
+EOF
+fi
+
+if [[ "$DEPLOY_SET" == "reparallelization" || "$DEPLOY_SET" == "all" ]]; then
+  cat <<EOF
+
+Run the dynamic-reparallelization benchmark with:
+
+podman exec ${CONTAINER} bash -lc '
+cd ${WORKDIR_IN_CONTAINER} &&
+${HEAD_PYTHON} benchmarks/spotserve/run_benchmark.py \\
+  --config benchmarks/spotserve/benchmark_matrix_reparallelization.yaml \\
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \\
+  --request-timeout 30
 '
 EOF
 fi

@@ -281,6 +281,15 @@ def summarize_context_migration_metrics(
         total_reusable_blocks if total_context_blocks else total_reusable_tokens
     )
     latest_plans = migration_rows[-1].get("plans", []) if migration_rows else []
+    kv_rows = [
+        row.get("kv_cache_migration") or {}
+        for row in migration_rows
+        if row.get("kv_cache_migration")
+    ]
+    kv_attempted = sum(int(row.get("attempted", 0) or 0) for row in kv_rows)
+    kv_succeeded = sum(int(row.get("succeeded", 0) or 0) for row in kv_rows)
+    kv_tokens = sum(int(row.get("total_tokens", 0) or 0) for row in kv_rows)
+    latest_kv = kv_rows[-1] if kv_rows else None
     return {
         "context_migration_events": len(migration_rows),
         "context_migration_plan_count": total_plan_count,
@@ -296,6 +305,12 @@ def summarize_context_migration_metrics(
         ),
         "context_migration_latest_plans": (
             json.dumps(latest_plans, sort_keys=True) if latest_plans else ""
+        ),
+        "kv_cache_migration_attempts": kv_attempted,
+        "kv_cache_migration_successes": kv_succeeded,
+        "kv_cache_migration_tokens": kv_tokens,
+        "kv_cache_migration_latest": (
+            json.dumps(latest_kv, sort_keys=True) if latest_kv else ""
         ),
     }
 

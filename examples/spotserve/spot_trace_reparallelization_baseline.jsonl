@@ -1,0 +1,3 @@
+{"time": 1.0, "event": "preempt", "node_id": "0", "model_name": "dummy-reparallelization-baseline"}
+{"time": 3.0, "event": "recover", "node_id": "0", "model_name": "dummy-reparallelization-baseline"}
+{"time": 5.0, "event": "dead", "node_id": "1", "model_name": "dummy-reparallelization-baseline"}

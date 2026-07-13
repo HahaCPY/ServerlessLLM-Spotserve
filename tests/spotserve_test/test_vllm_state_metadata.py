@@ -2,6 +2,12 @@ from sllm.backends.vllm_state_metadata import get_vllm_inference_state
 from sllm.spot.stateful_recovery import InferenceState
 
 
+class FakeKvTransferParams:
+    def __init__(self):
+        self.block_ids = [21, 22]
+        self.block_table = {"req-3": [21, 22]}
+
+
 def test_vllm_inference_state_exports_token_snapshot():
     state = get_vllm_inference_state(
         model_name="vllm-moe",
@@ -48,3 +54,20 @@ def test_vllm_inference_state_can_use_runtime_tokens():
     assert state["metadata"]["prompt_token_count"] == 2
     assert state["metadata"]["generated_token_count"] == 1
     assert state["metadata"]["kv_block_count"] == 3
+
+
+def test_vllm_inference_state_preserves_kv_transfer_metadata():
+    state = get_vllm_inference_state(
+        model_name="vllm-dense",
+        runtime_metadata={
+            "request_id": "req-3",
+            "prompt_tokens": [1],
+            "output_tokens": [2, 3],
+            "kv_transfer_params": FakeKvTransferParams(),
+        },
+    )
+
+    assert state["metadata"]["kv_block_count"] == 2
+    assert state["metadata"]["block_ids"] == [21, 22]
+    assert state["metadata"]["block_table"] == {"req-3": [21, 22]}
+    assert state["supports_restore"] is False

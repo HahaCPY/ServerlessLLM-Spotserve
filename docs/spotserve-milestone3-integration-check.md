@@ -133,6 +133,22 @@ Status:
 
 This is the correct integration state until true vLLM KV restore exists.
 
+## V7 KV Cache Warmup Check
+
+CPY router now has an opt-in cache warmup path for context migration:
+
+```text
+enable_context_migration = true
+enable_kv_cache_migration = true
+source get_current_tokens()
+-> target resume_kv_cache(request_datas=tokens)
+-> kv_cache_migration metrics in context_migration event
+```
+
+This validates the live control-plane path and target prefix/cache warmup. It is
+not true vLLM KV block restore; `supports_state_restore=false` still causes V8
+stateful recovery to use fallback behavior for real request restoration.
+
 Existing dummy benchmark validation:
 
 ```text

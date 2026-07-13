@@ -14,7 +14,7 @@
 #  see the license for the specific language governing permissions and         #
 #  limitations under the license.                                              #
 # ---------------------------------------------------------------------------- #
-from typing import Any, Dict, Mapping
+from typing import Any, Dict, Mapping, Optional
 
 
 def _non_negative_int(value: Any, default: int = 0) -> int:
@@ -32,6 +32,12 @@ def _int_mapping(value: Any) -> Dict[str, int]:
         str(key): _non_negative_int(raw_value)
         for key, raw_value in value.items()
     }
+
+
+def _runtime_value(payload: Any, key: str) -> Any:
+    if isinstance(payload, Mapping):
+        return payload.get(key)
+    return getattr(payload, key, None)
 
 
 def _token_count(runtime_metadata: Mapping[str, Any]) -> int:
@@ -52,6 +58,62 @@ def _token_count(runtime_metadata: Mapping[str, Any]) -> int:
     return 0
 
 
+def _sequence_len(value: Any) -> int:
+    if isinstance(value, (list, tuple, set)):
+        return len(value)
+    return 0
+
+
+def _block_table_count(value: Any) -> int:
+    if isinstance(value, Mapping):
+        total = 0
+        for child in value.values():
+            child_count = _block_table_count(child)
+            if child_count > 0:
+                total += child_count
+            elif child is not None:
+                total += 1
+        return total
+    if isinstance(value, (list, tuple, set)):
+        return len(value)
+    return 0
+
+
+def _explicit_block_count(payload: Any) -> int:
+    for key in ("context_blocks", "kv_block_count", "num_kv_blocks"):
+        value = _runtime_value(payload, key)
+        if value is not None:
+            parsed = _non_negative_int(value)
+            if parsed > 0:
+                return parsed
+
+    for key in ("block_ids", "kv_block_ids"):
+        count = _sequence_len(_runtime_value(payload, key))
+        if count > 0:
+            return count
+
+    count = _block_table_count(_runtime_value(payload, "block_table"))
+    if count > 0:
+        return count
+
+    return 0
+
+
+def context_block_count_from_runtime(
+    runtime_metadata: Mapping[str, Any],
+) -> int:
+    direct_count = _explicit_block_count(runtime_metadata)
+    if direct_count > 0:
+        return direct_count
+
+    kv_transfer_params: Optional[Any] = runtime_metadata.get(
+        "kv_transfer_params"
+    )
+    if kv_transfer_params is None:
+        return 0
+    return _explicit_block_count(kv_transfer_params)
+
+
 def get_vllm_context_metadata(
     model_name: str,
     instance_id: str,
@@ -65,9 +127,7 @@ def get_vllm_context_metadata(
         "model_name": model_name,
         "backend": "vllm",
         "num_tokens": _token_count(runtime_metadata),
-        "context_blocks": _non_negative_int(
-            runtime_metadata.get("context_blocks")
-        ),
+        "context_blocks": context_block_count_from_runtime(runtime_metadata),
         "reusable_tokens_by_target": _int_mapping(
             runtime_metadata.get("reusable_tokens_by_target")
         ),
