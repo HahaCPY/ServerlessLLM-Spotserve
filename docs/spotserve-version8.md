@@ -244,16 +244,42 @@ state_restored_tokens_total > 0
 
 ## vLLM Feasibility
 
-vLLM is not marked as true state-restore capable yet. Until 大鼻 provides real
-runtime hooks, vLLM should report:
+大鼻 backend-side 目前提供 vLLM state metadata 的保守第一版：
+
+```text
+sllm/backends/vllm_state_metadata.py
+Backend.supports_state_restore()
+Backend.export_inference_state()
+Backend.restore_inference_state()
+VllmBackend.supports_state_restore()
+VllmBackend.export_inference_state()
+VllmBackend.restore_inference_state()
+```
+
+vLLM is not marked as true state-restore capable yet. The backend explicitly
+reports:
 
 ```text
 supports_state_restore = false
 ```
 
-and CPY will fall back to token replay / retry.
+and CPY falls back to token replay / retry.
 
-大鼻 needs to confirm whether vLLM can safely expose:
+The current vLLM export payload is a token snapshot that CPY
+`InferenceState.from_dict()` can parse:
+
+```text
+state_kind = token_snapshot
+supports_restore = false
+metadata.cache_engine = vllm
+metadata.can_restore_same_node = false
+metadata.can_restore_cross_node = false
+metadata.reason = vllm_kv_restore_not_available
+```
+
+這個 hook 讓 CPY 有明確 fallback input，但不宣稱 true KV cache restore。若之後
+vLLM 可以安全 expose 下列資訊，才可以把 restore capability 從 false 改成
+true：
 
 - active request ids
 - prompt + generated token ids
@@ -273,4 +299,5 @@ Version 8 CPY side is complete when:
 - router tries state restore before fallback.
 - state recovery metrics are emitted and summarized.
 - recovery correctness benchmark includes the stateful policy.
-- vLLM feasibility is documented as backend handoff, not claimed complete.
+- vLLM backend reports explicit conservative state metadata without claiming
+  true KV restore.

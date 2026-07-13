@@ -150,12 +150,17 @@ max_num_gpus = 4
 大鼻主要碰這些檔案：
 
 ```text
+sllm/backends/capability.py
 sllm/backends/backend_utils.py
 sllm/backends/vllm_backend.py
 sllm/backends/vllm_capability.py
-sllm/backends/vllm_moe_capability.py
-examples/spotserve/config-vllm-moe-*.json
-docs/vllm_moe_config.md
+sllm/backends/vllm_context_metadata.py
+sllm/backends/vllm_state_metadata.py
+sllm/backends/vllm_runtime_metadata.py
+tests/spotserve_test/test_backend_capability.py
+tests/spotserve_test/test_vllm_context_metadata.py
+tests/spotserve_test/test_vllm_state_metadata.py
+tests/spotserve_test/test_vllm_runtime_metadata.py
 ```
 
 大鼻原則上不要改：
@@ -504,20 +509,22 @@ allowlist。也就是 config 看起來像 MoE 時，`supported_configs` 應該�
 - unit tests cover dense vLLM TP config, dense default TP behavior, and MoE allowlist.
 - no CPY router/scheduler/controller main-flow changes are required.
 
-## Open Questions For 大鼻
+## Current Backend Answers For 大鼻
 
-請大鼻確認以下問題，確認後再更新 capability：
+第一版 capability 已用保守方式回答：
 
-- vLLM dense 是否只支援 `tensor_parallel_size`，還是能明確表示 DP？
-- vLLM MoE expert parallel 目前已可用於 allowlist 中的 EP=2 config；是否能 expose 更細的 expert metadata 仍需確認。
-- vLLM MoE 是否還有更多可驗證 config，例如 `TP=4, DP=2` 或更大的 EP？
-- state export / state restore 是否有任何可用 hook？
-- `num_gpus` 應該以 ServerlessLLM top-level `num_gpus` 為準，還是以
-  `backend_config.tensor_parallel_size` 為準？
-- dynamic replan 時，backend 是否允許「線上改 TP」，還是必須重建 actor？
+- dense vLLM 只宣告目前設定中的 `tensor_parallel_size`，不宣告任意 DP / PP / EP。
+- MoE vLLM 只宣告已實測過的 allowlist；EP=2 只代表 allowlist 中的 config 可用。
+- state export / restore 不宣告 true KV restore；`supports_state_export = false`，
+  `supports_state_restore = false`。
+- dense `num_gpus` 取 `max(model_config.num_gpus, tensor_parallel_size)`，避免
+  top-level config 比 TP 小時產生不可執行 plan。
+- dynamic replan 不做線上改 TP；CPY 若選到新 plan，backend 應重建對應 actor。
 
-第一版可以全部保守回答。重點是先把 contract 接起來，讓 CPY planner 可以
-filter legal plans。
+Future work:
+
+- 若要新增 `TP=4, DP=2` 或更大的 EP，必須先用 vLLM/MoE 實測通過再加入 allowlist。
+- 若 vLLM 未來能 expose 更細的 expert / KV metadata，再擴充 capability metadata。
 
 ---
 
@@ -628,16 +635,53 @@ def get_vllm_context_metadata(
         "request_id": runtime_metadata.get("request_id"),
         "instance_id": instance_id,
         "node_id": node_id,
-        "num_tokens": runtime_metadata.get("num_tokens", 0),
-        "context_blocks": runtime_metadata.get("context_blocks", 0),
+        "model_name": model_name,
+        "backend": "vllm",
+        "num_tokens": _token_count(runtime_metadata),
+        "context_blocks": _non_negative_int(
+            runtime_metadata.get("context_blocks", 0)
+        ),
         "reusable_tokens_by_target": (
             runtime_metadata.get("reusable_tokens_by_target", {})
         ),
         "reusable_blocks_by_target": (
             runtime_metadata.get("reusable_blocks_by_target", {})
         ),
+        "supports_state_export": bool(
+            runtime_metadata.get("supports_state_export", False)
+        ),
+        "supports_state_restore": bool(
+            runtime_metadata.get("supports_state_restore", False)
+        ),
+        "metadata": dict(runtime_metadata.get("metadata", {}) or {}),
     }
 ```
+
+`token_count(runtime_metadata)` 的優先順序：
+
+```text
+1. runtime_metadata["num_tokens"]
+2. len(runtime_metadata["tokens"])
+3. len(runtime_metadata["prompt_tokens"]) + len(runtime_metadata["output_tokens"])
+4. 0
+```
+
+`ContextMetadata.from_dict()` 目前只消費 migration planner 需要的核心欄位：
+
+```text
+request_id
+instance_id
+node_id
+num_tokens
+context_blocks
+reusable_tokens_by_target
+reusable_blocks_by_target
+```
+
+`model_name`、`backend`、`supports_state_export`、`supports_state_restore`、
+`metadata` 是 backend payload 的補充欄位。這些欄位讓 CPY 或 debug/reporting
+可以知道資料來源和 state capability；即使 CPY V7 planner 暫時忽略，也應該由
+backend 保守填上。
 
 同時可以在 backend base class 補保守 hook：
 
@@ -655,7 +699,11 @@ metadata：
 
 ```text
 request_id = RequestOutput.request_id
+model_name = self.model_name
+backend = vllm
 num_tokens = len(prompt_token_ids + output_token_ids)
+metadata.prompt_token_count = len(prompt_token_ids)
+metadata.generated_token_count = len(output_token_ids)
 context_blocks = 0
 reusable_tokens_by_target = {}
 reusable_blocks_by_target = {}
@@ -788,26 +836,34 @@ target node_id
 
 CPY planner 會用 conservative default 估算。
 
-## V7 Backend Questions 大鼻需要確認
+## V7 Current Backend Answers
 
-- vLLM runtime 是否能列出目前 active request ids？
-- 每個 request 是否能拿到 prompt tokens + generated tokens？
-- 每個 request 是否能知道 KV cache block count？
-- block id / block table 是否能安全 expose？
-- 同 node restore 是否能 reuse GPU KV blocks？
-- cross node restore 是否只能 token replay？
-- vLLM 是否有 state export hook？
-- vLLM 是否有 state restore hook？
-- MoE request 是否需要 expert metadata 才能正確估 reuse？
+第一版 vLLM backend metadata 已採保守答案：
 
-如果答案是不確定，第一版請保守填：
+| Question | Current answer |
+| --- | --- |
+| vLLM runtime 是否能列出目前 active request ids？ | 可以。`VllmBackend.request_trace` 保留 active request id，並可透過 `return_all_request_ids()` / `return_all_results()` 讀取。注意：`trace_debug=false` 時 completed request 會被刪除，所以這裡只代表 ongoing request。 |
+| 每個 request 是否能拿到 prompt tokens + generated tokens？ | 可以拿到 token ids。`RequestOutput.prompt_token_ids` 提供 prompt tokens，`RequestOutput.outputs[0].token_ids` 提供目前 generated tokens。V7 metadata 會回報 `num_tokens`，並在 `metadata.prompt_token_count` / `metadata.generated_token_count` 保留數量。 |
+| 每個 request 是否能知道 KV cache block count？ | 目前不安全宣告。V7 第一版回 `context_blocks = 0`。 |
+| block id / block table 是否能安全 expose？ | 目前不安全宣告。V7 第一版不 expose block ids / block table。 |
+| 同 node restore 是否能 reuse GPU KV blocks？ | 目前不能宣告。沒有 true KV restore hook 前，same-node reuse 不標成可用。 |
+| cross node restore 是否只能 token replay？ | 是。第一版 cross-node 只支援 fallback token replay / retry，不做 KV transfer。 |
+| vLLM 是否有 state export hook？ | 有 backend-level token snapshot export：`VllmBackend.export_inference_state()`。但這不是 vLLM true KV export，所以 V7 context metadata 中 `supports_state_export = false`。 |
+| vLLM 是否有 state restore hook？ | 沒有 true KV restore。`VllmBackend.restore_inference_state()` 目前回 `restored = false`、`reason = vllm_kv_restore_not_available`。 |
+| MoE request 是否需要 expert metadata 才能正確估 reuse？ | 對目前 token-level estimated migration 不需要；若未來要估 KV/expert-level reuse，才需要 expert/routing metadata。 |
+
+目前保守輸出：
 
 ```text
 supports_state_export = false
 supports_state_restore = false
 context_blocks = 0
+reusable_tokens_by_target = {}
 reusable_blocks_by_target = {}
 ```
+
+Future work 是確認 vLLM 是否能安全 expose KV block table、same-node reuse、
+cross-node transfer，以及 MoE expert/routing metadata。
 
 ## V7 Definition Of Done For 大鼻
 
@@ -1027,17 +1083,20 @@ replay；不宣告真 KV restore。
 }
 ```
 
-## V8 Backend Questions 大鼻需要確認
+## V8 Current Backend Answers
 
-- vLLM 是否能列出 active request ids？
-- request 是否能對應到 prompt token ids + generated token ids？
-- request 是否能對應到 KV block table？
-- KV block ids expose 後是否安全，不會被 scheduler 改動後失效？
-- restore 是否只能 same node？
-- cross node restore 是否需要 serialize / transfer KV blocks？
-- restore 後 request id 要沿用舊 id，還是新 id binding old state？
-- preemption 發生時，state export 還有多少時間可以完成？
-- MoE 下 expert/routing state 是否也需要被保存？
+第一版 vLLM state hook 提供 token snapshot，不宣稱 true KV restore：
+
+- active request token snapshot 由 `get_current_tokens()` / `request_trace` 取得。
+- request token snapshot 可包含 prompt token ids + generated token ids。
+- KV block table / block ids 預設為空，metadata 標註
+  `vllm_kv_restore_not_available`。
+- same-node / cross-node restore 都回報不可用。
+- `restore_inference_state()` 回傳 `restored = false`，讓 CPY fallback。
+- MoE expert/routing state 尚未保存。
+
+Future work 是確認 vLLM 是否能提供穩定 KV block ownership、serialize / transfer
+KV blocks，以及 restore 後 request id binding 語意。
 
 ## V8 Definition Of Done For 大鼻
 
@@ -1247,14 +1306,19 @@ loading_cost = max(values)
 `scheduler_config.node_risk` 或 synthetic benchmark 提供；backend metadata
 主要先提供 loading cost 和 model resource profile。
 
-## V9 Backend Questions 大鼻需要確認
+## V9 Current Backend Answers
 
-- vLLM backend 是否能 expose model load time？
-- 每個 model / config 的 GPU memory requirement 是否可估？
-- backend 是否能回報目前 GPU usage / capacity？
-- node metadata 是否能攜帶 spot risk 或 remaining lifetime？
-- 如果沒有 cloud provider，是否用 static synthetic risk config？
-- MoE model loading cost 是否跟 dense model 不同，需要獨立 profile？
+第一版 vLLM runtime metadata 已提供：
+
+- `VllmBackend.init_backend()` 會記錄 model load time，作為 loading cost。
+- resource profile 會回報 TP / PP / DP、EP enabled flag、`max_model_len`、
+  `max_num_seqs`、`gpu_memory_utilization`。
+- GPU usage / free capacity、spot risk、remaining lifetime 若 runtime 沒提供，
+  就回 conservative defaults。
+- cloud provider risk predictor 不在 backend 實作；CPY benchmark 可用 synthetic
+  metadata。
+- MoE loading cost 目前不做獨立預估；若 runtime 提供實測 load time，profile 會
+  使用該值。
 
 ## V9 Definition Of Done For 大鼻
 

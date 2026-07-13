@@ -75,3 +75,24 @@ def test_vllm_context_metadata_counts_prompt_and_output_tokens():
     )
 
     assert metadata["num_tokens"] == 5
+
+
+def test_vllm_context_metadata_preserves_backend_metadata():
+    metadata = get_vllm_context_metadata(
+        model_name="vllm-dense",
+        instance_id="old-vllm-0",
+        node_id="node-0",
+        runtime_metadata={
+            "request_id": "req-3",
+            "tokens": [1, 2, 3],
+            "metadata": {
+                "prompt_token_count": 1,
+                "generated_token_count": 2,
+            },
+        },
+    )
+
+    assert metadata["metadata"] == {
+        "prompt_token_count": 1,
+        "generated_token_count": 2,
+    }

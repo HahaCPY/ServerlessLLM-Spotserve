@@ -356,7 +356,13 @@ class VllmBackend(SllmBackend):
                     node_id=node_id,
                     runtime_metadata={
                         "request_id": result.request_id,
+                        "prompt_tokens": prompt_tokens,
+                        "output_tokens": output_tokens,
                         "tokens": tokens,
+                        "metadata": {
+                            "prompt_token_count": len(prompt_tokens),
+                            "generated_token_count": len(output_tokens),
+                        },
                     },
                 )
             )

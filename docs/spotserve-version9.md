@@ -219,17 +219,29 @@ risk_scheduling_latest_decision
 ## Backend Handoff
 
 大鼻 does not need to implement the scheduler decision. Backend/runtime work is
-only to expose better metadata later:
+to expose conservative runtime metadata:
 
 ```text
-model loading cost
-GPU usage / free capacity
-model resource profile
-optional spot risk / lifetime estimate if available
+sllm/backends/vllm_runtime_metadata.py
+Backend.get_runtime_metadata()
+VllmBackend.get_runtime_metadata()
 ```
 
-If those fields are unavailable, CPY can still run with conservative defaults
-or synthetic metadata.
+The current vLLM metadata includes:
+
+```text
+model loading cost from VllmBackend.init_backend()
+model resource profile
+tensor / pipeline / data parallel sizes
+expert parallel enabled flag
+GPU usage / free capacity when supplied by runtime metadata
+optional spot risk / lifetime estimate when supplied by runtime metadata
+```
+
+If GPU free capacity, spot risk, or remaining lifetime are unavailable, the
+backend returns conservative defaults and CPY can still run with synthetic
+metadata. Bignose does not implement scheduler ranking or a real cloud risk
+predictor in backend code.
 
 The scheduler can now consume those backend fields directly from running backend
 actors when `enable_backend_runtime_metadata=true`.
@@ -244,4 +256,5 @@ Version 9 CPY side is complete when:
 - scheduler can opt into backend actor `get_runtime_metadata()` refresh.
 - health-only and risk-aware synthetic benchmark can be compared.
 - metrics/report fields expose selected risk and latest decision.
-- backend handoff is documented without claiming a real cloud risk predictor.
+- backend handoff exposes conservative vLLM runtime metadata without claiming
+  a real cloud risk predictor.

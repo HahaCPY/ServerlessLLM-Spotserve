@@ -12,7 +12,8 @@ context metadata
 ```
 
 This version does not implement true KV cache migration. It produces the
-mapping decision that a later backend/runtime implementation can execute.
+mapping decision and consumes conservative backend metadata; true KV transfer
+still requires a later vLLM/runtime implementation.
 
 ## Scope
 
@@ -286,20 +287,39 @@ claim real KV cache migration or serving latency improvement.
 
 ## Backend Handoff
 
-大鼻 needs to provide backend/runtime metadata later:
+大鼻 backend-side 提供 vLLM context metadata 的保守第一版：
 
 ```text
-active request ids
-instance id
-node id
-token count
-context block count
-reusable tokens / blocks per target
-state export support
-state restore support
+sllm/backends/vllm_context_metadata.py
+Backend.get_context_metadata()
+VllmBackend.get_context_metadata()
 ```
 
-The backend handoff is documented in:
+這個 hook 只回傳 CPY `ContextMetadata.from_dict()` 可讀的 payload，不做
+matching，也不決定要把 request 搬到哪個 target。CPY planner 仍然使用
+`sllm/spot/context_migration.py` 做 assignment。
+
+目前 vLLM 第一版 metadata 的語意是：
+
+```text
+request_id = RequestOutput.request_id when available
+instance_id = backend caller provided instance id
+node_id = backend caller provided node id
+num_tokens = prompt token count + generated token count when available
+context_blocks = 0 when vLLM KV block metadata is not safely exposed
+reusable_tokens_by_target = {} unless backend can prove target-specific reuse
+reusable_blocks_by_target = {} unless backend can prove target-specific reuse
+```
+
+因此 V7 backend 目前支援 token-level estimated migration input，但不宣稱 true
+KV cache migration、KV block transfer、或 production request resume。若之後
+vLLM 能安全 expose block table / KV cache metadata，只需要擴充這個 helper
+輸出的 `context_blocks` 和 reusable maps，CPY assignment algorithm 不需要改。
+
+Backend state export / restore capability 由後續 state metadata hook 明確回報；
+在 V7 context metadata 中，未知或未驗證的 KV restore 不會被假設為可用。
+
+完整 backend handoff 細節記在：
 
 ```text
 docs/Bignose-milestone3-backend-capability.md
@@ -325,3 +345,6 @@ Version 7 CPY side is complete when:
   context migration decision.
 - tests validate cost, assignment, target capacity, per-target warmup,
   unassigned contexts, live router planning, and metric shape.
+- Bignose backend hook can provide conservative vLLM `ContextMetadata` payloads
+  from active request traces without changing CPY router/scheduler/controller
+  main flow.
