@@ -666,6 +666,22 @@ def get_vllm_context_metadata(
 4. 0
 ```
 
+`context_blocks` 的優先順序：
+
+```text
+1. runtime_metadata["context_blocks"]
+2. runtime_metadata["kv_block_count"] / ["num_kv_blocks"]
+3. len(runtime_metadata["block_ids"] / ["kv_block_ids"])
+4. block count from runtime_metadata["block_table"]
+5. the same explicit fields under runtime_metadata["kv_transfer_params"]
+6. 0
+```
+
+也就是說，如果 vLLM runtime / scheduler / block manager 能透過
+`kv_transfer_params` 或其他明確欄位 expose block ids / block table，backend
+helper 會把它轉成 `context_blocks`。如果沒有明確 block metadata，仍然回 0，
+不使用 token count 假裝 KV block count。
+
 `ContextMetadata.from_dict()` 目前只消費 migration planner 需要的核心欄位：
 
 ```text
@@ -704,7 +720,9 @@ backend = vllm
 num_tokens = len(prompt_token_ids + output_token_ids)
 metadata.prompt_token_count = len(prompt_token_ids)
 metadata.generated_token_count = len(output_token_ids)
-context_blocks = 0
+metadata.num_cached_tokens = RequestOutput.num_cached_tokens
+metadata.kv_transfer_params_available = RequestOutput.kv_transfer_params is not None
+context_blocks = explicit KV block count if safely exposed, else 0
 reusable_tokens_by_target = {}
 reusable_blocks_by_target = {}
 supports_state_export = false
@@ -744,9 +762,8 @@ VllmBackend.get_context_metadata()
 CPY router 也已經能在 spot preemption / dead-node live path 中呼叫
 `get_context_metadata()`，並用 READY instances 自動建立 migration targets。
 
-但這只代表 V7 的 live planning path 已接上。若要把 V7 算作完整完成，並且
-讓 live metadata 真正取代 synthetic benchmark 裡的 rich context data，大鼻
-還需要補齊下列資料：
+但這只代表 V7 的 live planning path 已接上。若要讓 live metadata 真正取代
+synthetic benchmark 裡的 rich context data，大鼻需要提供或保守回答下列資料：
 
 ```text
 request_id: active request id, stable across export / restore / replay
@@ -758,18 +775,49 @@ supports_state_export: whether backend can export real request/KV state
 supports_state_restore: whether backend can restore real request/KV state
 ```
 
-其中最重要的是：
+目前大鼻可以提供 / 保守回答：
 
 ```text
-context_blocks
+request_id: yes, from RequestOutput.request_id for active requests
+num_tokens: yes, from prompt_token_ids + generated token_ids
+context_blocks: yes if explicit block metadata or kv_transfer_params is exposed,
+                otherwise conservative 0
+supports_state_export: false for true request/KV state
+supports_state_restore: false for true request/KV state
+```
+
+目前不能安全提供非空值的是 target-specific reuse：
+
+```text
 reusable_blocks_by_target
 reusable_tokens_by_target
 ```
 
-現在的保守 vLLM hook 主要能提供 token-level metadata。若
-`context_blocks = 0` 且 `reusable_* = {}`，CPY planner 可以跑，但 cost /
-reuse ratio 只能算保守估計，不能宣稱已經完成真正 low-cost KV context
-migration，也不能拿來公平比較「V7 比 naive 快多少」。
+原因是現在 live path 只把 source instance 資訊傳給 backend：
+
+```text
+CPY -> VllmBackend.get_context_metadata(instance_id, node_id)
+```
+
+backend 可以知道 source request 的 token / cache metadata，但不知道每個
+target instance/node 目前有哪些 prefix cache 或 KV blocks。因此現在合理輸出是：
+
+```text
+reusable_tokens_by_target = {}
+reusable_blocks_by_target = {}
+```
+
+若要填非空值，需要先有 target-specific 證據，例如 CPY 把 target list 傳給
+backend，或 backend/runtime 自己維護 prefix-cache / KV-transfer registry。
+在沒有這些資料前，不能把 `num_cached_tokens`、`context_blocks` 或 prefix
+length 直接填給所有 target。
+
+MoE 目前不需要 expert metadata 才能做 token-level planning；若未來要宣稱
+MoE KV/expert-level reuse，才需要補 expert routing / expert-parallel state。
+
+所以現在 CPY planner 可以跑，但 cost / reuse ratio 是保守估計；不能宣稱已經
+完成真正 low-cost KV context migration，也不能拿來公平比較「V7 比 naive 快
+多少」。
 
 大鼻不需要實作 matching algorithm，也不需要決定 target。大鼻只需要把上述
 metadata 從 vLLM runtime / scheduler / block manager 裡 expose 出來。CPY 會
@@ -844,8 +892,8 @@ CPY planner 會用 conservative default 估算。
 | --- | --- |
 | vLLM runtime 是否能列出目前 active request ids？ | 可以。`VllmBackend.request_trace` 保留 active request id，並可透過 `return_all_request_ids()` / `return_all_results()` 讀取。注意：`trace_debug=false` 時 completed request 會被刪除，所以這裡只代表 ongoing request。 |
 | 每個 request 是否能拿到 prompt tokens + generated tokens？ | 可以拿到 token ids。`RequestOutput.prompt_token_ids` 提供 prompt tokens，`RequestOutput.outputs[0].token_ids` 提供目前 generated tokens。V7 metadata 會回報 `num_tokens`，並在 `metadata.prompt_token_count` / `metadata.generated_token_count` 保留數量。 |
-| 每個 request 是否能知道 KV cache block count？ | 目前不安全宣告。V7 第一版回 `context_blocks = 0`。 |
-| block id / block table 是否能安全 expose？ | 目前不安全宣告。V7 第一版不 expose block ids / block table。 |
+| 每個 request 是否能知道 KV cache block count？ | 如果 vLLM `RequestOutput.kv_transfer_params` 或 runtime metadata 明確提供 `context_blocks` / `kv_block_count` / `block_ids` / `block_table`，helper 會回報 block count；否則保守回 `context_blocks = 0`。 |
+| block id / block table 是否能安全 expose？ | backend helper 可以讀取已提供的 block ids / block table 來計算 count，但 V7 context metadata 第一版不把 raw block table 交給 CPY planner。 |
 | 同 node restore 是否能 reuse GPU KV blocks？ | 目前不能宣告。沒有 true KV restore hook 前，same-node reuse 不標成可用。 |
 | cross node restore 是否只能 token replay？ | 是。第一版 cross-node 只支援 fallback token replay / retry，不做 KV transfer。 |
 | vLLM 是否有 state export hook？ | 有 backend-level token snapshot export：`VllmBackend.export_inference_state()`。但這不是 vLLM true KV export，所以 V7 context metadata 中 `supports_state_export = false`。 |
@@ -857,12 +905,12 @@ CPY planner 會用 conservative default 估算。
 ```text
 supports_state_export = false
 supports_state_restore = false
-context_blocks = 0
+context_blocks = explicit KV block count if safely exposed, else 0
 reusable_tokens_by_target = {}
 reusable_blocks_by_target = {}
 ```
 
-Future work 是確認 vLLM 是否能安全 expose KV block table、same-node reuse、
+Future work 是確認 vLLM 是否能安全 expose target-specific same-node reuse、
 cross-node transfer，以及 MoE expert/routing metadata。
 
 ## V7 Definition Of Done For 大鼻
