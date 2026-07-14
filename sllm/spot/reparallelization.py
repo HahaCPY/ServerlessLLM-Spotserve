@@ -319,7 +319,7 @@ def _supported_config_candidates(
                 expert_parallel_size=expert_parallel_size,
                 total_gpus=total_gpus,
                 unused_gpus=unused_gpus,
-                score=_candidate_score(
+                score=_candidate_score( #!! score
                     total_gpus=total_gpus,
                     data_parallel_size=data_parallel_size,
                     replica_gpus=replica_gpus,
