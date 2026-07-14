@@ -150,6 +150,10 @@ def runtime_metadata_from_request_output(
     return runtime_metadata
 
 
+async def _maybe_await(value: Any) -> Any:
+    return await value if inspect.isawaitable(value) else value
+
+
 class LLMEngineStatusDict:
     def __init__(self):
         self.status_dict: Dict[str, Union[RequestOutput, str]] = {}
@@ -243,6 +247,65 @@ class VllmBackend(SllmBackend):
 
         self.engine = None
         self.model_load_time_s = 0.0
+
+    def _runtime_hook(self, *names: str):
+        """Find an optional state-transfer hook exposed by the vLLM runtime.
+
+        Upstream vLLM does not currently have one stable public API for this.
+        Keeping the discovery here lets patched engines/connectors expose the
+        small CPY contract without depending on scheduler internals.
+        """
+        owners = [self.engine]
+        for attribute in ("engine_core", "engine", "_engine"):
+            owner = getattr(self.engine, attribute, None)
+            if owner is not None and owner not in owners:
+                owners.append(owner)
+        for owner in owners:
+            for name in names:
+                hook = getattr(owner, name, None)
+                if callable(hook):
+                    return hook
+        return None
+
+    async def _call_runtime_hook(self, names, **kwargs):
+        hook = self._runtime_hook(*names)
+        if hook is None:
+            return None
+        try:
+            signature = inspect.signature(hook)
+        except (TypeError, ValueError):
+            # Some RPC/proxy callables do not expose an inspectable signature.
+            call_kwargs = kwargs
+        else:
+            accepts_kwargs = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD
+                for p in signature.parameters.values()
+            )
+            call_kwargs = (
+                kwargs
+                if accepts_kwargs
+                else {
+                    k: v
+                    for k, v in kwargs.items()
+                    if k in signature.parameters
+                }
+            )
+        return await _maybe_await(hook(**call_kwargs))
+
+    async def _request_runtime_metadata(
+        self, result: RequestOutput
+    ) -> Dict[str, Any]:
+        metadata = runtime_metadata_from_request_output(result)
+        extra = await self._call_runtime_hook(
+            ("get_request_kv_metadata", "get_kv_cache_metadata"),
+            request_id=result.request_id,
+        )
+        if isinstance(extra, dict):
+            metadata.update(extra)
+        restore_supported = await self.supports_state_restore()
+        metadata["supports_state_export"] = restore_supported
+        metadata["supports_state_restore"] = restore_supported
+        return metadata
 
     async def init_backend(self) -> None:
         async with self.status_lock:
@@ -368,6 +431,33 @@ class VllmBackend(SllmBackend):
             if self.status != BackendStatus.RUNNING:
                 return []
 
+        all_metadata_hook = self._runtime_hook(
+            "get_all_request_kv_metadata"
+        )
+        if all_metadata_hook is not None:
+            try:
+                runtime_snapshots = await _maybe_await(all_metadata_hook())
+            except Exception:
+                logger.exception("Could not query active vLLM KV metadata")
+            else:
+                if isinstance(runtime_snapshots, list):
+                    restore_supported = await self.supports_state_restore()
+                    return [
+                        get_vllm_context_metadata(
+                            model_name=self.model_name,
+                            instance_id=instance_id or self.model_name,
+                            node_id=node_id,
+                            runtime_metadata={
+                                **snapshot,
+                                "supports_state_export": restore_supported,
+                                "supports_state_restore": restore_supported,
+                            },
+                        )
+                        for snapshot in runtime_snapshots
+                        if isinstance(snapshot, dict)
+                        and snapshot.get("found", True)
+                    ]
+
         results = await self.request_trace.return_all_results()
         ongoing_results: List[RequestOutput] = [
             result for result in results if isinstance(result, RequestOutput)
@@ -382,9 +472,7 @@ class VllmBackend(SllmBackend):
                     model_name=self.model_name,
                     instance_id=instance_id or self.model_name,
                     node_id=node_id,
-                    runtime_metadata=runtime_metadata_from_request_output(
-                        result
-                    ),
+                    runtime_metadata=await self._request_runtime_metadata(result),
                 )
             )
         return metadata
@@ -404,7 +492,24 @@ class VllmBackend(SllmBackend):
         await asyncio.gather(*tasks)
 
     async def supports_state_restore(self) -> bool:
-        return False
+        if self.engine is None:
+            return False
+        advertised = self._runtime_hook("supports_state_restore")
+        if advertised is not None:
+            try:
+                if not bool(await _maybe_await(advertised())):
+                    return False
+            except Exception:
+                logger.exception("vLLM state-restore capability probe failed")
+                return False
+        return (
+            self._runtime_hook("export_inference_state", "export_kv_cache_state")
+            is not None
+            and self._runtime_hook(
+                "restore_inference_state", "restore_kv_cache_state"
+            )
+            is not None
+        )
 
     async def export_inference_state(
         self,
@@ -421,31 +526,185 @@ class VllmBackend(SllmBackend):
                 continue
             if request_id is not None and result.request_id != request_id:
                 continue
-            runtime_metadata = runtime_metadata_from_request_output(result)
+            runtime_metadata = await self._request_runtime_metadata(result)
             break
+        if request_id is not None and not runtime_metadata:
+            live_metadata = await self._call_runtime_hook(
+                ("get_request_kv_metadata", "get_kv_cache_metadata"),
+                request_id=request_id,
+            )
+            if isinstance(live_metadata, dict) and live_metadata.get(
+                "found", True
+            ):
+                runtime_metadata = dict(live_metadata)
         if current_output is None:
             if runtime_metadata.get("tokens"):
                 current_output = [list(runtime_metadata["tokens"])]
             else:
                 current_output = await self.get_current_tokens()
-        return get_vllm_inference_state(
+        fallback = get_vllm_inference_state(
             model_name=self.model_name,
             request_data=request_data or {},
             current_output=current_output,
             completed_tokens=completed_tokens,
+            instance_id=str(request_data.get("instance_id", "")),
+            node_id=str(request_data.get("node_id", "")),
             runtime_metadata=runtime_metadata,
         )
+        if not await self.supports_state_restore():
+            return fallback
+
+        try:
+            exported = await self._call_runtime_hook(
+                ("export_inference_state", "export_kv_cache_state"),
+                request_id=request_id or runtime_metadata.get("request_id"),
+                request_data=request_data,
+                runtime_metadata=runtime_metadata,
+            )
+        except Exception:
+            logger.exception("vLLM KV state export failed")
+            exported = None
+        if (
+            not isinstance(exported, dict)
+            or exported.get("supports_restore") is not True
+            or not isinstance(exported.get("runtime_state"), dict)
+            or not exported["runtime_state"]
+        ):
+            fallback["metadata"]["reason"] = "vllm_kv_export_failed"
+            return fallback
+
+        state = dict(fallback)
+        state.update(exported)
+        state["backend"] = "vllm"
+        state["model_name"] = self.model_name
+        state["state_kind"] = exported.get("state_kind", "vllm_kv_snapshot")
+        state["supports_restore"] = True
+        state_metadata = dict(fallback["metadata"])
+        state_metadata.update(exported.get("metadata", {}) or {})
+        state_metadata.pop("reason", None)
+        state_metadata.setdefault("cache_engine", "vllm")
+        state_metadata.setdefault("can_restore_same_node", False)
+        state_metadata.setdefault("can_restore_cross_node", False)
+        config_metadata = {
+            "tensor_parallel_size": self.backend_config.get(
+                "tensor_parallel_size"
+            ),
+            "pipeline_parallel_size": self.backend_config.get(
+                "pipeline_parallel_size"
+            ),
+            "cache_block_size": self.backend_config.get("block_size"),
+            "cache_dtype": self.backend_config.get("kv_cache_dtype"),
+            "cache_layout": self.backend_config.get("kv_cache_layout"),
+        }
+        for key, value in config_metadata.items():
+            if value is not None:
+                state_metadata.setdefault(key, value)
+        state["metadata"] = state_metadata
+        return state
 
     async def restore_inference_state(
         self,
         state: Dict[str, Any],
         request_data: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        return {
-            "restored": False,
-            "reason": "vllm_kv_restore_not_available",
-            "state_kind": state.get("state_kind", "token_snapshot"),
+        state_kind = state.get("state_kind", "token_snapshot")
+        if (
+            not state.get("supports_restore")
+            or not isinstance(state.get("runtime_state"), dict)
+            or not state["runtime_state"]
+            or not await self.supports_state_restore()
+        ):
+            return {
+                "restored": False,
+                "reason": "vllm_kv_restore_not_available",
+                "state_kind": state_kind,
+            }
+        if (
+            state.get("backend") != "vllm"
+            or state.get("model_name") != self.model_name
+        ):
+            return {
+                "restored": False,
+                "reason": "incompatible_model",
+                "state_kind": state_kind,
+            }
+
+        request_data = request_data or {}
+        metadata = state.get("metadata", {}) or {}
+        source_node = state.get("node_id") or metadata.get("source_node_id")
+        target_node = request_data.get("node_id") or request_data.get(
+            "target_node_id"
+        )
+        if not source_node or not target_node:
+            return {
+                "restored": False,
+                "reason": "unknown_restore_scope",
+                "state_kind": state_kind,
+            }
+        cross_node = bool(
+            source_node and target_node and source_node != target_node
+        )
+        if cross_node and not metadata.get("can_restore_cross_node", False):
+            return {
+                "restored": False,
+                "reason": "cross_node_restore_unsupported",
+                "state_kind": state_kind,
+            }
+        if not cross_node and not metadata.get("can_restore_same_node", False):
+            return {
+                "restored": False,
+                "reason": "same_node_restore_unsupported",
+                "state_kind": state_kind,
+            }
+
+        compatibility_keys = {
+            "tensor_parallel_size": "tensor_parallel_size",
+            "pipeline_parallel_size": "pipeline_parallel_size",
+            "cache_block_size": "block_size",
+            "cache_dtype": "kv_cache_dtype",
+            "cache_layout": "kv_cache_layout",
         }
+        for state_key, config_key in compatibility_keys.items():
+            source_value = metadata.get(state_key)
+            target_value = self.backend_config.get(config_key)
+            if (
+                source_value is not None
+                and target_value is not None
+                and str(source_value) != str(target_value)
+            ):
+                return {
+                    "restored": False,
+                    "reason": "incompatible_cache_config",
+                    "state_kind": state_kind,
+                }
+
+        try:
+            restored = await self._call_runtime_hook(
+                ("restore_inference_state", "restore_kv_cache_state"),
+                state=state,
+                request_id=request_data.get("request_id")
+                or state.get("request_id"),
+                request_data=request_data,
+            )
+        except Exception:
+            logger.exception("vLLM KV state restore failed")
+            restored = None
+        if not isinstance(restored, dict):
+            restored = {"restored": bool(restored)}
+        restored.setdefault("state_kind", state_kind)
+        if restored.get("restored"):
+            restored.setdefault(
+                "recovered_tokens", state.get("completed_tokens", 0)
+            )
+            restored.setdefault(
+                "restored_blocks", metadata.get("kv_block_count", 0)
+            )
+            restored.setdefault(
+                "restore_scope", "cross_node" if cross_node else "same_node"
+            )
+        else:
+            restored.setdefault("reason", "vllm_kv_restore_failed")
+        return restored
 
     async def get_runtime_metadata(
         self,

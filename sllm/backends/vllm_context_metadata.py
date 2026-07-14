@@ -120,6 +120,43 @@ def get_vllm_context_metadata(
     node_id: str,
     runtime_metadata: Mapping[str, Any],
 ) -> Dict[str, Any]:
+    metadata = dict(runtime_metadata.get("metadata", {}) or {})
+    for key in (
+        "prompt_tokens",
+        "output_tokens",
+        "completed_tokens",
+        "request_status",
+        "sequence_id",
+        "sequence_group_id",
+        "sequence_ids",
+        "kv_block_count",
+        "allocated_kv_block_count",
+        "block_ids",
+        "kv_block_ids_by_group",
+        "raw_block_ids_by_group",
+        "null_block_mask_by_group",
+        "kv_block_count_by_group",
+        "block_table",
+        "cache_block_size",
+        "cache_dtype",
+        "configured_cache_dtype",
+        "cache_layout",
+        "cache_groups",
+        "cache_engine",
+        "engine_id",
+        "source_hostname",
+        "source_device_ids",
+        "worker_kv_metadata",
+        "model_revision",
+        "tensor_parallel_size",
+        "pipeline_parallel_size",
+        "kv_connector",
+        "runtime_epoch",
+        "vllm_version",
+        "cache_config_fingerprint",
+    ):
+        if key in runtime_metadata:
+            metadata[key] = runtime_metadata[key]
     return {
         "request_id": runtime_metadata.get("request_id"),
         "instance_id": instance_id,
@@ -140,5 +177,5 @@ def get_vllm_context_metadata(
         "supports_state_restore": bool(
             runtime_metadata.get("supports_state_restore", False)
         ),
-        "metadata": dict(runtime_metadata.get("metadata", {}) or {}),
+        "metadata": metadata,
     }

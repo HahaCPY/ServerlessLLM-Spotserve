@@ -25,6 +25,7 @@ class InferenceState:
     state_kind: str = "token_snapshot"
     supports_restore: bool = False
     metadata: Dict[str, Any] = field(default_factory=dict)
+    runtime_state: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "InferenceState":
@@ -43,6 +44,7 @@ class InferenceState:
             state_kind=str(payload.get("state_kind", "token_snapshot")),
             supports_restore=bool(payload.get("supports_restore", False)),
             metadata=dict(payload.get("metadata", {}) or {}),
+            runtime_state=dict(payload.get("runtime_state", {}) or {}),
         )
 
     @classmethod
@@ -58,6 +60,7 @@ class InferenceState:
         state_kind: str = "token_snapshot",
         supports_restore: bool = False,
         metadata: Optional[Mapping[str, Any]] = None,
+        runtime_state: Optional[Mapping[str, Any]] = None,
     ) -> "InferenceState":
         return cls(
             request_id=request_id,
@@ -74,6 +77,7 @@ class InferenceState:
             state_kind=state_kind,
             supports_restore=supports_restore,
             metadata=dict(metadata or {}),
+            runtime_state=dict(runtime_state or {}),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -88,6 +92,7 @@ class InferenceState:
             "state_kind": self.state_kind,
             "supports_restore": self.supports_restore,
             "metadata": dict(self.metadata),
+            "runtime_state": dict(self.runtime_state),
         }
 
 

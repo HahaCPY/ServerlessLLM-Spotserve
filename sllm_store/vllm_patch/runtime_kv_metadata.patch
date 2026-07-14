@@ -1,0 +1,248 @@
+--- a/vllm/v1/engine/async_llm.py
++++ b/vllm/v1/engine/async_llm.py
+@@ -257,6 +257,44 @@
+     async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
+         return await self.engine_core.get_supported_tasks_async()
+ 
++    async def get_request_kv_metadata(self, request_id: str) -> dict[str, Any]:
++        """Get a point-in-time KV metadata snapshot from EngineCore."""
++        child_ids = sorted(
++            req_id
++            for req_id in self.output_processor.request_states
++            if req_id.endswith(f"_{request_id}")
++            and req_id[: -len(request_id) - 1].isdigit()
++        )
++        if child_ids:
++            return {
++                "request_id": request_id,
++                "found": False,
++                "reason": "parallel_sampling_metadata_not_supported",
++                "sequence_ids": child_ids,
++            }
++        engine_core = self.engine_core
++        request_engine = getattr(engine_core, "reqs_in_flight", {}).get(
++            request_id
++        )
++        if request_engine is not None:
++            return await engine_core._call_utility_async(
++                "get_request_kv_metadata",
++                request_id,
++                engine=request_engine,
++            )
++        return await engine_core.call_utility_async(
++            "get_request_kv_metadata", request_id
++        )
++
++    async def get_all_request_kv_metadata(self) -> list[dict[str, Any]]:
++        """Get live KV metadata for all requests known to this frontend."""
++        request_ids = list(self.output_processor.request_states)
++        if not request_ids:
++            return []
++        return await asyncio.gather(
++            *(self.get_request_kv_metadata(req_id) for req_id in request_ids)
++        )
++
+     async def add_request(
+         self,
+         request_id: str,
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -3,6 +3,7 @@
+ import os
+ import queue
+ import signal
++import socket
+ import threading
+ import time
+ from collections import deque
+@@ -113,6 +114,9 @@
+         vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks
+         vllm_config.cache_config.num_cpu_blocks = num_cpu_blocks
+         self.collective_rpc("initialize_cache", args=(num_gpu_blocks, num_cpu_blocks))
++        self.worker_kv_metadata = self.model_executor.collective_rpc(
++            "get_kv_runtime_metadata"
++        )
+ 
+         self.structured_output_manager = StructuredOutputManager(vllm_config)
+ 
+@@ -506,6 +510,150 @@
+     def pin_lora(self, lora_id: int) -> bool:
+         return self.model_executor.pin_lora(lora_id)
+ 
++    def get_kv_cache_group_metadata(self) -> list[dict[str, Any]]:
++        """Return initialized metadata for scheduler KV cache groups."""
++        kv_cache_config = getattr(self.scheduler, "kv_cache_config", None)
++        if kv_cache_config is None:
++            return []
++        return [
++            {
++                "group_idx": group_idx,
++                "kind": type(group.kv_cache_spec).__name__,
++                "block_size": group.kv_cache_spec.block_size,
++                "dtype": str(getattr(group.kv_cache_spec, "dtype", "unknown")),
++                "sliding_window": getattr(
++                    group.kv_cache_spec, "sliding_window", None
++                ),
++            }
++            for group_idx, group in enumerate(kv_cache_config.kv_cache_groups)
++        ]
++
++    def get_request_kv_metadata(self, request_id: str) -> dict[str, Any]:
++        """Return a point-in-time KV metadata snapshot for an active request."""
++        requests = getattr(self.scheduler, "requests", {})
++        request = requests.get(request_id)
++        if request is None:
++            return {
++                "request_id": request_id,
++                "found": False,
++                "reason": "request_not_active",
++            }
++
++        manager = getattr(self.scheduler, "kv_cache_manager", None)
++        raw_block_ids_by_group: list[list[int]] = []
++        null_block_mask_by_group: list[list[bool]] = []
++        block_ids_by_group: list[list[int]] = []
++        if manager is not None:
++            blocks = manager.get_blocks(request_id).blocks
++            raw_block_ids_by_group = [
++                [block.block_id for block in group] for group in blocks
++            ]
++            null_block_mask_by_group = [
++                [block.is_null for block in group] for group in blocks
++            ]
++            block_ids_by_group = [
++                [block.block_id for block in group if not block.is_null]
++                for group in blocks
++            ]
++        block_ids = [
++            block_id for group in block_ids_by_group for block_id in group
++        ]
++        block_table = {
++            f"group_{group_idx}": group
++            for group_idx, group in enumerate(raw_block_ids_by_group)
++        }
++
++        cache_groups = self.get_kv_cache_group_metadata()
++        block_sizes = {
++            group["block_size"]
++            for group in cache_groups
++            if group["block_size"] is not None
++        }
++        dtypes = {
++            group["dtype"]
++            for group in cache_groups
++            if group["dtype"] is not None
++        }
++        worker_metadata = self.worker_kv_metadata
++        layouts = {
++            worker["cache_layout"]
++            for worker in worker_metadata
++            if worker.get("cache_layout") is not None
++        }
++        source_device_ids = sorted(
++            {
++                device_id
++                for worker in worker_metadata
++                for device_id in worker.get("physical_device_ids", [])
++            }
++        )
++
++        config = self.vllm_config
++        model_config = config.model_config
++        parallel_config = config.parallel_config
++        cache_config = config.cache_config
++        transfer_config = config.kv_transfer_config
++        connector = getattr(self.scheduler, "connector", None)
++        return {
++            "request_id": request_id,
++            "found": True,
++            "prompt_tokens": list(request.prompt_token_ids or []),
++            "output_tokens": list(request.output_token_ids),
++            "tokens": list(request.all_token_ids),
++            "completed_tokens": request.num_computed_tokens,
++            "request_status": request.status.name,
++            "sequence_id": request_id,
++            "sequence_group_id": request_id,
++            "kv_block_count": max(map(len, block_ids_by_group), default=0),
++            "allocated_kv_block_count": len(block_ids),
++            "block_ids": block_ids,
++            "kv_block_ids_by_group": block_ids_by_group,
++            "raw_block_ids_by_group": raw_block_ids_by_group,
++            "null_block_mask_by_group": null_block_mask_by_group,
++            "kv_block_count_by_group": list(map(len, block_ids_by_group)),
++            "block_table": block_table,
++            "cache_block_size": (
++                next(iter(block_sizes)) if len(block_sizes) == 1 else None
++            ),
++            "cache_dtype": next(iter(dtypes)) if len(dtypes) == 1 else None,
++            "configured_cache_dtype": str(cache_config.cache_dtype),
++            "cache_layout": (
++                next(iter(layouts)) if len(layouts) == 1 else None
++            ),
++            "cache_groups": cache_groups,
++            "cache_engine": "vllm_v1",
++            "engine_id": (
++                transfer_config.engine_id
++                if transfer_config is not None
++                else getattr(config, "instance_id", "")
++            ),
++            "source_hostname": socket.gethostname(),
++            "source_device_ids": source_device_ids,
++            "worker_kv_metadata": worker_metadata,
++            "model_name": model_config.model,
++            "model_revision": model_config.revision,
++            "tensor_parallel_size": parallel_config.tensor_parallel_size,
++            "pipeline_parallel_size": parallel_config.pipeline_parallel_size,
++            "kv_connector": (
++                type(connector).__name__ if connector is not None else None
++            ),
++            "kv_transfer_params": request.kv_transfer_params,
++            "reusable_tokens_by_target": {},
++            "reusable_blocks_by_target": {},
++            "can_restore_same_node": False,
++            "can_restore_cross_node": False,
++            "supports_state_export": False,
++            "supports_state_restore": False,
++        }
++
++    def get_all_request_kv_metadata(self) -> list[dict[str, Any]]:
++        """Return point-in-time KV metadata for every active request."""
++        requests = getattr(self.scheduler, "requests", {})
++        return [
++            self.get_request_kv_metadata(request_id)
++            for request_id in list(requests)
++        ]
++
+     def save_sharded_state(
+         self,
+         path: str,
+--- a/vllm/v1/worker/worker_base.py
++++ b/vllm/v1/worker/worker_base.py
+@@ -88,6 +88,27 @@
+         """Get specifications for KV cache implementation."""
+         raise NotImplementedError
+ 
++    def get_kv_runtime_metadata(self) -> dict[str, Any]:
++        """Return KV properties that are fixed for this worker lifetime."""
++        from vllm.v1.attention.backends.utils import get_kv_cache_layout
++
++        with set_current_vllm_config(self.vllm_config):
++            cache_layout = get_kv_cache_layout()
++        return {
++            "rank": self.rank,
++            "local_rank": self.local_rank,
++            "device": str(self.device) if self.device is not None else None,
++            "cache_layout": cache_layout,
++            "physical_device_ids": list(
++                getattr(
++                    self.parallel_config,
++                    "assigned_physical_gpu_ids",
++                    None,
++                )
++                or []
++            ),
++        }
++
+     def compile_or_warm_up_model(self) -> None:
+         """Prepare model for execution through compilation/warmup."""
+         raise NotImplementedError

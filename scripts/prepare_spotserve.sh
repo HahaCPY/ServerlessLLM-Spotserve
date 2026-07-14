@@ -98,6 +98,7 @@ VLLM_MOE_MODEL_PATH="${SPOTSERVE_VLLM_MOE_MODEL_PATH:-}"
 HEAD_PYTHON="/opt/venvs/head/bin/python"
 HEAD_SLLM="/opt/venvs/head/bin/sllm"
 HEAD_RAY="/opt/venvs/head/bin/ray"
+WORKER_PYTHON="/opt/venvs/worker/bin/python"
 
 MODEL_FOLDER="${MODEL_FOLDER:-${ROOT_DIR}/model}"
 export MODEL_FOLDER
@@ -124,6 +125,7 @@ cd "$ROOT_DIR"
 mkdir -p "$HOST_TMPDIR"
 RAY_STATUS_LOG="${HOST_TMPDIR}/spotserve-ray-status.log"
 VLLM_RESOURCES_LOG="${HOST_TMPDIR}/spotserve-vllm-resources.log"
+VLLM_RUNTIME_LOG="${HOST_TMPDIR}/spotserve-vllm-runtime.log"
 HEALTH_LOG="${HOST_TMPDIR}/spotserve-health.log"
 
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
@@ -154,6 +156,28 @@ done
 
 if [[ "$DEPLOY_SET" == "vllm-dense" || "$DEPLOY_SET" == "vllm-moe" || "$DEPLOY_SET" == "vllm-blackbox" || "$DEPLOY_SET" == "all" ]]; then
   log "Checking vLLM worker resources"
+  if ! podman exec -i "$WORKER_CONTAINER" "$WORKER_PYTHON" - >"$VLLM_RUNTIME_LOG" 2>&1 <<'PY'
+import inspect
+from importlib.metadata import version
+
+from vllm import AsyncLLMEngine
+
+required_hooks = (
+    "get_request_kv_metadata",
+    "get_all_request_kv_metadata",
+)
+missing = [name for name in required_hooks if not hasattr(AsyncLLMEngine, name)]
+print("vLLM version:", version("vllm"))
+print("AsyncLLMEngine module:", inspect.getfile(AsyncLLMEngine))
+print("runtime metadata hooks:", {name: name not in missing for name in required_hooks})
+if missing:
+    raise SystemExit(f"Missing patched vLLM runtime hooks: {missing}")
+PY
+  then
+    cat "$VLLM_RUNTIME_LOG" >&2 || true
+    exit 1
+  fi
+  cat "$VLLM_RUNTIME_LOG"
   if [[ -n "$VLLM_DENSE_MODEL_PATH" ]]; then
     for attempt in $(seq 1 90); do
       if podman exec "$WORKER_CONTAINER" test -f "${VLLM_DENSE_MODEL_PATH}/config.json"; then

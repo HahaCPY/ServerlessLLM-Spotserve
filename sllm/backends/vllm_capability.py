@@ -171,7 +171,6 @@ def get_vllm_capability(
     supports_ep = any(
         config.expert_parallel_size > 1 for config in supported_configs
     )
-
     return BackendCapability(
         backend="vllm",
         model_name=model_name,

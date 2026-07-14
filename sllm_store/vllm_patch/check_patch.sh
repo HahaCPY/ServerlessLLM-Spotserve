@@ -19,11 +19,10 @@
 set -e
 
 SCRIPT_DIR=$(cd "$(dirname "$0")"; pwd)
-PATCH_FILE="$SCRIPT_DIR/sllm_load.patch"
-if [ ! -f "$PATCH_FILE" ]; then
-    echo "File does not exist: $PATCH_FILE"
-    exit 1
-fi
+PATCH_FILES=(
+    "$SCRIPT_DIR/sllm_load.patch"
+    "$SCRIPT_DIR/runtime_kv_metadata.patch"
+)
 
 VLLM_PATH_OUTPUT=$(python -c "import vllm; import os; print(os.path.dirname(os.path.abspath(vllm.__file__)))" 2>/dev/null)
 VLLM_PATH=$(echo "$VLLM_PATH_OUTPUT" | tail -n 1)
@@ -37,8 +36,17 @@ if [ ! -d "$VLLM_PATH" ]; then
     exit 1
 fi
 
-if patch -p2 --dry-run -d $VLLM_PATH < $PATCH_FILE > /dev/null 2>&1; then
-  echo "vLLM patch is not applied"
-else
-  echo "vLLM patch has been applied"
-fi
+for PATCH_FILE in "${PATCH_FILES[@]}"; do
+    if [ ! -f "$PATCH_FILE" ]; then
+        echo "File does not exist: $PATCH_FILE"
+        exit 1
+    fi
+    if patch -p2 --dry-run -d "$VLLM_PATH" < "$PATCH_FILE" > /dev/null 2>&1; then
+        echo "$(basename "$PATCH_FILE") is not applied"
+    elif patch -R -p2 --dry-run -d "$VLLM_PATH" < "$PATCH_FILE" > /dev/null 2>&1; then
+        echo "$(basename "$PATCH_FILE") has been applied"
+    else
+        echo "$(basename "$PATCH_FILE") is incompatible with the installed vLLM"
+        exit 1
+    fi
+done

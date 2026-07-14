@@ -19,13 +19,17 @@
 set -e
 
 SCRIPT_DIR=$(cd "$(dirname "$0")"; pwd)
-PATCH_FILE="$SCRIPT_DIR/sllm_load.patch"
+PATCH_FILES=(
+    "$SCRIPT_DIR/sllm_load.patch"
+    "$SCRIPT_DIR/runtime_kv_metadata.patch"
+)
 
-# Check if the patch file exists
-if [ ! -f "$PATCH_FILE" ]; then
-    echo "File does not exist: $PATCH_FILE"
-    exit 1
-fi
+for PATCH_FILE in "${PATCH_FILES[@]}"; do
+    if [ ! -f "$PATCH_FILE" ]; then
+        echo "File does not exist: $PATCH_FILE"
+        exit 1
+    fi
+done
 
 # Get the vLLM installation path
 VLLM_PATH_OUTPUT=$(python -c "import vllm; import os; print(os.path.dirname(os.path.abspath(vllm.__file__)))" 2>/dev/null)
@@ -40,12 +44,15 @@ if [ ! -d "$VLLM_PATH" ]; then
     exit 1
 fi
 
-# Attempt a dry run of the patch to check if it's already applied
-if patch -p2 --dry-run -d "$VLLM_PATH" < "$PATCH_FILE"; then
-    echo "vLLM patch is not applied. Applying the patch now..."
-    # Apply the patch
-    patch -p2 -d "$VLLM_PATH" < "$PATCH_FILE"
-    echo "Patch applied successfully."
-else
-    echo "vLLM patch has already been applied. Skipping..."
-fi
+for PATCH_FILE in "${PATCH_FILES[@]}"; do
+    if patch -p2 --dry-run -d "$VLLM_PATH" < "$PATCH_FILE"; then
+        echo "Applying $(basename "$PATCH_FILE")..."
+        patch -p2 -d "$VLLM_PATH" < "$PATCH_FILE"
+        echo "Patch applied successfully."
+    elif patch -R -p2 --dry-run -d "$VLLM_PATH" < "$PATCH_FILE" > /dev/null 2>&1; then
+        echo "$(basename "$PATCH_FILE") is already applied. Skipping..."
+    else
+        echo "$(basename "$PATCH_FILE") is incompatible with the installed vLLM." >&2
+        exit 1
+    fi
+done

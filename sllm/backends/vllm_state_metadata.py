@@ -69,6 +69,17 @@ def _runtime_dict(runtime_metadata: Mapping[str, Any], key: str) -> Dict[str, An
     return {}
 
 
+def _optional_runtime_metadata(
+    runtime_metadata: Mapping[str, Any], *keys: str
+) -> Dict[str, Any]:
+    metadata: Dict[str, Any] = {}
+    for key in keys:
+        value = _runtime_or_kv_value(runtime_metadata, key)
+        if value is not None:
+            metadata[key] = value
+    return metadata
+
+
 def get_vllm_inference_state(
     model_name: str,
     request_data: Optional[Mapping[str, Any]] = None,
@@ -122,5 +133,33 @@ def get_vllm_inference_state(
             "can_restore_same_node": False,
             "can_restore_cross_node": False,
             "reason": "vllm_kv_restore_not_available",
+            **_optional_runtime_metadata(
+                runtime_metadata,
+                "cache_block_size",
+                "cache_dtype",
+                "configured_cache_dtype",
+                "cache_layout",
+                "cache_groups",
+                "engine_id",
+                "source_node_id",
+                "source_hostname",
+                "source_device_ids",
+                "worker_kv_metadata",
+                "sequence_id",
+                "sequence_group_id",
+                "sequence_ids",
+                "request_status",
+                "allocated_kv_block_count",
+                "raw_block_ids_by_group",
+                "null_block_mask_by_group",
+                "kv_block_count_by_group",
+                "tensor_parallel_size",
+                "pipeline_parallel_size",
+                "model_revision",
+                "kv_connector",
+                "runtime_epoch",
+                "vllm_version",
+                "cache_config_fingerprint",
+            ),
         },
     }

@@ -484,8 +484,10 @@ class RoundRobinRouter(SllmRouter):
             return None
 
         payload = dict(payload)
-        payload.setdefault("instance_id", instance.instance_id)
-        payload.setdefault("node_id", instance.node_id or "")
+        if not payload.get("instance_id"):
+            payload["instance_id"] = instance.instance_id
+        if not payload.get("node_id"):
+            payload["node_id"] = instance.node_id or ""
         payload.setdefault("backend", self.backend)
         payload.setdefault("model_name", self.model_name)
 
@@ -1014,11 +1016,14 @@ class RoundRobinRouter(SllmRouter):
         if instance.backend_instance is None:
             return False
         try:
+            restore_request_data = dict(request_data)
+            restore_request_data["target_instance_id"] = instance.instance_id
+            restore_request_data["target_node_id"] = instance.node_id or ""
             result = await self._call_backend_method(
                 instance.backend_instance,
                 "restore_inference_state",
                 state=state.to_dict(),
-                request_data=request_data,
+                request_data=restore_request_data,
             )
         except Exception as e:
             logger.info(

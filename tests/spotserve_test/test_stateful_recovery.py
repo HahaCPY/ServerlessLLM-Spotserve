@@ -85,6 +85,25 @@ def test_state_recovery_metric_contains_restore_summary():
     assert event["fallback_used"] is False
 
 
+def test_inference_state_preserves_runtime_restore_payload():
+    state = InferenceState.from_dict(
+        {
+            "request_id": "req-stateful",
+            "tokens": [1, 2],
+            "supports_restore": True,
+            "runtime_state": {
+                "snapshot_handle": "snapshot-1",
+                "expires_at": 123,
+            },
+        }
+    )
+
+    assert state.to_dict()["runtime_state"] == {
+        "snapshot_handle": "snapshot-1",
+        "expires_at": 123,
+    }
+
+
 @pytest.mark.asyncio
 async def test_dummy_backend_exports_and_restores_inference_state():
     source = DummyBackend("dummy-stateful", {})

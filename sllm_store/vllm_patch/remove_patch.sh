@@ -19,11 +19,10 @@
 set -e
 
 SCRIPT_DIR=$(cd "$(dirname "$0")"; pwd)
-PATCH_FILE="$SCRIPT_DIR/sllm_load.patch"
-if [ ! -f "$PATCH_FILE" ]; then
-    echo "File does not exist: $PATCH_FILE"
-    exit 1
-fi
+PATCH_FILES=(
+    "$SCRIPT_DIR/runtime_kv_metadata.patch"
+    "$SCRIPT_DIR/sllm_load.patch"
+)
 
 VLLM_PATH_OUTPUT=$(python -c "import vllm; import os; print(os.path.dirname(os.path.abspath(vllm.__file__)))" 2>/dev/null)
 VLLM_PATH=$(echo "$VLLM_PATH_OUTPUT" | tail -n 1)
@@ -37,4 +36,10 @@ if [ ! -d "$VLLM_PATH" ]; then
     exit 1
 fi
 
-patch -p2 -d $VLLM_PATH -R < $PATCH_FILE
+for PATCH_FILE in "${PATCH_FILES[@]}"; do
+    if [ ! -f "$PATCH_FILE" ]; then
+        echo "File does not exist: $PATCH_FILE"
+        exit 1
+    fi
+    patch -p2 -d "$VLLM_PATH" -R < "$PATCH_FILE"
+done
