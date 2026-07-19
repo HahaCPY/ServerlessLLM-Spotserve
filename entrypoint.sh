@@ -30,6 +30,19 @@ DEFAULT_STORAGE_PATH="/models"
 activate_venv() {
   local venv_path="$1"
   if [ ! -f "$venv_path/bin/activate" ]; then
+    # The published ServerlessLLM image uses named conda environments while
+    # the current Dockerfile creates lightweight venvs.  Keep the entrypoint
+    # usable for both image layouts so deployment smoke checks exercise the
+    # same startup path as the production image.
+    local env_name
+    env_name="${venv_path##*/}"
+    if [ -f /opt/conda/etc/profile.d/conda.sh ] &&
+        [ -d "/opt/conda/envs/${env_name}" ]; then
+      # shellcheck disable=SC1091
+      source /opt/conda/etc/profile.d/conda.sh
+      conda activate "${env_name}"
+      return
+    fi
     echo "Virtual environment not found: $venv_path"
     exit 1
   fi

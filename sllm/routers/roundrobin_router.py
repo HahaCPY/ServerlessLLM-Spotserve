@@ -22,6 +22,7 @@ import logging
 import os
 import time
 import uuid
+from dataclasses import replace
 from typing import Any, Dict, List, Optional, Tuple
 
 import ray
@@ -45,8 +46,14 @@ from sllm.spot.context_migration import (
 from sllm.spot.recovery_policy import RecoveryPolicy, normalize_policy
 from sllm.spot.reparallelization import (
     READY,
+    ParallelPlan,
     apply_spot_event_to_worker_nodes,
     plan_dynamic_reparallelization,
+)
+from sllm.spot.reparallelization_executor import ReparallelizationExecutor
+from sllm.spot.vllm_deployment_adapter import (
+    VllmDeployment,
+    VllmDeploymentAdapter,
 )
 from sllm.spot.stateful_recovery import (
     InferenceState,
@@ -135,6 +142,10 @@ class RoundRobinRouter(SllmRouter):
             str(node_id): dict(node_info)
             for node_id, node_info in synthetic_worker_nodes.items()
         }
+        self.vllm_deployment_adapter: Optional[VllmDeploymentAdapter] = None
+        self.reparallelization_executor: Optional[
+            ReparallelizationExecutor
+        ] = None
         metrics_path = router_config.get("metrics_path") or os.getenv(
             "SLLM_SPOT_METRICS_PATH"
         )
@@ -208,6 +219,76 @@ class RoundRobinRouter(SllmRouter):
         async with self.running_lock:
             self.running = True
         logger.info(f"Started handler for model {self.model_name}")
+
+    def _ensure_vllm_reparallelization_adapter(self) -> bool:
+        """Wire V6 planning to real vLLM actors when enabled.
+
+        Dummy and transformer routers continue to use the planner as a
+        decision-only path.  vLLM gets the concrete Ray actor deployment
+        adapter, so a selected ``ParallelPlan`` is executable rather than only
+        a metric artifact.
+        """
+        if self.backend != "vllm" or not self.enable_reparallelization:
+            return False
+        if self.vllm_deployment_adapter is not None:
+            return True
+        scheduler = getattr(self, "model_loading_scheduler", None)
+        if scheduler is None:
+            logger.warning(
+                "Cannot enable vLLM re-parallelization before scheduler start"
+            )
+            return False
+        self.vllm_deployment_adapter = VllmDeploymentAdapter(
+            model_name=self.model_name,
+            backend_config=self.backend_config,
+            resource_requirements=self.resource_requirements,
+            scheduler=scheduler,
+            traffic_switcher=self._switch_vllm_deployment,
+            max_queue_length=max(
+                1, int(self.auto_scaling_config.get("target", 1) or 1)
+            ),
+            drain_timeout_s=float(
+                self.reparallelization_config.get("drain_timeout_s", 30.0)
+                or 30.0
+            ),
+        )
+        self.reparallelization_executor = ReparallelizationExecutor(
+            self.vllm_deployment_adapter.create_workers,
+            self.vllm_deployment_adapter.ready_workers,
+            self.vllm_deployment_adapter.switch_workers,
+            self.vllm_deployment_adapter.drain_workers,
+            self.vllm_deployment_adapter.stop_workers,
+        )
+        return True
+
+    async def _switch_vllm_deployment(
+        self, deployment: VllmDeployment, plan: ParallelPlan
+    ):
+        """Atomically make the newly initialised actors serve traffic."""
+        if deployment.plan != plan:
+            raise ValueError("vLLM deployment plan mismatch during switch")
+        async with self.instance_management_lock:
+            self.ready_inference_instances = dict(deployment.instances)
+            self.backend_config = dict(deployment.backend_config)
+            self.resource_requirements = dict(deployment.resource_requirements)
+            self.vllm_deployment_adapter.backend_config = dict(
+                deployment.backend_config
+            )
+            self.vllm_deployment_adapter.resource_requirements = dict(
+                deployment.resource_requirements
+            )
+        return {
+            "status": "switched",
+            "instance_ids": sorted(deployment.instances),
+            "parallel_plan": plan.to_dict(),
+        }
+
+    def _vllm_active_deployment(self) -> Optional[VllmDeployment]:
+        if self.vllm_deployment_adapter is None:
+            return None
+        return self.vllm_deployment_adapter.snapshot(
+            self.ready_inference_instances
+        )
 
     async def update(
         self,
@@ -316,6 +397,30 @@ class RoundRobinRouter(SllmRouter):
                 )
             }
 
+        # The router's active instances only describe nodes already serving
+        # this model.  Ask the real scheduler for the complete worker set so a
+        # replan can place the replacement on an idle vLLM worker node.
+        scheduler = getattr(self, "model_loading_scheduler", None)
+        scheduler_snapshot = getattr(scheduler, "_get_worker_nodes", None)
+        if scheduler_snapshot is not None:
+            try:
+                remote = getattr(scheduler_snapshot, "remote", None)
+                worker_nodes = (
+                    await remote()
+                    if remote is not None
+                    else await scheduler_snapshot()
+                )
+                if isinstance(worker_nodes, dict) and worker_nodes:
+                    return {
+                        str(node_id): dict(node_info)
+                        for node_id, node_info in worker_nodes.items()
+                    }
+            except Exception:
+                logger.info(
+                    "Could not query scheduler worker nodes for replan",
+                    exc_info=True,
+                )
+
         async with self.instance_management_lock:
             instances = (
                 list(self.starting_inference_instances.values())
@@ -381,6 +486,34 @@ class RoundRobinRouter(SllmRouter):
             instance_id=instance_id,
             backend=self.backend,
         )
+        if decision.get("action") == "reparallelize":
+            if self._ensure_vllm_reparallelization_adapter():
+                try:
+                    plan = ParallelPlan.from_dict(decision["parallel_plan"])
+                    self.reparallelization_executor.current = (
+                        self._vllm_active_deployment()
+                    )
+                    deployment = await self.reparallelization_executor.apply(
+                        plan
+                    )
+                    decision["execution"] = {
+                        "status": "applied",
+                        "instance_ids": sorted(deployment.instances),
+                        "parallel_plan": plan.to_dict(),
+                    }
+                except Exception as exc:
+                    logger.exception(
+                        "Failed applying vLLM re-parallelization plan"
+                    )
+                    decision["execution"] = {
+                        "status": "failed",
+                        "reason": str(exc),
+                    }
+            else:
+                decision["execution"] = {
+                    "status": "decision_only",
+                    "reason": "vllm_deployment_adapter_unavailable",
+                }
         self._emit_metric(
             make_replanning_event(
                 model=self.model_name,
@@ -564,6 +697,96 @@ class RoundRobinRouter(SllmRouter):
         for instance in matches:
             sources.extend(await self._capture_context_metadata(instance))
         return sources
+
+    async def _populate_target_reuse_maps(
+        self,
+        sources: List[ContextMetadata],
+        targets: List[MigrationTarget],
+    ) -> List[ContextMetadata]:
+        """Annotate reuse only when a target exposes the same cached prefix.
+
+        A target-specific reuse value is evidence-based: both runtimes must
+        expose tokens and compatible cache geometry, run on the same node, and
+        share a non-empty token prefix aligned to the cache block size.
+        """
+        async with self.instance_management_lock:
+            target_instances = dict(self.ready_inference_instances)
+
+        target_contexts: Dict[str, List[ContextMetadata]] = {}
+        for target in targets:
+            instance = target_instances.get(target.instance_id)
+            if instance is None or instance.backend_instance is None:
+                continue
+            try:
+                rows = await self._call_backend_method(
+                    instance.backend_instance,
+                    "get_context_metadata",
+                    instance_id=target.instance_id,
+                    node_id=target.node_id,
+                )
+            except Exception:
+                logger.info(
+                    "Could not query target KV metadata from %s",
+                    target.instance_id,
+                    exc_info=True,
+                )
+                continue
+            if isinstance(rows, dict):
+                rows = rows.get("contexts", [])
+            target_contexts[target.instance_id] = [
+                ContextMetadata.from_dict(row)
+                for row in (rows or [])
+                if isinstance(row, dict)
+            ]
+
+        annotated: List[ContextMetadata] = []
+        for source in sources:
+            reusable_tokens: Dict[str, int] = dict(
+                source.reusable_tokens_by_target
+            )
+            reusable_blocks: Dict[str, int] = dict(
+                source.reusable_blocks_by_target
+            )
+            for target in targets:
+                if source.node_id != target.node_id:
+                    continue
+                if not source.tokens or source.cache_block_size <= 0:
+                    continue
+                for target_context in target_contexts.get(target.instance_id, []):
+                    if target_context.cache_block_size != source.cache_block_size:
+                        continue
+                    if source.cache_dtype and target_context.cache_dtype:
+                        if source.cache_dtype != target_context.cache_dtype:
+                            continue
+                    if source.cache_layout and target_context.cache_layout:
+                        if source.cache_layout != target_context.cache_layout:
+                            continue
+                    common_tokens = 0
+                    for source_token, target_token in zip(
+                        source.tokens, target_context.tokens
+                    ):
+                        if source_token != target_token:
+                            break
+                        common_tokens += 1
+                    aligned_tokens = (
+                        common_tokens // source.cache_block_size
+                    ) * source.cache_block_size
+                    blocks = min(
+                        source.context_blocks,
+                        aligned_tokens // source.cache_block_size,
+                    )
+                    if aligned_tokens > 0 and blocks > 0:
+                        reusable_tokens[target.instance_id] = aligned_tokens
+                        reusable_blocks[target.instance_id] = blocks
+                        break
+            annotated.append(
+                replace(
+                    source,
+                    reusable_tokens_by_target=reusable_tokens,
+                    reusable_blocks_by_target=reusable_blocks,
+                )
+            )
+        return annotated
 
     def _context_migration_target_capacity(
         self,
@@ -751,6 +974,7 @@ class RoundRobinRouter(SllmRouter):
                 "planner_config", self.context_migration_config
             )
         )
+        sources = await self._populate_target_reuse_maps(sources, targets)
         decision = plan_low_cost_migration(
             sources=sources,
             targets=targets,
@@ -1012,9 +1236,9 @@ class RoundRobinRouter(SllmRouter):
         instance: InstanceHandle,
         state: InferenceState,
         request_data: dict,
-    ) -> bool:
+    ) -> dict:
         if instance.backend_instance is None:
-            return False
+            return {"restored": False}
         try:
             restore_request_data = dict(request_data)
             restore_request_data["target_instance_id"] = instance.instance_id
@@ -1029,8 +1253,8 @@ class RoundRobinRouter(SllmRouter):
             logger.info(
                 f"State restore failed on {instance.instance_id}: {e}"
             )
-            return False
-        return isinstance(result, dict) and bool(result.get("restored"))
+            return {"restored": False}
+        return result if isinstance(result, dict) else {"restored": bool(result)}
 
     async def _prepare_stateful_recovery(
         self,
@@ -1075,12 +1299,14 @@ class RoundRobinRouter(SllmRouter):
 
         if decision.action == "restore_state":
             counters["state_restore_attempts"] = 1
-            restored = await self._restore_inference_state(
+            restore_result = await self._restore_inference_state(
                 target_instance, state, request_data
             )
-            if restored:
+            if restore_result.get("restored"):
                 counters["state_restore_successes"] = 1
                 counters["state_restored_tokens"] = decision.recovered_tokens
+                return state, None, counters, False
+            if restore_result.get("staged"):
                 return state, None, counters, False
 
         if state.tokens:
@@ -1276,6 +1502,23 @@ class RoundRobinRouter(SllmRouter):
                         replay_tokens=replay_tokens,
                         state_snapshot=state_snapshot,
                     )
+                    kv_restore = (
+                        result.get("_spotserve_kv_restore", {})
+                        if isinstance(result, dict)
+                        else {}
+                    )
+                    if state_snapshot is not None and kv_restore:
+                        if kv_restore.get("restored"):
+                            restored_count = (
+                                state_snapshot.completed_tokens
+                                or len(state_snapshot.tokens)
+                            )
+                            state_restore_successes += 1
+                            state_restored_tokens += restored_count
+                            recovered_tokens += restored_count
+                        else:
+                            state_restore_fallback = True
+                            recovery_fallback = True
                     logger.info("Finished processing request")
 
                     if not self._result_is_preempted(

@@ -201,6 +201,7 @@ class VllmBackend(SllmBackend):
         self.status_lock = asyncio.Lock()
         self.backend_config = backend_config
         self.request_trace = LLMEngineStatusDict()
+        self.pending_kv_restores: Dict[str, int] = {}
         # if trace_debug is True, request trace will not be deleted after completion
         self.trace_debug = backend_config.get("trace_debug", False)
         self.enforce_eager = backend_config.get("enforce_eager", False)
@@ -371,7 +372,23 @@ class VllmBackend(SllmBackend):
         if not self.trace_debug:
             await self.request_trace.delete_request(request_id)
 
-        return process_output(final_output, model_name)
+        response = process_output(final_output, model_name)
+        expected_blocks = self.pending_kv_restores.pop(request_id, 0)
+        if expected_blocks:
+            cached_tokens = int(
+                getattr(final_output, "num_cached_tokens", 0) or 0
+            )
+            response["_spotserve_kv_restore"] = {
+                "restored": cached_tokens > 0,
+                "restored_blocks": expected_blocks if cached_tokens > 0 else 0,
+                "cached_tokens": cached_tokens,
+                "reason": (
+                    "nixl_kv_attach_completed"
+                    if cached_tokens > 0
+                    else "nixl_kv_attach_empty"
+                ),
+            }
+        return response
 
     async def shutdown(self):
         """Abort all requests and shutdown the backend."""
@@ -567,6 +584,7 @@ class VllmBackend(SllmBackend):
         if (
             not isinstance(exported, dict)
             or exported.get("supports_restore") is not True
+            or exported.get("state_kind") != "vllm_kv_snapshot"
             or not isinstance(exported.get("runtime_state"), dict)
             or not exported["runtime_state"]
         ):
@@ -577,7 +595,7 @@ class VllmBackend(SllmBackend):
         state.update(exported)
         state["backend"] = "vllm"
         state["model_name"] = self.model_name
-        state["state_kind"] = exported.get("state_kind", "vllm_kv_snapshot")
+        state["state_kind"] = "vllm_kv_snapshot"
         state["supports_restore"] = True
         state_metadata = dict(fallback["metadata"])
         state_metadata.update(exported.get("metadata", {}) or {})
@@ -609,7 +627,8 @@ class VllmBackend(SllmBackend):
     ) -> Dict[str, Any]:
         state_kind = state.get("state_kind", "token_snapshot")
         if (
-            not state.get("supports_restore")
+            state_kind != "vllm_kv_snapshot"
+            or not state.get("supports_restore")
             or not isinstance(state.get("runtime_state"), dict)
             or not state["runtime_state"]
             or not await self.supports_state_restore()
@@ -658,8 +677,10 @@ class VllmBackend(SllmBackend):
             }
 
         compatibility_keys = {
+            "model_revision": "revision",
             "tensor_parallel_size": "tensor_parallel_size",
             "pipeline_parallel_size": "pipeline_parallel_size",
+            "expert_parallel_enabled": "enable_expert_parallel",
             "cache_block_size": "block_size",
             "cache_dtype": "kv_cache_dtype",
             "cache_layout": "kv_cache_layout",
@@ -691,14 +712,47 @@ class VllmBackend(SllmBackend):
             restored = None
         if not isinstance(restored, dict):
             restored = {"restored": bool(restored)}
-        restored.setdefault("state_kind", state_kind)
+        if restored.get("staged"):
+            request_id = request_data.get("request_id") or state.get("request_id")
+            expected_blocks = int(restored.get("expected_blocks", 0) or 0)
+            if not request_id or expected_blocks <= 0:
+                return {
+                    "restored": False,
+                    "reason": "vllm_kv_restore_staging_failed",
+                    "state_kind": state_kind,
+                }
+            self.pending_kv_restores[str(request_id)] = expected_blocks
+            return {
+                "restored": False,
+                "staged": True,
+                "expected_blocks": expected_blocks,
+                "state_kind": state_kind,
+            }
+        if restored.get("state_kind", state_kind) != state_kind:
+            return {
+                "restored": False,
+                "reason": "vllm_kv_restore_state_kind_mismatch",
+                "state_kind": state_kind,
+            }
+        restored["state_kind"] = state_kind
         if restored.get("restored"):
+            restored_blocks = restored.get(
+                "restored_blocks", metadata.get("kv_block_count", 0)
+            )
+            try:
+                restored_blocks = int(restored_blocks or 0)
+            except (TypeError, ValueError):
+                restored_blocks = 0
+            if restored_blocks <= 0:
+                return {
+                    "restored": False,
+                    "reason": "vllm_kv_restore_empty",
+                    "state_kind": state_kind,
+                }
             restored.setdefault(
                 "recovered_tokens", state.get("completed_tokens", 0)
             )
-            restored.setdefault(
-                "restored_blocks", metadata.get("kv_block_count", 0)
-            )
+            restored["restored_blocks"] = restored_blocks
             restored.setdefault(
                 "restore_scope", "cross_node" if cross_node else "same_node"
             )
@@ -711,6 +765,18 @@ class VllmBackend(SllmBackend):
         instance_id: str = "",
         node_id: str = "",
     ) -> Dict[str, Any]:
+        gpu_metadata: Dict[str, Any] = {}
+        if torch.cuda.is_available():
+            try:
+                free_bytes, total_bytes = torch.cuda.mem_get_info()
+                gpu_metadata = {
+                    "free_gpu_memory_gb": free_bytes / (1024**3),
+                    "total_gpu_memory_gb": total_bytes / (1024**3),
+                    "total_gpu": torch.cuda.device_count(),
+                    "free_gpu": torch.cuda.device_count(),
+                }
+            except Exception:
+                logger.debug("Unable to query CUDA runtime metadata", exc_info=True)
         return get_vllm_runtime_metadata(
             model_name=self.model_name,
             backend_config=self.backend_config,
@@ -718,6 +784,7 @@ class VllmBackend(SllmBackend):
             node_id=node_id,
             runtime_metadata={
                 "load_time_s": self.model_load_time_s,
+                **gpu_metadata,
             },
         )
 

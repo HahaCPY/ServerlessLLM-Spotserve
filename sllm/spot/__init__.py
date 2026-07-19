@@ -8,6 +8,15 @@ from .context_migration import (
 )
 from .recovery_policy import RecoveryPolicy, normalize_policy
 from .reparallelization import ParallelPlan, plan_dynamic_reparallelization
+from .reparallelization_executor import ReparallelizationExecutor
+from .risk_metadata_provider import (
+    CallableRiskMetadataProvider,
+    CompositeRiskMetadataProvider,
+    ConservativeRiskMetadataProvider,
+    EnvironmentRiskMetadataProvider,
+    build_risk_metadata_provider,
+    normalize_risk_metadata,
+)
 from .risk_aware_scheduling import (
     NodeRiskScore,
     SchedulingDecision,
@@ -30,6 +39,11 @@ __all__ = [
     "MigrationTarget",
     "NodeRiskScore",
     "ParallelPlan",
+    "ReparallelizationExecutor",
+    "CallableRiskMetadataProvider",
+    "CompositeRiskMetadataProvider",
+    "ConservativeRiskMetadataProvider",
+    "EnvironmentRiskMetadataProvider",
     "RecoveryPolicy",
     "SchedulingDecision",
     "SpotEvent",
@@ -43,4 +57,6 @@ __all__ = [
     "plan_risk_aware_scheduling",
     "plan_stateful_recovery",
     "rank_nodes_by_spot_risk",
+    "build_risk_metadata_provider",
+    "normalize_risk_metadata",
 ]

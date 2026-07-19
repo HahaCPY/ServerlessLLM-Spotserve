@@ -40,6 +40,54 @@ class ParallelPlan:
     target_nodes: List[str] = field(default_factory=list)
     reason: str = "replan"
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "ParallelPlan":
+        """Build a validated plan from a planner/controller response.
+
+        The planner serialises plans before they cross the Ray actor boundary.
+        Keeping deserialisation here prevents the deployment adapter from
+        depending on the planner's internal dictionary shape.
+        """
+        if not isinstance(payload, Mapping):
+            raise TypeError("parallel plan must be a mapping")
+        required = {
+            "model_name",
+            "backend",
+            "tensor_parallel_size",
+            "data_parallel_size",
+        }
+        missing = sorted(required.difference(payload))
+        if missing:
+            raise ValueError(
+                "parallel plan is missing required fields: "
+                + ", ".join(missing)
+            )
+        return cls(
+            model_name=str(payload["model_name"]),
+            backend=str(payload["backend"]),
+            tensor_parallel_size=max(1, int(payload["tensor_parallel_size"])),
+            data_parallel_size=max(1, int(payload["data_parallel_size"])),
+            pipeline_parallel_size=max(
+                1, int(payload.get("pipeline_parallel_size", 1) or 1)
+            ),
+            expert_parallel_size=max(
+                1, int(payload.get("expert_parallel_size", 1) or 1)
+            ),
+            num_replicas=max(
+                1,
+                int(
+                    payload.get(
+                        "num_replicas",
+                        payload.get("data_parallel_size", 1),
+                    )
+                    or 1
+                ),
+            ),
+            num_gpus=max(1, int(payload.get("num_gpus", 1) or 1)),
+            target_nodes=[str(node) for node in payload.get("target_nodes", [])],
+            reason=str(payload.get("reason", "replan")),
+        )
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "model_name": self.model_name,

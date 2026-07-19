@@ -122,6 +122,7 @@ COPY requirements-worker.txt /app/
 
 RUN /opt/venvs/worker/bin/python -m pip install -r /app/requirements-worker.txt
 RUN /opt/venvs/worker/bin/python -c "import torch; flags = torch._C._cuda_getArchFlags().split(); print(torch.__version__, torch.version.cuda, flags); assert 'sm_120' in flags"
+RUN /opt/venvs/worker/bin/python -c "from nixl._api import nixl_agent; print('NIXL import OK', nixl_agent)"
 
 # Copy vllm patch for worker
 COPY sllm_store/vllm_patch /app/vllm_patch

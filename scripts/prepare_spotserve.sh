@@ -135,7 +135,7 @@ fi
 
 if [[ "$SKIP_RECREATE" -eq 0 ]]; then
   log "Recreating ${COMPOSE_SERVICES[*]}"
-  docker compose up -d --force-recreate "${COMPOSE_SERVICES[@]}"
+  docker compose up -d --force-recreate --no-build "${COMPOSE_SERVICES[@]}"
 fi
 
 log "Waiting for Ray in ${CONTAINER}"
@@ -161,13 +161,18 @@ import inspect
 from importlib.metadata import version
 
 from vllm import AsyncLLMEngine
+from nixl._api import nixl_agent
 
 required_hooks = (
     "get_request_kv_metadata",
     "get_all_request_kv_metadata",
+    "export_inference_state",
+    "restore_inference_state",
+    "supports_state_restore",
 )
 missing = [name for name in required_hooks if not hasattr(AsyncLLMEngine, name)]
 print("vLLM version:", version("vllm"))
+print("NIXL version:", version("nixl"))
 print("AsyncLLMEngine module:", inspect.getfile(AsyncLLMEngine))
 print("runtime metadata hooks:", {name: name not in missing for name in required_hooks})
 if missing:
@@ -342,6 +347,7 @@ if [[ "$SKIP_DEPLOY" -eq 0 ]]; then
     "examples/spotserve/config-vllm-moe-none.json"
     "examples/spotserve/config-vllm-moe-naive-retry.json"
     "examples/spotserve/config-vllm-moe-token-replay.json"
+    "examples/spotserve/config-vllm-moe-stateful-nixl.json"
   )
   DEPLOY_CONFIGS=()
   if [[ "$DEPLOY_SET" == "standard" || "$DEPLOY_SET" == "all" ]]; then

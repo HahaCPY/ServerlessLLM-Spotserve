@@ -164,7 +164,11 @@ def get_vllm_context_metadata(
         "model_name": model_name,
         "backend": "vllm",
         "num_tokens": _token_count(runtime_metadata),
+        "tokens": list(runtime_metadata.get("tokens", []) or []),
         "context_blocks": context_block_count_from_runtime(runtime_metadata),
+        "cache_block_size": runtime_metadata.get("cache_block_size"),
+        "cache_dtype": runtime_metadata.get("cache_dtype"),
+        "cache_layout": runtime_metadata.get("cache_layout"),
         "reusable_tokens_by_target": _int_mapping(
             runtime_metadata.get("reusable_tokens_by_target")
         ),

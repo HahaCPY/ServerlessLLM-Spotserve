@@ -87,6 +87,7 @@ class StorageAwareScheduler(FcfsScheduler):
                         request_time,
                         num_gpus,
                         allocation_result,
+                        target_node_id,
                     ) in enumerate(loading_queue):
                         loading_requests.append(
                             (
@@ -95,6 +96,7 @@ class StorageAwareScheduler(FcfsScheduler):
                                 request_time,
                                 num_gpus,
                                 allocation_result,
+                                target_node_id,
                             )
                         )
             if loading_requests:
@@ -126,6 +128,7 @@ class StorageAwareScheduler(FcfsScheduler):
                     request_time,
                     num_gpus,
                     allocation_result,
+                    target_node_id,
                 ) in loading_requests:
                     logger.info(f"Processing request for model {model_name}")
                     scheduling_options = await self.schedule(
@@ -138,6 +141,19 @@ class StorageAwareScheduler(FcfsScheduler):
                     )
                     # sort by latency
                     if scheduling_options:
+                        if target_node_id is not None:
+                            scheduling_options = [
+                                option
+                                for option in scheduling_options
+                                if str(option.node_id) == str(target_node_id)
+                            ]
+                        if not scheduling_options:
+                            logger.info(
+                                "No storage-aware option for requested target "
+                                "node %s",
+                                target_node_id,
+                            )
+                            continue
                         scheduling_options.sort(
                             key=lambda x: (x.latency, x.node_id)
                         )

@@ -21,7 +21,11 @@ class FakeContextBackend:
                 "instance_id": instance_id,
                 "node_id": node_id,
                 "num_tokens": 8,
+                "tokens": [1, 2, 3, 4, 5, 6, 7, 8],
                 "context_blocks": 2,
+                "cache_block_size": 4,
+                "cache_dtype": "torch.float16",
+                "cache_layout": "NHD",
                 "reusable_tokens_by_target": {"instance-target": 6},
                 "reusable_blocks_by_target": {"instance-target": 2},
             }
@@ -40,6 +44,70 @@ class FakeKvTargetBackend:
     async def resume_kv_cache(self, request_datas):
         self.resumed_batches.append(request_datas)
         return True
+
+
+class FakeReusableTargetBackend:
+    async def get_context_metadata(self, instance_id="", node_id=""):
+        return [
+            {
+                "request_id": "target-live-0",
+                "instance_id": instance_id,
+                "node_id": node_id,
+                "num_tokens": 8,
+                "tokens": [1, 2, 3, 4, 5, 6, 7, 8],
+                "context_blocks": 2,
+                "cache_block_size": 4,
+                "cache_dtype": "torch.float16",
+                "cache_layout": "NHD",
+            }
+        ]
+
+
+class FakeRouterRestoreBackend:
+    def __init__(self, source=False):
+        self.source = source
+        self.restore_calls = 0
+
+    async def generate(self, request_data):
+        if self.source:
+            self.source = False
+            return {
+                "preempted": True,
+                "current_output": [[1, 2, 3, 4]],
+                "completed_tokens": 4,
+            }
+        return {"usage": {"completion_tokens": 2}, "choices": []}
+
+    async def export_inference_state(
+        self, request_data=None, current_output=None, completed_tokens=None
+    ):
+        return {
+            "request_id": (request_data or {}).get("request_id"),
+            "tokens": [1, 2, 3, 4],
+            "completed_tokens": completed_tokens or 4,
+            "state_kind": "vllm_kv_snapshot",
+            "supports_restore": True,
+            "runtime_state": {"kv_transfer_params": {"remote_block_ids": [[1]]}},
+            "metadata": {
+                "can_restore_same_node": True,
+                "can_restore_cross_node": False,
+                "kv_block_count": 1,
+            },
+            "backend": "vllm",
+            "model_name": "test-model",
+            "node_id": "node-shared",
+        }
+
+    async def supports_state_restore(self):
+        return True
+
+    async def restore_inference_state(self, state, request_data=None):
+        self.restore_calls += 1
+        return {
+            "restored": True,
+            "state_kind": "vllm_kv_snapshot",
+            "restored_blocks": 1,
+        }
 
 
 @pytest.mark.asyncio
@@ -390,3 +458,99 @@ async def test_router_executes_kv_cache_migration_on_preemption(tmp_path):
         row for row in rows if row["type"] == "context_migration"
     ]
     assert context_rows[-1]["kv_cache_migration"]["succeeded"] == 1
+
+
+@pytest.mark.asyncio
+async def test_router_derives_target_specific_reuse_from_runtime_prefix(tmp_path):
+    metrics_path = tmp_path / "router-metrics.jsonl"
+    router = RoundRobinRouter(
+        model_name="test-model",
+        resource_requirements={"num_cpus": 1, "num_gpus": 0},
+        backend="dummy",
+        backend_config={},
+        router_config={
+            "metrics_path": str(metrics_path),
+            "enable_context_migration": True,
+            "context_migration_config": {"planner_config": {"cross_node_penalty": 0}},
+        },
+    )
+    source = InstanceHandle(
+        instance_id="instance-source",
+        max_queue_length=1,
+        num_gpu=0,
+        backend_instance=FakeContextBackend(),
+    )
+    target = InstanceHandle(
+        instance_id="instance-target",
+        max_queue_length=1,
+        num_gpu=0,
+        backend_instance=FakeReusableTargetBackend(),
+    )
+    await source.mark_ready(node_id="node-shared")
+    await target.mark_ready(node_id="node-shared")
+    router.ready_inference_instances[source.instance_id] = source
+    router.ready_inference_instances[target.instance_id] = target
+
+    result = await router.handle_preemption(instance_id="instance-source")
+    plan = result["context_migration"]["plans"][0]
+
+    assert plan["new_instance_id"] == "instance-target"
+    assert plan["reusable_tokens"] == 8
+    assert plan["reusable_context_blocks"] == 2
+
+
+@pytest.mark.asyncio
+async def test_router_stateful_restore_end_to_end_records_no_fallback(tmp_path):
+    metrics_path = tmp_path / "router-metrics.jsonl"
+    router = RoundRobinRouter(
+        model_name="test-model",
+        resource_requirements={"num_cpus": 1, "num_gpus": 0},
+        backend="vllm",
+        backend_config={},
+        router_config={
+            "metrics_path": str(metrics_path),
+            "recovery_policy": "stateful_recovery",
+            "max_retries": 1,
+        },
+    )
+    source_backend = FakeRouterRestoreBackend(source=True)
+    target_backend = FakeRouterRestoreBackend()
+    source = InstanceHandle(
+        instance_id="instance-source",
+        max_queue_length=1,
+        num_gpu=0,
+        backend_instance=source_backend,
+    )
+    target = InstanceHandle(
+        instance_id="instance-target",
+        max_queue_length=1,
+        num_gpu=0,
+        backend_instance=target_backend,
+    )
+    await source.mark_ready(node_id="node-shared")
+    await target.mark_ready(node_id="node-shared")
+    router.ready_inference_instances[source.instance_id] = source
+    router.ready_inference_instances[target.instance_id] = target
+
+    allocations = iter([source, target])
+
+    async def allocate():
+        instance = next(allocations)
+        return instance.instance_id, instance
+
+    router._allocate_instance_for_request = allocate
+    router.running = True
+    result = await router.inference(
+        {"request_id": "req-router-restore", "max_tokens": 2}, "generate"
+    )
+
+    assert result.get("usage", {}).get("completion_tokens") == 2, result
+    assert target_backend.restore_calls == 1
+    rows = [
+        json.loads(line)
+        for line in metrics_path.read_text(encoding="utf-8").splitlines()
+    ]
+    request_row = next(row for row in rows if row["type"] == "request")
+    assert request_row["state_restore_attempts"] == 1
+    assert request_row["state_restore_successes"] == 1
+    assert request_row["state_restore_fallback"] is False

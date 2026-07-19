@@ -45,6 +45,7 @@ def test_vllm_inference_state_can_use_runtime_tokens():
             "prompt_tokens": [10, 11],
             "output_tokens": [12],
             "kv_block_count": 3,
+            "expert_parallel_enabled": True,
         },
     )
 
@@ -54,6 +55,7 @@ def test_vllm_inference_state_can_use_runtime_tokens():
     assert state["metadata"]["prompt_token_count"] == 2
     assert state["metadata"]["generated_token_count"] == 1
     assert state["metadata"]["kv_block_count"] == 3
+    assert state["metadata"]["expert_parallel_enabled"] is True
 
 
 def test_vllm_inference_state_preserves_kv_transfer_metadata():

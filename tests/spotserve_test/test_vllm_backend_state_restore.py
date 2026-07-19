@@ -71,12 +71,31 @@ class FakeMetadataEngine:
             "reusable_blocks_by_target": {},
         }
 
+
+class FakeEmptyRestoreEngine(FakeStatefulEngine):
+    def restore_inference_state(self, state, request_id, **kwargs):
+        return {"restored": True, "restored_blocks": 0}
+
+
+class FakeWrongStateKindEngine(FakeStatefulEngine):
+    def export_inference_state(self, request_id, **kwargs):
+        state = super().export_inference_state(request_id, **kwargs)
+        state["state_kind"] = "token_snapshot"
+        return state
+
+
+class FakeStagingEngine(FakeStatefulEngine):
+    def restore_inference_state(self, state, request_id, **kwargs):
+        return {"restored": False, "staged": True, "expected_blocks": 2}
+
+
 def make_backend(engine=None, **backend_config):
     backend = VllmBackend.__new__(VllmBackend)
     backend.model_name = "model"
     backend.backend_config = backend_config
     backend.engine = engine
     backend.request_trace = LLMEngineStatusDict()
+    backend.pending_kv_restores = {}
     backend.status = BackendStatus.RUNNING
     backend.status_lock = asyncio.Lock()
     return backend
@@ -102,6 +121,15 @@ async def test_export_is_restorable_only_when_runtime_hooks_exist():
     assert state["supports_restore"] is True
     assert state["state_kind"] == "vllm_kv_snapshot"
     assert state["metadata"]["kv_block_count"] == 2
+
+    wrong_kind = make_backend(FakeWrongStateKindEngine())
+    state = await wrong_kind.export_inference_state(
+        request_data={"request_id": "req-1"},
+        current_output=[[1, 2, 3]],
+        completed_tokens=3,
+    )
+    assert state["supports_restore"] is False
+    assert state["state_kind"] == "token_snapshot"
 
 
 @pytest.mark.asyncio
@@ -132,6 +160,16 @@ async def test_restore_attaches_state_and_rejects_incompatible_cache():
     assert result["restored"] is False
     assert result["reason"] == "incompatible_cache_config"
 
+    state["metadata"]["expert_parallel_enabled"] = True
+    incompatible_ep = make_backend(
+        FakeStatefulEngine(), enable_expert_parallel=False
+    )
+    result = await incompatible_ep.restore_inference_state(
+        state, {"request_id": "req-1", "node_id": "node-0"}
+    )
+    assert result["restored"] is False
+    assert result["reason"] == "incompatible_cache_config"
+
 
 @pytest.mark.asyncio
 async def test_restore_rejects_cross_node_without_transfer_support():
@@ -144,6 +182,42 @@ async def test_restore_rejects_cross_node_without_transfer_support():
     )
     assert result["restored"] is False
     assert result["reason"] == "cross_node_restore_unsupported"
+
+
+@pytest.mark.asyncio
+async def test_restore_rejects_success_without_restored_kv_blocks():
+    backend = make_backend(FakeEmptyRestoreEngine())
+    state = await backend.export_inference_state(
+        request_data={"request_id": "req-1"}, current_output=[[1]]
+    )
+    result = await backend.restore_inference_state(
+        state, {"request_id": "req-1", "node_id": "node-0"}
+    )
+    assert result == {
+        "restored": False,
+        "reason": "vllm_kv_restore_empty",
+        "state_kind": "vllm_kv_snapshot",
+    }
+
+
+@pytest.mark.asyncio
+async def test_restore_stages_nixl_payload_without_reporting_early_success():
+    backend = make_backend(FakeStagingEngine())
+    state = await backend.export_inference_state(
+        request_data={"request_id": "req-1"}, current_output=[[1]]
+    )
+
+    result = await backend.restore_inference_state(
+        state, {"request_id": "req-1", "node_id": "node-0"}
+    )
+
+    assert result == {
+        "restored": False,
+        "staged": True,
+        "expected_blocks": 2,
+        "state_kind": "vllm_kv_snapshot",
+    }
+    assert backend.pending_kv_restores == {"req-1": 2}
 
 
 @pytest.mark.asyncio

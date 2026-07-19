@@ -10,6 +10,10 @@ class ContextMetadata:
     node_id: str
     num_tokens: int = 0
     context_blocks: int = 0
+    tokens: Tuple[int, ...] = ()
+    cache_block_size: int = 0
+    cache_dtype: str = ""
+    cache_layout: str = ""
     reusable_tokens_by_target: Mapping[str, int] = field(
         default_factory=dict
     )
@@ -25,6 +29,14 @@ class ContextMetadata:
             node_id=str(payload["node_id"]),
             num_tokens=max(0, int(payload.get("num_tokens", 0) or 0)),
             context_blocks=max(0, int(payload.get("context_blocks", 0) or 0)),
+            tokens=tuple(
+                int(token) for token in (payload.get("tokens", []) or [])
+            ),
+            cache_block_size=max(
+                0, int(payload.get("cache_block_size", 0) or 0)
+            ),
+            cache_dtype=str(payload.get("cache_dtype", "") or ""),
+            cache_layout=str(payload.get("cache_layout", "") or ""),
             reusable_tokens_by_target={
                 str(key): int(value)
                 for key, value in (
@@ -46,6 +58,10 @@ class ContextMetadata:
             "node_id": self.node_id,
             "num_tokens": self.num_tokens,
             "context_blocks": self.context_blocks,
+            "tokens": list(self.tokens),
+            "cache_block_size": self.cache_block_size,
+            "cache_dtype": self.cache_dtype,
+            "cache_layout": self.cache_layout,
             "reusable_tokens_by_target": dict(self.reusable_tokens_by_target),
             "reusable_blocks_by_target": dict(
                 self.reusable_blocks_by_target

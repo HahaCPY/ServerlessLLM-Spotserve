@@ -1,0 +1,289 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl_connector.py
+index a70c98b63..f57300e7a 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl_connector.py
+@@ -120,6 +120,7 @@ class ReqMeta:
+     remote_host: str
+     remote_port: int
+     remote_engine_id: str
++    remote_request_id: str
+     tp_size: int
+ 
+ 
+@@ -146,6 +147,9 @@ class NixlConnectorMetadata(KVConnectorMetadata):
+             local_physical_block_ids=local_block_ids,
+             remote_block_ids=kv_transfer_params["remote_block_ids"],
+             remote_engine_id=kv_transfer_params["remote_engine_id"],
++            remote_request_id=kv_transfer_params.get(
++                "remote_request_id", request_id
++            ),
+             remote_host=kv_transfer_params["remote_host"],
+             remote_port=kv_transfer_params["remote_port"],
+             # P workers don't need to receive tp_size from proxy here.
+@@ -236,6 +240,15 @@ class NixlConnector(KVConnectorBase_V1):
+         assert self.connector_scheduler is not None
+         return self.connector_scheduler.request_finished(request, block_ids)
+ 
++    def export_active_request(
++        self, request: "Request", block_ids: list[int]
++    ) -> dict[str, Any]:
++        assert self.connector_scheduler is not None
++        export = getattr(self.connector_scheduler, "export_active_request", None)
++        if export is None:
++            raise RuntimeError("active request export requires NIXL pull mode")
++        return export(request, block_ids)
++
+     def set_xfer_handshake_metadata(
+         self, metadata: dict[int, KVConnectorHandshakeMetadata]
+     ) -> None:
+@@ -379,6 +392,8 @@ class NixlConnectorScheduler:
+         # Reqs to remove from processed set because they're not to send after
+         # remote prefill or aborted.
+         self._reqs_not_processed: set[ReqId] = set()
++        self._spotserve_exported_requests: set[ReqId] = set()
++        self._spotserve_export_params: dict[ReqId, dict[str, Any]] = {}
+ 
+     def shutdown(self):
+         self._stop_event.set()
+@@ -499,6 +513,33 @@ class NixlConnectorScheduler:
+         # No remote prefill for this request.
+         return 0, False
+ 
++    def export_active_request(
++        self, request: "Request", block_ids: list[int]
++    ) -> dict[str, Any]:
++        if not block_ids:
++            raise ValueError("request has no KV blocks to export")
++        if not hasattr(self, "_spotserve_export_params"):
++            self._spotserve_export_params = {}
++        self._spotserve_exported_requests.add(request.request_id)
++        self._reqs_in_batch.add(request.request_id)
++        params = dict(getattr(request, "kv_transfer_params", None) or {})
++        params["do_remote_decode"] = True
++        params["spotserve_kv_lease"] = True
++        # Keep lease state in the connector. Older deployed Request objects do
++        # not expose a writable kv_transfer_params attribute.
++        self._spotserve_export_params[request.request_id] = params
++        return {
++            "do_remote_prefill": True,
++            "do_remote_decode": False,
++            "remote_block_ids": list(block_ids),
++            "remote_engine_id": self.engine_id,
++            "remote_request_id": request.request_id,
++            "remote_host": self.side_channel_host,
++            "remote_port": self.side_channel_port,
++            "tp_size": self.vllm_config.parallel_config.tensor_parallel_size,
++            "remote_num_tokens": request.num_computed_tokens,
++        }
++
+     def update_state_after_alloc(
+         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
+     ):
+@@ -532,7 +569,12 @@ class NixlConnectorScheduler:
+             if params.get("remote_block_ids"):
+                 if all(
+                     p in params
+-                    for p in ("remote_engine_id", "remote_host", "remote_port")
++                    for p in (
++                        "remote_engine_id",
++                        "remote_request_id",
++                        "remote_host",
++                        "remote_port",
++                    )
+                 ):
+                     # If remote_blocks and num_external_tokens = 0, we have
+                     # a full prefix cache hit on the D worker. We need to call
+@@ -634,7 +676,13 @@ class NixlConnectorScheduler:
+ 
++        params = self._spotserve_export_params.pop(request.request_id, None) or params
+         if not params.get("do_remote_decode"):
+             return False, None
+-        if request.status != RequestStatus.FINISHED_LENGTH_CAPPED:
++        spotserve_exported = request.request_id in self._spotserve_exported_requests
++        self._spotserve_exported_requests.discard(request.request_id)
++        if (
++            not spotserve_exported
++            and request.status != RequestStatus.FINISHED_LENGTH_CAPPED
++        ):
+             # Also include the case of a P/D Prefill request with immediate
+             # block free (eg abort). Stop tracking this request.
+             self._reqs_not_processed.add(request.request_id)
+@@ -1905,6 +1952,7 @@ class NixlConnectorWorker:
+         )
+         self._read_blocks(
+             request_id=req_id,
++            remote_request_id=meta.remote_request_id,
+             dst_engine_id=meta.remote_engine_id,
+             local_block_ids=meta.local_physical_block_ids,
+             remote_block_ids=meta.remote_block_ids,
+@@ -1916,6 +1964,7 @@ class NixlConnectorWorker:
+         remote_block_ids: list[int],
+         dst_engine_id: str,
+         request_id: str,
++        remote_request_id: str,
+     ):
+         block_size_ratio = self.kv_topo.block_size_ratio_from_engine_id(dst_engine_id)
+         if block_size_ratio > 1:
+@@ -1948,7 +1997,7 @@ class NixlConnectorWorker:
+         # Number of D TP workers that will read from dst P. Propagate tp_ratio
+         # on notification so that dst worker can wait before freeing blocks.
+         tp_ratio = self.kv_topo.tp_ratio_from_engine_id(dst_engine_id)
+-        notif_id = f"{request_id}:{tp_ratio}".encode()
++        notif_id = f"{remote_request_id}:{tp_ratio}".encode()
+ 
+         # Full prefix cache hit: do not need to read remote blocks,
+         # just notify P worker that we have the blocks we need.
+diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
+index 5998ce1b8..c0c1f913b 100644
+--- a/vllm/v1/engine/async_llm.py
++++ b/vllm/v1/engine/async_llm.py
+@@ -295,6 +295,66 @@ class AsyncLLM(EngineClient):
+             *(self.get_request_kv_metadata(req_id) for req_id in request_ids)
+         )
+ 
++    def _spotserve_internal_request_ids(self, request_id: str) -> list[str]:
++        """Resolve one external request ID to active engine request IDs."""
++        if request_id in self.output_processor.request_states:
++            return [request_id]
++        suffix = f"_{request_id}"
++        return sorted(
++            req_id
++            for req_id in self.output_processor.request_states
++            if req_id.endswith(suffix)
++            and req_id[: -len(suffix)].isdigit()
++        )
++
++    async def export_inference_state(
++        self, request_id: str, **_: Any
++    ) -> dict[str, Any]:
++        internal_ids = self._spotserve_internal_request_ids(request_id)
++        if len(internal_ids) != 1:
++            return {
++                "supports_restore": False,
++                "reason": "request_not_active"
++                if not internal_ids
++                else "parallel_sampling_export_not_supported",
++            }
++        internal_id = internal_ids[0]
++        engine_core = self.engine_core
++        request_engine = getattr(engine_core, "reqs_in_flight", {}).get(
++            internal_id
++        )
++        if request_engine is not None:
++            state = await engine_core._call_utility_async(
++                "export_inference_state", internal_id, engine=request_engine
++            )
++        else:
++            state = await engine_core.call_utility_async(
++                "export_inference_state", internal_id
++            )
++        state["request_id"] = request_id
++        return state
++
++    async def supports_state_restore(self) -> bool:
++        return bool(
++            await self.engine_core.call_utility_async("supports_state_restore")
++        )
++
++    def restore_inference_state(
++        self, state: dict[str, Any], request_id: str, **_: Any
++    ) -> dict[str, Any]:
++        params = (state.get("runtime_state") or {}).get("kv_transfer_params")
++        if not isinstance(params, dict) or not params.get("remote_block_ids"):
++            return {"restored": False, "reason": "invalid_kv_transfer_payload"}
++        pending = getattr(self, "_spotserve_pending_kv_restores", None)
++        if pending is None:
++            pending = self._spotserve_pending_kv_restores = {}
++        pending[request_id] = dict(params)
++        return {
++            "restored": False,
++            "staged": True,
++            "expected_blocks": len(params["remote_block_ids"]),
++        }
++
+     async def add_request(
+         self,
+         request_id: str,
+@@ -372,6 +432,17 @@ class AsyncLLM(EngineClient):
+         index: int,
+         queue: RequestOutputCollector,
+     ):
++        pending = getattr(self, "_spotserve_pending_kv_restores", {})
++        # vLLM 0.11.x does not carry external_req_id on EngineCoreRequest;
++        # newer vLLM versions do.  Keep the deployment patch compatible with
++        # both layouts while preserving the internal/external mapping when it
++        # is available.
++        external_id = getattr(request, "external_req_id", None) or request.request_id
++        params = pending.pop(external_id, None)
++        if params is not None:
++            if request.sampling_params is None:
++                raise ValueError(
++                    "SpotServe KV restore only supports generation requests"
++                )
++            extra_args = dict(request.sampling_params.extra_args or {})
++            extra_args["kv_transfer_params"] = params
++            request.sampling_params.extra_args = extra_args
+         # Add the request to OutputProcessor (this process).
+         self.output_processor.add_request(request, prompt, parent_req, index, queue)
+ 
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index 8cee1f12d..5bc564f36 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -654,6 +654,56 @@ class EngineCore:
+             for request_id in list(requests)
+         ]
+ 
++    def supports_state_restore(self) -> bool:
++        connector = self.scheduler.get_kv_connector()
++        if connector is None:
++            return False
++        return callable(getattr(connector, "export_active_request", None)) or callable(
++            getattr(
++                getattr(connector, "connector_scheduler", None),
++                "export_active_request",
++                None,
++            )
++        )
++
++    def export_inference_state(self, request_id: str) -> dict[str, Any]:
++        request = self.scheduler.requests.get(request_id)
++        if request is None:
++            return {"supports_restore": False, "reason": "request_not_active"}
++        connector = self.scheduler.get_kv_connector()
++        export = getattr(connector, "export_active_request", None)
++        if export is None and connector is not None:
++            export = getattr(
++                getattr(connector, "connector_scheduler", None),
++                "export_active_request",
++                None,
++            )
++        if export is None:
++            return {
++                "supports_restore": False,
++                "reason": "connector_export_unsupported",
++            }
++        block_groups = self.scheduler.kv_cache_manager.get_block_ids(request_id)
++        if len(block_groups) != 1:
++            return {
++                "supports_restore": False,
++                "reason": "hybrid_kv_export_unsupported",
++            }
++        block_ids = block_groups[0]
++        transfer_params = export(request, block_ids)
++        metadata = self.get_request_kv_metadata(request_id)
++        return {
++            "request_id": request_id,
++            "state_kind": "vllm_kv_snapshot",
++            "supports_restore": True,
++            "runtime_state": {"kv_transfer_params": transfer_params},
++            "metadata": {
++                **metadata,
++                "can_restore_same_node": True,
++                "can_restore_cross_node": False,
++            },
++        }
++
+     def save_sharded_state(
+         self,
+         path: str,

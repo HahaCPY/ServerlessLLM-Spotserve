@@ -11,6 +11,9 @@
 docker-compose.yml
 .docker
 
+# Local model checkpoints are mounted at runtime and are not part of the image.
+model/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 */__pycache__/

@@ -27,6 +27,7 @@ from sllm.spot.metrics import (
     JsonlMetricsWriter,
     make_risk_aware_scheduling_event,
 )
+from sllm.spot.risk_metadata_provider import build_risk_metadata_provider
 from sllm.spot.risk_aware_scheduling import plan_risk_aware_scheduling
 from sllm.utils import NodeState, get_worker_nodes
 
@@ -39,6 +40,13 @@ class FcfsScheduler(SllmScheduler):
     def __init__(self, scheduler_config: Optional[Mapping] = None):
         super().__init__()
         self.scheduler_config = dict(scheduler_config or {})
+        # Provider output is collected for every node when available, even if
+        # risk-aware ordering is disabled.  The ranking policy can therefore
+        # consume the same provenance-bearing metadata without changing the
+        # conservative fallback behavior.
+        self.risk_metadata_provider = build_risk_metadata_provider(
+            self.scheduler_config
+        )
         self.enable_spot_risk_aware = bool(
             self.scheduler_config.get("enable_spot_risk_aware", False)
         )
@@ -116,11 +124,51 @@ class FcfsScheduler(SllmScheduler):
             "loading_cost",
             "model_loading_cost",
             "load_cost",
+            "risk_metadata_source",
+            "risk_provider",
+            "risk_observed_at",
+            "risk_confidence",
+            "provider",
+            "region",
+            "instance_type",
         ):
             if key in previous_node_info:
                 updated_node_info[key] = previous_node_info[key]
         updated_node_info.update(self._configured_node_risk(str(node_id)))
         return updated_node_info
+
+    async def _collect_provider_risk_metadata(
+        self, worker_nodes: Mapping[str, Mapping[str, Any]]
+    ) -> Dict[str, Dict[str, Any]]:
+        """Collect provider signals without making them mandatory."""
+        collected: Dict[str, Dict[str, Any]] = {}
+        for node_id, node_info in worker_nodes.items():
+            try:
+                payload = self.risk_metadata_provider.collect(
+                    str(node_id), dict(node_info)
+                )
+                if inspect.isawaitable(payload):
+                    payload = await asyncio.wait_for(
+                        payload, timeout=self.runtime_metadata_timeout_s
+                    )
+            except Exception as exc:
+                logger.info(
+                    "Risk metadata provider failed for node %s: %s",
+                    node_id,
+                    exc,
+                )
+                continue
+            if not isinstance(payload, Mapping):
+                continue
+            normalized = dict(payload)
+            # Ray's live GPU accounting is authoritative for capacity.  A
+            # provider may expose capacity too, but must not replace a
+            # non-zero value reported by the worker heartbeat.
+            for key in ("free_gpu", "total_gpu"):
+                if key in node_info and int(node_info.get(key, 0) or 0) > 0:
+                    normalized.pop(key, None)
+            collected[str(node_id)] = normalized
+        return collected
 
     def _ordered_candidate_nodes(
         self,
@@ -144,6 +192,9 @@ class FcfsScheduler(SllmScheduler):
                 policy="risk_aware",
                 decision=self.latest_scheduling_decision,
             )
+        )
+        self.risk_metadata_provider = build_risk_metadata_provider(
+            self.scheduler_config
         )
         ranked = [
             (candidate.node_id, worker_nodes[candidate.node_id])
@@ -349,7 +400,11 @@ class FcfsScheduler(SllmScheduler):
             await self.loop_task
 
     async def allocate_resource(
-        self, model_name: str, instance_id: str, resources: Mapping
+        self,
+        model_name: str,
+        instance_id: str,
+        resources: Mapping,
+        target_node_id: Optional[str] = None,
     ) -> int:
         logger.info(f"Model {model_name} requested")
         # TODO: consider other resources
@@ -359,9 +414,16 @@ class FcfsScheduler(SllmScheduler):
                 self.model_loading_queues[model_name] = []
             allocation_result = self.loop.create_future()
             self.model_loading_queues[model_name].append(
-                (time.time(), num_gpus, allocation_result)
+                (time.time(), num_gpus, allocation_result, target_node_id)
             )
-        logger.info(f"Model {model_name} added to the loading queue")
+        logger.info(
+            f"Model {model_name} added to the loading queue"
+            + (
+                f" for target node {target_node_id}"
+                if target_node_id is not None
+                else ""
+            )
+        )
         node_id = await allocation_result
         async with self.metadata_lock:
             if model_name not in self.model_instance:
@@ -403,6 +465,7 @@ class FcfsScheduler(SllmScheduler):
                         request_time,
                         num_gpus,
                         allocation_result,
+                        target_node_id,
                     ) in enumerate(loading_queue):
                         loading_requests.append(
                             (
@@ -411,6 +474,7 @@ class FcfsScheduler(SllmScheduler):
                                 request_time,
                                 num_gpus,
                                 allocation_result,
+                                target_node_id,
                             )
                         )
             # logger.info(f"Loading requests: {loading_requests}")
@@ -425,6 +489,7 @@ class FcfsScheduler(SllmScheduler):
                     request_time,
                     num_gpus,
                     allocation_result,
+                    target_node_id,
                 ) in loading_requests:
                     allocated = False
                     for node_id, node_info in self._ordered_candidate_nodes(
@@ -432,6 +497,11 @@ class FcfsScheduler(SllmScheduler):
                         num_gpus,
                         worker_nodes,
                     ):
+                        if (
+                            target_node_id is not None
+                            and str(node_id) != str(target_node_id)
+                        ):
+                            continue
                         if not self._node_is_ready(node_info):
                             logger.info(
                                 f"Skipping node {node_id} in state "
@@ -453,6 +523,7 @@ class FcfsScheduler(SllmScheduler):
                                             request_time,
                                             num_gpus,
                                             allocation_result,
+                                            target_node_id,
                                         )
                                     )
                                     allocation_result.set_result(node_id)
@@ -472,6 +543,12 @@ class FcfsScheduler(SllmScheduler):
 
     async def _get_worker_nodes(self):
         worker_nodes = get_worker_nodes()
+        provider_metadata = await self._collect_provider_risk_metadata(
+            worker_nodes
+        )
+        for node_id, metadata in provider_metadata.items():
+            if node_id in worker_nodes:
+                worker_nodes[node_id].update(metadata)
         async with self.metadata_lock:
             updated_worker_nodes = copy.deepcopy(self.worker_nodes)
         for node_id, node_info in worker_nodes.items():

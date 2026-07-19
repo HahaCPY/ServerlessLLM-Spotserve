@@ -16,6 +16,9 @@ class NodeRiskScore:
     loading_cost: float
     score: float
     reason: str = "risk_aware_ranking"
+    metadata_source: str = "conservative"
+    provider: str = ""
+    confidence: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -28,6 +31,9 @@ class NodeRiskScore:
             "loading_cost": self.loading_cost,
             "score": self.score,
             "reason": self.reason,
+            "metadata_source": self.metadata_source,
+            "provider": self.provider,
+            "confidence": self.confidence,
         }
 
 
@@ -152,6 +158,13 @@ def node_risk_score(
         remaining_lifetime_s=remaining_lifetime_s,
         loading_cost=loading_cost,
         score=float(score),
+        metadata_source=str(
+            node_info.get("risk_metadata_source", "conservative")
+        ),
+        provider=str(node_info.get("risk_provider", "")),
+        confidence=_bounded(
+            _float_value(node_info, ("risk_confidence",), 0.0), 0.0, 1.0
+        ),
     )
 
 

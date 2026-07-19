@@ -155,6 +155,7 @@ def get_vllm_inference_state(
                 "kv_block_count_by_group",
                 "tensor_parallel_size",
                 "pipeline_parallel_size",
+                "expert_parallel_enabled",
                 "model_revision",
                 "kv_connector",
                 "runtime_epoch",

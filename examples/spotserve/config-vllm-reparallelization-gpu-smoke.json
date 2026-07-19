@@ -1,0 +1,37 @@
+{
+  "model": "vllm-reparallelization-gpu-smoke",
+  "backend": "vllm",
+  "router_num_cpus": 0,
+  "num_cpus": 1,
+  "num_gpus": 1,
+  "auto_scaling_config": {
+    "metric": "concurrency",
+    "target": 1,
+    "min_instances": 1,
+    "max_instances": 1,
+    "keep_alive": 60
+  },
+  "backend_config": {
+    "pretrained_model_name_or_path": "/models/Qwen2-MoE-Tiny",
+    "load_format": "auto",
+    "torch_dtype": "bfloat16",
+    "gpu_memory_utilization": 0.20,
+    "max_model_len": 512,
+    "max_num_seqs": 2,
+    "tensor_parallel_size": 1,
+    "pipeline_parallel_size": 1,
+    "enable_prefix_caching": true,
+    "enforce_eager": true,
+    "trust_remote_code": true
+  },
+  "router_config": {
+    "enable_reparallelization": true,
+    "reparallelization_config": {
+      "target_replica_gpus": 1,
+      "max_tensor_parallel_size": 1,
+      "max_pipeline_parallel_size": 1,
+      "drain_timeout_s": 30
+    },
+    "metrics_path": "/tmp/spotserve-work/results/v6-reparallelization-router.jsonl"
+  }
+}

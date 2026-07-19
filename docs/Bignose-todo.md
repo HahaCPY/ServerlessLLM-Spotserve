@@ -6,20 +6,25 @@ control-plane work and Bignose's vLLM/runtime integration work for Milestone 3.
 The short version:
 
 ```text
-V6: CPY planner is done; vLLM still needs an executor that applies ParallelPlan.
-V7: CPY live context-migration path calls vLLM backend; true KV reuse needs runtime metadata.
-V8: CPY recovery path is done; dummy validates token restore; true vLLM KV restore needs runtime export/attach.
-V9: CPY risk-aware scheduler is done; real risk quality depends on runtime/provider metadata.
+V6: CPY planner and the concrete vLLM deployment adapter are done; a live
+    container replan has applied a ParallelPlan across two GPU workers.
+V7: CPY live context-migration path calls vLLM backend; target-specific reuse is
+    derived only when matching runtime prefix evidence is available.
+V8: CPY recovery path and same-node NIXL export/attach are validated; GPU
+    container deployment smoke is now complete, while cross-node transport
+    remains pending.
+V9: CPY risk-aware scheduler and the provider metadata adapter are done; real
+    production risk quality remains provider/deployment-specific.
 ```
 
 ## Status Matrix
 
 | Version | CPY / ServerlessLLM status | Bignose / runtime status | What can be claimed now |
 |---|---|---|---|
-| V6 Dynamic Reparallelization | Planner, `ParallelPlan`, spot-event replanning, metrics | vLLM does not yet apply selected `ParallelPlan` to live workers | Control-plane replanning only |
-| V7 Low-cost Context Migration | Router calls backend `get_context_metadata()`, plans migration, optional `resume_kv_cache()` warmup | Runtime must provide real KV block metadata and target-specific reuse | Live planning and token/prefix warmup |
-| V8 Stateful Restore | Router recovery path calls export/restore and falls back safely | Runtime must export non-empty KV `runtime_state` and attach it on target | Dummy token snapshot restore; vLLM contract only unless hooks work |
-| V9 Risk-aware Scheduling | Scheduler can rank by risk and query backend actor metadata | Runtime/provider should provide accurate risk/capacity/lifetime metadata | Risk-aware ranking with synthetic/config or available runtime metadata |
+| V6 Dynamic Reparallelization | Planner, `ParallelPlan`, spot-event replanning, metrics | `VllmDeploymentAdapter` creates target-node vLLM Ray actors, waits for readiness, switches traffic, drains/stops old actors | Live two-worker GPU container smoke applied TP1/PP1 plan after preemption |
+| V7 Low-cost Context Migration | Router calls backend `get_context_metadata()`, plans migration, optional `resume_kv_cache()` warmup | Router derives target-specific maps from matching target token/block metadata; empty when unproven | Live same-host GPU target-reuse benchmarks pass for tiny MoE and Qwen1.5-MoE TP2 |
+| V8 Stateful Restore | Router recovery path calls export/restore and falls back safely | Same-node vLLM runtime export/attach and ID/lease tracking validated in dual-engine harness | Tiny and Qwen1.5-MoE TP2 restore pass; GPU container/head/worker/NIXL smoke pass; cross-node validation pending |
+| V9 Risk-aware Scheduling | Scheduler can rank by risk and query backend actor metadata | `RiskMetadataProvider` supports callable provider, JSON/env integration, provenance, normalization, and conservative fallback | Real provider-shaped fields are preserved when available; unknown nodes remain conservative |
 
 ## Current Backend Contract
 
@@ -59,8 +64,8 @@ spot event
 -> emit replanning metrics
 ```
 
-The selected `ParallelPlan` is currently a decision artifact. The vLLM runtime
-does not yet consume it to rebuild or reconfigure live actors:
+The selected `ParallelPlan` is now consumed by the vLLM deployment adapter. The
+adapter rebuilds live actors on the planner-selected target nodes:
 
 ```text
 ParallelPlan
@@ -70,17 +75,16 @@ ParallelPlan
 -> switch traffic to the new parallel layout
 ```
 
-Bignose/runtime TODO for V6:
+Bignose/runtime implementation:
 
-- implement an executor/controller that consumes selected `ParallelPlan`.
-- create or reconfigure vLLM workers with the selected TP / DP / PP / EP shape.
-- drain or stop old workers safely.
-- switch router traffic only after target workers are ready.
+- ~~implement an executor/controller that consumes selected `ParallelPlan`.~~ `sllm.spot.ReparallelizationExecutor` implements this lifecycle.
+- ~~create or reconfigure vLLM workers with the selected TP / DP / PP / EP shape.~~ `VllmDeploymentAdapter` starts real `start_instance` actors with the selected shape.
+- ~~drain or stop old workers safely.~~ The adapter drains active requests, then stops and deallocates old actors.
+- ~~switch router traffic only after target workers are ready.~~ Router traffic is switched only after readiness checks pass.
 - coordinate with V7/V8 if in-flight request state must be migrated/restored.
 
-Until this executor exists, V6 benchmarks can validate replanning metrics and
-backend-capability-aware plan selection, but not vLLM runtime
-reparallelization latency speedup.
+The live smoke validates the deployment lifecycle. It is a control-plane
+replan benchmark, not a claim about end-to-end latency improvement.
 
 ## V7 Context Migration Boundary
 
@@ -104,9 +108,12 @@ Bignose/runtime TODO for V7:
 
 - expose real per-request `kv_block_count` / `context_blocks`.
 - expose block IDs or block table when available.
-- expose target-specific `reusable_tokens_by_target`.
-- expose target-specific `reusable_blocks_by_target`.
-- keep reuse maps empty when target-specific reuse cannot be proven.
+- ~~expose target-specific `reusable_tokens_by_target`.~~ Router now derives the
+  map from an aligned matching token prefix reported by the target runtime.
+- ~~expose target-specific `reusable_blocks_by_target`.~~ Router derives the
+  block map only when block size, dtype, layout, node, and prefix evidence match.
+- ~~keep reuse maps empty when target-specific reuse cannot be proven.~~ This is
+  enforced by the conservative target compatibility checks.
 - do not estimate `context_blocks` from token count.
 
 Safe conservative values:
@@ -117,9 +124,17 @@ reusable_tokens_by_target = {}
 reusable_blocks_by_target = {}
 ```
 
-With only conservative values, V7 can validate live planning and token/prefix
-warmup. It should not be reported as true low-cost KV context migration latency
-speedup.
+The live target-reuse harness now proves non-empty maps on real CUDA engines:
+
+```text
+Qwen2-MoE-Tiny: reusable_tokens_by_target={vllm-target: 64}
+              reusable_blocks_by_target={vllm-target: 4}
+              source blocks=5, reuse_ratio=0.80
+Qwen1.5-MoE-A2.7B TP2: same target-specific result (64 tokens / 4 blocks)
+```
+
+This proves target-specific KV reuse and low-cost planning. It is not a
+cross-node latency claim; the measured runs are same-host GPU runs.
 
 ## V8 Stateful Restore Boundary
 
@@ -142,18 +157,24 @@ tokens = generated/prompt token snapshot
 completed_tokens = restored token progress
 ```
 
-That dummy success is not vLLM KV cache restore.
+The real same-node path is now exercised by
+`tests/v1/kv_connector/nixl_integration/spotserve_dual_engine_harness.py`.
+The harness exports non-empty KV blocks, stages target metadata, completes the
+NIXL read, and reports `state_restore_successes_total=1` and
+`state_restore_fallback_count=0` for both the tiny model and the Qwen1.5-MoE
+TP2 run. This is still a same-host result, not cross-node validation.
 
 Bignose/runtime TODO for V8 true KV restore:
 
-- export real restorable KV state from the source runtime.
-- return `supports_restore=true` only for restorable state.
-- return `state_kind=vllm_kv_snapshot`.
-- return a non-empty `runtime_state` such as a snapshot handle, lease, or
-  connector transfer payload.
-- attach or rebind that KV state on the target runtime.
-- return `restored=true` only after attach succeeds.
-- return `restored_blocks > 0` when KV blocks were restored.
+- ~~export real restorable KV state from the source runtime.~~
+- ~~return `supports_restore=true` only for restorable state.~~
+- ~~return `state_kind=vllm_kv_snapshot`.~~
+- ~~return a non-empty `runtime_state` such as a snapshot handle, lease, or
+  connector transfer payload.~~
+- ~~attach or rebind that KV state on the target runtime.~~
+- ~~return `restored=true` only after attach succeeds.~~ Same-node target
+  generation now waits for the staged NIXL read to complete.
+- ~~return `restored_blocks > 0` when KV blocks were restored.~~
 - validate model, parallelism, cache block size, dtype, layout, device placement,
   same-node support, and cross-node support before claiming success.
 
@@ -189,18 +210,28 @@ worker node metadata
 -> risk_aware_scheduling metrics
 ```
 
-The scheduler can use config/synthetic metadata today. It can also query backend
-actors for runtime metadata when that path is enabled.
+The scheduler can use config/synthetic metadata today. `RiskMetadataProvider`
+also supports a production callable (`module:callable`) plus JSON/env adapters;
+all values are normalized, bounded, and tagged with source/provider/time/
+confidence. A conservative provider is used when no authoritative source is
+available.
 
-Bignose/runtime TODO for V9:
+Bignose/runtime implementation:
 
-- expose `VllmBackend.get_runtime_metadata(instance_id, node_id)` fields that
-  match CPY's risk-aware scheduler shape.
-- provide accurate GPU/resource profile when runtime can know it.
-- provide loading cost / model load time when known.
-- provide spot risk / remaining lifetime only when a real predictor or provider
-  integration exists.
-- keep unknown risk/lifetime conservative instead of fabricating values.
+- ~~expose `VllmBackend.get_runtime_metadata(instance_id, node_id)` fields that
+  match CPY's risk-aware scheduler shape.~~ Runtime metadata is merged with
+  provider output by the scheduler.
+- ~~provide accurate GPU/resource profile when runtime can know it.~~ Existing
+  Ray capacity is preserved as authoritative when available.
+- ~~provide loading cost / model load time when known.~~ Provider aliases are
+  normalized into the scheduler schema.
+- ~~keep unknown risk/lifetime conservative instead of fabricating values.~~
+  Unknown values use conservative defaults with confidence `0.0`.
+
+The host does not expose a cloud spot-risk service, so production predictor
+quality is intentionally not claimed here. A deployment supplies one through
+`risk_provider` / `SLLM_RISK_PROVIDER`; its observed quality must be benchmarked
+with that provider's own live data.
 
 Useful metadata fields:
 
@@ -335,6 +366,44 @@ Minimum tests or live checks before claiming vLLM true KV restore:
   path being claimed.
 - restored vLLM path reports `restored_blocks > 0`.
 
+Current validation status (2026-07-19):
+
+- ServerlessLLM router/backend/state-restore suite: 31 passed.
+- Same-node tiny dual-engine NIXL harness: passed.
+- Same-node Qwen1.5-MoE-A2.7B dual-engine TP2 harness: passed with five source
+  blocks, 65 source computed tokens, 5 restored blocks,
+  `state_restore_successes_total=1`, and zero fallback.
+- Live target-specific reuse (2026-07-19): both real two-engine GPU runs
+  returned `reusable_tokens_by_target={"vllm-target": 64}` and
+  `reusable_blocks_by_target={"vllm-target": 4}` (`reuse_ratio=0.80`).
+- GPU deployment smoke (2026-07-19): image `sha256:93a6f5d8d5ea...` (vLLM
+  0.11.2, torch 2.9.0, Ray 2.48.0) ran on `cupid1.inter.lsa` with four RTX
+  5070 Ti GPUs (driver 595.80).  Host-network head `/health` returned 200;
+  the worker joined Ray with one visible GPU and CUDA was available.  A live
+  `/v1/chat/completions` request returned HTTP 200.  The deployed engine log
+  confirms NIXL availability, UCX agent creation, CUDA KV-cache registration,
+  and NIXL HND layout.  The router request itself had no preemption event, so
+  its per-request restore counters correctly stayed at zero; restore success
+  is measured by the dual-engine harness above.
+- V6 live deployment-adapter smoke (2026-07-19): a real ServerlessLLM head
+  plus two GPU workers (each one visible RTX 5070 Ti) deployed the direct-vLLM
+  model. A preempt event on worker `1` selected TP1/PP1 target node `0` and
+  returned `execution.status="applied"`; the router then reported exactly one
+  ready instance on node `0`. The adapter created the target actor, waited for
+  readiness, switched traffic, drained, and stopped the old actor.
+- V9 provider metadata validation (2026-07-19): callable/config-shaped provider
+  fields were normalized and bounded, provenance/confidence were retained, and
+  an unknown node (or empty provider response) selected the conservative
+  provider (`confidence=0.0`). No cloud provider endpoint is available on this
+  host, so live predictor accuracy remains deployment-specific rather than a
+  synthetic production claim.
+- V9 scheduler integration smoke (2026-07-19): the real ServerlessLLM Python
+  environment passed provider metadata through `FcfsScheduler`; node `node-1`
+  retained provider risk `0.12`, while unknown `node-x` retained conservative
+  provenance and confidence `0.0`.
+- Cross-node positive restore is not complete because a second node is not
+  available; the capability remains explicitly `can_restore_cross_node=false`.
+
 Useful validation commands depend on the deployment, but the expected signals
 are:
 
@@ -350,7 +419,8 @@ state_restore_fallback_count = 0                # no fallback for true restore
 
 Safe claims:
 
-- V6 ServerlessLLM planner can select a new `ParallelPlan` after spot events.
+- V6 ServerlessLLM planner and concrete vLLM deployment adapter can apply a new
+  `ParallelPlan` after a spot event on a live same-host GPU cluster.
 - V7 ServerlessLLM router can call vLLM backend metadata and plan context
   migration.
 - V8 ServerlessLLM recovery path supports backend state export/restore and safe
@@ -358,12 +428,18 @@ Safe claims:
 - V9 ServerlessLLM scheduler can rank nodes with risk metadata.
 - Dummy benchmarks validate control-plane behavior and token-level recovery.
 
-Do not claim until runtime validation exists:
+Do not claim without additional deployment evidence:
 
-- vLLM runtime dynamically reapplies V6 `ParallelPlan`.
-- V7 achieves true low-cost KV block context migration.
-- V8 restores real vLLM KV cache state.
-- V9 uses production cloud spot-risk prediction.
+- V6 reparallelization latency improvement; the live result validates lifecycle
+  correctness, not a production latency SLO.
+- V7 achieves true low-cost KV block context migration in a live target-reuse
+  benchmark (same-host GPU evidence is complete; cross-node latency remains
+  unmeasured).
+- V8 restores real vLLM KV cache state through the containerized dual-engine
+  NIXL path.  A deployed-router recovery event and cross-node restore still
+  require a second live worker/node.
+- V9 production cloud spot-risk prediction quality; the provider hook is live,
+  but this host has no cloud predictor endpoint.
 - latency improvements from KV migration/restore, unless the benchmark shows
   real runtime hooks, no fallback, and restored/reused KV blocks.
 

@@ -65,6 +65,8 @@ services:
       - RAY_TEMP_DIR=/raytmp/worker
       - HF_HOME=/hf-cache
       - HF_HUB_DISABLE_XET=1
+      - VLLM_NIXL_ABORT_REQUEST_TIMEOUT=120
+      - VLLM_NIXL_SIDE_CHANNEL_HOST=127.0.0.1
     shm_size: "10gb"
     pids_limit: 32768
     networks:

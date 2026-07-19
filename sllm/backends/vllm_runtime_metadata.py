@@ -103,6 +103,12 @@ def get_vllm_runtime_metadata(
         "loading_cost": profile["estimated_load_time_s"],
         "free_gpu": int(runtime_metadata.get("free_gpu", 0) or 0),
         "total_gpu": int(runtime_metadata.get("total_gpu", 0) or 0),
+        "free_gpu_memory_gb": _non_negative_float(
+            runtime_metadata.get("free_gpu_memory_gb"), 0.0
+        ),
+        "total_gpu_memory_gb": _non_negative_float(
+            runtime_metadata.get("total_gpu_memory_gb"), 0.0
+        ),
         "spot_risk": _non_negative_float(
             runtime_metadata.get("spot_risk"), 0.0
         ),
