@@ -458,3 +458,39 @@ Bignose runtime work is done when:
 - same-node and cross-node capabilities are reported separately.
 - capability flags are true only for actually working runtime paths.
 - live GPU benchmark results confirm the claimed path without fallback.
+
+## Completed Core Work
+
+The following Bignose runtime tasks are completed and validated as of
+2026-07-19:
+
+- **V6 executor:** `ReparallelizationExecutor` is connected to the concrete
+  `VllmDeploymentAdapter`. A live ServerlessLLM GPU smoke applied a selected
+  `ParallelPlan` (TP1/PP1) after preemption, created the target vLLM worker,
+  switched traffic, drained/stopped the old worker, and served a successful
+  inference request.
+- **V7 target-specific KV reuse:** live CUDA engines reported real block
+  metadata and target-specific reuse:
+  `reusable_tokens_by_target={"vllm-target": 64}` and
+  `reusable_blocks_by_target={"vllm-target": 4}`. Reuse maps remain empty when
+  compatibility evidence is unavailable.
+- **V8 same-node KV restore:** source export returned non-empty
+  `runtime_state`; target attach completed through NIXL; restored blocks were
+  reported with `state_restore_successes_total=1` and
+  `state_restore_fallback_count=0` in the validated same-node harness.
+- **V9 risk metadata:** callable provider, JSON/file, and environment inputs
+  are normalized, bounded, and tagged with provider/source/time/confidence.
+  `FcfsScheduler` preserves authoritative Ray capacity and falls back to
+  conservative metadata (`confidence=0.0`) when provider data is unavailable.
+- **Capability reporting:** same-node and cross-node restore capabilities are
+  reported independently. Same-node capability is enabled only on the tested
+  path; `can_restore_cross_node` remains false until a real cross-node test
+  succeeds.
+- **Validation artifacts:** router/backend/state-restore tests, same-node
+  tiny and Qwen1.5-MoE dual-engine NIXL harnesses, target-reuse GPU harnesses,
+  V6 deployment smoke, and V9 provider/scheduler smoke have passed.
+
+The remaining non-completed items are external deployment validations: a
+positive cross-node NIXL restore, production cloud risk-provider quality, and
+production latency/SLO benchmarking. These are intentionally not marked as
+completed by the runtime implementation.
