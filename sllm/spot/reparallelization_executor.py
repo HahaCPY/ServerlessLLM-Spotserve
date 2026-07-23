@@ -27,6 +27,9 @@ class ReparallelizationExecutor:
     ``create_workers`` must return a worker handle; ``ready`` may perform a
     health check.  The old handle is only stopped after the target is ready,
     so a failed replan leaves serving traffic untouched.
+
+    Set ``stop_current_before_create`` only for deployments where the planned
+    target must reuse the exact GPU resources currently held by ``current``.
     """
 
     create_workers: MaybeAsync
@@ -35,8 +38,15 @@ class ReparallelizationExecutor:
     drain: MaybeAsync
     stop: MaybeAsync
     current: Optional[Any] = None
+    stop_current_before_create: bool = False
 
     async def apply(self, plan: ParallelPlan) -> Any:
+        if self.stop_current_before_create and self.current is not None:
+            old = self.current
+            await _call(self.drain, old)
+            await _call(self.stop, old)
+            self.current = None
+
         target = await _call(self.create_workers, plan)
         try:
             if not await _call(self.ready, target, plan):

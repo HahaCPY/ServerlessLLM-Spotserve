@@ -204,7 +204,7 @@ index 5998ce1b8..c0c1f913b 100644
      async def add_request(
          self,
          request_id: str,
-@@ -372,6 +432,17 @@ class AsyncLLM(EngineClient):
+@@ -372,6 +432,21 @@ class AsyncLLM(EngineClient):
          index: int,
          queue: RequestOutputCollector,
      ):

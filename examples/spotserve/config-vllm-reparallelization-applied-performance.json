@@ -1,5 +1,5 @@
 {
-  "model": "vllm-reparallelization-gpu-smoke",
+  "model": "vllm-reparallelization-applied-perf",
   "backend": "vllm",
   "router_num_cpus": 0,
   "num_cpus": 1,
@@ -49,6 +49,6 @@
         }
       }
     },
-    "metrics_path": "/tmp/spotserve-work/results/spotserve_reparallelization/vllm-reparallelization-router.jsonl"
+    "metrics_path": "/tmp/spotserve-work/results/spotserve_reparallelization_performance/vllm-reparallelization-applied-router.jsonl"
   }
 }

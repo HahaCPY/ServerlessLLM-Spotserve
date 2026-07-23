@@ -12,8 +12,12 @@ Options:
   --skip-build       Do not run "docker compose build sllm_head"
   --skip-recreate    Do not recreate the sllm_head container
   --skip-deploy      Copy artifacts but do not deploy models
+  --build-only       Build the image, run cleanup, and exit
+  --no-cleanup       Do not prune stale build artifacts after build/recreate
+  --cleanup-only     Prune stale build artifacts and exit
   --deploy-set SET   Models to deploy: standard, correctness,
-                     reparallelization, vllm-dense, vllm-moe,
+                     reparallelization, reparallelization-performance,
+                     vllm-dense, vllm-moe,
                      vllm-blackbox, or all.
                      Default: standard. "all" can require substantial GPU capacity.
   -h, --help         Show this help
@@ -29,7 +33,21 @@ Environment overrides:
                             Default: <repo>/.spotserve-tmp
   SPOTSERVE_WORKDIR          Container workdir. Default: /tmp/spotserve-work
   SPOTSERVE_HEALTH_URL       Container API health URL. Default: http://127.0.0.1:8343/health
-  SPOTSERVE_WORKER_CONTAINER Worker container used by vllm-dense. Default: sllm_worker_0
+  SPOTSERVE_WORKER_CONTAINER Worker container used by vLLM deploy sets. Default: sllm_worker_0
+  SPOTSERVE_HF_CACHE_DIR     Host HF cache dir mounted as /hf-cache.
+                            Default: /tmp/sllm-hf-cache-rootless
+  SPOTSERVE_CLEANUP_BUILD_ARTIFACTS
+                            Prune dangling images/build cache after build.
+                            Default: 1
+  SPOTSERVE_CLEANUP_STOPPED_CONTAINERS
+                            Remove stopped sllm_head/sllm_worker_* containers.
+                            Default: 1
+  SPOTSERVE_REPARALLELIZATION_MODEL_PATH
+                            vLLM model path/id used by V6 reparallelization.
+                            Default: /models/vllm/vllm-dense-baseline
+  SPOTSERVE_REPARALLELIZATION_LOAD_FORMAT
+                            vLLM load_format used by V6 reparallelization.
+                            Default: serverless_llm
   SPOTSERVE_VLLM_DENSE_MODEL_PATH
                             Optional container-local HF snapshot path to verify.
   SPOTSERVE_VLLM_MOE_MODEL  MoE HF model id or container-local path.
@@ -46,6 +64,11 @@ EOF
 SKIP_BUILD=0
 SKIP_RECREATE=0
 SKIP_DEPLOY=0
+BUILD_ONLY=0
+CLEANUP_ONLY=0
+CLEANUP_BUILD_ARTIFACTS="${SPOTSERVE_CLEANUP_BUILD_ARTIFACTS:-1}"
+CLEANUP_STOPPED_CONTAINERS="${SPOTSERVE_CLEANUP_STOPPED_CONTAINERS:-1}"
+CLEANUP_RAN=0
 DEPLOY_SET="${SPOTSERVE_DEPLOY_SET:-standard}"
 
 while [[ $# -gt 0 ]]; do
@@ -62,10 +85,25 @@ while [[ $# -gt 0 ]]; do
       SKIP_DEPLOY=1
       shift
       ;;
+    --build-only)
+      BUILD_ONLY=1
+      SKIP_RECREATE=1
+      SKIP_DEPLOY=1
+      shift
+      ;;
+    --no-cleanup)
+      CLEANUP_BUILD_ARTIFACTS=0
+      CLEANUP_STOPPED_CONTAINERS=0
+      shift
+      ;;
+    --cleanup-only)
+      CLEANUP_ONLY=1
+      shift
+      ;;
     --deploy-set)
       DEPLOY_SET="${2:-}"
-      if [[ "$DEPLOY_SET" != "standard" && "$DEPLOY_SET" != "correctness" && "$DEPLOY_SET" != "reparallelization" && "$DEPLOY_SET" != "vllm-dense" && "$DEPLOY_SET" != "vllm-moe" && "$DEPLOY_SET" != "vllm-blackbox" && "$DEPLOY_SET" != "all" ]]; then
-        echo "--deploy-set must be one of: standard, correctness, reparallelization, vllm-dense, vllm-moe, vllm-blackbox, all" >&2
+      if [[ "$DEPLOY_SET" != "standard" && "$DEPLOY_SET" != "correctness" && "$DEPLOY_SET" != "reparallelization" && "$DEPLOY_SET" != "reparallelization-performance" && "$DEPLOY_SET" != "vllm-dense" && "$DEPLOY_SET" != "vllm-moe" && "$DEPLOY_SET" != "vllm-blackbox" && "$DEPLOY_SET" != "all" ]]; then
+        echo "--deploy-set must be one of: standard, correctness, reparallelization, reparallelization-performance, vllm-dense, vllm-moe, vllm-blackbox, all" >&2
         exit 2
       fi
       shift 2
@@ -87,9 +125,12 @@ CONTAINER="${SPOTSERVE_CONTAINER:-sllm_head}"
 COMPOSE_SERVICE="${SPOTSERVE_COMPOSE_SERVICE:-sllm_head}"
 WORKER_CONTAINER="${SPOTSERVE_WORKER_CONTAINER:-sllm_worker_0}"
 HOST_TMPDIR="${SPOTSERVE_HOST_TMPDIR:-${ROOT_DIR}/.spotserve-tmp}"
+HF_CACHE_DIR="${SPOTSERVE_HF_CACHE_DIR:-/tmp/sllm-hf-cache-rootless}"
 WORKDIR_IN_CONTAINER="${SPOTSERVE_WORKDIR:-/tmp/spotserve-work}"
 HEALTH_URL="${SPOTSERVE_HEALTH_URL:-http://127.0.0.1:8343/health}"
 MODELS_URL="${SPOTSERVE_MODELS_URL:-http://127.0.0.1:8343/v1/models}"
+REPARALLELIZATION_MODEL_PATH="${SPOTSERVE_REPARALLELIZATION_MODEL_PATH:-/models/vllm/vllm-dense-baseline}"
+REPARALLELIZATION_LOAD_FORMAT="${SPOTSERVE_REPARALLELIZATION_LOAD_FORMAT:-serverless_llm}"
 VLLM_DENSE_MODEL_PATH="${SPOTSERVE_VLLM_DENSE_MODEL_PATH:-}"
 VLLM_MOE_MODEL="${SPOTSERVE_VLLM_MOE_MODEL:-Qwen/Qwen1.5-MoE-A2.7B}"
 VLLM_MOE_LOAD_FORMAT="${SPOTSERVE_VLLM_MOE_LOAD_FORMAT:-auto}"
@@ -102,10 +143,11 @@ WORKER_PYTHON="/opt/venvs/worker/bin/python"
 
 MODEL_FOLDER="${MODEL_FOLDER:-${ROOT_DIR}/model}"
 export MODEL_FOLDER
+export HF_CACHE_DIR
 
 if [[ -n "${SPOTSERVE_COMPOSE_SERVICES:-}" ]]; then
   read -r -a COMPOSE_SERVICES <<<"$SPOTSERVE_COMPOSE_SERVICES"
-elif [[ "$DEPLOY_SET" == "vllm-dense" || "$DEPLOY_SET" == "vllm-moe" || "$DEPLOY_SET" == "vllm-blackbox" || "$DEPLOY_SET" == "all" ]]; then
+elif [[ "$DEPLOY_SET" == "reparallelization" || "$DEPLOY_SET" == "reparallelization-performance" || "$DEPLOY_SET" == "vllm-dense" || "$DEPLOY_SET" == "vllm-moe" || "$DEPLOY_SET" == "vllm-blackbox" || "$DEPLOY_SET" == "all" ]]; then
   COMPOSE_SERVICES=("$COMPOSE_SERVICE" "sllm_worker_0")
 else
   COMPOSE_SERVICES=("$COMPOSE_SERVICE")
@@ -121,21 +163,78 @@ log() {
   printf '\n[%s] %s\n' "$(date '+%H:%M:%S')" "$*"
 }
 
+cleanup_build_artifacts() {
+  if [[ "$CLEANUP_BUILD_ARTIFACTS" -ne 1 && "$CLEANUP_STOPPED_CONTAINERS" -ne 1 ]]; then
+    return
+  fi
+  CLEANUP_RAN=1
+  log "Cleaning stale SpotServe build artifacts"
+  if [[ "$CLEANUP_BUILD_ARTIFACTS" -eq 1 ]]; then
+    podman image prune -f || true
+    if podman builder prune --help >/dev/null 2>&1; then
+      podman builder prune -f || true
+    fi
+  fi
+  if [[ "$CLEANUP_STOPPED_CONTAINERS" -eq 1 ]]; then
+    local status id name
+    for status in created exited dead; do
+      while read -r id name; do
+        if [[ -z "${id:-}" || -z "${name:-}" ]]; then
+          continue
+        fi
+        case "$name" in
+          "$CONTAINER"|"$WORKER_CONTAINER"|sllm_head|sllm_worker_*)
+            podman rm -f "$id" || true
+            ;;
+        esac
+      done < <(podman ps -a --filter "status=${status}" --format "{{.ID}} {{.Names}}" 2>/dev/null || true)
+    done
+  fi
+}
+
+cleanup_on_exit() {
+  local status=$?
+  trap - EXIT
+  if [[ "$CLEANUP_RAN" -ne 1 ]]; then
+    cleanup_build_artifacts
+  fi
+  exit "$status"
+}
+
 cd "$ROOT_DIR"
 mkdir -p "$HOST_TMPDIR"
+mkdir -p "${HF_CACHE_DIR}/hub" "${HF_CACHE_DIR}/modules"
+chmod -R a+rwX "$HF_CACHE_DIR" 2>/dev/null || true
 RAY_STATUS_LOG="${HOST_TMPDIR}/spotserve-ray-status.log"
 VLLM_RESOURCES_LOG="${HOST_TMPDIR}/spotserve-vllm-resources.log"
 VLLM_RUNTIME_LOG="${HOST_TMPDIR}/spotserve-vllm-runtime.log"
 HEALTH_LOG="${HOST_TMPDIR}/spotserve-health.log"
 
+if [[ "$CLEANUP_ONLY" -eq 1 ]]; then
+  cleanup_build_artifacts
+  exit 0
+fi
+
+trap cleanup_on_exit EXIT
+
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
   log "Building ${COMPOSE_BUILD_SERVICES[*]}"
   docker compose build "${COMPOSE_BUILD_SERVICES[@]}"
+  cleanup_build_artifacts
+fi
+
+if [[ "$BUILD_ONLY" -eq 1 ]]; then
+  log "Build-only mode complete"
+  exit 0
 fi
 
 if [[ "$SKIP_RECREATE" -eq 0 ]]; then
   log "Recreating ${COMPOSE_SERVICES[*]}"
-  docker compose up -d --force-recreate --no-build "${COMPOSE_SERVICES[@]}"
+  if ! docker compose up -d --force-recreate --remove-orphans --no-build "${COMPOSE_SERVICES[@]}"; then
+    log "Retrying recreate without --remove-orphans"
+    docker compose up -d --force-recreate --no-build "${COMPOSE_SERVICES[@]}"
+  fi
+  cleanup_build_artifacts
 fi
 
 log "Waiting for Ray in ${CONTAINER}"
@@ -154,27 +253,41 @@ for attempt in $(seq 1 60); do
   sleep 2
 done
 
-if [[ "$DEPLOY_SET" == "vllm-dense" || "$DEPLOY_SET" == "vllm-moe" || "$DEPLOY_SET" == "vllm-blackbox" || "$DEPLOY_SET" == "all" ]]; then
+if [[ "$DEPLOY_SET" == "reparallelization" || "$DEPLOY_SET" == "reparallelization-performance" || "$DEPLOY_SET" == "vllm-dense" || "$DEPLOY_SET" == "vllm-moe" || "$DEPLOY_SET" == "vllm-blackbox" || "$DEPLOY_SET" == "all" ]]; then
   log "Checking vLLM worker resources"
-  if ! podman exec -i "$WORKER_CONTAINER" "$WORKER_PYTHON" - >"$VLLM_RUNTIME_LOG" 2>&1 <<'PY'
+  podman exec "$WORKER_CONTAINER" bash -lc \
+    "mkdir -p /hf-cache/hub /hf-cache/modules && chmod -R a+rwX /hf-cache && touch /hf-cache/modules/.spotserve-write-test"
+  if ! podman exec -i "$WORKER_CONTAINER" "$WORKER_PYTHON" - "$DEPLOY_SET" >"$VLLM_RUNTIME_LOG" 2>&1 <<'PY'
 import inspect
-from importlib.metadata import version
+import sys
+from importlib.metadata import PackageNotFoundError, version
 
 from vllm import AsyncLLMEngine
-from nixl._api import nixl_agent
 
-required_hooks = (
-    "get_request_kv_metadata",
-    "get_all_request_kv_metadata",
-    "export_inference_state",
-    "restore_inference_state",
-    "supports_state_restore",
-)
+deploy_set = sys.argv[1]
+required_hooks = ()
+if deploy_set not in ("reparallelization", "reparallelization-performance"):
+    from nixl._api import nixl_agent
+
+    required_hooks = (
+        "get_request_kv_metadata",
+        "get_all_request_kv_metadata",
+        "export_inference_state",
+        "restore_inference_state",
+        "supports_state_restore",
+    )
 missing = [name for name in required_hooks if not hasattr(AsyncLLMEngine, name)]
+try:
+    nixl_version = version("nixl")
+except PackageNotFoundError:
+    nixl_version = "not installed"
 print("vLLM version:", version("vllm"))
-print("NIXL version:", version("nixl"))
+print("NIXL version:", nixl_version)
 print("AsyncLLMEngine module:", inspect.getfile(AsyncLLMEngine))
-print("runtime metadata hooks:", {name: name not in missing for name in required_hooks})
+if required_hooks:
+    print("runtime metadata hooks:", {name: name not in missing for name in required_hooks})
+else:
+    print("runtime metadata hooks: not required for reparallelization deploy set")
 if missing:
     raise SystemExit(f"Missing patched vLLM runtime hooks: {missing}")
 PY
@@ -195,6 +308,25 @@ Expected: ${VLLM_DENSE_MODEL_PATH}/config.json
 Host MODEL_FOLDER is: ${MODEL_FOLDER}
 Set SPOTSERVE_VLLM_DENSE_MODEL_PATH only when you have a container-local
 Hugging Face snapshot path with config/tokenizer/weight files.
+EOF
+        exit 1
+      fi
+      sleep 2
+    done
+  fi
+  if [[ "$DEPLOY_SET" == "reparallelization" || "$DEPLOY_SET" == "reparallelization-performance" || "$DEPLOY_SET" == "all" ]] &&
+      [[ "$REPARALLELIZATION_MODEL_PATH" == /* ]]; then
+    for attempt in $(seq 1 90); do
+      if podman exec "$WORKER_CONTAINER" test -f "${REPARALLELIZATION_MODEL_PATH}/config.json"; then
+        break
+      fi
+      if [[ "$attempt" -eq 90 ]]; then
+        cat >&2 <<EOF
+vLLM reparallelization model is not visible in ${WORKER_CONTAINER}.
+Expected: ${REPARALLELIZATION_MODEL_PATH}/config.json
+Host MODEL_FOLDER is: ${MODEL_FOLDER}
+Set SPOTSERVE_REPARALLELIZATION_MODEL_PATH to a container-local model path
+or Hugging Face model id that the worker can load.
 EOF
         exit 1
       fi
@@ -244,6 +376,8 @@ PY
       cat >&2 <<'EOF'
 Ray has no GPU worker available for vLLM deploy.
 Start sllm_worker_0 on a node where the NVIDIA driver is available, then rerun:
+  scripts/prepare_spotserve.sh --deploy-set reparallelization
+or:
   scripts/prepare_spotserve.sh --deploy-set vllm-dense
 or:
   scripts/prepare_spotserve.sh --deploy-set vllm-moe
@@ -291,6 +425,34 @@ podman cp benchmarks/spotserve/. "${CONTAINER}:${WORKDIR_IN_CONTAINER}/benchmark
 podman cp examples/spotserve/. "${CONTAINER}:${WORKDIR_IN_CONTAINER}/examples/spotserve"
 podman cp scripts/. "${CONTAINER}:${WORKDIR_IN_CONTAINER}/scripts"
 
+if [[ "$DEPLOY_SET" == "reparallelization" || "$DEPLOY_SET" == "reparallelization-performance" || "$DEPLOY_SET" == "all" ]]; then
+  log "Applying vLLM reparallelization config override"
+  podman exec -i "$CONTAINER" "$HEAD_PYTHON" - \
+    "$WORKDIR_IN_CONTAINER" \
+    "$REPARALLELIZATION_MODEL_PATH" \
+    "$REPARALLELIZATION_LOAD_FORMAT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+workdir = Path(sys.argv[1])
+model_path = sys.argv[2]
+load_format = sys.argv[3]
+for relative_path in (
+    "examples/spotserve/config-vllm-reparallelization-applied-performance.json",
+    "examples/spotserve/config-vllm-reparallelization-baseline-gpu-smoke.json",
+    "examples/spotserve/config-vllm-reparallelization-gpu-smoke.json",
+):
+    path = workdir / relative_path
+    config = json.loads(path.read_text(encoding="utf-8"))
+    backend_config = config.setdefault("backend_config", {})
+    backend_config["pretrained_model_name_or_path"] = model_path
+    backend_config["load_format"] = load_format
+    path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    print(f"patched {path}: model={model_path} load_format={load_format}")
+PY
+fi
+
 if [[ "$DEPLOY_SET" == "vllm-moe" || "$DEPLOY_SET" == "vllm-blackbox" || "$DEPLOY_SET" == "all" ]]; then
   log "Applying vLLM MoE config overrides"
   podman exec -i "$CONTAINER" "$HEAD_PYTHON" - \
@@ -333,8 +495,11 @@ if [[ "$SKIP_DEPLOY" -eq 0 ]]; then
     "examples/spotserve/config-dummy-correctness-stateful-recovery.json"
   )
   REPARALLELIZATION_CONFIGS=(
-    "examples/spotserve/config-dummy-reparallelization-baseline.json"
-    "examples/spotserve/config-dummy-reparallelization.json"
+    "examples/spotserve/config-vllm-reparallelization-gpu-smoke.json"
+  )
+  REPARALLELIZATION_PERFORMANCE_CONFIGS=(
+    "examples/spotserve/config-vllm-reparallelization-baseline-gpu-smoke.json"
+    "examples/spotserve/config-vllm-reparallelization-applied-performance.json"
   )
   VLLM_DENSE_CONFIGS=(
     "examples/spotserve/config-vllm-dense-baseline.json"
@@ -358,6 +523,9 @@ if [[ "$SKIP_DEPLOY" -eq 0 ]]; then
   fi
   if [[ "$DEPLOY_SET" == "reparallelization" || "$DEPLOY_SET" == "all" ]]; then
     DEPLOY_CONFIGS+=("${REPARALLELIZATION_CONFIGS[@]}")
+  fi
+  if [[ "$DEPLOY_SET" == "reparallelization-performance" || "$DEPLOY_SET" == "all" ]]; then
+    DEPLOY_CONFIGS+=("${REPARALLELIZATION_PERFORMANCE_CONFIGS[@]}")
   fi
   if [[ "$DEPLOY_SET" == "vllm-dense" || "$DEPLOY_SET" == "vllm-blackbox" || "$DEPLOY_SET" == "all" ]]; then
     DEPLOY_CONFIGS+=("${VLLM_DENSE_CONFIGS[@]}")
@@ -432,7 +600,22 @@ cd ${WORKDIR_IN_CONTAINER} &&
 ${HEAD_PYTHON} benchmarks/spotserve/run_benchmark.py \\
   --config benchmarks/spotserve/benchmark_matrix_reparallelization.yaml \\
   --endpoint http://127.0.0.1:8343/v1/chat/completions \\
-  --request-timeout 30
+  --request-timeout 120
+'
+EOF
+fi
+
+if [[ "$DEPLOY_SET" == "reparallelization-performance" || "$DEPLOY_SET" == "all" ]]; then
+  cat <<EOF
+
+Run the dynamic-reparallelization performance comparison with:
+
+podman exec ${CONTAINER} bash -lc '
+cd ${WORKDIR_IN_CONTAINER} &&
+${HEAD_PYTHON} benchmarks/spotserve/run_benchmark.py \\
+  --config benchmarks/spotserve/benchmark_matrix_reparallelization_performance.yaml \\
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \\
+  --request-timeout 180
 '
 EOF
 fi

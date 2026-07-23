@@ -1,0 +1,31 @@
+{
+  "endpoint": "http://127.0.0.1:8345/v1/chat/completions",
+  "output_dir": "results/spotserve_reparallelization_performance",
+  "runs": [
+    {
+      "name": "vllm-reparallelization-disabled",
+      "model": "vllm-reparallelization-baseline",
+      "backend": "vllm",
+      "policy": "none",
+      "workload": "benchmarks/spotserve/workloads/reparallelization_vllm_performance.jsonl",
+      "trace": "examples/spotserve/spot_trace_vllm_reparallelization_baseline_performance.jsonl",
+      "router_metrics_path": "/tmp/spotserve-work/results/spotserve_reparallelization_performance/vllm-reparallelization-baseline-router.jsonl"
+    },
+    {
+      "name": "vllm-reparallelization-applied",
+      "model": "vllm-reparallelization-applied-perf",
+      "backend": "vllm",
+      "policy": "none",
+      "workload": "benchmarks/spotserve/workloads/reparallelization_vllm_performance.jsonl",
+      "trace": "examples/spotserve/spot_trace_vllm_reparallelization_applied_performance.jsonl",
+      "router_metrics_path": "/tmp/spotserve-work/results/spotserve_reparallelization_performance/vllm-reparallelization-applied-router.jsonl"
+    }
+  ],
+  "comparisons": [
+    {
+      "name": "applied-vs-disabled",
+      "baseline": "vllm-reparallelization-disabled",
+      "candidate": "vllm-reparallelization-applied"
+    }
+  ]
+}

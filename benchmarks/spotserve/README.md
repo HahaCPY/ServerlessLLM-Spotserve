@@ -69,7 +69,12 @@ On head-only dummy setups, avoid deploying both standard and correctness dummy
 model sets at the same time; the extra Ray actors can exceed the container
 thread limit.
 
-For dynamic reparallelization planner validation, deploy only the
+`scripts/prepare_spotserve.sh` prunes dangling images, build cache, and stopped
+SpotServe containers after build/recreate by default so repeated benchmark
+iterations do not keep filling local container storage. Use `--no-cleanup` to
+preserve cache for debugging.
+
+For dynamic reparallelization validation, deploy only the
 reparallelization configs and run:
 
 ```bash
@@ -78,14 +83,73 @@ scripts/prepare_spotserve.sh --deploy-set reparallelization
 python benchmarks/spotserve/run_benchmark.py \
   --config benchmarks/spotserve/benchmark_matrix_reparallelization.yaml \
   --endpoint http://127.0.0.1:8345/v1/chat/completions \
-  --request-timeout 30
+  --request-timeout 120
 ```
 
-This matrix includes a baseline model with `enable_reparallelization=false` and
-a planner model with `enable_reparallelization=true`. It validates replan
-metrics and control-plane overhead. It does not claim serving latency gains from
-runtime reconfiguration because the dummy backend does not execute a new
-parallel plan.
+This matrix deploys the vLLM reparallelization smoke model with
+`enable_reparallelization=true`. It validates that the selected `ParallelPlan`
+is consumed by the vLLM deployment adapter and that the router metrics report
+`replanning_execution_applied > 0`.
+
+By default the smoke config loads `/models/vllm/vllm-dense-baseline` with the
+patched `serverless_llm` load format. That local fixture is a
+ServerlessLLM-store layout (`rank_0/tensor.data_0`), not a standard HF
+safetensors/bin snapshot. Set both overrides before running
+`prepare_spotserve.sh` if your worker exposes a different model path or should
+load a Hugging Face model id:
+
+```bash
+export SPOTSERVE_REPARALLELIZATION_MODEL_PATH=/models/vllm/vllm-dense-baseline
+export SPOTSERVE_REPARALLELIZATION_LOAD_FORMAT=serverless_llm
+
+# For a normal Hugging Face id or snapshot:
+export SPOTSERVE_REPARALLELIZATION_MODEL_PATH=Qwen/Qwen2.5-0.5B-Instruct
+export SPOTSERVE_REPARALLELIZATION_LOAD_FORMAT=auto
+```
+
+The smoke config enables `allow_stop_before_recreate=true` so the root
+single-worker compose setup can release and recreate the vLLM actor on
+`sllm_worker_0`. Multi-worker deployments can leave that option disabled to keep
+the safer create-before-stop flow.
+
+The old dummy reparallelization configs remain useful for planner-only unit
+validation, but they are no longer the default V6 benchmark path because dummy
+does not execute a selected `ParallelPlan`.
+
+For a V6 performance comparison, run the separate performance matrix:
+
+```bash
+scripts/prepare_spotserve.sh --deploy-set reparallelization-performance
+
+podman exec sllm_head bash -lc '
+cd /tmp/spotserve-work &&
+/opt/venvs/head/bin/python benchmarks/spotserve/run_benchmark.py \
+  --config benchmarks/spotserve/benchmark_matrix_reparallelization_performance.yaml \
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \
+  --request-timeout 180
+'
+```
+
+This matrix compares:
+
+```text
+vllm-reparallelization-disabled: enable_reparallelization=false
+vllm-reparallelization-applied:  enable_reparallelization=true
+```
+
+The workload labels each request as `warmup`, `pre_replan`,
+`replan_window`, or `post_replan`; the summary writes phase-specific fields
+such as `phase_post_replan_latency_p95_ms`. It also writes
+`latest_comparisons.json` in the performance output directory.
+
+On the default root compose setup there is only one real worker id
+(`sllm_worker_0`). The performance matrix is therefore useful for measuring
+adapter/recreate overhead and post-replan steady-state latency, but a true
+latency-improvement claim needs at least two real worker nodes so the baseline
+can lose the active node while the applied run moves to a different live node.
+The applied performance run uses the model alias
+`vllm-reparallelization-applied-perf` so its router metrics do not collide with
+the correctness smoke.
 
 For risk-aware scheduling validation, run the synthetic scheduler benchmark.
 This does not require a deployed model:

@@ -258,6 +258,11 @@ class RoundRobinRouter(SllmRouter):
             self.vllm_deployment_adapter.switch_workers,
             self.vllm_deployment_adapter.drain_workers,
             self.vllm_deployment_adapter.stop_workers,
+            stop_current_before_create=bool(
+                self.reparallelization_config.get(
+                    "allow_stop_before_recreate", False
+                )
+            ),
         )
         return True
 

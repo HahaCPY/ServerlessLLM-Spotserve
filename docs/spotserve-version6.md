@@ -8,13 +8,16 @@ spot event
 -> GPU availability changes
 -> replanning heuristic
 -> ParallelPlan
+-> vLLM deployment adapter
 -> replanning metrics
 -> benchmark report
 ```
 
 This version produces a backend-independent deployment plan after spot GPU
-resources change. It does not modify vLLM internals and does not execute true
-MoE repartitioning yet.
+resources change. For `backend=vllm`, the selected plan is handed to the vLLM
+deployment adapter, which rebuilds target Ray actors and switches router traffic
+after readiness checks pass. It does not modify vLLM internals or execute
+in-place MoE expert repartitioning.
 
 ## Scope
 
@@ -26,16 +29,17 @@ Implemented:
 - target-node selection for the selected plan
 - router-side replanning after `preempt`, `recover`, and `dead` events
 - JSONL replanning metrics
-- benchmark summary fields for replanning decisions
+- benchmark summary fields for replanning decisions and execution status
+- vLLM deployment adapter path for applying a selected `ParallelPlan`
 - planner and router tests for the shared interface and metric path
 
 Out of scope:
 
-- vLLM internal repartitioning
+- in-place vLLM internal repartitioning
 - MoE expert placement optimization
 - CUDA kernels
-- KV cache migration
-- request-state migration
+- KV cache migration during V6 replan
+- request-state migration during V6 replan
 
 ## Shared Interface
 
@@ -62,8 +66,9 @@ File:
 sllm/spot/reparallelization.py
 ```
 
-CPY owns producing this plan. Backend owners can later validate whether the
-selected TP / DP / PP / EP shape is executable by vLLM or a MoE runtime.
+CPY owns producing this plan. Backend capability metadata and the deployment
+executor validate whether the selected TP / DP / PP / EP shape is executable by
+vLLM or another runtime.
 
 For now, `expert_parallel_size` defaults to `1`. Version 6 is a decision-layer
 implementation, not an expert-aware runtime implementation.
@@ -127,13 +132,16 @@ Router replanning is opt-in:
 
 ```json
 {
+  "model": "vllm-reparallelization-gpu-smoke",
+  "backend": "vllm",
   "router_config": {
     "enable_reparallelization": true,
     "reparallelization_config": {
-      "model_gpu_requirement": 2,
-      "max_tensor_parallel_size": 4,
-      "max_pipeline_parallel_size": 2,
-      "min_data_parallel_size": 1
+      "target_replica_gpus": 1,
+      "max_tensor_parallel_size": 1,
+      "max_pipeline_parallel_size": 1,
+      "drain_timeout_s": 30,
+      "allow_stop_before_recreate": true
     }
   }
 }
@@ -155,16 +163,20 @@ also includes:
   "reparallelization": {
     "action": "reparallelize",
     "parallel_plan": {
-      "model_name": "dummy-reparallelization",
-      "backend": "dummy",
-      "tensor_parallel_size": 2,
+      "model_name": "vllm-reparallelization-gpu-smoke",
+      "backend": "vllm",
+      "tensor_parallel_size": 1,
       "data_parallel_size": 1,
       "pipeline_parallel_size": 1,
       "expert_parallel_size": 1,
       "num_replicas": 1,
-      "num_gpus": 2,
-      "target_nodes": ["1"],
+      "num_gpus": 1,
+      "target_nodes": ["0"],
       "reason": "preempt_replan"
+    },
+    "execution": {
+      "status": "applied",
+      "instance_ids": ["vllm-reparallelization-gpu-smoke_reparallel_..."]
     }
   }
 }
@@ -208,28 +220,33 @@ Each replanning decision emits a JSONL metric:
 ```json
 {
   "type": "reparallelization",
-  "model": "dummy-reparallelization",
+  "model": "vllm-reparallelization-gpu-smoke",
   "event": "preempt",
   "action": "reparallelize",
-  "available_gpus": 2,
-  "unavailable_gpus": 2,
-  "candidate_count": 3,
-  "selected_total_gpus": 2,
-  "selected_tensor_parallel_size": 2,
+  "available_gpus": 1,
+  "unavailable_gpus": 1,
+  "candidate_count": 1,
+  "selected_total_gpus": 1,
+  "selected_tensor_parallel_size": 1,
   "selected_pipeline_parallel_size": 1,
   "selected_data_parallel_size": 1,
-  "target_nodes": ["1"],
+  "target_nodes": ["0"],
   "parallel_plan": {
-    "model_name": "dummy-reparallelization",
-    "backend": "dummy",
-    "tensor_parallel_size": 2,
+    "model_name": "vllm-reparallelization-gpu-smoke",
+    "backend": "vllm",
+    "tensor_parallel_size": 1,
     "data_parallel_size": 1,
     "pipeline_parallel_size": 1,
     "expert_parallel_size": 1,
     "num_replicas": 1,
-    "num_gpus": 2,
-    "target_nodes": ["1"],
+    "num_gpus": 1,
+    "target_nodes": ["0"],
     "reason": "preempt_replan"
+  },
+  "execution_status": "applied",
+  "execution": {
+    "status": "applied",
+    "instance_ids": ["vllm-reparallelization-gpu-smoke_reparallel_..."]
   }
 }
 ```
@@ -241,6 +258,9 @@ replanning_events
 replanning_no_capacity_events
 replanning_max_selected_gpus
 replanning_latest_plan
+replanning_execution_applied
+replanning_execution_failed
+replanning_latest_execution
 ```
 
 ## Benchmark
@@ -248,38 +268,63 @@ replanning_latest_plan
 Files:
 
 ```text
-examples/spotserve/config-dummy-reparallelization-baseline.json
-examples/spotserve/config-dummy-reparallelization.json
-examples/spotserve/spot_trace_reparallelization_baseline.jsonl
-examples/spotserve/spot_trace_reparallelization.jsonl
+examples/spotserve/config-vllm-reparallelization-gpu-smoke.json
+examples/spotserve/spot_trace_vllm_reparallelization.jsonl
+benchmarks/spotserve/workloads/reparallelization_vllm_smoke.jsonl
 benchmarks/spotserve/benchmark_matrix_reparallelization.yaml
 ```
 
-The benchmark matrix includes two runs:
+The benchmark matrix now uses the vLLM reparallelization smoke model:
 
 ```text
-dummy-reparallelization-baseline: enable_reparallelization=false
-dummy-reparallelization-planner:  enable_reparallelization=true
+vllm-reparallelization-applied: enable_reparallelization=true
 ```
 
-Both runs replay equivalent spot events against their own model names. The
-baseline is useful for validating control-plane overhead and confirming that
-replanning metrics only appear when the planner is enabled.
+This run replays a spot event against a deployed vLLM model and expects the
+router metrics to report `replanning_execution_applied > 0`. The old dummy
+configs remain useful for planner-only tests, but they are no longer the default
+V6 benchmark path because dummy cannot execute a selected `ParallelPlan`.
 
-The synthetic trace is:
+The default smoke model path is `/models/vllm/vllm-dense-baseline`, matching the
+local ServerlessLLM-store layout prepared by the dense vLLM benchmark fixtures:
+
+```text
+/models/vllm/vllm-dense-baseline/rank_0/tensor.data_0
+/models/vllm/vllm-dense-baseline/rank_0/tensor_index.json
+```
+
+Because that layout is not a Hugging Face safetensors/bin snapshot, the smoke
+config uses the patched vLLM `load_format="serverless_llm"` loader. Override
+the defaults when using a different container-local path or a normal Hugging
+Face model id:
+
+```bash
+export SPOTSERVE_REPARALLELIZATION_MODEL_PATH=/models/vllm/vllm-dense-baseline
+export SPOTSERVE_REPARALLELIZATION_LOAD_FORMAT=serverless_llm
+
+# or, for a standard Hugging Face id/snapshot:
+export SPOTSERVE_REPARALLELIZATION_MODEL_PATH=Qwen/Qwen2.5-0.5B-Instruct
+export SPOTSERVE_REPARALLELIZATION_LOAD_FORMAT=auto
+```
+
+The vLLM trace is:
 
 ```json
-{"time": 1.0, "event": "preempt", "node_id": "0", "model_name": "dummy-reparallelization"}
-{"time": 3.0, "event": "recover", "node_id": "0", "model_name": "dummy-reparallelization"}
-{"time": 5.0, "event": "dead", "node_id": "1", "model_name": "dummy-reparallelization"}
+{"time": 1.0, "event": "preempt", "node_id": "1", "model_name": "vllm-reparallelization-gpu-smoke"}
 ```
 
 Expected planner behavior:
 
-- after `preempt(node=0)`, node 0 is unavailable and the plan targets node 1
-- after `recover(node=0)`, both nodes are available again
-- after `dead(node=1)`, node 1 is unavailable and the plan targets node 0
+- after `preempt(node=1)`, node 1 is unavailable and the plan targets node 0
+- for vLLM, the deployment adapter creates the target actor and switches traffic
+- metrics show `execution.status = applied`
 - if no ready GPU remains, action becomes `no_capacity`
+
+The smoke config enables `allow_stop_before_recreate=true` because the default
+root compose file starts one GPU worker (`sllm_worker_0`). This lets the adapter
+release the current actor before recreating it on the same target GPU. Production
+or multi-worker deployments should keep the default create-before-stop behavior
+unless they explicitly accept that disruptive re-create window.
 
 ## How To Run
 
@@ -290,15 +335,13 @@ scripts/prepare_spotserve.sh --deploy-set reparallelization
 ```
 
 If the container is already running and you only need to deploy manually, deploy
-both configs:
+the vLLM smoke config:
 
 ```bash
 podman exec sllm_head bash -lc '
 cd /tmp/spotserve-work &&
 /opt/venvs/head/bin/sllm deploy \
-  --config examples/spotserve/config-dummy-reparallelization-baseline.json &&
-/opt/venvs/head/bin/sllm deploy \
-  --config examples/spotserve/config-dummy-reparallelization.json
+  --config examples/spotserve/config-vllm-reparallelization-gpu-smoke.json
 '
 ```
 
@@ -310,15 +353,77 @@ cd /tmp/spotserve-work &&
 /opt/venvs/head/bin/python benchmarks/spotserve/run_benchmark.py \
   --config benchmarks/spotserve/benchmark_matrix_reparallelization.yaml \
   --endpoint http://127.0.0.1:8343/v1/chat/completions \
-  --request-timeout 30
+  --request-timeout 120
 '
 ```
+
+To compare the V6 applied path against a no-reparallelization baseline, run the
+performance matrix:
+
+```bash
+scripts/prepare_spotserve.sh --deploy-set reparallelization-performance
+
+podman exec sllm_head bash -lc '
+cd /tmp/spotserve-work &&
+/opt/venvs/head/bin/python benchmarks/spotserve/run_benchmark.py \
+  --config benchmarks/spotserve/benchmark_matrix_reparallelization_performance.yaml \
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \
+  --request-timeout 180
+'
+```
+
+This matrix deploys and compares:
+
+```text
+vllm-reparallelization-disabled: enable_reparallelization=false
+vllm-reparallelization-applied:  enable_reparallelization=true
+```
+
+The applied performance run uses the model alias
+`vllm-reparallelization-applied-perf` so its router metrics path is independent
+from the correctness smoke model.
+
+The performance workload labels requests by phase:
+
+```text
+warmup
+pre_replan
+replan_window
+post_replan
+```
+
+Benchmark summaries include phase-specific fields such as:
+
+```text
+phase_replan_window_latency_p95_ms
+phase_post_replan_latency_p95_ms
+phase_post_replan_throughput_req_s
+```
+
+The runner also writes:
+
+```text
+results/spotserve_reparallelization_performance/latest_comparisons.json
+```
+
+On the default root compose setup, only `sllm_worker_0` is a real worker id.
+This performance matrix can measure V6 adapter/recreate overhead and
+post-replan steady-state behavior. A true latency-improvement or capacity-loss
+recovery claim requires at least two real worker nodes, so the baseline can
+lose the active node while the applied run moves traffic to another live node.
+
+In the local root-compose validation on 2026-07-23, the performance matrix
+passed with both runs at `successes=8/8`; the applied run reported
+`replanning_events=1`, `replanning_execution_applied=1`, and
+`replanning_execution_failed=0`. The most useful single-worker performance
+signal was the post-replan phase (`1044.20ms` baseline p95 vs `1047.13ms`
+applied p95), while the replan-window phase captured recreate/model-load
+overhead.
 
 The matrix writes router metrics to:
 
 ```text
-/tmp/spotserve-work/results/spotserve_reparallelization/dummy-reparallelization-baseline-router.jsonl
-/tmp/spotserve-work/results/spotserve_reparallelization/dummy-reparallelization-router.jsonl
+/tmp/spotserve-work/results/spotserve_reparallelization/vllm-reparallelization-router.jsonl
 ```
 
 The combined summary is written under:
@@ -334,8 +439,10 @@ Relevant tests:
 
 ```text
 tests/spotserve_test/test_reparallelization_planner.py
+tests/spotserve_test/test_reparallelization_executor.py
 tests/spotserve_test/test_router_state.py
-tests/spotserve_test/test_scheduler_node_health.py
+tests/spotserve_test/test_vllm_deployment_adapter.py
+tests/spotserve_test/run_vllm_deployment_adapter_smoke.py
 ```
 
 The planner tests cover:
@@ -351,6 +458,7 @@ The router tests cover:
 - dead instances are not revived
 - recover only revives preempting instances
 - replanning decisions are written to router metrics
+- vLLM replanning decisions can be applied by the deployment adapter
 
 ## Interpretation
 
@@ -359,24 +467,21 @@ spot GPU availability changes. When backend capability metadata is available,
 the planner now filters replanning candidates through `BackendCapability` before
 accepting a plan.
 
-The dummy benchmark can compare baseline request latency against planner-enabled
-request latency, but it should not be reported as runtime reparallelization
-speedup. The dummy backend does not execute the selected `ParallelPlan`, so the
-meaningful V6 signals are:
+The vLLM benchmark now verifies that the selected `ParallelPlan` is consumed by
+the vLLM deployment adapter. The meaningful V6 signals are:
 
 ```text
 replanning_events
 replanning_latest_plan
 replanning_no_capacity_events
 replanning_max_selected_gpus
+replanning_execution_applied
+replanning_latest_execution
 ```
 
-For vLLM / MoE integration, backend work still needs to confirm:
-
-- which TP / DP / PP / EP configurations are supported
-- maximum GPU count per model
-- whether state export and restore are supported
-- whether a selected `ParallelPlan` is legal for a specific backend
+This is still a deployment-lifecycle validation, not a production latency
+speedup claim. Latency gains require a benchmark that shows request traffic
+benefits from the new layout after the plan has been applied.
 
 That backend contract is represented by:
 

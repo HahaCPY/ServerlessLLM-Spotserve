@@ -7,7 +7,7 @@ The short version:
 
 ```text
 V6: CPY planner and the concrete vLLM deployment adapter are done; a live
-    container replan has applied a ParallelPlan across two GPU workers.
+    container replan applies a ParallelPlan through the vLLM adapter.
 V7: CPY live context-migration path calls vLLM backend; target-specific reuse is
     derived only when matching runtime prefix evidence is available.
 V8: CPY recovery path and same-node NIXL export/attach are validated; GPU
@@ -21,7 +21,7 @@ V9: CPY risk-aware scheduler and the provider metadata adapter are done; real
 
 | Version | CPY / ServerlessLLM status | Bignose / runtime status | What can be claimed now |
 |---|---|---|---|
-| V6 Dynamic Reparallelization | Planner, `ParallelPlan`, spot-event replanning, metrics | `VllmDeploymentAdapter` creates target-node vLLM Ray actors, waits for readiness, switches traffic, drains/stops old actors | Live two-worker GPU container smoke applied TP1/PP1 plan after preemption |
+| V6 Dynamic Reparallelization | Planner, `ParallelPlan`, spot-event replanning, metrics | `VllmDeploymentAdapter` creates target-node vLLM Ray actors, waits for readiness, switches traffic, drains/stops old actors | Live vLLM container smoke applies TP1/PP1 plan after preemption; single-worker smoke uses explicit stop-before-recreate |
 | V7 Low-cost Context Migration | Router calls backend `get_context_metadata()`, plans migration, optional `resume_kv_cache()` warmup | Router derives target-specific maps from matching target token/block metadata; empty when unproven | Live same-host GPU target-reuse benchmarks pass for tiny MoE and Qwen1.5-MoE TP2 |
 | V8 Stateful Restore | Router recovery path calls export/restore and falls back safely | Same-node vLLM runtime export/attach and ID/lease tracking validated in dual-engine harness | Tiny and Qwen1.5-MoE TP2 restore pass; GPU container/head/worker/NIXL smoke pass; cross-node validation pending |
 | V9 Risk-aware Scheduling | Scheduler can rank by risk and query backend actor metadata | `RiskMetadataProvider` supports callable provider, JSON/env integration, provenance, normalization, and conservative fallback | Real provider-shaped fields are preserved when available; unknown nodes remain conservative |
@@ -84,7 +84,10 @@ Bignose/runtime implementation:
 - coordinate with V7/V8 if in-flight request state must be migrated/restored.
 
 The live smoke validates the deployment lifecycle. It is a control-plane
-replan benchmark, not a claim about end-to-end latency improvement.
+replan benchmark, not a claim about end-to-end latency improvement. The default
+V6 smoke uses `allow_stop_before_recreate=true` so it can run on the root
+single-worker compose setup; multi-worker deployments can keep the safer
+create-before-stop behavior.
 
 ## V7 Context Migration Boundary
 
@@ -391,6 +394,27 @@ Current validation status (2026-07-19):
   returned `execution.status="applied"`; the router then reported exactly one
   ready instance on node `0`. The adapter created the target actor, waited for
   readiness, switched traffic, drained, and stopped the old actor.
+- V6 root-compose benchmark (2026-07-23): `vllm-reparallelization-applied`
+  passed with `successes=2/2`, `replanning_events=1`,
+  `replanning_execution_applied=1`, and `replanning_execution_failed=0`. The
+  smoke uses `/models/vllm/vllm-dense-baseline` with the patched
+  `load_format="serverless_llm"` loader because the local fixture is stored as
+  `rank_0/tensor.data_0` plus `tensor_index.json`, not as HF safetensors/bin.
+- V6 performance matrix (2026-07-23): a separate
+  `benchmark_matrix_reparallelization_performance.yaml` compares
+  `enable_reparallelization=false` and `enable_reparallelization=true` on the
+  same vLLM smoke model, with request phases for `warmup`, `pre_replan`,
+  `replan_window`, and `post_replan`. Deploy it with
+  `scripts/prepare_spotserve.sh --deploy-set reparallelization-performance`.
+  The root-compose validation passed with both runs at `successes=8/8`; the
+  applied run reported `replanning_events=1`,
+  `replanning_execution_applied=1`, and `replanning_execution_failed=0`.
+  The post-replan p95 was effectively flat in the local run
+  (`1044.20ms` baseline vs `1047.13ms` applied), while the replan window was
+  slower because it includes actor recreate/model load.
+  On the default single-worker compose setup, interpret this as
+  adapter/recreate overhead plus post-replan steady-state behavior, not as a
+  production latency-improvement claim.
 - V9 provider metadata validation (2026-07-19): callable/config-shaped provider
   fields were normalized and bounded, provenance/confidence were retained, and
   an unknown node (or empty provider response) selected the conservative
@@ -431,7 +455,10 @@ Safe claims:
 Do not claim without additional deployment evidence:
 
 - V6 reparallelization latency improvement; the live result validates lifecycle
-  correctness, not a production latency SLO.
+  correctness, not a production latency SLO. The single-worker performance
+  matrix measures overhead and post-replan behavior; an improvement claim needs
+  at least two real worker nodes and a trace that preempts the active baseline
+  node while the applied run moves to another live node.
 - V7 achieves true low-cost KV block context migration in a live target-reuse
   benchmark (same-host GPU evidence is complete; cross-node latency remains
   unmeasured).

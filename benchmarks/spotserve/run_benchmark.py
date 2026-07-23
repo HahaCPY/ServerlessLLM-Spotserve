@@ -23,6 +23,13 @@ class TraceTask(NamedTuple):
     log_path: Path
 
 
+BENCHMARK_ONLY_WORKLOAD_KEYS = {
+    "time",
+    "benchmark_phase",
+    "phase",
+}
+
+
 def load_config(path: Path) -> Dict[str, Any]:
     text = path.read_text(encoding="utf-8")
     try:
@@ -96,11 +103,78 @@ def write_combined_summary(output_root: Path, summaries: List[Dict[str, Any]]):
     )
 
     csv_path = output_root / "latest_summary.csv"
-    fieldnames = list(summaries[0].keys())
+    fieldnames = []
+    for summary in summaries:
+        for key in summary:
+            if key not in fieldnames:
+                fieldnames.append(key)
     with csv_path.open("w", encoding="utf-8", newline="") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(summaries)
+
+
+def build_comparisons(
+    comparisons: List[Dict[str, Any]],
+    summaries: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    by_name = {summary.get("run_name"): summary for summary in summaries}
+    rows = []
+    default_fields = [
+        "success_rate",
+        "latency_p95_ms",
+        "throughput_req_s",
+        "replanning_events",
+        "replanning_execution_applied",
+        "replanning_execution_failed",
+        "phase_replan_window_success_rate",
+        "phase_replan_window_latency_p95_ms",
+        "phase_post_replan_success_rate",
+        "phase_post_replan_latency_p95_ms",
+        "phase_post_replan_throughput_req_s",
+    ]
+    for comparison in comparisons:
+        baseline_name = comparison.get("baseline")
+        candidate_name = comparison.get("candidate")
+        baseline = by_name.get(baseline_name)
+        candidate = by_name.get(candidate_name)
+        if baseline is None or candidate is None:
+            continue
+        row = {
+            "name": comparison.get(
+                "name", f"{candidate_name}_vs_{baseline_name}"
+            ),
+            "baseline": baseline_name,
+            "candidate": candidate_name,
+        }
+        for field in comparison.get("fields", default_fields):
+            if field not in baseline or field not in candidate:
+                continue
+            baseline_value = baseline.get(field, 0.0) or 0.0
+            candidate_value = candidate.get(field, 0.0) or 0.0
+            if not isinstance(baseline_value, (int, float)) or not isinstance(
+                candidate_value, (int, float)
+            ):
+                continue
+            row[f"{field}_baseline"] = baseline_value
+            row[f"{field}_candidate"] = candidate_value
+            row[f"{field}_delta"] = candidate_value - baseline_value
+            row[f"{field}_ratio"] = (
+                candidate_value / baseline_value if baseline_value else 0.0
+            )
+        rows.append(row)
+    return rows
+
+
+def write_comparisons(
+    output_root: Path, comparisons: List[Dict[str, Any]]
+) -> None:
+    if not comparisons:
+        return
+    (output_root / "latest_comparisons.json").write_text(
+        json.dumps(comparisons, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
 
 
 def post_json(
@@ -189,13 +263,21 @@ async def send_workload(
     async def send_at(row: Dict[str, Any]):
         arrival_time = float(row.get("time", 0.0))
         await asyncio.sleep(max(0.0, started_at + arrival_time - time.monotonic()))
-        payload = {k: v for k, v in row.items() if k != "time"}
+        payload = {
+            k: v
+            for k, v in row.items()
+            if k not in BENCHMARK_ONLY_WORKLOAD_KEYS
+        }
         payload["model"] = model
         sent_at = time.time()
         result = await asyncio.to_thread(
             post_json, endpoint, payload, request_timeout_s
         )
         result["arrival_time"] = arrival_time
+        if row.get("benchmark_phase") or row.get("phase"):
+            result["benchmark_phase"] = str(
+                row.get("benchmark_phase") or row.get("phase")
+            )
         result["sent_at"] = sent_at
         result["completed_at"] = time.time()
         return result
@@ -453,8 +535,15 @@ async def main_async(args):
         try:
             summaries = generate_reports(produced_runs)
             write_combined_summary(output_root, summaries)
+            comparisons = build_comparisons(
+                config.get("comparisons", []), summaries
+            )
+            write_comparisons(output_root, comparisons)
         except Exception as exc:
             print(f"[benchmark report warning] {exc}", file=sys.stderr)
+            comparisons = []
+    else:
+        comparisons = []
 
     print("Produced benchmark runs:")
     for run_dir in produced_runs:
@@ -486,6 +575,15 @@ async def main_async(args):
                     f"ready={summary.get('instances_marked_ready', 0)}, "
                     f"dead={summary.get('instances_marked_dead', 0)}"
                 )
+            replanning_suffix = ""
+            if int(summary.get("replanning_events", 0) or 0) > 0:
+                replanning_suffix = (
+                    f", replans={summary.get('replanning_events', 0)}, "
+                    f"applied="
+                    f"{summary.get('replanning_execution_applied', 0)}, "
+                    f"failed="
+                    f"{summary.get('replanning_execution_failed', 0)}"
+                )
             print(
                 "  "
                 f"{summary['run_name']}: "
@@ -494,7 +592,28 @@ async def main_async(args):
                 f"p95={summary['latency_p95_ms']:.2f}ms"
                 f"{recovery_suffix}"
                 f"{instance_suffix}"
+                f"{replanning_suffix}"
             )
+        if comparisons:
+            print("\nBenchmark comparisons:")
+            for comparison in comparisons:
+                print(
+                    "  "
+                    f"{comparison['name']}: "
+                    f"baseline={comparison['baseline']}, "
+                    f"candidate={comparison['candidate']}"
+                )
+                for key, value in comparison.items():
+                    if not key.endswith("_delta"):
+                        continue
+                    field = key[: -len("_delta")]
+                    baseline = comparison.get(f"{field}_baseline")
+                    candidate = comparison.get(f"{field}_candidate")
+                    print(
+                        "    "
+                        f"{field}: baseline={baseline}, "
+                        f"candidate={candidate}, delta={value}"
+                    )
         if all(summary["successes"] == 0 for summary in summaries):
             print(
                 "\nWarning: every benchmark request failed. "

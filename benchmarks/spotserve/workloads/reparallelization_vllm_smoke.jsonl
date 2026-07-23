@@ -1,0 +1,2 @@
+{"time": 0.0, "request_id": "v6-vllm-before-replan", "messages": [{"role": "user", "content": "ping"}], "max_tokens": 1, "temperature": 0.0}
+{"time": 20.0, "request_id": "v6-vllm-after-replan", "messages": [{"role": "user", "content": "pong"}], "max_tokens": 1, "temperature": 0.0}

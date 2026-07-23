@@ -49,6 +49,39 @@ def summarize_requests(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def safe_metric_name(value: Any) -> str:
+    text = str(value).strip().lower()
+    chars = []
+    previous_underscore = False
+    for char in text:
+        if char.isalnum():
+            chars.append(char)
+            previous_underscore = False
+        elif not previous_underscore:
+            chars.append("_")
+            previous_underscore = True
+    name = "".join(chars).strip("_")
+    return name or "unknown"
+
+
+def summarize_phase_requests(
+    rows: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    rows_by_phase: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        phase = row.get("benchmark_phase")
+        if not phase:
+            continue
+        rows_by_phase.setdefault(safe_metric_name(phase), []).append(row)
+
+    summary: Dict[str, Any] = {}
+    for phase, phase_rows in sorted(rows_by_phase.items()):
+        phase_summary = summarize_requests(phase_rows)
+        for key, value in phase_summary.items():
+            summary[f"phase_{phase}_{key}"] = value
+    return summary
+
+
 def resolve_optional_path(
     path_value: Any, run_dir: Path
 ) -> Optional[Path]:
@@ -230,6 +263,14 @@ def summarize_replanning_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     latest_plan = (
         replanning_rows[-1].get("parallel_plan") if replanning_rows else None
     )
+    execution_statuses = [
+        str(row.get("execution_status", "") or "")
+        for row in replanning_rows
+        if row.get("execution_status")
+    ]
+    latest_execution = (
+        replanning_rows[-1].get("execution") if replanning_rows else None
+    )
     return {
         "replanning_events": len(replanning_rows),
         "replanning_no_capacity_events": no_capacity_count,
@@ -238,6 +279,13 @@ def summarize_replanning_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         ),
         "replanning_latest_plan": (
             json.dumps(latest_plan, sort_keys=True) if latest_plan else ""
+        ),
+        "replanning_execution_applied": execution_statuses.count("applied"),
+        "replanning_execution_failed": execution_statuses.count("failed"),
+        "replanning_latest_execution": (
+            json.dumps(latest_execution, sort_keys=True)
+            if latest_execution
+            else ""
         ),
     }
 
@@ -421,6 +469,7 @@ def analyze_run(run_dir: Path) -> Dict[str, Any]:
             str(router_metrics_path) if router_metrics_path is not None else ""
         ),
         **summarize_requests(request_rows),
+        **summarize_phase_requests(request_rows),
         **summarize_router_metrics(router_request_rows),
         **summarize_instance_state_metrics(router_metric_rows_in_window),
         **summarize_replanning_metrics(router_metric_rows_in_window),

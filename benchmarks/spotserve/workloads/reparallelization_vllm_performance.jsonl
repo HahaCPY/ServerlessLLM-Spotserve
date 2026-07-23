@@ -1,0 +1,8 @@
+{"time": 0.0, "benchmark_phase": "warmup", "request_id": "v6-perf-warmup-0000", "messages": [{"role": "user", "content": "warmup"}], "max_tokens": 1, "temperature": 0.0}
+{"time": 8.0, "benchmark_phase": "pre_replan", "request_id": "v6-perf-before-0001", "messages": [{"role": "user", "content": "before one"}], "max_tokens": 1, "temperature": 0.0}
+{"time": 16.0, "benchmark_phase": "pre_replan", "request_id": "v6-perf-before-0002", "messages": [{"role": "user", "content": "before two"}], "max_tokens": 1, "temperature": 0.0}
+{"time": 42.0, "benchmark_phase": "replan_window", "request_id": "v6-perf-window-0003", "messages": [{"role": "user", "content": "during one"}], "max_tokens": 1, "temperature": 0.0}
+{"time": 50.0, "benchmark_phase": "replan_window", "request_id": "v6-perf-window-0004", "messages": [{"role": "user", "content": "during two"}], "max_tokens": 1, "temperature": 0.0}
+{"time": 95.0, "benchmark_phase": "post_replan", "request_id": "v6-perf-after-0005", "messages": [{"role": "user", "content": "after one"}], "max_tokens": 1, "temperature": 0.0}
+{"time": 103.0, "benchmark_phase": "post_replan", "request_id": "v6-perf-after-0006", "messages": [{"role": "user", "content": "after two"}], "max_tokens": 1, "temperature": 0.0}
+{"time": 111.0, "benchmark_phase": "post_replan", "request_id": "v6-perf-after-0007", "messages": [{"role": "user", "content": "after three"}], "max_tokens": 1, "temperature": 0.0}

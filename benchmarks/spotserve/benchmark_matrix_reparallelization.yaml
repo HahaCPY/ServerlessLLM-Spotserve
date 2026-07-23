@@ -3,22 +3,13 @@
   "output_dir": "results/spotserve_reparallelization",
   "runs": [
     {
-      "name": "dummy-reparallelization-baseline",
-      "model": "dummy-reparallelization-baseline",
-      "backend": "dummy",
+      "name": "vllm-reparallelization-applied",
+      "model": "vllm-reparallelization-gpu-smoke",
+      "backend": "vllm",
       "policy": "none",
-      "workload": "benchmarks/spotserve/workloads/smoke.jsonl",
-      "trace": "examples/spotserve/spot_trace_reparallelization_baseline.jsonl",
-      "router_metrics_path": "/tmp/spotserve-work/results/spotserve_reparallelization/dummy-reparallelization-baseline-router.jsonl"
-    },
-    {
-      "name": "dummy-reparallelization-planner",
-      "model": "dummy-reparallelization",
-      "backend": "dummy",
-      "policy": "none",
-      "workload": "benchmarks/spotserve/workloads/smoke.jsonl",
-      "trace": "examples/spotserve/spot_trace_reparallelization.jsonl",
-      "router_metrics_path": "/tmp/spotserve-work/results/spotserve_reparallelization/dummy-reparallelization-router.jsonl"
+      "workload": "benchmarks/spotserve/workloads/reparallelization_vllm_smoke.jsonl",
+      "trace": "examples/spotserve/spot_trace_vllm_reparallelization.jsonl",
+      "router_metrics_path": "/tmp/spotserve-work/results/spotserve_reparallelization/vllm-reparallelization-router.jsonl"
     }
   ]
 }

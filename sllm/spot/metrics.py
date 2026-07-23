@@ -47,6 +47,7 @@ def make_replanning_event(
     instance_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     parallel_plan = decision.get("parallel_plan") or {}
+    execution = decision.get("execution") or {}
     return {
         "type": "reparallelization",
         "model": model,
@@ -73,6 +74,8 @@ def make_replanning_event(
         ),
         "target_nodes": parallel_plan.get("target_nodes", []),
         "parallel_plan": parallel_plan or None,
+        "execution": execution or None,
+        "execution_status": execution.get("status", ""),
     }
 
 

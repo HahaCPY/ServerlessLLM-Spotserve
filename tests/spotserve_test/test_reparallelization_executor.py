@@ -30,3 +30,26 @@ async def test_executor_stops_unready_target_and_keeps_old():
         await executor.apply(ParallelPlan("m", "vllm", 2, 1, num_gpus=2))
     assert stopped == ["new"]
     assert executor.current == "old"
+
+
+@pytest.mark.asyncio
+async def test_executor_can_stop_current_before_create_when_configured():
+    events = []
+    async def create(plan): events.append(("create", plan.num_gpus)); return "new"
+    async def ready(worker, plan): events.append(("ready", worker)); return True
+    async def switch(worker, plan): events.append(("switch", worker))
+    async def drain(worker): events.append(("drain", worker))
+    async def stop(worker): events.append(("stop", worker))
+    executor = ReparallelizationExecutor(
+        create,
+        ready,
+        switch,
+        drain,
+        stop,
+        "old",
+        stop_current_before_create=True,
+    )
+    await executor.apply(ParallelPlan("m", "vllm", 1, 1, num_gpus=1))
+    assert events == [("drain", "old"), ("stop", "old"), ("create", 1),
+                      ("ready", "new"), ("switch", "new")]
+    assert executor.current == "new"

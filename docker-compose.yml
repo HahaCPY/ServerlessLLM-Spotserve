@@ -31,7 +31,7 @@ services:
     volumes:
       - ./entrypoint.sh:/app/entrypoint.sh:ro
       - /tmp/sllm-ray/head:/raytmp/head
-      - /tmp/sllm-hf-cache:/hf-cache
+      - ${HF_CACHE_DIR:-/tmp/sllm-hf-cache-rootless}:/hf-cache
     command: []
 
   # Worker Node 0
@@ -75,7 +75,7 @@ services:
       - ${MODEL_FOLDER}:/models
       - ./entrypoint.sh:/app/entrypoint.sh:ro
       - /tmp/sllm-ray/worker:/raytmp/worker
-      - /tmp/sllm-hf-cache:/hf-cache
+      - ${HF_CACHE_DIR:-/tmp/sllm-hf-cache-rootless}:/hf-cache
     command: ["--mem-pool-size", "4GB", "--registration-required", "true"] # Customize the memory pool size here
 
 networks:
