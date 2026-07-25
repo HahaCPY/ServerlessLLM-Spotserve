@@ -586,37 +586,42 @@ class RoundRobinRouter(SllmRouter):
         request_data: Optional[dict] = None,
         current_output: Optional[List[List[int]]] = None,
         completed_tokens: Optional[int] = None,
+        exported_state: Optional[dict] = None,
     ) -> Optional[InferenceState]:
-        if instance.backend_instance is None:
+        if instance.backend_instance is None and exported_state is None:
             return None
 
-        try:
-            payload = await self._call_backend_method(
-                instance.backend_instance,
-                "export_inference_state",
-                request_data=request_data or {},
-                current_output=current_output,
-                completed_tokens=completed_tokens,
-            )
-        except Exception as e:
-            logger.info(
-                f"Could not export inference state from "
-                f"{instance.instance_id}: {e}"
-            )
-            tokens = current_output or await self._capture_current_tokens(
-                instance
-            )
-            if not tokens:
-                return None
-            payload = {
-                "request_id": (
-                    request_data.get("request_id") if request_data else None
-                ),
-                "tokens": tokens[0],
-                "completed_tokens": completed_tokens or len(tokens[0]),
-                "state_kind": "token_snapshot",
-                "supports_restore": False,
-            }
+        payload = exported_state
+        if payload is None:
+            try:
+                payload = await self._call_backend_method(
+                    instance.backend_instance,
+                    "export_inference_state",
+                    request_data=request_data or {},
+                    current_output=current_output,
+                    completed_tokens=completed_tokens,
+                )
+            except Exception as e:
+                logger.info(
+                    f"Could not export inference state from "
+                    f"{instance.instance_id}: {e}"
+                )
+                tokens = current_output or await self._capture_current_tokens(
+                    instance
+                )
+                if not tokens:
+                    return None
+                payload = {
+                    "request_id": (
+                        request_data.get("request_id")
+                        if request_data
+                        else None
+                    ),
+                    "tokens": tokens[0],
+                    "completed_tokens": completed_tokens or len(tokens[0]),
+                    "state_kind": "token_snapshot",
+                    "supports_restore": False,
+                }
 
         if not isinstance(payload, dict):
             return None
@@ -1652,12 +1657,20 @@ class RoundRobinRouter(SllmRouter):
                             self.recovery_policy
                             == RecoveryPolicy.STATEFUL_RECOVERY
                         ):
+                            exported_state = result.get(
+                                "_spotserve_inference_state"
+                            )
                             recovery_state = (
                                 await self._capture_inference_state(
                                     instance,
                                     request_data=request_data,
                                     current_output=replay_tokens,
                                     completed_tokens=completed_tokens,
+                                    exported_state=(
+                                        exported_state
+                                        if isinstance(exported_state, dict)
+                                        else None
+                                    ),
                                 )
                             )
                             recovery_state_source_instance_id = instance_id

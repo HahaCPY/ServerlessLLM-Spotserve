@@ -1,0 +1,38 @@
+{
+  "model": "vllm-stateful-recovery-applied-perf",
+  "backend": "vllm",
+  "router_num_cpus": 0,
+  "num_cpus": 1,
+  "num_gpus": 1,
+  "auto_scaling_config": {
+    "metric": "concurrency",
+    "target": 1,
+    "min_instances": 2,
+    "max_instances": 2,
+    "keep_alive": 180
+  },
+  "backend_config": {
+    "pretrained_model_name_or_path": "/models/vllm/vllm-dense-baseline",
+    "load_format": "serverless_llm",
+    "torch_dtype": "float16",
+    "gpu_memory_utilization": 0.20,
+    "max_model_len": 512,
+    "max_num_seqs": 2,
+    "tensor_parallel_size": 1,
+    "pipeline_parallel_size": 1,
+    "enable_prefix_caching": true,
+    "enforce_eager": true,
+    "trace_debug": true,
+    "trust_remote_code": true,
+    "kv_transfer_config": {
+      "kv_connector": "NixlConnector",
+      "kv_role": "kv_both"
+    }
+  },
+  "router_config": {
+    "recovery_policy": "stateful_recovery",
+    "max_retries": 2,
+    "count_preempting_toward_capacity": true,
+    "metrics_path": "/tmp/spotserve-work/results/spotserve_stateful_recovery_performance/vllm-stateful-recovery-applied-router.jsonl"
+  }
+}

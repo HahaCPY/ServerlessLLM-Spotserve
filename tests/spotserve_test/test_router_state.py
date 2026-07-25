@@ -94,6 +94,7 @@ class FakeRouterRestoreBackend:
     def __init__(self, source=False):
         self.source = source
         self.restore_calls = 0
+        self.export_calls = 0
 
     async def generate(self, request_data):
         if self.source:
@@ -108,6 +109,7 @@ class FakeRouterRestoreBackend:
     async def export_inference_state(
         self, request_data=None, current_output=None, completed_tokens=None
     ):
+        self.export_calls += 1
         return {
             "request_id": (request_data or {}).get("request_id"),
             "tokens": [1, 2, 3, 4],
@@ -135,6 +137,36 @@ class FakeRouterRestoreBackend:
             "state_kind": "vllm_kv_snapshot",
             "restored_blocks": 1,
         }
+
+
+class FakeRouterEmbeddedStateBackend(FakeRouterRestoreBackend):
+    async def generate(self, request_data):
+        if self.source:
+            self.source = False
+            return {
+                "preempted": True,
+                "current_output": [[1, 2, 3, 4]],
+                "completed_tokens": 4,
+                "_spotserve_inference_state": {
+                    "request_id": request_data.get("request_id"),
+                    "tokens": [1, 2, 3, 4],
+                    "completed_tokens": 4,
+                    "state_kind": "vllm_kv_snapshot",
+                    "supports_restore": True,
+                    "runtime_state": {
+                        "kv_transfer_params": {"remote_block_ids": [[1]]}
+                    },
+                    "metadata": {
+                        "can_restore_same_node": True,
+                        "can_restore_cross_node": False,
+                        "kv_block_count": 1,
+                    },
+                    "backend": "vllm",
+                    "model_name": "test-model",
+                    "node_id": "node-shared",
+                },
+            }
+        return await super().generate(request_data)
 
 
 @pytest.mark.asyncio
@@ -692,3 +724,52 @@ async def test_router_stateful_restore_end_to_end_records_no_fallback(tmp_path):
     assert request_row["state_restore_attempts"] == 1
     assert request_row["state_restore_successes"] == 1
     assert request_row["state_restore_fallback"] is False
+
+
+@pytest.mark.asyncio
+async def test_router_uses_embedded_preempted_inference_state(tmp_path):
+    router = RoundRobinRouter(
+        model_name="test-model",
+        resource_requirements={"num_cpus": 1, "num_gpus": 0},
+        backend="vllm",
+        backend_config={},
+        router_config={
+            "recovery_policy": "stateful_recovery",
+            "max_retries": 1,
+        },
+    )
+    source_backend = FakeRouterEmbeddedStateBackend(source=True)
+    target_backend = FakeRouterRestoreBackend()
+    source = InstanceHandle(
+        instance_id="instance-source",
+        max_queue_length=1,
+        num_gpu=0,
+        backend_instance=source_backend,
+    )
+    target = InstanceHandle(
+        instance_id="instance-target",
+        max_queue_length=1,
+        num_gpu=0,
+        backend_instance=target_backend,
+    )
+    await source.mark_ready(node_id="node-shared")
+    await target.mark_ready(node_id="node-shared")
+    router.ready_inference_instances[source.instance_id] = source
+    router.ready_inference_instances[target.instance_id] = target
+
+    allocations = iter([source, target])
+
+    async def allocate():
+        instance = next(allocations)
+        return instance.instance_id, instance
+
+    router._allocate_instance_for_request = allocate
+    router.running = True
+    result = await router.inference(
+        {"request_id": "req-router-embedded-state", "max_tokens": 2},
+        "generate",
+    )
+
+    assert result.get("usage", {}).get("completion_tokens") == 2, result
+    assert source_backend.export_calls == 0
+    assert target_backend.restore_calls == 1

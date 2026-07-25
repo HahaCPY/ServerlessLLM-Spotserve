@@ -1,0 +1,73 @@
+{
+  "endpoint": "http://127.0.0.1:8343/v1/chat/completions",
+  "output_dir": "results/spotserve_stateful_recovery_performance",
+  "runs": [
+    {
+      "name": "vllm-stateful-recovery-token-replay",
+      "model": "vllm-stateful-recovery-token-replay-perf",
+      "backend": "vllm",
+      "policy": "generated_token_replay",
+      "max_retries": 2,
+      "deploy_config": "examples/spotserve/config-vllm-stateful-recovery-token-replay-performance.json",
+      "delete_models_before_run": [
+        "vllm-stateful-recovery-token-replay-perf",
+        "vllm-stateful-recovery-applied-perf"
+      ],
+      "delete_settle_s": 15,
+      "delete_after_run": true,
+      "workload": "benchmarks/spotserve/workloads/stateful_recovery_vllm_performance.jsonl",
+      "trace": null,
+      "min_ready_instances": 2,
+      "ready_timeout_s": 600,
+      "router_metrics_path": "/tmp/spotserve-work/results/spotserve_stateful_recovery_performance/vllm-stateful-recovery-token-replay-router.jsonl"
+    },
+    {
+      "name": "vllm-stateful-recovery-applied",
+      "model": "vllm-stateful-recovery-applied-perf",
+      "backend": "vllm",
+      "policy": "stateful_recovery",
+      "max_retries": 2,
+      "deploy_config": "examples/spotserve/config-vllm-stateful-recovery-applied-performance.json",
+      "delete_models_before_run": [
+        "vllm-stateful-recovery-token-replay-perf",
+        "vllm-stateful-recovery-applied-perf"
+      ],
+      "delete_settle_s": 15,
+      "delete_after_run": true,
+      "workload": "benchmarks/spotserve/workloads/stateful_recovery_vllm_performance.jsonl",
+      "trace": null,
+      "min_ready_instances": 2,
+      "ready_timeout_s": 600,
+      "router_metrics_path": "/tmp/spotserve-work/results/spotserve_stateful_recovery_performance/vllm-stateful-recovery-applied-router.jsonl"
+    }
+  ],
+  "comparisons": [
+    {
+      "name": "stateful-recovery-applied-vs-token-replay",
+      "baseline": "vllm-stateful-recovery-token-replay",
+      "candidate": "vllm-stateful-recovery-applied",
+      "fields": [
+        "success_rate",
+        "latency_p95_ms",
+        "throughput_req_s",
+        "failed_attempts_total",
+        "retry_count_total",
+        "recovered_tokens_total",
+        "recovery_fallback_count",
+        "state_restore_attempts_total",
+        "state_restore_successes_total",
+        "state_restore_fallback_count",
+        "state_restored_tokens_total",
+        "state_recovery_events",
+        "state_recovery_restore_events",
+        "state_recovery_fallback_events",
+        "state_recovery_recovered_tokens",
+        "phase_failure_window_success_rate",
+        "phase_failure_window_latency_p95_ms",
+        "phase_post_recovery_success_rate",
+        "phase_post_recovery_latency_p95_ms",
+        "phase_post_recovery_throughput_req_s"
+      ]
+    }
+  ]
+}

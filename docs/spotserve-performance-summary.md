@@ -9,7 +9,7 @@ correctness, availability, or scheduling quality.
 
 ## High-level Result
 
-The clearest latency improvement so far is Version 7:
+The clearest direct latency improvements so far are Version 7 and Version 8:
 
 ```text
 V7 context migration performance benchmark
@@ -17,6 +17,12 @@ success_rate: 100% -> 100%
 overall p95: 62489.00ms -> 4616.59ms
 migration-window p95: 51255.32ms -> 1027.54ms
 post-migration p95: 5233.93ms -> 1051.30ms
+
+V8 stateful recovery performance benchmark
+success_rate: 100% -> 100%
+overall p95: 63540.97ms -> 2904.41ms
+failure-window p95: 63540.97ms -> 2904.41ms
+post-recovery p95: 24243.46ms -> 1073.46ms
 ```
 
 The applied V7 run also produced the required context-migration signals:
@@ -46,7 +52,7 @@ or direct KV transfer.
 | V5 | MoE vLLM black-box integration | MoE aliases deploy and serve through SLLM; dense-vs-MoE matrix exists | MoE compatibility milestone. No expert-aware or MoE-specific latency speedup claim. |
 | V6 | Dynamic reparallelization planner + vLLM deployment adapter | Live vLLM performance matrix: `success_rate=1.0` both; applied has `replanning_events=1`, `replanning_execution_applied=1` | On the recorded single-worker run, overall p95 improved by 74.25%, but the safe claim is lifecycle correctness and post-replan steady-state parity. A production capacity-loss speedup needs multi-worker evidence. |
 | V7 | Low-cost context migration planner + live vLLM metadata | Latest live vLLM matrix: `plan_count=1`, `reuse_ratio=0.909`, `kv_cache_migration_successes=1` | Strong same-host latency result: migration-window p95 reduced by 98.00% and post-migration p95 by 79.91%. This is target warmup/reuse, not full cross-node KV direct transfer. |
-| V8 | Stateful inference recovery | Correctness matrix: `none=0/2`, `naive_retry=2/2`, `token_replay=2/2`, `stateful_recovery=2/2`; state restore attempts/successes/tokens are positive | Recovery correctness improvement. Dummy p95 is similar to retry/replay because the benchmark validates restore behavior, not a latency speedup. Same-node NIXL restore is validated separately from production latency. |
+| V8 | Stateful inference recovery | Live vLLM matrix: `state_restore_successes_total=1`, `state_restore_fallback_count=0`, `state_restored_tokens_total=16` | Strong same-node NIXL restore result: failure-window p95 reduced by 95.43% versus token replay while maintaining 100% success rate. Cross-node restore remains out of scope. |
 | V9 | Spot-risk-aware scheduling | Synthetic scheduler benchmark selects lower-risk / longer-lived nodes instead of the first health-only candidate | Scheduling-quality improvement. No request-latency speedup claim yet; benefit is reduced expected preemption risk / placement cost. |
 
 ## Direct Latency Comparisons
@@ -128,6 +134,88 @@ Boundary:
 ```text
 This validates metadata-driven context reuse and target warmup. It does not
 prove full cross-node KV block serialization or direct KV transfer.
+```
+
+### V8 Stateful Recovery Performance
+
+Benchmark:
+
+```text
+benchmarks/spotserve/benchmark_matrix_stateful_recovery_performance.yaml
+```
+
+This matrix compares:
+
+```text
+baseline:  vllm-stateful-recovery-token-replay
+candidate: vllm-stateful-recovery-applied
+```
+
+Both runs use the same vLLM/NIXL backend shape. The only intended policy
+difference is:
+
+```text
+baseline:  recovery_policy = generated_token_replay
+candidate: recovery_policy = stateful_recovery
+```
+
+The runner deploys and deletes each policy model one run at a time. This avoids
+holding four vLLM replicas in memory just to compare two policies; each run
+still waits for two ready replicas before sending the forced-preemption
+workload.
+
+Expected applied-run counters:
+
+```text
+state_recovery_events > 0
+state_restore_attempts_total > 0
+state_restore_successes_total > 0
+state_restore_fallback_count = 0
+state_restored_tokens_total > 0
+```
+
+Recorded comparison:
+
+| Metric | Token Replay | Stateful Recovery | Delta | Change |
+|---|---:|---:|---:|---:|
+| `success_rate` | 1.0 | 1.0 | 0.0 | 0.00% |
+| `latency_p95_ms` | 63540.97 | 2904.41 | -60636.56 | 95.43% lower |
+| `throughput_req_s` | 0.04721 | 0.10332 | 0.05610 | 2.19x |
+| `phase_failure_window_latency_p95_ms` | 63540.97 | 2904.41 | -60636.56 | 95.43% lower |
+| `phase_post_recovery_latency_p95_ms` | 24243.46 | 1073.46 | -23170.00 | 95.57% lower |
+| `phase_post_recovery_throughput_req_s` | 0.07993 | 0.22152 | 0.14159 | 2.77x |
+
+Stateful recovery counters:
+
+| Metric | Token Replay | Stateful Recovery |
+|---|---:|---:|
+| `failed_attempts_total` | 1 | 1 |
+| `retry_count_total` | 1 | 1 |
+| `recovered_tokens_total` | 16 | 16 |
+| `state_restore_attempts_total` | 0 | 1 |
+| `state_restore_successes_total` | 0 | 1 |
+| `state_restore_fallback_count` | 0 | 0 |
+| `state_restored_tokens_total` | 0 | 16 |
+| `state_recovery_events` | 0 | 1 |
+| `state_recovery_restore_events` | 0 | 1 |
+
+Interpretation:
+
+- The benchmark forces one synthetic mid-generation vLLM preemption.
+- The vLLM backend exports a `vllm_kv_snapshot` before returning the
+  preempted response.
+- The router stages that snapshot on the target backend before retrying.
+- The applied run restored 16 tokens through stateful recovery and did not fall
+  back to token replay.
+- The latency win is valid for the same-node vLLM/NIXL live benchmark.
+
+Boundary:
+
+```text
+This validates same-node NIXL stateful restore in the live vLLM path. It does
+not prove cross-node KV restore unless `restore_scope`/runtime metadata report
+cross-node support and the benchmark actually places source and target on
+different nodes.
 ```
 
 ## Correctness / Availability Comparisons
@@ -258,6 +346,20 @@ cd /tmp/spotserve-work &&
   --endpoint http://127.0.0.1:8343/v1/chat/completions \
   --request-timeout 30 \
   --skip-trace
+'
+```
+
+V8 stateful-recovery performance:
+
+```bash
+scripts/prepare_spotserve.sh --deploy-set stateful-recovery-performance
+
+podman exec sllm_head bash -lc '
+cd /tmp/spotserve-work &&
+/opt/venvs/head/bin/python benchmarks/spotserve/run_benchmark.py \
+  --config benchmarks/spotserve/benchmark_matrix_stateful_recovery_performance.yaml \
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \
+  --request-timeout 240
 '
 ```
 

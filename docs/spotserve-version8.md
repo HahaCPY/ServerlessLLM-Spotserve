@@ -11,8 +11,9 @@ request failure / preemption
 -> record state recovery metrics
 ```
 
-This version validates the flow with the dummy backend. It does not implement
-production vLLM KV cache export/restore.
+This version validates the control-plane flow with the dummy backend and adds a
+live vLLM same-node NIXL state-restore path when the patched runtime hooks are
+available.
 
 ## Scope
 
@@ -24,18 +25,20 @@ Implemented:
 - `StateRecoveryDecision`
 - backend default hooks for state restore capability
 - dummy backend state export / restore
+- vLLM runtime hook discovery for KV state export / restore
+- vLLM forced-preemption benchmark hook for repeatable live recovery tests
 - router fallback to generated-token replay / retry
 - `type=state_recovery` metrics
 - benchmark analyzer/report fields for stateful recovery
 - recovery correctness benchmark matrix entry
+- live vLLM stateful-recovery performance matrix entry
 - Version 8 tests
 
 Out of scope:
 
-- production vLLM KV cache export
-- production vLLM KV cache restore
-- CUDA / PagedAttention block movement
-- MoE expert state migration
+- unpatched upstream vLLM state restore
+- cross-node KV cache restore without runtime support
+- MoE expert-state-aware restore policy
 
 ## Shared Interface
 
@@ -60,6 +63,7 @@ class InferenceState:
     state_kind: str = "token_snapshot"
     supports_restore: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
+    runtime_state: dict[str, Any] = field(default_factory=dict)
 ```
 
 The decision layer returns:
@@ -112,10 +116,10 @@ async def restore_inference_state(
 ) -> dict
 ```
 
-The base backend returns conservative unsupported values. This keeps vLLM and
-transformers safe until their real runtime hooks are implemented.
+The base backend returns conservative unsupported values. Backends opt into
+state restore only when they can return a non-empty restorable state payload.
 
-## vLLM Metadata
+## vLLM Live Restore
 
 File:
 
@@ -124,25 +128,69 @@ sllm/backends/vllm_state_metadata.py
 sllm/backends/vllm_backend.py
 ```
 
-vLLM state export remains conservative:
+The vLLM backend first builds a conservative token snapshot from visible
+`RequestOutput` / runtime metadata. If the patched runtime exposes all of the
+following hooks, the snapshot is upgraded to a restorable KV snapshot:
 
 ```text
-supports_restore = false
+supports_state_restore
+export_inference_state
+restore_inference_state
+get_request_kv_metadata
+get_all_request_kv_metadata
+```
+
+Restorable vLLM state has this shape:
+
+```text
+state_kind = vllm_kv_snapshot
+supports_restore = true
+runtime_state.kv_transfer_params.remote_block_ids
+metadata.can_restore_same_node = true
+```
+
+If those hooks are missing or return an unsupported payload, CPY keeps the safe
+fallback:
+
+```text
 state_kind = token_snapshot
+supports_restore = false
+fallback_policy = generated_token_replay
 ```
 
-However, when vLLM `RequestOutput` or `kv_transfer_params` exposes cache
-metadata, the exported state now preserves it for debugging/planning:
+The live benchmark uses a synthetic request field to force one vLLM preemption
+after a known number of generated tokens:
+
+```json
+{
+  "force_failure": "preempted",
+  "force_fail_after_tokens": 16,
+  "force_fail_once": true
+}
+```
+
+These keys are removed before creating vLLM `SamplingParams`, so normal vLLM
+requests are unaffected. On the forced-preempt path, the backend exports
+`_spotserve_inference_state` before returning the preempted response. The router
+uses that embedded snapshot first, then falls back to calling
+`export_inference_state()` if no embedded state is present.
+
+When multiple same-node vLLM/NIXL replicas run at once, each backend actor also
+derives its own `VLLM_NIXL_SIDE_CHANNEL_PORT` before engine startup. Without
+this, every NIXL engine tries to bind the default `127.0.0.1:5600`, and the
+second replica remains stuck in `starting` with:
 
 ```text
-metadata.kv_block_count
-metadata.block_ids
-metadata.block_table
-metadata.cache_engine = vllm
+ZMQError: Address already in use (addr='tcp://127.0.0.1:5600')
 ```
 
-This does not make `restore_inference_state()` a true KV restore. It only means
-CPY no longer discards visible KV/cache metadata while falling back safely.
+The derived port can be controlled with:
+
+```text
+nixl_side_channel_base_port
+nixl_side_channel_port_span
+nixl_side_channel_port
+```
 
 ## Dummy Backend
 
@@ -232,9 +280,9 @@ state_recovery_recovered_tokens
 state_recovery_latest_plan
 ```
 
-## Benchmark
+## Benchmarks
 
-Files:
+Correctness files:
 
 ```text
 examples/spotserve/config-dummy-correctness-stateful-recovery.json
@@ -271,52 +319,94 @@ state_restore_successes_total > 0
 state_restored_tokens_total > 0
 ```
 
-## vLLM Feasibility
-
-大鼻 backend-side 目前提供 vLLM state metadata 的保守第一版：
+Live vLLM performance files:
 
 ```text
-sllm/backends/vllm_state_metadata.py
-Backend.supports_state_restore()
-Backend.export_inference_state()
-Backend.restore_inference_state()
-VllmBackend.supports_state_restore()
-VllmBackend.export_inference_state()
-VllmBackend.restore_inference_state()
+examples/spotserve/config-vllm-stateful-recovery-token-replay-performance.json
+examples/spotserve/config-vllm-stateful-recovery-applied-performance.json
+benchmarks/spotserve/workloads/stateful_recovery_vllm_performance.jsonl
+benchmarks/spotserve/benchmark_matrix_stateful_recovery_performance.yaml
 ```
 
-vLLM is not marked as true state-restore capable yet. The backend explicitly
-reports:
+Deploy:
+
+```bash
+scripts/prepare_spotserve.sh --deploy-set stateful-recovery-performance
+```
+
+This deploy set prepares the container and copies the benchmark/config files.
+The benchmark runner then deploys and deletes each policy model one run at a
+time, so only one policy's two replicas are alive concurrently.
+
+Run:
+
+```bash
+podman exec sllm_head bash -lc '
+cd /tmp/spotserve-work &&
+/opt/venvs/head/bin/python benchmarks/spotserve/run_benchmark.py \
+  --config benchmarks/spotserve/benchmark_matrix_stateful_recovery_performance.yaml \
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \
+  --request-timeout 240
+'
+```
+
+Expected applied-run shape:
 
 ```text
-supports_state_restore = false
+policy = stateful_recovery
+failed_attempts_total > 0
+retry_count_total > 0
+state_recovery_events > 0
+state_restore_attempts_total > 0
+state_restore_successes_total > 0
+state_restore_fallback_count = 0
+state_restored_tokens_total > 0
 ```
 
-and CPY falls back to token replay / retry.
+The baseline run uses `generated_token_replay`; the applied run uses
+`stateful_recovery`. A latency claim should compare the generated
+`latest_comparisons.json` fields from the same benchmark invocation.
 
-The current vLLM export payload is a token snapshot that CPY
-`InferenceState.from_dict()` can parse:
+Recorded live vLLM result:
 
 ```text
-state_kind = token_snapshot
-supports_restore = false
-metadata.cache_engine = vllm
-metadata.can_restore_same_node = false
-metadata.can_restore_cross_node = false
-metadata.reason = vllm_kv_restore_not_available
+vllm-stateful-recovery-token-replay:
+  successes=3/3
+  p95=63540.97ms
+  failed_attempts=1
+  retries=1
+  recovered_tokens=16
+
+vllm-stateful-recovery-applied:
+  successes=3/3
+  p95=2904.41ms
+  failed_attempts=1
+  retries=1
+  recovered_tokens=16
+  state_restores=1/1
+  state_tokens=16
 ```
 
-這個 hook 讓 CPY 有明確 fallback input，但不宣稱 true KV cache restore。若之後
-vLLM 可以安全 expose 下列資訊，才可以把 restore capability 從 false 改成
-true：
+Recorded comparison:
 
-- active request ids
-- prompt + generated token ids
-- KV block table / block ids
-- per-request KV block ownership
-- same-node KV reuse semantics
-- cross-node state transfer semantics
-- restore hook that can bind state to a new request
+| Metric | Token Replay | Stateful Recovery | Result |
+|---|---:|---:|---:|
+| `latency_p95_ms` | 63540.97 | 2904.41 | 95.43% lower |
+| `phase_failure_window_latency_p95_ms` | 63540.97 | 2904.41 | 95.43% lower |
+| `phase_post_recovery_latency_p95_ms` | 24243.46 | 1073.46 | 95.57% lower |
+| `throughput_req_s` | 0.04721 | 0.10332 | 2.19x |
+| `phase_post_recovery_throughput_req_s` | 0.07993 | 0.22152 | 2.77x |
+| `state_restore_successes_total` | 0 | 1 | restore path active |
+| `state_restore_fallback_count` | 0 | 0 | no fallback |
+| `state_restored_tokens_total` | 0 | 16 | 16 tokens restored |
+
+Safe claim:
+
+```text
+V8 reduced failure-window p95 latency from 63.5s to 2.90s in the live
+same-node vLLM/NIXL stateful-recovery benchmark, while maintaining 100%
+success rate and restoring 16 tokens with zero state-restore fallback.
+```
 
 ## Definition Of Done
 
@@ -328,5 +418,7 @@ Version 8 CPY side is complete when:
 - router tries state restore before fallback.
 - state recovery metrics are emitted and summarized.
 - recovery correctness benchmark includes the stateful policy.
-- vLLM backend reports explicit conservative state metadata without claiming
-  true KV restore.
+- vLLM backend consumes patched runtime hooks when present and falls back safely
+  when they are not available.
+- vLLM performance benchmark compares token replay against stateful recovery
+  and reports state-restore counters.

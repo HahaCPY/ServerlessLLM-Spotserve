@@ -195,6 +195,33 @@ does not assume cross-node cache reuse without explicit runtime proof. For a
 same-node reuse benchmark, run on a worker with at least two GPUs or target a
 specific same-node replica via the trace.
 
+For vLLM stateful-recovery performance, deploy the V8 live restore pair and run
+the dedicated matrix:
+
+```bash
+export MODEL_FOLDER=$PWD/model
+scripts/prepare_spotserve.sh --deploy-set stateful-recovery-performance
+
+podman exec sllm_head bash -lc '
+cd /tmp/spotserve-work &&
+/opt/venvs/head/bin/python benchmarks/spotserve/run_benchmark.py \
+  --config benchmarks/spotserve/benchmark_matrix_stateful_recovery_performance.yaml \
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \
+  --request-timeout 240
+'
+```
+
+This compares `generated_token_replay` against `stateful_recovery` on the same
+patched vLLM/NIXL backend shape. The applied run should show
+`state_restore_successes_total > 0`, `state_restore_fallback_count = 0`, and
+`state_restored_tokens_total > 0` before you claim V8 is using true state
+restore instead of token replay fallback.
+
+Unlike V6/V7 performance configs, this matrix deploys and deletes each V8
+model alias inside `run_benchmark.py`. That keeps only one policy's two
+replicas alive at a time, instead of preloading baseline and applied replicas
+simultaneously.
+
 For risk-aware scheduling validation, run the synthetic scheduler benchmark.
 This does not require a deployed model:
 

@@ -266,6 +266,40 @@ def post_json(
     }
 
 
+def deploy_config_over_http(
+    endpoint: str, config_path: str, timeout_s: float
+) -> None:
+    base_url = base_url_from_chat_endpoint(endpoint)
+    payload = load_config(Path(config_path))
+    result = post_json(f"{base_url}/register", payload, timeout_s)
+    if not result.get("success"):
+        raise RuntimeError(
+            f"Deploy failed for {config_path}: {result.get('response')}"
+        )
+
+
+def delete_model_over_http(
+    endpoint: str,
+    model_name: str,
+    timeout_s: float,
+    fail_on_error: bool = False,
+) -> None:
+    base_url = base_url_from_chat_endpoint(endpoint)
+    result = post_json(
+        f"{base_url}/delete", {"model": model_name}, timeout_s
+    )
+    if fail_on_error and not result.get("success"):
+        raise RuntimeError(
+            f"Delete failed for {model_name}: {result.get('response')}"
+        )
+    if not result.get("success"):
+        print(
+            "[benchmark cleanup warning] Delete failed for "
+            f"{model_name}: {result.get('response')}",
+            file=sys.stderr,
+        )
+
+
 def get_json(endpoint: str, timeout_s: float) -> Dict[str, Any]:
     with request.urlopen(endpoint, timeout=timeout_s) as response:
         return json.loads(response.read().decode("utf-8"))
@@ -650,42 +684,57 @@ async def run_one(
         encoding="utf-8",
     )
 
-    await wait_for_ready_instances(
-        run_config["model"],
-        int(run_config.get("min_ready_instances", 0) or 0),
-        float(run_config.get("ready_timeout_s", 180.0) or 180.0),
-        ray_address,
-        ray_namespace,
-    )
+    deleted_before_run = False
+    for model_name in run_config.get("delete_models_before_run", []):
+        delete_model_over_http(endpoint, model_name, request_timeout_s)
+        deleted_before_run = True
+    if deleted_before_run:
+        await asyncio.sleep(float(run_config.get("delete_settle_s", 0.0) or 0.0))
 
-    workload = load_jsonl(Path(run_config["workload"]))
+    deploy_config = run_config.get("deploy_config")
+    if deploy_config:
+        deploy_config_over_http(endpoint, deploy_config, request_timeout_s)
+
     trace_replayer = None
-    if not skip_trace:
-        if trace_transport == "ray":
-            trace_replayer = start_ray_trace_replayer(
-                run_config.get("trace"),
-                speedup,
-                run_dir / "trace_replayer.log",
-                ray_address=ray_address,
-                ray_namespace=ray_namespace,
-                controller_name=controller_name,
-            )
-        else:
-            trace_replayer = start_http_trace_replayer(
-                run_config.get("trace"),
-                speedup,
-                endpoint,
-                run_dir / "trace_replayer.log",
-                request_timeout_s,
-                ray_address,
-                ray_namespace,
-            )
     try:
+        await wait_for_ready_instances(
+            run_config["model"],
+            int(run_config.get("min_ready_instances", 0) or 0),
+            float(run_config.get("ready_timeout_s", 180.0) or 180.0),
+            ray_address,
+            ray_namespace,
+        )
+
+        workload = load_jsonl(Path(run_config["workload"]))
+        if not skip_trace:
+            if trace_transport == "ray":
+                trace_replayer = start_ray_trace_replayer(
+                    run_config.get("trace"),
+                    speedup,
+                    run_dir / "trace_replayer.log",
+                    ray_address=ray_address,
+                    ray_namespace=ray_namespace,
+                    controller_name=controller_name,
+                )
+            else:
+                trace_replayer = start_http_trace_replayer(
+                    run_config.get("trace"),
+                    speedup,
+                    endpoint,
+                    run_dir / "trace_replayer.log",
+                    request_timeout_s,
+                    ray_address,
+                    ray_namespace,
+                )
         rows = await send_workload(
             endpoint, run_config["model"], workload, request_timeout_s
         )
     finally:
         await wait_trace_replayer(trace_replayer)
+        if run_config.get("delete_after_run"):
+            delete_model_over_http(
+                endpoint, run_config["model"], request_timeout_s
+            )
 
     for row in rows:
         row["policy"] = run_config.get("policy", "none")
@@ -698,9 +747,14 @@ async def main_async(args):
     config = load_config(Path(args.config))
     output_root = Path(config.get("output_dir", "results/spotserve"))
     endpoint = args.endpoint or config["endpoint"]
+    static_models = [
+        run_config["model"]
+        for run_config in config["runs"]
+        if not run_config.get("deploy_config")
+    ]
     check_endpoint_ready(
         endpoint,
-        [run_config["model"] for run_config in config["runs"]],
+        static_models,
         args.request_timeout,
     )
 
@@ -787,6 +841,21 @@ async def main_async(args):
                     f"kv_successes="
                     f"{summary.get('kv_cache_migration_successes', 0)}"
                 )
+            state_recovery_suffix = ""
+            if (
+                int(summary.get("state_recovery_events", 0) or 0) > 0
+                or int(summary.get("state_restore_attempts_total", 0) or 0)
+                > 0
+            ):
+                state_recovery_suffix = (
+                    f", state_events="
+                    f"{summary.get('state_recovery_events', 0)}, "
+                    f"state_restores="
+                    f"{summary.get('state_restore_successes_total', 0)}/"
+                    f"{summary.get('state_restore_attempts_total', 0)}, "
+                    f"state_tokens="
+                    f"{summary.get('state_restored_tokens_total', 0)}"
+                )
             print(
                 "  "
                 f"{summary['run_name']}: "
@@ -797,6 +866,7 @@ async def main_async(args):
                 f"{instance_suffix}"
                 f"{replanning_suffix}"
                 f"{context_migration_suffix}"
+                f"{state_recovery_suffix}"
             )
         if comparisons:
             print("\nBenchmark comparisons:")

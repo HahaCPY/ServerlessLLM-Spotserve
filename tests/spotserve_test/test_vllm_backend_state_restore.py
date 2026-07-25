@@ -96,9 +96,72 @@ def make_backend(engine=None, **backend_config):
     backend.engine = engine
     backend.request_trace = LLMEngineStatusDict()
     backend.pending_kv_restores = {}
+    backend._forced_failures_seen = set()
     backend.status = BackendStatus.RUNNING
     backend.status_lock = asyncio.Lock()
     return backend
+
+
+def test_spotserve_request_controls_are_removed_before_sampling_params():
+    backend = make_backend(object())
+    request_data = {
+        "temperature": 0.0,
+        "force_failure": "preempted",
+        "force_fail_after_tokens": 2,
+        "force_fail_once": True,
+        "_completed_tokens": 2,
+    }
+
+    forced_failure = backend._pop_spotserve_request_controls(
+        request_data, "req-1"
+    )
+
+    assert forced_failure["failure_mode"] == "preempted"
+    assert forced_failure["fail_after_tokens"] == 2
+    assert request_data == {"temperature": 0.0}
+
+
+def test_spotserve_request_controls_skip_replay_requests():
+    backend = make_backend(object())
+    request_data = {
+        "temperature": 0.0,
+        "force_failure": "preempted",
+        "force_fail_after_tokens": 2,
+        "input_tokens": [1, 2],
+    }
+
+    forced_failure = backend._pop_spotserve_request_controls(
+        request_data, "req-1", skip_forced_failure=True
+    )
+
+    assert forced_failure is None
+    assert request_data == {"temperature": 0.0, "input_tokens": [1, 2]}
+
+
+def test_spotserve_nixl_side_channel_port_is_actor_specific():
+    backend = make_backend(
+        object(),
+        kv_transfer_config={"kv_connector": "NixlConnector"},
+        nixl_side_channel_base_port=5600,
+        nixl_side_channel_port_span=20000,
+    )
+
+    port_a = backend._derive_spotserve_nixl_side_channel_port("actor-a")
+    port_b = backend._derive_spotserve_nixl_side_channel_port("actor-b")
+
+    assert 5600 <= port_a < 25600
+    assert 5600 <= port_b < 25600
+    assert port_a != port_b
+
+
+def test_spotserve_nixl_side_channel_port_allows_exact_override():
+    backend = make_backend(
+        object(),
+        kv_transfer_config={"kv_connector": "NixlConnector"},
+        nixl_side_channel_port=6123,
+    )
+
+    assert backend._derive_spotserve_nixl_side_channel_port("actor-a") == 6123
 
 
 @pytest.mark.asyncio

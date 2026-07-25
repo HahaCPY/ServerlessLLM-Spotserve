@@ -18,6 +18,7 @@ Options:
   --deploy-set SET   Models to deploy: standard, correctness,
                      reparallelization, reparallelization-performance,
                      context-migration-performance,
+                     stateful-recovery-performance,
                      vllm-dense, vllm-moe,
                      vllm-blackbox, or all.
                      Default: standard. "all" can require substantial GPU capacity.
@@ -55,6 +56,12 @@ Environment overrides:
   SPOTSERVE_CONTEXT_MIGRATION_LOAD_FORMAT
                             vLLM load_format used by V7 context migration.
                             Default: SPOTSERVE_REPARALLELIZATION_LOAD_FORMAT
+  SPOTSERVE_STATEFUL_RECOVERY_MODEL_PATH
+                            vLLM model path/id used by V8 stateful recovery.
+                            Default: SPOTSERVE_CONTEXT_MIGRATION_MODEL_PATH
+  SPOTSERVE_STATEFUL_RECOVERY_LOAD_FORMAT
+                            vLLM load_format used by V8 stateful recovery.
+                            Default: SPOTSERVE_CONTEXT_MIGRATION_LOAD_FORMAT
   SPOTSERVE_VLLM_DENSE_MODEL_PATH
                             Optional container-local HF snapshot path to verify.
   SPOTSERVE_VLLM_MOE_MODEL  MoE HF model id or container-local path.
@@ -109,8 +116,8 @@ while [[ $# -gt 0 ]]; do
       ;;
     --deploy-set)
       DEPLOY_SET="${2:-}"
-      if [[ "$DEPLOY_SET" != "standard" && "$DEPLOY_SET" != "correctness" && "$DEPLOY_SET" != "reparallelization" && "$DEPLOY_SET" != "reparallelization-performance" && "$DEPLOY_SET" != "context-migration-performance" && "$DEPLOY_SET" != "vllm-dense" && "$DEPLOY_SET" != "vllm-moe" && "$DEPLOY_SET" != "vllm-blackbox" && "$DEPLOY_SET" != "all" ]]; then
-        echo "--deploy-set must be one of: standard, correctness, reparallelization, reparallelization-performance, context-migration-performance, vllm-dense, vllm-moe, vllm-blackbox, all" >&2
+      if [[ "$DEPLOY_SET" != "standard" && "$DEPLOY_SET" != "correctness" && "$DEPLOY_SET" != "reparallelization" && "$DEPLOY_SET" != "reparallelization-performance" && "$DEPLOY_SET" != "context-migration-performance" && "$DEPLOY_SET" != "stateful-recovery-performance" && "$DEPLOY_SET" != "vllm-dense" && "$DEPLOY_SET" != "vllm-moe" && "$DEPLOY_SET" != "vllm-blackbox" && "$DEPLOY_SET" != "all" ]]; then
+        echo "--deploy-set must be one of: standard, correctness, reparallelization, reparallelization-performance, context-migration-performance, stateful-recovery-performance, vllm-dense, vllm-moe, vllm-blackbox, all" >&2
         exit 2
       fi
       shift 2
@@ -140,6 +147,8 @@ REPARALLELIZATION_MODEL_PATH="${SPOTSERVE_REPARALLELIZATION_MODEL_PATH:-/models/
 REPARALLELIZATION_LOAD_FORMAT="${SPOTSERVE_REPARALLELIZATION_LOAD_FORMAT:-serverless_llm}"
 CONTEXT_MIGRATION_MODEL_PATH="${SPOTSERVE_CONTEXT_MIGRATION_MODEL_PATH:-$REPARALLELIZATION_MODEL_PATH}"
 CONTEXT_MIGRATION_LOAD_FORMAT="${SPOTSERVE_CONTEXT_MIGRATION_LOAD_FORMAT:-$REPARALLELIZATION_LOAD_FORMAT}"
+STATEFUL_RECOVERY_MODEL_PATH="${SPOTSERVE_STATEFUL_RECOVERY_MODEL_PATH:-$CONTEXT_MIGRATION_MODEL_PATH}"
+STATEFUL_RECOVERY_LOAD_FORMAT="${SPOTSERVE_STATEFUL_RECOVERY_LOAD_FORMAT:-$CONTEXT_MIGRATION_LOAD_FORMAT}"
 VLLM_DENSE_MODEL_PATH="${SPOTSERVE_VLLM_DENSE_MODEL_PATH:-}"
 VLLM_MOE_MODEL="${SPOTSERVE_VLLM_MOE_MODEL:-Qwen/Qwen1.5-MoE-A2.7B}"
 VLLM_MOE_LOAD_FORMAT="${SPOTSERVE_VLLM_MOE_LOAD_FORMAT:-auto}"
@@ -156,7 +165,7 @@ export HF_CACHE_DIR
 
 if [[ -n "${SPOTSERVE_COMPOSE_SERVICES:-}" ]]; then
   read -r -a COMPOSE_SERVICES <<<"$SPOTSERVE_COMPOSE_SERVICES"
-elif [[ "$DEPLOY_SET" == "reparallelization" || "$DEPLOY_SET" == "reparallelization-performance" || "$DEPLOY_SET" == "context-migration-performance" || "$DEPLOY_SET" == "vllm-dense" || "$DEPLOY_SET" == "vllm-moe" || "$DEPLOY_SET" == "vllm-blackbox" || "$DEPLOY_SET" == "all" ]]; then
+elif [[ "$DEPLOY_SET" == "reparallelization" || "$DEPLOY_SET" == "reparallelization-performance" || "$DEPLOY_SET" == "context-migration-performance" || "$DEPLOY_SET" == "stateful-recovery-performance" || "$DEPLOY_SET" == "vllm-dense" || "$DEPLOY_SET" == "vllm-moe" || "$DEPLOY_SET" == "vllm-blackbox" || "$DEPLOY_SET" == "all" ]]; then
   COMPOSE_SERVICES=("$COMPOSE_SERVICE" "sllm_worker_0")
 else
   COMPOSE_SERVICES=("$COMPOSE_SERVICE")
@@ -262,7 +271,7 @@ for attempt in $(seq 1 60); do
   sleep 2
 done
 
-if [[ "$DEPLOY_SET" == "reparallelization" || "$DEPLOY_SET" == "reparallelization-performance" || "$DEPLOY_SET" == "context-migration-performance" || "$DEPLOY_SET" == "vllm-dense" || "$DEPLOY_SET" == "vllm-moe" || "$DEPLOY_SET" == "vllm-blackbox" || "$DEPLOY_SET" == "all" ]]; then
+if [[ "$DEPLOY_SET" == "reparallelization" || "$DEPLOY_SET" == "reparallelization-performance" || "$DEPLOY_SET" == "context-migration-performance" || "$DEPLOY_SET" == "stateful-recovery-performance" || "$DEPLOY_SET" == "vllm-dense" || "$DEPLOY_SET" == "vllm-moe" || "$DEPLOY_SET" == "vllm-blackbox" || "$DEPLOY_SET" == "all" ]]; then
   log "Checking vLLM worker resources"
   podman exec "$WORKER_CONTAINER" bash -lc \
     "mkdir -p /hf-cache/hub /hf-cache/modules && chmod -R a+rwX /hf-cache && touch /hf-cache/modules/.spotserve-write-test"
@@ -359,6 +368,25 @@ vLLM context-migration model is not visible in ${WORKER_CONTAINER}.
 Expected: ${CONTEXT_MIGRATION_MODEL_PATH}/config.json
 Host MODEL_FOLDER is: ${MODEL_FOLDER}
 Set SPOTSERVE_CONTEXT_MIGRATION_MODEL_PATH to a container-local model path
+or Hugging Face model id that the worker can load.
+EOF
+        exit 1
+      fi
+      sleep 2
+    done
+  fi
+  if [[ "$DEPLOY_SET" == "stateful-recovery-performance" || "$DEPLOY_SET" == "all" ]] &&
+      [[ "$STATEFUL_RECOVERY_MODEL_PATH" == /* ]]; then
+    for attempt in $(seq 1 90); do
+      if podman exec "$WORKER_CONTAINER" test -f "${STATEFUL_RECOVERY_MODEL_PATH}/config.json"; then
+        break
+      fi
+      if [[ "$attempt" -eq 90 ]]; then
+        cat >&2 <<EOF
+vLLM stateful-recovery model is not visible in ${WORKER_CONTAINER}.
+Expected: ${STATEFUL_RECOVERY_MODEL_PATH}/config.json
+Host MODEL_FOLDER is: ${MODEL_FOLDER}
+Set SPOTSERVE_STATEFUL_RECOVERY_MODEL_PATH to a container-local model path
 or Hugging Face model id that the worker can load.
 EOF
         exit 1
@@ -513,6 +541,33 @@ for relative_path in (
 PY
 fi
 
+if [[ "$DEPLOY_SET" == "stateful-recovery-performance" || "$DEPLOY_SET" == "all" ]]; then
+  log "Applying vLLM stateful-recovery config override"
+  podman exec -i "$CONTAINER" "$HEAD_PYTHON" - \
+    "$WORKDIR_IN_CONTAINER" \
+    "$STATEFUL_RECOVERY_MODEL_PATH" \
+    "$STATEFUL_RECOVERY_LOAD_FORMAT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+workdir = Path(sys.argv[1])
+model_path = sys.argv[2]
+load_format = sys.argv[3]
+for relative_path in (
+    "examples/spotserve/config-vllm-stateful-recovery-token-replay-performance.json",
+    "examples/spotserve/config-vllm-stateful-recovery-applied-performance.json",
+):
+    path = workdir / relative_path
+    config = json.loads(path.read_text(encoding="utf-8"))
+    backend_config = config.setdefault("backend_config", {})
+    backend_config["pretrained_model_name_or_path"] = model_path
+    backend_config["load_format"] = load_format
+    path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    print(f"patched {path}: model={model_path} load_format={load_format}")
+PY
+fi
+
 if [[ "$DEPLOY_SET" == "vllm-moe" || "$DEPLOY_SET" == "vllm-blackbox" || "$DEPLOY_SET" == "all" ]]; then
   log "Applying vLLM MoE config overrides"
   podman exec -i "$CONTAINER" "$HEAD_PYTHON" - \
@@ -565,6 +620,10 @@ if [[ "$SKIP_DEPLOY" -eq 0 ]]; then
     "examples/spotserve/config-vllm-context-migration-disabled-performance.json"
     "examples/spotserve/config-vllm-context-migration-applied-performance.json"
   )
+  STATEFUL_RECOVERY_PERFORMANCE_CONFIGS=(
+    "examples/spotserve/config-vllm-stateful-recovery-token-replay-performance.json"
+    "examples/spotserve/config-vllm-stateful-recovery-applied-performance.json"
+  )
   VLLM_DENSE_CONFIGS=(
     "examples/spotserve/config-vllm-dense-baseline.json"
     "examples/spotserve/config-vllm-dense-none.json"
@@ -594,6 +653,9 @@ if [[ "$SKIP_DEPLOY" -eq 0 ]]; then
   if [[ "$DEPLOY_SET" == "context-migration-performance" || "$DEPLOY_SET" == "all" ]]; then
     DEPLOY_CONFIGS+=("${CONTEXT_MIGRATION_PERFORMANCE_CONFIGS[@]}")
   fi
+  if [[ "$DEPLOY_SET" == "stateful-recovery-performance" || "$DEPLOY_SET" == "all" ]]; then
+    log "Stateful-recovery performance configs will be deployed one run at a time by the benchmark runner"
+  fi
   if [[ "$DEPLOY_SET" == "vllm-dense" || "$DEPLOY_SET" == "vllm-blackbox" || "$DEPLOY_SET" == "all" ]]; then
     DEPLOY_CONFIGS+=("${VLLM_DENSE_CONFIGS[@]}")
   fi
@@ -601,23 +663,27 @@ if [[ "$SKIP_DEPLOY" -eq 0 ]]; then
     DEPLOY_CONFIGS+=("${VLLM_MOE_CONFIGS[@]}")
   fi
 
-  podman exec "$CONTAINER" bash -lc "
-    set -euo pipefail
-    cd '$WORKDIR_IN_CONTAINER'
-    for config in ${DEPLOY_CONFIGS[*]}
-    do
-      for attempt in \$(seq 1 30); do
-        if '$HEAD_SLLM' deploy --config \"\$config\"; then
-          break
-        fi
-        if [[ \"\$attempt\" -eq 30 ]]; then
-          echo \"Failed to deploy \$config after \$attempt attempts\" >&2
-          exit 1
-        fi
-        sleep 2
+  if [[ "${#DEPLOY_CONFIGS[@]}" -gt 0 ]]; then
+    podman exec "$CONTAINER" bash -lc "
+      set -euo pipefail
+      cd '$WORKDIR_IN_CONTAINER'
+      for config in ${DEPLOY_CONFIGS[*]}
+      do
+        for attempt in \$(seq 1 30); do
+          if '$HEAD_SLLM' deploy --config \"\$config\"; then
+            break
+          fi
+          if [[ \"\$attempt\" -eq 30 ]]; then
+            echo \"Failed to deploy \$config after \$attempt attempts\" >&2
+            exit 1
+          fi
+          sleep 2
+        done
       done
-    done
-  "
+    "
+  else
+    log "No models predeployed for ${DEPLOY_SET}"
+  fi
 
   log "Current model status"
   podman exec "$CONTAINER" bash -lc "'$HEAD_SLLM' status"
@@ -696,6 +762,21 @@ podman exec ${CONTAINER} bash -lc '
 cd ${WORKDIR_IN_CONTAINER} &&
 ${HEAD_PYTHON} benchmarks/spotserve/run_benchmark.py \\
   --config benchmarks/spotserve/benchmark_matrix_context_migration_performance.yaml \\
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \\
+  --request-timeout 240
+'
+EOF
+fi
+
+if [[ "$DEPLOY_SET" == "stateful-recovery-performance" || "$DEPLOY_SET" == "all" ]]; then
+  cat <<EOF
+
+Run the stateful-recovery performance comparison with:
+
+podman exec ${CONTAINER} bash -lc '
+cd ${WORKDIR_IN_CONTAINER} &&
+${HEAD_PYTHON} benchmarks/spotserve/run_benchmark.py \\
+  --config benchmarks/spotserve/benchmark_matrix_stateful_recovery_performance.yaml \\
   --endpoint http://127.0.0.1:8343/v1/chat/completions \\
   --request-timeout 240
 '

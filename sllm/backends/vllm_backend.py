@@ -22,6 +22,7 @@ import logging
 import os
 import time
 import uuid
+import zlib
 from dataclasses import fields
 from typing import Any, Dict, List, Optional, Sequence, Union, cast
 
@@ -202,6 +203,7 @@ class VllmBackend(SllmBackend):
         self.backend_config = backend_config
         self.request_trace = LLMEngineStatusDict()
         self.pending_kv_restores: Dict[str, int] = {}
+        self._forced_failures_seen = set()
         # if trace_debug is True, request trace will not be deleted after completion
         self.trace_debug = backend_config.get("trace_debug", False)
         self.enforce_eager = backend_config.get("enforce_eager", False)
@@ -313,9 +315,164 @@ class VllmBackend(SllmBackend):
             if self.status != BackendStatus.UNINITIALIZED:
                 return
             started_at = time.monotonic()
+            self._configure_spotserve_nixl_side_channel_port()
             self.engine = AsyncLLMEngine.from_engine_args(self.engine_args)
             self.model_load_time_s = time.monotonic() - started_at
             self.status = BackendStatus.RUNNING
+
+    def _spotserve_runtime_identity(self) -> str:
+        try:
+            import ray
+
+            context = ray.get_runtime_context()
+            actor_id = context.get_actor_id()
+            actor_name = ""
+            get_actor_name = getattr(context, "get_actor_name", None)
+            if callable(get_actor_name):
+                actor_name = str(get_actor_name() or "")
+            actor_id_text = (
+                actor_id.hex()
+                if callable(getattr(actor_id, "hex", None))
+                else str(actor_id)
+            )
+            return f"{actor_name}:{actor_id_text}"
+        except Exception:
+            return f"{self.model_name}:{id(self)}"
+
+    def _derive_spotserve_nixl_side_channel_port(
+        self, identity: str
+    ) -> int:
+        exact_port = self.backend_config.get("nixl_side_channel_port")
+        if exact_port is not None:
+            return int(exact_port)
+        base_port = int(
+            self.backend_config.get(
+                "nixl_side_channel_base_port",
+                os.getenv(
+                    "SPOTSERVE_NIXL_SIDE_CHANNEL_BASE_PORT",
+                    os.getenv("VLLM_NIXL_SIDE_CHANNEL_PORT", "5600"),
+                ),
+            )
+        )
+        port_span = max(
+            1,
+            int(
+                self.backend_config.get(
+                    "nixl_side_channel_port_span",
+                    os.getenv("SPOTSERVE_NIXL_SIDE_CHANNEL_PORT_SPAN", "20000"),
+                )
+            ),
+        )
+        return base_port + (zlib.crc32(identity.encode("utf-8")) % port_span)
+
+    def _configure_spotserve_nixl_side_channel_port(self) -> None:
+        kv_transfer_config = self.backend_config.get("kv_transfer_config") or {}
+        if kv_transfer_config.get("kv_connector") != "NixlConnector":
+            return
+        port = self._derive_spotserve_nixl_side_channel_port(
+            self._spotserve_runtime_identity()
+        )
+        os.environ["VLLM_NIXL_SIDE_CHANNEL_PORT"] = str(port)
+        logger.info("Configured vLLM NIXL side-channel port: %s", port)
+
+    def _pop_spotserve_request_controls(
+        self,
+        request_data: Dict[str, Any],
+        request_id: str,
+        skip_forced_failure: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        failure_mode = request_data.pop("force_failure", None)
+        alternate_failure_mode = request_data.pop(
+            "force_backend_failure", None
+        )
+        failure_mode = failure_mode or alternate_failure_mode
+
+        fail_after_tokens = request_data.pop("force_fail_after_tokens", None)
+        alternate_fail_after_tokens = request_data.pop(
+            "force_preempt_after_tokens", None
+        )
+        if fail_after_tokens is None:
+            fail_after_tokens = alternate_fail_after_tokens
+
+        force_once = bool(request_data.pop("force_fail_once", True))
+        no_current_tokens = bool(
+            request_data.pop("force_no_current_tokens", False)
+        )
+        request_data.pop("_completed_tokens", None)
+
+        if not failure_mode or fail_after_tokens is None:
+            return None
+        if skip_forced_failure:
+            return None
+
+        failure_mode = str(failure_mode).lower()
+        failure_key = f"{self.model_name}:{request_id}:{failure_mode}"
+        if force_once and failure_key in self._forced_failures_seen:
+            return None
+
+        return {
+            "failure_mode": failure_mode,
+            "fail_after_tokens": int(fail_after_tokens),
+            "failure_key": failure_key,
+            "force_once": force_once,
+            "no_current_tokens": no_current_tokens,
+        }
+
+    def _forced_failure_ready(
+        self,
+        forced_failure: Optional[Dict[str, Any]],
+        output: RequestOutput,
+    ) -> bool:
+        if not forced_failure or not output.outputs:
+            return False
+        output_tokens = list(output.outputs[0].token_ids or [])
+        return len(output_tokens) >= int(forced_failure["fail_after_tokens"])
+
+    async def _forced_failure_result(
+        self,
+        request_data: Dict[str, Any],
+        forced_failure: Dict[str, Any],
+        output: RequestOutput,
+    ) -> Dict[str, Any]:
+        if forced_failure.get("force_once", True):
+            self._forced_failures_seen.add(str(forced_failure["failure_key"]))
+
+        output_tokens = (
+            list(output.outputs[0].token_ids or []) if output.outputs else []
+        )
+        tokens = list(output.prompt_token_ids or []) + output_tokens
+        current_output = [] if forced_failure["no_current_tokens"] else [tokens]
+        completed_tokens = len(output_tokens)
+        state_snapshot = await self.export_inference_state(
+            request_data=request_data,
+            current_output=current_output,
+            completed_tokens=completed_tokens,
+        )
+        try:
+            await self.engine.abort(output.request_id)
+        except Exception:
+            logger.debug(
+                "Could not abort forced-preempted vLLM request",
+                exc_info=True,
+            )
+
+        failure_mode = str(forced_failure["failure_mode"])
+        if failure_mode in {"preempt", "preempted", "preemption"}:
+            return {
+                "error": (
+                    "Forced vLLM backend preemption after "
+                    f"{completed_tokens} tokens"
+                ),
+                "preempted": True,
+                "current_output": current_output,
+                "completed_tokens": completed_tokens,
+                "_spotserve_inference_state": state_snapshot,
+            }
+
+        raise RuntimeError(
+            "Forced vLLM backend failure after "
+            f"{completed_tokens} tokens"
+        )
 
     async def generate(self, request_data: Dict[str, Any]):
         async with self.status_lock:
@@ -341,6 +498,7 @@ class VllmBackend(SllmBackend):
         inputs: Union[str, TokensPrompt] = request_data.pop(
             "prompt", construct_prompt
         )
+        has_input_tokens = request_data.get("input_tokens") is not None
         if request_data.get("input_tokens") is not None:
             inputs = TokensPrompt(
                 prompt_token_ids=request_data.pop("input_tokens"),
@@ -349,6 +507,21 @@ class VllmBackend(SllmBackend):
         request_id: str = request_data.pop(
             "request_id", f"chatcmpl-{uuid.uuid4()}"
         )
+        forced_failure = self._pop_spotserve_request_controls(
+            request_data,
+            request_id,
+            skip_forced_failure=has_input_tokens,
+        )
+        state_request_data = dict(request_data)
+        state_request_data.update(
+            {
+                "model": model_name,
+                "messages": messages,
+                "request_id": request_id,
+            }
+        )
+        if isinstance(inputs, str):
+            state_request_data["prompt"] = inputs
 
         try:
             sampling_params = SamplingParams(**request_data)
@@ -366,6 +539,10 @@ class VllmBackend(SllmBackend):
         async for response_output in results_generator:
             final_output = response_output
             await self.request_trace.update_status(request_id, response_output)
+            if self._forced_failure_ready(forced_failure, response_output):
+                return await self._forced_failure_result(
+                    state_request_data, forced_failure, response_output
+                )
 
         assert final_output is not None
 
