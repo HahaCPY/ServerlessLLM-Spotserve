@@ -115,6 +115,30 @@ reusable_blocks_by_target[target_instance_id or target_node_id]
 If target-specific reuse is not available, the planner falls back to configured
 same-node and cross-node reuse ratios.
 
+For the live router path, Version 7 now uses proof-only defaults:
+
+```text
+same_node_token_reuse_ratio = 0
+same_node_block_reuse_ratio = 0
+cross_node_token_reuse_ratio = 0
+cross_node_block_reuse_ratio = 0
+```
+
+The router fills `reusable_tokens_by_target` and
+`reusable_blocks_by_target` only when source and target runtimes expose:
+
+```text
+matching token prefix
+positive source and target KV block counts
+same cache_block_size
+compatible cache_dtype and cache_layout
+compatible model/cache runtime metadata when available
+same node
+```
+
+This keeps the synthetic planner useful for configured what-if studies while
+making live vLLM context migration evidence-based by default.
+
 ## Assignment
 
 The planner respects target capacity:
@@ -306,6 +330,84 @@ results/spotserve_context_migration/summary.json
 This synthetic benchmark validates the planner and metrics only. It does not
 claim real KV cache migration or serving latency improvement.
 
+## vLLM Performance Benchmark
+
+Files:
+
+```text
+benchmarks/spotserve/benchmark_matrix_context_migration_performance.yaml
+benchmarks/spotserve/workloads/context_migration_vllm_performance.jsonl
+examples/spotserve/config-vllm-context-migration-disabled-performance.json
+examples/spotserve/config-vllm-context-migration-applied-performance.json
+examples/spotserve/spot_trace_vllm_context_migration_*_performance.jsonl
+```
+
+Run:
+
+```bash
+scripts/prepare_spotserve.sh --deploy-set context-migration-performance
+
+podman exec sllm_head bash -lc '
+cd /tmp/spotserve-work &&
+/opt/venvs/head/bin/python benchmarks/spotserve/run_benchmark.py \
+  --config benchmarks/spotserve/benchmark_matrix_context_migration_performance.yaml \
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \
+  --request-timeout 240
+'
+```
+
+The matrix deploys two live vLLM replicas for each model alias:
+
+```text
+vllm-context-migration-disabled-perf:
+  enable_context_migration=false
+
+vllm-context-migration-applied-perf:
+  enable_context_migration=true
+  enable_kv_cache_migration=true
+```
+
+The trace uses:
+
+```json
+{"event": "preempt", "instance_selector": "busy", "model_name": "..."}
+```
+
+`run_benchmark.py` resolves `instance_selector=busy` through the Ray router
+actor right before replaying the spot event, so the trace does not need
+deploy-time instance UUIDs. The selector targets a ready instance with active
+concurrency, which prevents the benchmark from preempting an idle replica and
+getting `action=no_context`. Runs can also set `min_ready_instances` to wait
+for both replicas before the workload starts.
+
+The workload sends two same-prefix long requests before preemption. The
+warm-prefix requests intentionally use a larger decode length, and the trace
+preempts at 3 seconds, so `get_context_metadata()` runs while the source
+replica still has active context. At the spot event, the applied run can
+collect active source context metadata and active target KV metadata, then
+populate target-specific reuse maps only when runtime cache compatibility is
+proven.
+
+Interpretation:
+
+```text
+context_migration_events > 0
+context_migration_plan_count > 0
+context_migration_reusable_context_blocks > 0
+context_migration_reuse_ratio > 0
+```
+
+Those fields show that V7 observed real runtime context metadata and planned a
+low-cost assignment. If `kv_cache_migration_successes > 0`, the conservative
+target warmup path also ran through `resume_kv_cache()`.
+
+This benchmark is still proof-limited by the current restore implementation.
+`resume_kv_cache()` replays token batches to warm target cache state; it is not
+true vLLM KV block serialization, transfer, or request binding. Also, the
+router does not assume cross-node reuse. If two replicas land on different
+worker nodes and no cross-node KV proof is exposed, the benchmark can
+correctly report `context_migration_reusable_context_blocks=0`.
+
 ## Backend Handoff
 
 大鼻 backend-side 提供 vLLM context metadata 的保守第一版：
@@ -327,15 +429,17 @@ request_id = RequestOutput.request_id when available
 instance_id = backend caller provided instance id
 node_id = backend caller provided node id
 num_tokens = prompt token count + generated token count when available
-context_blocks = 0 when vLLM KV block metadata is not safely exposed
-reusable_tokens_by_target = {} unless backend can prove target-specific reuse
-reusable_blocks_by_target = {} unless backend can prove target-specific reuse
+context_blocks = explicit runtime KV block count when safely exposed
+cache_block_size/cache_dtype/cache_layout = runtime cache geometry when exposed
+metadata.block_ids / block_table / cache_config_fingerprint are preserved
+reusable_tokens_by_target = {} unless runtime target reuse can be proven
+reusable_blocks_by_target = {} unless runtime target reuse can be proven
 ```
 
-因此 V7 backend 目前支援 token-level estimated migration input，但不宣稱 true
-KV cache migration、KV block transfer、或 production request resume。若之後
-vLLM 能安全 expose block table / KV cache metadata，只需要擴充這個 helper
-輸出的 `context_blocks` 和 reusable maps，CPY assignment algorithm 不需要改。
+因此 V7 backend 現在可以把 vLLM runtime KV block metadata 餵進低成本
+assignment。Router 只會在 source/target 都提供相容 KV block metadata 且 token
+prefix 對齊 cache block size 時，填入 target-specific reusable maps；否則
+reuse 維持 0，不再由 same-node heuristic 假設。
 
 Backend state export / restore capability 由後續 state metadata hook 明確回報；
 在 V7 context metadata 中，未知或未驗證的 KV restore 不會被假設為可用。
@@ -362,6 +466,8 @@ Version 7 CPY side is complete when:
 - unassigned contexts are reported.
 - migration metrics are emitted and summarized.
 - synthetic benchmark can produce a migration plan and summary.
+- live vLLM performance benchmark can compare context migration disabled vs
+  applied and report context/KV migration counters.
 - router spot-event path can collect live backend context metadata and return a
   context migration decision.
 - tests validate cost, assignment, target capacity, per-target warmup,

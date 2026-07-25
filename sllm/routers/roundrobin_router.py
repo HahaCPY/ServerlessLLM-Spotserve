@@ -703,6 +703,99 @@ class RoundRobinRouter(SllmRouter):
             sources.extend(await self._capture_context_metadata(instance))
         return sources
 
+    @staticmethod
+    def _context_metadata_value(
+        context: ContextMetadata, key: str
+    ) -> Any:
+        if key == "cache_block_size":
+            return context.cache_block_size or None
+        if key == "cache_dtype":
+            return context.cache_dtype or None
+        if key == "cache_layout":
+            return context.cache_layout or None
+        return (context.metadata or {}).get(key)
+
+    @classmethod
+    def _context_cache_compatible(
+        cls,
+        source: ContextMetadata,
+        target: ContextMetadata,
+    ) -> bool:
+        if source.cache_block_size <= 0 or target.cache_block_size <= 0:
+            return False
+        if source.cache_block_size != target.cache_block_size:
+            return False
+        if source.context_blocks <= 0 or target.context_blocks <= 0:
+            return False
+
+        for key in ("cache_dtype", "cache_layout"):
+            source_value = cls._context_metadata_value(source, key)
+            target_value = cls._context_metadata_value(target, key)
+            if source_value and target_value and source_value != target_value:
+                return False
+
+        compatibility_keys = (
+            "cache_config_fingerprint",
+            "model_revision",
+            "tensor_parallel_size",
+            "pipeline_parallel_size",
+            "cache_engine",
+            "kv_connector",
+            "configured_cache_dtype",
+        )
+        for key in compatibility_keys:
+            source_value = cls._context_metadata_value(source, key)
+            target_value = cls._context_metadata_value(target, key)
+            if source_value is None or target_value is None:
+                continue
+            if str(source_value) != str(target_value):
+                return False
+
+        source_groups = cls._context_metadata_value(source, "cache_groups")
+        target_groups = cls._context_metadata_value(target, "cache_groups")
+        if source_groups and target_groups and source_groups != target_groups:
+            return False
+        return True
+
+    @classmethod
+    def _target_specific_reuse(
+        cls,
+        source: ContextMetadata,
+        target_context: ContextMetadata,
+    ) -> Tuple[int, int]:
+        if not source.tokens or not target_context.tokens:
+            return 0, 0
+        if not cls._context_cache_compatible(source, target_context):
+            return 0, 0
+
+        common_tokens = 0
+        for source_token, target_token in zip(
+            source.tokens, target_context.tokens
+        ):
+            if source_token != target_token:
+                break
+            common_tokens += 1
+        aligned_tokens = (
+            common_tokens // source.cache_block_size
+        ) * source.cache_block_size
+        reusable_blocks = min(
+            source.context_blocks,
+            target_context.context_blocks,
+            aligned_tokens // source.cache_block_size,
+        )
+        if reusable_blocks <= 0:
+            return 0, 0
+        source_token_count = source.num_tokens or len(source.tokens)
+        target_token_count = target_context.num_tokens or len(
+            target_context.tokens
+        )
+        reusable_tokens = min(
+            source_token_count,
+            target_token_count,
+            reusable_blocks * source.cache_block_size,
+        )
+        return reusable_tokens, reusable_blocks
+
     async def _populate_target_reuse_maps(
         self,
         sources: List[ContextMetadata],
@@ -755,33 +848,12 @@ class RoundRobinRouter(SllmRouter):
             for target in targets:
                 if source.node_id != target.node_id:
                     continue
-                if not source.tokens or source.cache_block_size <= 0:
-                    continue
                 for target_context in target_contexts.get(target.instance_id, []):
-                    if target_context.cache_block_size != source.cache_block_size:
-                        continue
-                    if source.cache_dtype and target_context.cache_dtype:
-                        if source.cache_dtype != target_context.cache_dtype:
-                            continue
-                    if source.cache_layout and target_context.cache_layout:
-                        if source.cache_layout != target_context.cache_layout:
-                            continue
-                    common_tokens = 0
-                    for source_token, target_token in zip(
-                        source.tokens, target_context.tokens
-                    ):
-                        if source_token != target_token:
-                            break
-                        common_tokens += 1
-                    aligned_tokens = (
-                        common_tokens // source.cache_block_size
-                    ) * source.cache_block_size
-                    blocks = min(
-                        source.context_blocks,
-                        aligned_tokens // source.cache_block_size,
+                    tokens, blocks = self._target_specific_reuse(
+                        source, target_context
                     )
-                    if aligned_tokens > 0 and blocks > 0:
-                        reusable_tokens[target.instance_id] = aligned_tokens
+                    if tokens > 0 and blocks > 0:
+                        reusable_tokens[target.instance_id] = tokens
                         reusable_blocks[target.instance_id] = blocks
                         break
             annotated.append(
@@ -833,6 +905,20 @@ class RoundRobinRouter(SllmRouter):
                 or 0.0
             ),
         )
+
+    def _context_migration_planner_config(self) -> Dict[str, Any]:
+        configured = self.context_migration_config.get(
+            "planner_config", self.context_migration_config
+        )
+        planner_config = dict(configured or {})
+        if self.context_migration_config.get(
+            "require_target_runtime_reuse", True
+        ):
+            planner_config.setdefault("same_node_token_reuse_ratio", 0.0)
+            planner_config.setdefault("same_node_block_reuse_ratio", 0.0)
+            planner_config.setdefault("cross_node_token_reuse_ratio", 0.0)
+            planner_config.setdefault("cross_node_block_reuse_ratio", 0.0)
+        return planner_config
 
     async def _context_migration_targets(
         self,
@@ -974,11 +1060,7 @@ class RoundRobinRouter(SllmRouter):
         sources = await self._context_migration_sources(matches)
         source_instance_ids = {instance.instance_id for instance in matches}
         targets = await self._context_migration_targets(source_instance_ids)
-        planner_config = dict(
-            self.context_migration_config.get(
-                "planner_config", self.context_migration_config
-            )
-        )
+        planner_config = self._context_migration_planner_config()
         sources = await self._populate_target_reuse_maps(sources, targets)
         decision = plan_low_cost_migration(
             sources=sources,

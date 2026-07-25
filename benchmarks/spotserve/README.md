@@ -151,6 +151,50 @@ The applied performance run uses the model alias
 `vllm-reparallelization-applied-perf` so its router metrics do not collide with
 the correctness smoke.
 
+For a V7 context-migration performance comparison, run:
+
+```bash
+scripts/prepare_spotserve.sh --deploy-set context-migration-performance
+
+podman exec sllm_head bash -lc '
+cd /tmp/spotserve-work &&
+/opt/venvs/head/bin/python benchmarks/spotserve/run_benchmark.py \
+  --config benchmarks/spotserve/benchmark_matrix_context_migration_performance.yaml \
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \
+  --request-timeout 240
+'
+```
+
+This matrix compares:
+
+```text
+vllm-context-migration-disabled: enable_context_migration=false
+vllm-context-migration-applied:  enable_context_migration=true
+```
+
+Both configs keep two vLLM replicas alive. The trace targets
+`instance_selector=busy`; the benchmark runner resolves that to a live router
+instance id with active concurrency immediately before replaying the spot
+event. This avoids hardcoding deploy-time UUIDs in the trace and prevents a
+preemption from landing on an idle replica with no source context.
+
+The workload overlaps two same-prefix long requests before the preemption so
+the applied run can observe source and target runtime KV metadata. The
+warm-prefix requests intentionally use a larger decode length, and the trace
+preempts at 3 seconds, so `get_context_metadata()` runs while the source
+replica still has active context. A true low-cost context-reuse result should
+show `context_migration_events > 0`,
+`context_migration_reusable_context_blocks > 0`, and
+`context_migration_reuse_ratio > 0`. `kv_cache_migration_successes > 0` means
+the conservative target warmup path ran; it is still prefill/replay based, not
+vLLM KV block serialization.
+
+On clusters where the two replicas land on different worker nodes, the
+proof-only V7 router may report migration with zero reusable blocks because it
+does not assume cross-node cache reuse without explicit runtime proof. For a
+same-node reuse benchmark, run on a worker with at least two GPUs or target a
+specific same-node replica via the trace.
+
 For risk-aware scheduling validation, run the synthetic scheduler benchmark.
 This does not require a deployed model:
 

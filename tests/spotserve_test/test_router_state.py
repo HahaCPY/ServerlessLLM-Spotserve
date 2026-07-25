@@ -28,6 +28,13 @@ class FakeContextBackend:
                 "cache_layout": "NHD",
                 "reusable_tokens_by_target": {"instance-target": 6},
                 "reusable_blocks_by_target": {"instance-target": 2},
+                "metadata": {
+                    "cache_config_fingerprint": "cache-a",
+                    "model_revision": "rev-a",
+                    "tensor_parallel_size": 1,
+                    "pipeline_parallel_size": 1,
+                    "cache_engine": "vllm_v1",
+                },
             }
         ]
 
@@ -35,6 +42,15 @@ class FakeContextBackend:
 class FakeKvSourceBackend(FakeContextBackend):
     async def get_current_tokens(self):
         return [[1, 2, 3, 4]]
+
+
+class FakeContextBackendNoExplicitReuse(FakeContextBackend):
+    async def get_context_metadata(self, instance_id="", node_id=""):
+        rows = await super().get_context_metadata(instance_id, node_id)
+        for row in rows:
+            row["reusable_tokens_by_target"] = {}
+            row["reusable_blocks_by_target"] = {}
+        return rows
 
 
 class FakeKvTargetBackend:
@@ -47,6 +63,10 @@ class FakeKvTargetBackend:
 
 
 class FakeReusableTargetBackend:
+    def __init__(self, *, context_blocks=2, cache_fingerprint="cache-a"):
+        self.context_blocks = context_blocks
+        self.cache_fingerprint = cache_fingerprint
+
     async def get_context_metadata(self, instance_id="", node_id=""):
         return [
             {
@@ -55,10 +75,17 @@ class FakeReusableTargetBackend:
                 "node_id": node_id,
                 "num_tokens": 8,
                 "tokens": [1, 2, 3, 4, 5, 6, 7, 8],
-                "context_blocks": 2,
+                "context_blocks": self.context_blocks,
                 "cache_block_size": 4,
                 "cache_dtype": "torch.float16",
                 "cache_layout": "NHD",
+                "metadata": {
+                    "cache_config_fingerprint": self.cache_fingerprint,
+                    "model_revision": "rev-a",
+                    "tensor_parallel_size": 1,
+                    "pipeline_parallel_size": 1,
+                    "cache_engine": "vllm_v1",
+                },
             }
         ]
 
@@ -497,6 +524,117 @@ async def test_router_derives_target_specific_reuse_from_runtime_prefix(tmp_path
     assert plan["new_instance_id"] == "instance-target"
     assert plan["reusable_tokens"] == 8
     assert plan["reusable_context_blocks"] == 2
+
+
+@pytest.mark.asyncio
+async def test_router_derives_runtime_reuse_without_explicit_maps(tmp_path):
+    router = RoundRobinRouter(
+        model_name="test-model",
+        resource_requirements={"num_cpus": 1, "num_gpus": 0},
+        backend="dummy",
+        backend_config={},
+        router_config={
+            "enable_context_migration": True,
+            "context_migration_config": {"planner_config": {"cross_node_penalty": 0}},
+        },
+    )
+    source = InstanceHandle(
+        instance_id="instance-source",
+        max_queue_length=1,
+        num_gpu=0,
+        backend_instance=FakeContextBackendNoExplicitReuse(),
+    )
+    target = InstanceHandle(
+        instance_id="instance-target",
+        max_queue_length=1,
+        num_gpu=0,
+        backend_instance=FakeReusableTargetBackend(),
+    )
+    await source.mark_ready(node_id="node-shared")
+    await target.mark_ready(node_id="node-shared")
+    router.ready_inference_instances[source.instance_id] = source
+    router.ready_inference_instances[target.instance_id] = target
+
+    result = await router.handle_preemption(instance_id="instance-source")
+    plan = result["context_migration"]["plans"][0]
+
+    assert plan["reusable_tokens"] == 8
+    assert plan["reusable_context_blocks"] == 2
+
+
+@pytest.mark.asyncio
+async def test_router_requires_runtime_blocks_for_target_reuse(tmp_path):
+    router = RoundRobinRouter(
+        model_name="test-model",
+        resource_requirements={"num_cpus": 1, "num_gpus": 0},
+        backend="dummy",
+        backend_config={},
+        router_config={
+            "enable_context_migration": True,
+            "context_migration_config": {"planner_config": {"cross_node_penalty": 0}},
+        },
+    )
+    source = InstanceHandle(
+        instance_id="instance-source",
+        max_queue_length=1,
+        num_gpu=0,
+        backend_instance=FakeContextBackendNoExplicitReuse(),
+    )
+    target = InstanceHandle(
+        instance_id="instance-target",
+        max_queue_length=1,
+        num_gpu=0,
+        backend_instance=FakeReusableTargetBackend(context_blocks=0),
+    )
+    await source.mark_ready(node_id="node-shared")
+    await target.mark_ready(node_id="node-shared")
+    router.ready_inference_instances[source.instance_id] = source
+    router.ready_inference_instances[target.instance_id] = target
+
+    result = await router.handle_preemption(instance_id="instance-source")
+    plan = result["context_migration"]["plans"][0]
+
+    assert plan["reusable_tokens"] == 0
+    assert plan["reusable_context_blocks"] == 0
+
+
+@pytest.mark.asyncio
+async def test_router_rejects_incompatible_runtime_cache_metadata(tmp_path):
+    router = RoundRobinRouter(
+        model_name="test-model",
+        resource_requirements={"num_cpus": 1, "num_gpus": 0},
+        backend="dummy",
+        backend_config={},
+        router_config={
+            "enable_context_migration": True,
+            "context_migration_config": {"planner_config": {"cross_node_penalty": 0}},
+        },
+    )
+    source = InstanceHandle(
+        instance_id="instance-source",
+        max_queue_length=1,
+        num_gpu=0,
+        backend_instance=FakeContextBackendNoExplicitReuse(),
+    )
+    target = InstanceHandle(
+        instance_id="instance-target",
+        max_queue_length=1,
+        num_gpu=0,
+        backend_instance=FakeReusableTargetBackend(
+            context_blocks=2,
+            cache_fingerprint="cache-b",
+        ),
+    )
+    await source.mark_ready(node_id="node-shared")
+    await target.mark_ready(node_id="node-shared")
+    router.ready_inference_instances[source.instance_id] = source
+    router.ready_inference_instances[target.instance_id] = target
+
+    result = await router.handle_preemption(instance_id="instance-source")
+    plan = result["context_migration"]["plans"][0]
+
+    assert plan["reusable_tokens"] == 0
+    assert plan["reusable_context_blocks"] == 0
 
 
 @pytest.mark.asyncio

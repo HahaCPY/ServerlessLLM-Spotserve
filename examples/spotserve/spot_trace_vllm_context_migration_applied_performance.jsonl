@@ -1,0 +1,1 @@
+{"time": 3.0, "event": "preempt", "instance_selector": "busy", "model_name": "vllm-context-migration-applied-perf"}

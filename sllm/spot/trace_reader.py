@@ -16,6 +16,8 @@ class SpotEvent:
     node_id: Optional[str] = None
     model_name: Optional[str] = None
     instance_id: Optional[str] = None
+    instance_index: Optional[int] = None
+    instance_selector: Optional[str] = None
 
     def __post_init__(self):
         if self.time < 0:
@@ -25,9 +27,23 @@ class SpotEvent:
                 f"Unsupported spot event '{self.event}'. "
                 f"Expected one of {sorted(SUPPORTED_EVENTS)}"
             )
-        if self.node_id is None and self.instance_id is None:
+        if (
+            self.node_id is None
+            and self.instance_id is None
+            and self.instance_index is None
+            and self.instance_selector is None
+        ):
             raise ValueError(
-                "Spot event must target either node_id or instance_id"
+                "Spot event must target node_id, instance_id, or "
+                "instance_index"
+            )
+        if (
+            self.instance_index is not None
+            or self.instance_selector is not None
+        ) and self.model_name is None:
+            raise ValueError(
+                "Spot event with instance_index or instance_selector must "
+                "include model_name"
             )
 
 
@@ -46,6 +62,12 @@ def _event_from_dict(raw_event: dict, source: str) -> SpotEvent:
         node_id=raw_event.get("node_id"),
         model_name=raw_event.get("model_name"),
         instance_id=raw_event.get("instance_id"),
+        instance_index=(
+            int(raw_event["instance_index"])
+            if raw_event.get("instance_index") is not None
+            else None
+        ),
+        instance_selector=raw_event.get("instance_selector"),
     )
 
 

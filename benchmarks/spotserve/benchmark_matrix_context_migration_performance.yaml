@@ -1,0 +1,53 @@
+{
+  "endpoint": "http://127.0.0.1:8345/v1/chat/completions",
+  "output_dir": "results/spotserve_context_migration_performance",
+  "runs": [
+    {
+      "name": "vllm-context-migration-disabled",
+      "model": "vllm-context-migration-disabled-perf",
+      "backend": "vllm",
+      "policy": "none",
+      "workload": "benchmarks/spotserve/workloads/context_migration_vllm_performance.jsonl",
+      "trace": "examples/spotserve/spot_trace_vllm_context_migration_disabled_performance.jsonl",
+      "router_metrics_path": "/tmp/spotserve-work/results/spotserve_context_migration_performance/vllm-context-migration-disabled-router.jsonl",
+      "min_ready_instances": 2,
+      "ready_timeout_s": 240
+    },
+    {
+      "name": "vllm-context-migration-applied",
+      "model": "vllm-context-migration-applied-perf",
+      "backend": "vllm",
+      "policy": "none",
+      "workload": "benchmarks/spotserve/workloads/context_migration_vllm_performance.jsonl",
+      "trace": "examples/spotserve/spot_trace_vllm_context_migration_applied_performance.jsonl",
+      "router_metrics_path": "/tmp/spotserve-work/results/spotserve_context_migration_performance/vllm-context-migration-applied-router.jsonl",
+      "min_ready_instances": 2,
+      "ready_timeout_s": 240
+    }
+  ],
+  "comparisons": [
+    {
+      "name": "context-migration-applied-vs-disabled",
+      "baseline": "vllm-context-migration-disabled",
+      "candidate": "vllm-context-migration-applied",
+      "fields": [
+        "success_rate",
+        "latency_p95_ms",
+        "throughput_req_s",
+        "context_migration_events",
+        "context_migration_plan_count",
+        "context_migration_reusable_tokens",
+        "context_migration_reusable_context_blocks",
+        "context_migration_reuse_ratio",
+        "kv_cache_migration_attempts",
+        "kv_cache_migration_successes",
+        "kv_cache_migration_tokens",
+        "phase_migration_window_success_rate",
+        "phase_migration_window_latency_p95_ms",
+        "phase_post_migration_success_rate",
+        "phase_post_migration_latency_p95_ms",
+        "phase_post_migration_throughput_req_s"
+      ]
+    }
+  ]
+}

@@ -107,17 +107,23 @@ spot preempt/dead event
 `get_all_request_kv_metadata()`. If those hooks are unavailable, it falls back
 to active `RequestOutput` / request trace metadata.
 
-Bignose/runtime TODO for V7:
+V7 runtime/CPY contract:
 
-- expose real per-request `kv_block_count` / `context_blocks`.
-- expose block IDs or block table when available.
-- ~~expose target-specific `reusable_tokens_by_target`.~~ Router now derives the
-  map from an aligned matching token prefix reported by the target runtime.
-- ~~expose target-specific `reusable_blocks_by_target`.~~ Router derives the
-  block map only when block size, dtype, layout, node, and prefix evidence match.
-- ~~keep reuse maps empty when target-specific reuse cannot be proven.~~ This is
-  enforced by the conservative target compatibility checks.
-- do not estimate `context_blocks` from token count.
+- vLLM runtime hooks expose real per-request `kv_block_count` /
+  `context_blocks` when available.
+- vLLM runtime hooks expose block IDs, block tables, cache geometry, and cache
+  compatibility metadata when available.
+- CPY preserves the raw runtime metadata in `ContextMetadata.metadata`.
+- Router derives `reusable_tokens_by_target` and
+  `reusable_blocks_by_target` only from aligned source/target runtime prefix
+  evidence.
+- Router requires positive source and target KV block counts plus compatible
+  block size, dtype, layout, and cache/model metadata before claiming block
+  reuse.
+- Live router planning defaults to proof-only reuse ratios. When no
+  target-specific runtime proof exists, reusable maps stay empty and estimated
+  reuse is 0.
+- `context_blocks` is not estimated from token count.
 
 Safe conservative values:
 
@@ -430,6 +436,18 @@ Current validation status (2026-07-19):
 
 Useful validation commands depend on the deployment, but the expected signals
 are:
+
+```bash
+scripts/prepare_spotserve.sh --deploy-set context-migration-performance
+
+podman exec sllm_head bash -lc '
+cd /tmp/spotserve-work &&
+/opt/venvs/head/bin/python benchmarks/spotserve/run_benchmark.py \
+  --config benchmarks/spotserve/benchmark_matrix_context_migration_performance.yaml \
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \
+  --request-timeout 240
+'
+```
 
 ```text
 context_migration_events > 0

@@ -40,6 +40,20 @@ def _runtime_value(payload: Any, key: str) -> Any:
     return getattr(payload, key, None)
 
 
+def _first_runtime_value(runtime_metadata: Mapping[str, Any], key: str) -> Any:
+    value = _runtime_value(runtime_metadata, key)
+    if value is not None:
+        return value
+
+    nested_metadata = runtime_metadata.get("metadata")
+    value = _runtime_value(nested_metadata, key)
+    if value is not None:
+        return value
+
+    kv_transfer_params = runtime_metadata.get("kv_transfer_params")
+    return _runtime_value(kv_transfer_params, key)
+
+
 def _token_count(runtime_metadata: Mapping[str, Any]) -> int:
     if "num_tokens" in runtime_metadata:
         return _non_negative_int(runtime_metadata.get("num_tokens"))
@@ -80,7 +94,12 @@ def _block_table_count(value: Any) -> int:
 
 
 def _explicit_block_count(payload: Any) -> int:
-    for key in ("context_blocks", "kv_block_count", "num_kv_blocks"):
+    for key in (
+        "context_blocks",
+        "kv_block_count",
+        "num_kv_blocks",
+        "num_blocks",
+    ):
         value = _runtime_value(payload, key)
         if value is not None:
             parsed = _non_negative_int(value)
@@ -91,6 +110,23 @@ def _explicit_block_count(payload: Any) -> int:
         count = _sequence_len(_runtime_value(payload, key))
         if count > 0:
             return count
+
+    group_counts = _runtime_value(payload, "kv_block_count_by_group")
+    if isinstance(group_counts, (list, tuple)):
+        parsed_counts = [
+            _non_negative_int(value) for value in group_counts
+        ]
+        if parsed_counts:
+            return max(parsed_counts)
+
+    for key in ("kv_block_ids_by_group", "raw_block_ids_by_group"):
+        groups = _runtime_value(payload, key)
+        if isinstance(groups, (list, tuple)):
+            group_lengths = [
+                _sequence_len(group) for group in groups
+            ]
+            if group_lengths:
+                return max(group_lengths)
 
     count = _block_table_count(_runtime_value(payload, "block_table"))
     if count > 0:
@@ -105,6 +141,12 @@ def context_block_count_from_runtime(
     direct_count = _explicit_block_count(runtime_metadata)
     if direct_count > 0:
         return direct_count
+
+    nested_metadata = runtime_metadata.get("metadata")
+    if isinstance(nested_metadata, Mapping):
+        metadata_count = _explicit_block_count(nested_metadata)
+        if metadata_count > 0:
+            return metadata_count
 
     kv_transfer_params: Optional[Any] = runtime_metadata.get(
         "kv_transfer_params"
@@ -154,9 +196,15 @@ def get_vllm_context_metadata(
         "runtime_epoch",
         "vllm_version",
         "cache_config_fingerprint",
+        "num_blocks",
     ):
         if key in runtime_metadata:
             metadata[key] = runtime_metadata[key]
+    cache_block_size = _first_runtime_value(
+        runtime_metadata, "cache_block_size"
+    )
+    cache_dtype = _first_runtime_value(runtime_metadata, "cache_dtype")
+    cache_layout = _first_runtime_value(runtime_metadata, "cache_layout")
     return {
         "request_id": runtime_metadata.get("request_id"),
         "instance_id": instance_id,
@@ -166,9 +214,9 @@ def get_vllm_context_metadata(
         "num_tokens": _token_count(runtime_metadata),
         "tokens": list(runtime_metadata.get("tokens", []) or []),
         "context_blocks": context_block_count_from_runtime(runtime_metadata),
-        "cache_block_size": runtime_metadata.get("cache_block_size"),
-        "cache_dtype": runtime_metadata.get("cache_dtype"),
-        "cache_layout": runtime_metadata.get("cache_layout"),
+        "cache_block_size": cache_block_size,
+        "cache_dtype": cache_dtype,
+        "cache_layout": cache_layout,
         "reusable_tokens_by_target": _int_mapping(
             runtime_metadata.get("reusable_tokens_by_target")
         ),

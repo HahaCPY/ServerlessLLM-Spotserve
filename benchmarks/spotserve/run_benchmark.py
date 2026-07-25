@@ -23,11 +23,23 @@ class TraceTask(NamedTuple):
     log_path: Path
 
 
+class BenchmarkSpotEvent(NamedTuple):
+    time: float
+    event: str
+    node_id: Optional[str]
+    model_name: Optional[str]
+    instance_id: Optional[str]
+    instance_index: Optional[int]
+    instance_selector: Optional[str]
+
+
 BENCHMARK_ONLY_WORKLOAD_KEYS = {
     "time",
     "benchmark_phase",
     "phase",
 }
+
+SUPPORTED_SPOT_EVENTS = {"preempt", "recover", "dead"}
 
 
 def load_config(path: Path) -> Dict[str, Any]:
@@ -52,6 +64,50 @@ def load_jsonl(path: Path) -> List[Dict[str, Any]]:
             if stripped:
                 rows.append(json.loads(stripped))
     return sorted(rows, key=lambda row: float(row.get("time", 0.0)))
+
+
+def load_spot_trace_events(path: Path) -> List[BenchmarkSpotEvent]:
+    rows = load_jsonl(path)
+    events = []
+    for row in rows:
+        event = str(row.get("event", ""))
+        if event not in SUPPORTED_SPOT_EVENTS:
+            raise ValueError(
+                f"{path}: unsupported spot event {event}; expected one of "
+                f"{sorted(SUPPORTED_SPOT_EVENTS)}"
+            )
+        instance_index = row.get("instance_index")
+        if instance_index is not None:
+            instance_index = int(instance_index)
+        instance_selector = row.get("instance_selector")
+        if (
+            row.get("node_id") is None
+            and row.get("instance_id") is None
+            and instance_index is None
+            and instance_selector is None
+        ):
+            raise ValueError(
+                f"{path}: spot event must target node_id, instance_id, "
+                "instance_index, or instance_selector"
+            )
+        if (
+            instance_index is not None or instance_selector is not None
+        ) and row.get("model_name") is None:
+            raise ValueError(
+                f"{path}: instance-selected spot events require model_name"
+            )
+        events.append(
+            BenchmarkSpotEvent(
+                time=float(row.get("time", 0.0)),
+                event=event,
+                node_id=row.get("node_id"),
+                model_name=row.get("model_name"),
+                instance_id=row.get("instance_id"),
+                instance_index=instance_index,
+                instance_selector=instance_selector,
+            )
+        )
+    return events
 
 
 def git_commit() -> Optional[str]:
@@ -251,6 +307,122 @@ def check_endpoint_ready(endpoint: str, model_names: List[str], timeout_s: float
         )
 
 
+def is_ready_instance_state(state: Dict[str, Any]) -> bool:
+    return state.get("pool") == "ready" and state.get("state") == "ready"
+
+
+def instance_concurrency(state: Dict[str, Any]) -> int:
+    try:
+        return int(state.get("concurrency", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+async def get_model_instance_states(
+    model_name: str,
+    ray_address: str,
+    ray_namespace: str,
+) -> Dict[str, Any]:
+    try:
+        import ray
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "Ray is required to inspect model instances. Run this benchmark "
+            "inside the SpotServe head environment or remove "
+            "min_ready_instances/instance_index/instance_selector from the "
+            "benchmark config."
+        ) from exc
+
+    if not ray.is_initialized():
+        ray.init(
+            address=ray_address,
+            namespace=ray_namespace,
+            ignore_reinit_error=True,
+        )
+    router = ray.get_actor(model_name, namespace="models")
+    return await asyncio.to_thread(
+        ray.get, router.get_instance_states.remote()
+    )
+
+
+async def wait_for_ready_instances(
+    model_name: str,
+    min_ready_instances: int,
+    timeout_s: float,
+    ray_address: str,
+    ray_namespace: str,
+) -> None:
+    if min_ready_instances <= 0:
+        return
+    deadline = time.monotonic() + timeout_s
+    latest_states: Dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        latest_states = await get_model_instance_states(
+            model_name, ray_address, ray_namespace
+        )
+        ready_instances = [
+            instance_id
+            for instance_id, state in latest_states.items()
+            if is_ready_instance_state(state)
+        ]
+        if len(ready_instances) >= min_ready_instances:
+            return
+        await asyncio.sleep(2.0)
+
+    raise RuntimeError(
+        f"Timed out waiting for {min_ready_instances} ready instances for "
+        f"{model_name}; latest states={latest_states}"
+    )
+
+
+async def resolve_trace_instance_id(
+    event: Any,
+    ray_address: str,
+    ray_namespace: str,
+) -> Optional[str]:
+    if event.instance_id is not None:
+        return event.instance_id
+
+    selector = getattr(event, "instance_selector", None)
+    if getattr(event, "instance_index", None) is None and selector is None:
+        return None
+
+    states = await get_model_instance_states(
+        event.model_name, ray_address, ray_namespace
+    )
+    ready_instances = [
+        (instance_id, state)
+        for instance_id, state in states.items()
+        if is_ready_instance_state(state)
+    ]
+    if selector in ("active", "active_context", "busy"):
+        ready_instances = [
+            (instance_id, state)
+            for instance_id, state in ready_instances
+            if instance_concurrency(state) > 0
+        ]
+        ready_instances = sorted(
+            ready_instances,
+            key=lambda item: (-instance_concurrency(item[1]), item[0]),
+        )
+    elif selector in (None, "ready"):
+        ready_instances = sorted(ready_instances, key=lambda item: item[0])
+    else:
+        raise RuntimeError(f"Unsupported instance_selector: {selector}")
+
+    ready_instance_ids = [instance_id for instance_id, _ in ready_instances]
+    index = int(event.instance_index or 0)
+    if index < 0:
+        index += len(ready_instance_ids)
+    if index < 0 or index >= len(ready_instance_ids):
+        raise RuntimeError(
+            f"instance_index {event.instance_index} is out of range for "
+            f"{event.model_name}; selector={selector}; "
+            f"ready instances={ready_instance_ids}; states={states}"
+        )
+    return ready_instance_ids[index]
+
+
 async def send_workload(
     endpoint: str,
     model: str,
@@ -336,13 +508,13 @@ async def replay_trace_over_http(
     endpoint: str,
     log_path: Path,
     timeout_s: float,
+    ray_address: str,
+    ray_namespace: str,
 ) -> None:
-    from sllm.spot.trace_reader import load_spot_trace
-
     if speedup <= 0:
         raise ValueError("speedup must be positive")
 
-    events = load_spot_trace(trace_path)
+    events = load_spot_trace_events(Path(trace_path))
     spot_endpoint = f"{base_url_from_chat_endpoint(endpoint)}/spot/event"
     replay_started_at = time.monotonic()
     last_event_time = 0.0
@@ -357,10 +529,15 @@ async def replay_trace_over_http(
             sleep_time = max(event.time - last_event_time, 0.0) / speedup
             if sleep_time > 0:
                 await asyncio.sleep(sleep_time)
+            instance_id = await resolve_trace_instance_id(
+                event,
+                ray_address=ray_address,
+                ray_namespace=ray_namespace,
+            )
             payload = {
                 "event": event.event,
                 "node_id": event.node_id,
-                "instance_id": event.instance_id,
+                "instance_id": instance_id,
                 "model_name": event.model_name,
             }
             log_file.write(f"Replaying spot event: {payload}\n")
@@ -388,6 +565,8 @@ def start_http_trace_replayer(
     endpoint: str,
     log_path: Path,
     timeout_s: float,
+    ray_address: str,
+    ray_namespace: str,
 ) -> Optional[TraceTask]:
     if not trace_path:
         return None
@@ -398,6 +577,8 @@ def start_http_trace_replayer(
             endpoint=endpoint,
             log_path=log_path,
             timeout_s=timeout_s,
+            ray_address=ray_address,
+            ray_namespace=ray_namespace,
         )
     )
     return TraceTask(task=task, log_path=log_path)
@@ -469,6 +650,14 @@ async def run_one(
         encoding="utf-8",
     )
 
+    await wait_for_ready_instances(
+        run_config["model"],
+        int(run_config.get("min_ready_instances", 0) or 0),
+        float(run_config.get("ready_timeout_s", 180.0) or 180.0),
+        ray_address,
+        ray_namespace,
+    )
+
     workload = load_jsonl(Path(run_config["workload"]))
     trace_replayer = None
     if not skip_trace:
@@ -488,6 +677,8 @@ async def run_one(
                 endpoint,
                 run_dir / "trace_replayer.log",
                 request_timeout_s,
+                ray_address,
+                ray_namespace,
             )
     try:
         rows = await send_workload(
@@ -584,6 +775,18 @@ async def main_async(args):
                     f"failed="
                     f"{summary.get('replanning_execution_failed', 0)}"
                 )
+            context_migration_suffix = ""
+            if int(summary.get("context_migration_events", 0) or 0) > 0:
+                context_migration_suffix = (
+                    f", context_migrations="
+                    f"{summary.get('context_migration_events', 0)}, "
+                    f"reusable_blocks="
+                    f"{summary.get('context_migration_reusable_context_blocks', 0)}, "
+                    f"reuse_ratio="
+                    f"{summary.get('context_migration_reuse_ratio', 0.0)}, "
+                    f"kv_successes="
+                    f"{summary.get('kv_cache_migration_successes', 0)}"
+                )
             print(
                 "  "
                 f"{summary['run_name']}: "
@@ -593,6 +796,7 @@ async def main_async(args):
                 f"{recovery_suffix}"
                 f"{instance_suffix}"
                 f"{replanning_suffix}"
+                f"{context_migration_suffix}"
             )
         if comparisons:
             print("\nBenchmark comparisons:")

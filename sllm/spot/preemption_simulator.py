@@ -16,23 +16,84 @@ from sllm.spot.trace_reader import SpotEvent, load_spot_trace
 logger = logging.getLogger(__name__)
 
 
+def _is_ready_instance_state(state: dict) -> bool:
+    return state.get("pool") == "ready" and state.get("state") == "ready"
+
+
+def _instance_concurrency(state: dict) -> int:
+    try:
+        return int(state.get("concurrency", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _resolve_instance_id(event: SpotEvent):
+    if event.instance_id is not None:
+        return event.instance_id
+    if event.instance_index is None and event.instance_selector is None:
+        return None
+    if ray is None:
+        raise RuntimeError(
+            "Ray is required to resolve trace instance selection"
+        )
+    if event.model_name is None:
+        raise ValueError("instance-selected trace event requires model_name")
+
+    router = ray.get_actor(event.model_name, namespace="models")
+    states = await router.get_instance_states.remote()
+    ready_instances = [
+        (instance_id, state)
+        for instance_id, state in states.items()
+        if _is_ready_instance_state(state)
+    ]
+    if event.instance_selector in ("active", "active_context", "busy"):
+        ready_instances = [
+            (instance_id, state)
+            for instance_id, state in ready_instances
+            if _instance_concurrency(state) > 0
+        ]
+        ready_instances = sorted(
+            ready_instances,
+            key=lambda item: (-_instance_concurrency(item[1]), item[0]),
+        )
+    elif event.instance_selector in (None, "ready"):
+        ready_instances = sorted(ready_instances, key=lambda item: item[0])
+    else:
+        raise RuntimeError(
+            f"Unsupported instance_selector: {event.instance_selector}"
+        )
+
+    ready_instance_ids = [instance_id for instance_id, _ in ready_instances]
+    index = int(event.instance_index or 0)
+    if index < 0:
+        index += len(ready_instance_ids)
+    if index < 0 or index >= len(ready_instance_ids):
+        raise RuntimeError(
+            f"instance_index {event.instance_index} is out of range for "
+            f"{event.model_name}; selector={event.instance_selector}; "
+            f"ready instances={ready_instance_ids}; states={states}"
+        )
+    return ready_instance_ids[index]
+
+
 async def _dispatch_event(controller, event: SpotEvent):
+    instance_id = await _resolve_instance_id(event)
     if event.event == "preempt":
         return await controller.handle_preemption.remote(
             node_id=event.node_id,
-            instance_id=event.instance_id,
+            instance_id=instance_id,
             model_name=event.model_name,
         )
     if event.event == "dead":
         return await controller.handle_instance_dead.remote(
             node_id=event.node_id,
-            instance_id=event.instance_id,
+            instance_id=instance_id,
             model_name=event.model_name,
         )
     if event.event == "recover":
         return await controller.handle_recover.remote(
             node_id=event.node_id,
-            instance_id=event.instance_id,
+            instance_id=instance_id,
             model_name=event.model_name,
         )
 

@@ -20,6 +20,7 @@ class ContextMetadata:
     reusable_blocks_by_target: Mapping[str, int] = field(
         default_factory=dict
     )
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "ContextMetadata":
@@ -49,6 +50,7 @@ class ContextMetadata:
                     payload.get("reusable_blocks_by_target", {}) or {}
                 ).items()
             },
+            metadata=dict(payload.get("metadata", {}) or {}),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -66,6 +68,7 @@ class ContextMetadata:
             "reusable_blocks_by_target": dict(
                 self.reusable_blocks_by_target
             ),
+            "metadata": dict(self.metadata),
         }
 
 @dataclass(frozen=True)
