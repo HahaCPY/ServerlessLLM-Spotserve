@@ -94,7 +94,7 @@ def get_vllm_runtime_metadata(
         backend_config=backend_config,
         runtime_metadata=runtime_metadata,
     )
-    return {
+    result = {
         "instance_id": instance_id,
         "node_id": node_id,
         "backend": "vllm",
@@ -109,11 +109,26 @@ def get_vllm_runtime_metadata(
         "total_gpu_memory_gb": _non_negative_float(
             runtime_metadata.get("total_gpu_memory_gb"), 0.0
         ),
-        "spot_risk": _non_negative_float(
-            runtime_metadata.get("spot_risk"), 0.0
-        ),
-        "remaining_lifetime_s": _non_negative_float(
-            runtime_metadata.get("remaining_lifetime_s"), 0.0
-        ),
         "metadata": dict(runtime_metadata.get("metadata", {}) or {}),
     }
+    if runtime_metadata.get("spot_risk") is not None:
+        result["spot_risk"] = _non_negative_float(
+            runtime_metadata.get("spot_risk"), 0.0
+        )
+    if runtime_metadata.get("risk_score") is not None:
+        result["risk_score"] = _non_negative_float(
+            runtime_metadata.get("risk_score"), 0.0
+        )
+    if runtime_metadata.get("preemption_risk") is not None:
+        result["preemption_risk"] = _non_negative_float(
+            runtime_metadata.get("preemption_risk"), 0.0
+        )
+    if runtime_metadata.get("remaining_lifetime_s") is not None:
+        result["remaining_lifetime_s"] = _non_negative_float(
+            runtime_metadata.get("remaining_lifetime_s"), 0.0
+        )
+    if runtime_metadata.get("expected_remaining_lifetime_s") is not None:
+        result["expected_remaining_lifetime_s"] = _non_negative_float(
+            runtime_metadata.get("expected_remaining_lifetime_s"), 0.0
+        )
+    return result

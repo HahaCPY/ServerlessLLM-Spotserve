@@ -46,5 +46,6 @@ def test_provider_falls_back_conservatively(monkeypatch):
     provider = build_risk_metadata_provider()
     metadata = provider.collect("node-0", {})
     assert metadata["risk_metadata_source"] == "conservative"
-    assert metadata["spot_risk"] == 0.0
-    assert metadata["remaining_lifetime_s"] == 0.0
+    assert metadata["risk_confidence"] == 0.0
+    assert "spot_risk" not in metadata
+    assert "remaining_lifetime_s" not in metadata

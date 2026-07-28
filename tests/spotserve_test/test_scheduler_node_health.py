@@ -65,6 +65,34 @@ async def test_scheduler_collects_backend_runtime_metadata(monkeypatch):
     assert metadata_rows[0]["instance_id"] == "instance-0"
     assert metadata_rows[0]["node_id"] == "node-0"
     assert metadata_rows[0]["loading_cost"] == 9.0
+    assert metadata_rows[0]["risk_metadata_source"] == "backend_runtime"
+    assert metadata_rows[0]["risk_provider"] == "backend_runtime"
+
+
+@pytest.mark.asyncio
+async def test_scheduler_collects_backend_runtime_metadata_from_models_namespace(
+    monkeypatch,
+):
+    scheduler = FcfsScheduler({"enable_backend_runtime_metadata": True})
+    scheduler.model_instance = {
+        "risk-model": {
+            "instance-0": "node-0",
+        }
+    }
+    calls = []
+
+    def fake_get_actor(name, namespace=None):
+        calls.append((name, namespace))
+        if namespace == "models":
+            return FakeRuntimeMetadataActor()
+        raise ValueError("wrong namespace")
+
+    monkeypatch.setattr(fcfs_scheduler_module.ray, "get_actor", fake_get_actor)
+
+    metadata_rows = await scheduler._collect_backend_runtime_metadata()
+
+    assert len(metadata_rows) == 1
+    assert calls == [("instance-0", None), ("instance-0", "models")]
 
 
 @pytest.mark.asyncio
@@ -113,6 +141,45 @@ async def test_scheduler_merges_backend_runtime_metadata_into_nodes():
         node_info["model_resource_profiles"][0]["model_name"]
         == "risk-model"
     )
+
+
+@pytest.mark.asyncio
+async def test_scheduler_keeps_ray_capacity_authoritative_when_merging_backend_metadata():
+    scheduler = FcfsScheduler({})
+    worker_nodes = {
+        "node-0": {
+            "ray_node_id": "ray-node-0",
+            "address": "10.0.0.1",
+            "free_gpu": 0,
+            "total_gpu": 1,
+            "state": NodeState.READY.value,
+        }
+    }
+
+    merged = scheduler._merge_backend_runtime_metadata(
+        worker_nodes,
+        [
+            {
+                "instance_id": "instance-0",
+                "node_id": "node-0",
+                "loading_cost": 9.0,
+                "spot_risk": 0.7,
+                "remaining_lifetime_s": 600,
+                "free_gpu": 4,
+                "total_gpu": 4,
+                "risk_metadata_source": "backend_runtime",
+                "risk_provider": "vllm",
+            }
+        ],
+    )
+
+    node_info = merged["node-0"]
+    assert node_info["free_gpu"] == 0
+    assert node_info["total_gpu"] == 1
+    assert node_info["backend_reported_free_gpu"] == 4
+    assert node_info["backend_reported_total_gpu"] == 4
+    assert node_info["risk_metadata_source"] == "backend_runtime"
+    assert node_info["risk_provider"] == "vllm"
 
 
 @pytest.mark.asyncio

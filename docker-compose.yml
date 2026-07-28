@@ -41,6 +41,8 @@ services:
       dockerfile: Dockerfile
     image: docker.io/serverlessllm/sllm:latest
     container_name: sllm_worker_0
+    group_add:
+      - keep-groups
     devices:
       - "nvidia.com/gpu=all"
     deploy:

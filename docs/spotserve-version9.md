@@ -126,8 +126,21 @@ currently allocated model instances to query backend actors:
 model_instance[model_name][instance_id] -> node_id
 ray.get_actor(instance_id)
 -> get_runtime_metadata(instance_id, node_id)
+-> normalize as risk_metadata_source=backend_runtime
 -> merge metadata into worker node info
 -> node_risk_score()
+```
+
+Backend actors are resolved first in the scheduler's current namespace and then
+in the `models` namespace, matching detached model actors created by
+`start_instance`. Deployments can override that search order with:
+
+```json
+{
+  "scheduler_config": {
+    "backend_actor_namespaces": [null, "models"]
+  }
+}
 ```
 
 The merge is conservative across multiple instances on the same node:
@@ -138,7 +151,13 @@ remaining_lifetime_s: min observed lifetime
 loading_cost: max observed loading cost
 model_resource_profiles: preserved as a list
 backend_runtime_metadata: preserved as raw rows
+risk_metadata_source / risk_provider / confidence: preserved for metrics
 ```
+
+Ray worker-node GPU accounting remains authoritative for placement capacity.
+If backend runtime metadata reports `free_gpu` or `total_gpu`, those values are
+kept as `backend_reported_free_gpu` and `backend_reported_total_gpu`; they do
+not overwrite the scheduler's live `free_gpu` count.
 
 Configured `scheduler_config.node_risk[node_id]` still takes precedence. This
 keeps synthetic/config benchmarks reproducible while allowing live backend
@@ -213,6 +232,9 @@ risk_scheduling_allocations
 risk_scheduling_avg_selected_risk
 risk_scheduling_avg_selected_score
 risk_scheduling_latest_node
+risk_scheduling_latest_metadata_source
+risk_scheduling_latest_provider
+risk_scheduling_avg_selected_confidence
 risk_scheduling_latest_decision
 ```
 
@@ -238,10 +260,10 @@ GPU usage / free capacity when supplied by runtime metadata
 optional spot risk / lifetime estimate when supplied by runtime metadata
 ```
 
-If GPU free capacity, spot risk, or remaining lifetime are unavailable, the
-backend returns conservative defaults and CPY can still run with synthetic
-metadata. Bignose does not implement scheduler ranking or a real cloud risk
-predictor in backend code.
+If spot risk or remaining lifetime are unavailable, the backend omits those
+fields instead of fabricating a prediction; CPY can still run with scheduler
+defaults, `scheduler_config.node_risk`, or synthetic metadata. Bignose does
+not implement scheduler ranking or a real cloud risk predictor in backend code.
 
 The scheduler can now consume those backend fields directly from running backend
 actors when `enable_backend_runtime_metadata=true`.
@@ -254,6 +276,9 @@ Version 9 CPY side is complete when:
 - unhealthy nodes are still filtered out.
 - scheduler can opt into risk-aware ranking.
 - scheduler can opt into backend actor `get_runtime_metadata()` refresh.
+- backend runtime rows are normalized with provenance before ranking.
+- Ray-reported capacity remains authoritative when backend metadata also
+  reports GPU counts.
 - health-only and risk-aware synthetic benchmark can be compared.
 - metrics/report fields expose selected risk and latest decision.
 - backend handoff exposes conservative vLLM runtime metadata without claiming

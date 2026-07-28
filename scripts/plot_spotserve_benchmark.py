@@ -161,6 +161,15 @@ def render_report(run_dir: Path) -> None:
     risk_scheduling_latest_node = str(
         summary.get("risk_scheduling_latest_node", "") or ""
     )
+    risk_scheduling_latest_metadata_source = str(
+        summary.get("risk_scheduling_latest_metadata_source", "") or ""
+    )
+    risk_scheduling_latest_provider = str(
+        summary.get("risk_scheduling_latest_provider", "") or ""
+    )
+    risk_scheduling_avg_selected_confidence = float(
+        summary.get("risk_scheduling_avg_selected_confidence", 0.0) or 0.0
+    )
 
     html_report = f"""<!doctype html>
 <html lang="en">
@@ -274,14 +283,17 @@ def render_report(run_dir: Path) -> None:
   <h2>Risk-aware Scheduling Metrics</h2>
   <table class="summary">
     <tr>
-      <th>Scheduling Events</th><th>Allocations</th><th>Avg Selected Risk</th><th>Avg Selected Score</th><th>Latest Node</th>
+      <th>Scheduling Events</th><th>Allocations</th><th>Avg Selected Risk</th><th>Avg Selected Score</th><th>Avg Confidence</th><th>Latest Node</th><th>Latest Source</th><th>Latest Provider</th>
     </tr>
     <tr>
       <td>{risk_scheduling_events}</td>
       <td>{risk_scheduling_allocations}</td>
       <td>{risk_scheduling_avg_selected_risk:.3f}</td>
       <td>{risk_scheduling_avg_selected_score:.3f}</td>
+      <td>{risk_scheduling_avg_selected_confidence:.3f}</td>
       <td>{html.escape(risk_scheduling_latest_node)}</td>
+      <td>{html.escape(risk_scheduling_latest_metadata_source)}</td>
+      <td>{html.escape(risk_scheduling_latest_provider)}</td>
     </tr>
   </table>
 
@@ -345,9 +357,9 @@ def render_report(run_dir: Path) -> None:
 
 ## Risk-aware Scheduling Metrics
 
-| Scheduling Events | Allocations | Avg Selected Risk | Avg Selected Score | Latest Node |
-|---:|---:|---:|---:|---|
-| {risk_scheduling_events} | {risk_scheduling_allocations} | {risk_scheduling_avg_selected_risk:.3f} | {risk_scheduling_avg_selected_score:.3f} | `{risk_scheduling_latest_node}` |
+| Scheduling Events | Allocations | Avg Selected Risk | Avg Selected Score | Avg Confidence | Latest Node | Latest Source | Latest Provider |
+|---:|---:|---:|---:|---:|---|---|---|
+| {risk_scheduling_events} | {risk_scheduling_allocations} | {risk_scheduling_avg_selected_risk:.3f} | {risk_scheduling_avg_selected_score:.3f} | {risk_scheduling_avg_selected_confidence:.3f} | `{risk_scheduling_latest_node}` | `{risk_scheduling_latest_metadata_source}` | `{risk_scheduling_latest_provider}` |
 
 Open `report.html` for the visual report.
 """

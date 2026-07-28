@@ -1,343 +1,55 @@
 # SpotServe Performance Summary
 
-Last updated: 2026-07-25
+Last updated: 2026-07-28
 
-This document summarizes the performance and benchmark evidence for each
-SpotServe version. The numbers below should be read with their benchmark scope:
-some versions measure request latency directly, while others validate
-correctness, availability, or scheduling quality.
+This page is intentionally short. It keeps only the commands needed to rerun
+each version's benchmark path and a compact performance summary. V6 and V7 were
+refreshed after the latest backend switch; V8 still needs a target new-backend
+performance rerun.
 
-## High-level Result
+## Performance Commands
 
-The clearest direct latency improvements so far are Version 7 and Version 8:
+All container-side runs assume the compose stack is already using the intended
+`MODEL_FOLDER`. Use `--skip-build` for benchmark reruns unless backend code,
+dependencies, or the image itself changed.
 
-```text
-V7 context migration performance benchmark
-success_rate: 100% -> 100%
-overall p95: 62489.00ms -> 4616.59ms
-migration-window p95: 51255.32ms -> 1027.54ms
-post-migration p95: 5233.93ms -> 1051.30ms
 
-V8 stateful recovery performance benchmark
-success_rate: 100% -> 100%
-overall p95: 63540.97ms -> 2904.41ms
-failure-window p95: 63540.97ms -> 2904.41ms
-post-recovery p95: 24243.46ms -> 1073.46ms
-```
-
-The applied V7 run also produced the required context-migration signals:
-
-```text
-context_migration_plan_count = 1
-context_migration_reusable_tokens = 160
-context_migration_reusable_context_blocks = 10
-context_migration_reuse_ratio = 0.9090909090909091
-kv_cache_migration_attempts = 1
-kv_cache_migration_successes = 1
-```
-
-This supports the claim that the live vLLM V7 runtime-metadata-driven context
-migration and target warmup path can reduce preemption-window latency in the
-same-host benchmark. It does not claim full cross-node KV block serialization
-or direct KV transfer.
-
-## Version Summary
-
-| Version | Feature | Benchmark Evidence | Performance Claim |
-|---|---|---|---|
-| V1 | Benchmark harness + initial dummy recovery policies | Full trace completed: `dummy-no-preemption`, `dummy-naive-retry`, and `dummy-token-replay` all reached `46/46` successes | No speedup claim. Validates benchmark/report plumbing and trace replay. |
-| V2 | Recover dispatch + scheduler node health | Recover/preempt/dead events are dispatched; non-ready nodes are filtered | Availability/control-plane improvement only. No direct latency benchmark. |
-| V3 | Recovery correctness validation | Forced-failure dummy benchmark: `none=0/2`, `naive_retry=2/2`, `token_replay=2/2`; token replay recovered 2 tokens with 1 fallback | Correctness improvement: recovery policies turn failures into successes. Tail latency is higher than failed `none` because retry/replay work is actually performed. |
-| V4 | Dense vLLM black-box integration | vLLM dense aliases deploy and serve through SLLM; HTTP spot trace replay works | Compatibility milestone. No controlled latency speedup claim. |
-| V5 | MoE vLLM black-box integration | MoE aliases deploy and serve through SLLM; dense-vs-MoE matrix exists | MoE compatibility milestone. No expert-aware or MoE-specific latency speedup claim. |
-| V6 | Dynamic reparallelization planner + vLLM deployment adapter | Live vLLM performance matrix: `success_rate=1.0` both; applied has `replanning_events=1`, `replanning_execution_applied=1` | On the recorded single-worker run, overall p95 improved by 74.25%, but the safe claim is lifecycle correctness and post-replan steady-state parity. A production capacity-loss speedup needs multi-worker evidence. |
-| V7 | Low-cost context migration planner + live vLLM metadata | Latest live vLLM matrix: `plan_count=1`, `reuse_ratio=0.909`, `kv_cache_migration_successes=1` | Strong same-host latency result: migration-window p95 reduced by 98.00% and post-migration p95 by 79.91%. This is target warmup/reuse, not full cross-node KV direct transfer. |
-| V8 | Stateful inference recovery | Live vLLM matrix: `state_restore_successes_total=1`, `state_restore_fallback_count=0`, `state_restored_tokens_total=16` | Strong same-node NIXL restore result: failure-window p95 reduced by 95.43% versus token replay while maintaining 100% success rate. Cross-node restore remains out of scope. |
-| V9 | Spot-risk-aware scheduling | Synthetic scheduler benchmark selects lower-risk / longer-lived nodes instead of the first health-only candidate | Scheduling-quality improvement. No request-latency speedup claim yet; benefit is reduced expected preemption risk / placement cost. |
-
-## Direct Latency Comparisons
-
-### V6 Dynamic Reparallelization
-
-Benchmark:
-
-```text
-benchmarks/spotserve/benchmark_matrix_reparallelization_performance.yaml
-```
-
-Recorded comparison:
-
-| Metric | Disabled | Applied | Delta | Reduction |
-|---|---:|---:|---:|---:|
-| `success_rate` | 1.0 | 1.0 | 0.0 | 0.00% |
-| `latency_p95_ms` | 54753.39 | 14099.99 | -40653.40 | 74.25% |
-| `phase_replan_window_latency_p95_ms` | 15333.89 | 14099.99 | -1233.91 | 8.05% |
-| `phase_post_replan_latency_p95_ms` | 1047.34 | 1047.15 | -0.19 | 0.02% |
-
-Interpretation:
-
-- The applied run did execute one `ParallelPlan`.
-- Post-replan steady-state latency is effectively the same as baseline.
-- The single-worker setup mostly measures adapter/recreate behavior.
-- Do not claim production V6 latency improvement without a multi-worker run
-  where the applied path moves traffic to another live worker.
-
-### V7 Low-cost Context Migration
-
-Benchmark:
-
-```text
-benchmarks/spotserve/benchmark_matrix_context_migration_performance.yaml
-```
-
-Latest recorded comparison:
-
-| Metric | Disabled | Applied | Delta | Reduction |
-|---|---:|---:|---:|---:|
-| `success_rate` | 1.0 | 1.0 | 0.0 | 0.00% |
-| `latency_p95_ms` | 62489.00 | 4616.59 | -57872.42 | 92.61% |
-| `phase_migration_window_latency_p95_ms` | 51255.32 | 1027.54 | -50227.78 | 98.00% |
-| `phase_post_migration_latency_p95_ms` | 5233.93 | 1051.30 | -4182.63 | 79.91% |
-
-Context migration counters:
-
-| Metric | Disabled | Applied |
-|---|---:|---:|
-| `context_migration_events` | 0 | 1 |
-| `context_migration_plan_count` | 0 | 1 |
-| `context_migration_reusable_tokens` | 0 | 160 |
-| `context_migration_reusable_context_blocks` | 0 | 10 |
-| `context_migration_reuse_ratio` | 0.0 | 0.9090909090909091 |
-| `kv_cache_migration_attempts` | 0 | 1 |
-| `kv_cache_migration_successes` | 0 | 1 |
-| `kv_cache_migration_tokens` | 0 | 164 |
-
-Interpretation:
-
-- The benchmark preempted a busy source replica.
-- The router collected live source context metadata.
-- The router found a target with compatible runtime prefix/KV metadata.
-- The planner produced one migration plan.
-- The target warmup path succeeded through `resume_kv_cache()`.
-
-Safe wording:
-
-```text
-V7 reduced preemption-window p95 latency from 51.3s to 1.03s in the live
-same-host vLLM context-migration benchmark, while maintaining 100% success
-rate and producing one real context-migration plan with 10 reusable context
-blocks.
-```
-
-Boundary:
-
-```text
-This validates metadata-driven context reuse and target warmup. It does not
-prove full cross-node KV block serialization or direct KV transfer.
-```
-
-### V8 Stateful Recovery Performance
-
-Benchmark:
-
-```text
-benchmarks/spotserve/benchmark_matrix_stateful_recovery_performance.yaml
-```
-
-This matrix compares:
-
-```text
-baseline:  vllm-stateful-recovery-token-replay
-candidate: vllm-stateful-recovery-applied
-```
-
-Both runs use the same vLLM/NIXL backend shape. The only intended policy
-difference is:
-
-```text
-baseline:  recovery_policy = generated_token_replay
-candidate: recovery_policy = stateful_recovery
-```
-
-The runner deploys and deletes each policy model one run at a time. This avoids
-holding four vLLM replicas in memory just to compare two policies; each run
-still waits for two ready replicas before sending the forced-preemption
-workload.
-
-Expected applied-run counters:
-
-```text
-state_recovery_events > 0
-state_restore_attempts_total > 0
-state_restore_successes_total > 0
-state_restore_fallback_count = 0
-state_restored_tokens_total > 0
-```
-
-Recorded comparison:
-
-| Metric | Token Replay | Stateful Recovery | Delta | Change |
-|---|---:|---:|---:|---:|
-| `success_rate` | 1.0 | 1.0 | 0.0 | 0.00% |
-| `latency_p95_ms` | 63540.97 | 2904.41 | -60636.56 | 95.43% lower |
-| `throughput_req_s` | 0.04721 | 0.10332 | 0.05610 | 2.19x |
-| `phase_failure_window_latency_p95_ms` | 63540.97 | 2904.41 | -60636.56 | 95.43% lower |
-| `phase_post_recovery_latency_p95_ms` | 24243.46 | 1073.46 | -23170.00 | 95.57% lower |
-| `phase_post_recovery_throughput_req_s` | 0.07993 | 0.22152 | 0.14159 | 2.77x |
-
-Stateful recovery counters:
-
-| Metric | Token Replay | Stateful Recovery |
-|---|---:|---:|
-| `failed_attempts_total` | 1 | 1 |
-| `retry_count_total` | 1 | 1 |
-| `recovered_tokens_total` | 16 | 16 |
-| `state_restore_attempts_total` | 0 | 1 |
-| `state_restore_successes_total` | 0 | 1 |
-| `state_restore_fallback_count` | 0 | 0 |
-| `state_restored_tokens_total` | 0 | 16 |
-| `state_recovery_events` | 0 | 1 |
-| `state_recovery_restore_events` | 0 | 1 |
-
-Interpretation:
-
-- The benchmark forces one synthetic mid-generation vLLM preemption.
-- The vLLM backend exports a `vllm_kv_snapshot` before returning the
-  preempted response.
-- The router stages that snapshot on the target backend before retrying.
-- The applied run restored 16 tokens through stateful recovery and did not fall
-  back to token replay.
-- The latency win is valid for the same-node vLLM/NIXL live benchmark.
-
-Boundary:
-
-```text
-This validates same-node NIXL stateful restore in the live vLLM path. It does
-not prove cross-node KV restore unless `restore_scope`/runtime metadata report
-cross-node support and the benchmark actually places source and target on
-different nodes.
-```
-
-## Correctness / Availability Comparisons
-
-### V3 Recovery Correctness
-
-Benchmark:
-
-```text
-benchmarks/spotserve/benchmark_matrix_recovery_correctness.yaml
-```
-
-Expected successful shape:
-
-```text
-dummy-correctness-none: successes=0/2
-dummy-correctness-naive-retry: successes=2/2, retries=2
-dummy-correctness-token-replay: successes=2/2, retries=2, recovered_tokens=2
-```
-
-Performance interpretation:
-
-- `none` has lower apparent latency only because the failed requests stop early.
-- `naive_retry` and `token_replay` increase work but recover the request.
-- The improvement is success rate and recovered work, not lower p95 latency.
-
-### V8 Stateful Recovery
-
-Benchmark:
-
-```text
-benchmarks/spotserve/benchmark_matrix_recovery_correctness.yaml
-```
-
-Recorded shape:
-
-```text
-dummy-correctness-none: successes=0/2
-dummy-correctness-naive-retry: successes=2/2
-dummy-correctness-token-replay: successes=2/2
-dummy-correctness-stateful-recovery: successes=2/2
-```
-
-Stateful recovery metrics:
-
-```text
-state_recovery_events = 1
-state_recovery_restore_events = 1
-state_recovery_fallback_events = 0
-state_restore_attempts_total = 1
-state_restore_successes_total = 1
-state_restored_tokens_total = 2
-```
-
-Performance interpretation:
-
-- V8 proves backend state export/restore integration and no-fallback restore in
-  the correctness benchmark.
-- The dummy benchmark does not show a latency win over retry/token replay.
-- A latency claim for V8 should use a live vLLM KV restore benchmark with
-  restored KV blocks and no fallback.
-
-## Scheduling / Placement Comparisons
-
-### V9 Risk-aware Scheduling
-
-Benchmark:
-
-```text
-benchmarks/spotserve/risk_aware_scheduling_synthetic.json
-scripts/run_scheduler_benchmark.py
-```
-
-Expected shape:
-
-```text
-health_only selects the first ready node with enough GPUs
-risk_aware selects the lower-risk / longer-lived ranked node
-```
-
-Performance interpretation:
-
-- V9 does not directly reduce per-request latency in the synthetic benchmark.
-- The improvement is placement quality: lower selected risk, longer expected
-  lifetime, and lower expected interruption cost.
-- Production latency/SLO improvement requires a live spot-risk predictor and a
-  workload where bad placements cause measurable preemption or reload cost.
-
-## Run Commands
-
-V6 performance:
+V1 benchmark harness smoke:
 
 ```bash
-scripts/prepare_spotserve.sh --deploy-set reparallelization-performance
+scripts/prepare_spotserve.sh --skip-build --deploy-set standard
 
 podman exec sllm_head bash -lc '
 cd /tmp/spotserve-work &&
 /opt/venvs/head/bin/python benchmarks/spotserve/run_benchmark.py \
-  --config benchmarks/spotserve/benchmark_matrix_reparallelization_performance.yaml \
+  --config benchmarks/spotserve/benchmark_matrix.yaml \
   --endpoint http://127.0.0.1:8343/v1/chat/completions \
-  --request-timeout 180
+  --request-timeout 30 \
+  --ray-address auto \
+  --ray-namespace sllm
 '
 ```
 
-V7 performance:
+V2 long-running availability benchmark:
 
 ```bash
-scripts/prepare_spotserve.sh --deploy-set context-migration-performance
+scripts/prepare_spotserve.sh --skip-build --deploy-set standard
 
 podman exec sllm_head bash -lc '
 cd /tmp/spotserve-work &&
 /opt/venvs/head/bin/python benchmarks/spotserve/run_benchmark.py \
-  --config benchmarks/spotserve/benchmark_matrix_context_migration_performance.yaml \
+  --config benchmarks/spotserve/benchmark_matrix_long.yaml \
   --endpoint http://127.0.0.1:8343/v1/chat/completions \
-  --request-timeout 240
+  --request-timeout 30 \
+  --ray-address auto \
+  --ray-namespace sllm
 '
 ```
 
-V8 recovery correctness:
+V3 recovery correctness:
 
 ```bash
-scripts/prepare_spotserve.sh --deploy-set correctness
+scripts/prepare_spotserve.sh --skip-build --deploy-set correctness
 
 podman exec sllm_head bash -lc '
 cd /tmp/spotserve-work &&
@@ -349,21 +61,147 @@ cd /tmp/spotserve-work &&
 '
 ```
 
-V8 stateful-recovery performance:
+V4 dense vLLM black-box benchmark:
 
 ```bash
-scripts/prepare_spotserve.sh --deploy-set stateful-recovery-performance
+MODEL_FOLDER="$PWD/model" scripts/prepare_spotserve.sh --skip-build --deploy-set vllm-dense
+
+podman exec sllm_head bash -lc '
+cd /tmp/spotserve-work &&
+/opt/venvs/head/bin/python benchmarks/spotserve/run_benchmark.py \
+  --config benchmarks/spotserve/benchmark_matrix_vllm_dense.yaml \
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \
+  --request-timeout 120 \
+  --ray-address auto \
+  --ray-namespace sllm
+'
+```
+
+V5 MoE vLLM black-box benchmark:
+
+```bash
+scripts/prepare_spotserve.sh --skip-build --deploy-set vllm-moe
+
+podman exec sllm_head bash -lc '
+cd /tmp/spotserve-work &&
+/opt/venvs/head/bin/python benchmarks/spotserve/run_benchmark.py \
+  --config benchmarks/spotserve/benchmark_matrix_vllm_moe.yaml \
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \
+  --request-timeout 180 \
+  --ray-address auto \
+  --ray-namespace sllm
+'
+```
+
+V5 dense-vs-MoE comparison, requires `/models` to contain both dense and MoE
+snapshots:
+
+```bash
+scripts/prepare_spotserve.sh --skip-build --deploy-set vllm-blackbox
+
+podman exec sllm_head bash -lc '
+cd /tmp/spotserve-work &&
+/opt/venvs/head/bin/python benchmarks/spotserve/run_benchmark.py \
+  --config benchmarks/spotserve/benchmark_matrix_vllm_dense_vs_moe.yaml \
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \
+  --request-timeout 180 \
+  --ray-address auto \
+  --ray-namespace sllm
+'
+```
+
+V6 dynamic reparallelization smoke:
+
+```bash
+MODEL_FOLDER=/work/spotserve-models \
+SPOTSERVE_REPARALLELIZATION_MODEL_PATH=/models/Qwen2-MoE-Tiny \
+SPOTSERVE_REPARALLELIZATION_LOAD_FORMAT=auto \
+scripts/prepare_spotserve.sh --skip-build --deploy-set reparallelization
+
+podman exec sllm_head bash -lc '
+cd /tmp/spotserve-work &&
+/opt/venvs/head/bin/python benchmarks/spotserve/run_benchmark.py \
+  --config benchmarks/spotserve/benchmark_matrix_reparallelization.yaml \
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \
+  --request-timeout 120 \
+  --ray-address auto \
+  --ray-namespace sllm
+'
+```
+
+V6 dynamic reparallelization performance:
+
+```bash
+MODEL_FOLDER=/work/spotserve-models \
+SPOTSERVE_REPARALLELIZATION_MODEL_PATH=/models/Qwen2-MoE-Tiny \
+SPOTSERVE_REPARALLELIZATION_LOAD_FORMAT=auto \
+scripts/prepare_spotserve.sh --skip-build --deploy-set reparallelization-performance
+
+podman exec sllm_head bash -lc '
+cd /tmp/spotserve-work &&
+/opt/venvs/head/bin/python benchmarks/spotserve/run_benchmark.py \
+  --config benchmarks/spotserve/benchmark_matrix_reparallelization_performance.yaml \
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \
+  --request-timeout 180 \
+  --ray-address auto \
+  --ray-namespace sllm
+'
+```
+
+V7 context migration performance:
+
+The MoE-side run uses the 1.5s `busy` preemption trace so Qwen2-MoE is still
+serving the warm-prefix requests when preemption is injected.
+
+```bash
+MODEL_FOLDER=/work/spotserve-models \
+SPOTSERVE_CONTEXT_MIGRATION_MODEL_PATH=/models/Qwen2-MoE-Tiny \
+SPOTSERVE_CONTEXT_MIGRATION_LOAD_FORMAT=auto \
+scripts/prepare_spotserve.sh --skip-build --deploy-set context-migration-performance
+
+podman exec sllm_head bash -lc '
+cd /tmp/spotserve-work &&
+/opt/venvs/head/bin/python benchmarks/spotserve/run_benchmark.py \
+  --config benchmarks/spotserve/benchmark_matrix_context_migration_performance.yaml \
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \
+  --request-timeout 240 \
+  --ray-address auto \
+  --ray-namespace sllm
+'
+```
+
+V8 stateful recovery correctness:
+
+```bash
+scripts/prepare_spotserve.sh --skip-build --deploy-set correctness
+
+podman exec sllm_head bash -lc '
+cd /tmp/spotserve-work &&
+/opt/venvs/head/bin/python benchmarks/spotserve/run_benchmark.py \
+  --config benchmarks/spotserve/benchmark_matrix_recovery_correctness.yaml \
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \
+  --request-timeout 30 \
+  --skip-trace
+'
+```
+
+V8 stateful recovery performance:
+
+```bash
+MODEL_FOLDER="$PWD/model" scripts/prepare_spotserve.sh --skip-build --deploy-set stateful-recovery-performance
 
 podman exec sllm_head bash -lc '
 cd /tmp/spotserve-work &&
 /opt/venvs/head/bin/python benchmarks/spotserve/run_benchmark.py \
   --config benchmarks/spotserve/benchmark_matrix_stateful_recovery_performance.yaml \
   --endpoint http://127.0.0.1:8343/v1/chat/completions \
-  --request-timeout 240
+  --request-timeout 240 \
+  --ray-address auto \
+  --ray-namespace sllm
 '
 ```
 
-V9 scheduling:
+V9 risk-aware scheduling synthetic benchmark:
 
 ```bash
 python scripts/run_scheduler_benchmark.py \
@@ -371,19 +209,48 @@ python scripts/run_scheduler_benchmark.py \
   --output-dir /tmp/spotserve_risk_aware_scheduling_test
 ```
 
-## Claim Checklist
+## Performance Summary
 
-Use these checks before writing performance claims:
+| Version | Benchmark | Current claim | Refresh status |
+|---|---|---|---|
+| V1 | `benchmark_matrix.yaml` | Harness/reporting validation only; no latency speedup claim. | Stable unless harness changes. |
+| V2 | `benchmark_matrix_long.yaml` | Availability/control-plane validation; no direct latency speedup claim. | Stable unless scheduler/control-plane changes. |
+| V3 | `benchmark_matrix_recovery_correctness.yaml` | Recovery policies turn forced failures into successes; latency is not the main metric. | Stable correctness check. |
+| V4 | `benchmark_matrix_vllm_dense.yaml` | Dense vLLM compatibility milestone; black-box recovery smoke only. | Rerun if backend image/model changed. |
+| V5 | `benchmark_matrix_vllm_moe.yaml`, `benchmark_matrix_vllm_dense_vs_moe.yaml` | MoE compatibility milestone; no MoE-specific speedup claim. | Rerun after backend/model changes. |
+| V6 | `benchmark_matrix_reparallelization_performance.yaml` | Shared Qwen2 run keeps both versions at 100% success; reparallelization executes once, succeeds, and lowers overall p95. Post-replan p95 stays near parity. | Refreshed 2026-07-27. |
+| V7 | `benchmark_matrix_context_migration_performance.yaml` | Shared Qwen2 MoE run keeps both versions at 100% success; preemption is injected, one context-migration plan executes, and one KV migration succeeds. | Refreshed 2026-07-28. |
+| V8 | `benchmark_matrix_stateful_recovery_performance.yaml` | Old backend record showed stateful recovery beating token replay with no fallback. | Needs rerun with new backend. |
+| V9 | `risk_aware_scheduling_synthetic.json` | Placement-quality improvement: lower-risk / longer-lived node selection. | Synthetic result; live latency/SLO impact still requires a real workload. |
 
-- A latency claim must compare a disabled baseline and an applied run in the
-  same benchmark matrix.
-- `success_rate` should remain equal or improve.
-- V6 claims require `replanning_execution_applied > 0`.
-- V7 claims require `context_migration_plan_count > 0`,
-  `context_migration_reusable_context_blocks > 0`, and
-  `kv_cache_migration_successes > 0` when describing the warmup path.
-- V8 true KV restore claims require `state_restore_successes_total > 0`,
-  `state_restore_fallback_count = 0`, and a live vLLM restore benchmark if
-  latency is mentioned.
-- V9 production claims require real provider/runtime risk metadata, not only
-  synthetic risk input.
+| Metric | Baseline | Applied | Result | Status |
+|---|---|---|---|---|
+| V6 success rate | Reparallelization disabled | Reparallelization applied | `100.00% -> 100.00%` | New backend, `8/8 -> 8/8`. |
+| V6 overall p95 | Reparallelization disabled | Reparallelization applied | `53261.47ms -> 13095.55ms` | Applied reduces overall p95 by `40165.93ms`. |
+| V6 replan-window p95 | Reparallelization disabled | Reparallelization applied | `14226.90ms -> 13095.55ms` | Replan window improved. |
+| V6 post-replan p95 | Reparallelization disabled | Reparallelization applied | `1048.39ms -> 1094.16ms` | Near parity after replan. |
+| V6 replan execution | Reparallelization disabled | Reparallelization applied | `0 replans -> 1 replan, 1 applied, 0 failed` | Lifecycle verified. |
+| V7 MoE success rate | Context migration disabled | Context migration applied | `100.00% -> 100.00%` | New backend, `8/8 -> 8/8`. |
+| V7 MoE overall p95 | Context migration disabled | Context migration applied | `45668.11ms -> 2541.99ms` | Applied reduces overall p95 by `43126.12ms`. |
+| V7 MoE migration-window p95 | Context migration disabled | Context migration applied | `34090.02ms -> 1023.38ms` | Migration window improved by `33066.64ms`. |
+| V7 MoE post-migration p95 | Context migration disabled | Context migration applied | `1021.80ms -> 1042.07ms` | Near parity after migration. |
+| V7 MoE migration signals | Context migration disabled | Context migration applied | `0 -> 1 context migration, 1 plan, 1 KV success, 245 KV tokens` | KV migration path verified; reusable blocks stayed `0`. |
+| V8 overall p95 | Token replay | Stateful recovery | `63540.97ms -> 2904.41ms` | Old backend; replace after rerun. |
+| V8 failure-window p95 | Token replay | Stateful recovery | `63540.97ms -> 2904.41ms` | Old backend; replace after rerun. |
+
+Notes:
+
+- Keep latency claims tied to the matrix that produced them.
+- For V7, require `context_migration_plan_count > 0` and
+  `kv_cache_migration_successes > 0` before claiming the migration path worked.
+  Only claim prefix/block reuse when
+  `context_migration_reusable_context_blocks > 0`.
+- For V8, require `state_restore_successes_total > 0` and
+  `state_restore_fallback_count = 0` before claiming true stateful restore.
+- The 2026-07-27 V6 table uses shared `Qwen2-MoE-Tiny` with
+  `SPOTSERVE_REPARALLELIZATION_LOAD_FORMAT=auto`.
+- A 2026-07-28 V7 dense-side run used `/models/vllm/vllm-dense-baseline`;
+  do not use it as the V7 MoE result.
+- The 2026-07-28 V7 MoE table uses shared `Qwen2-MoE-Tiny` with
+  `SPOTSERVE_CONTEXT_MIGRATION_LOAD_FORMAT=auto`; this run migrated KV tokens
+  but did not report reusable context blocks.

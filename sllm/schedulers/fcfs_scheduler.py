@@ -27,7 +27,10 @@ from sllm.spot.metrics import (
     JsonlMetricsWriter,
     make_risk_aware_scheduling_event,
 )
-from sllm.spot.risk_metadata_provider import build_risk_metadata_provider
+from sllm.spot.risk_metadata_provider import (
+    build_risk_metadata_provider,
+    normalize_risk_metadata,
+)
 from sllm.spot.risk_aware_scheduling import plan_risk_aware_scheduling
 from sllm.utils import NodeState, get_worker_nodes
 
@@ -53,6 +56,16 @@ class FcfsScheduler(SllmScheduler):
         self.enable_backend_runtime_metadata = bool(
             self.scheduler_config.get("enable_backend_runtime_metadata", False)
         )
+        configured_namespaces = self.scheduler_config.get(
+            "backend_actor_namespaces", [None, "models"]
+        )
+        if isinstance(configured_namespaces, str):
+            configured_namespaces = [configured_namespaces]
+        self.backend_actor_namespaces = []
+        for namespace in configured_namespaces:
+            normalized_namespace = namespace or None
+            if normalized_namespace not in self.backend_actor_namespaces:
+                self.backend_actor_namespaces.append(normalized_namespace)
         self.runtime_metadata_timeout_s = max(
             0.001,
             float(
@@ -254,6 +267,45 @@ class FcfsScheduler(SllmScheduler):
             )
         return result
 
+    def _get_backend_actor(self, instance_id: str):
+        last_error = None
+        for namespace in self.backend_actor_namespaces:
+            try:
+                if namespace is None:
+                    return ray.get_actor(instance_id)
+                return ray.get_actor(instance_id, namespace=namespace)
+            except Exception as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        return ray.get_actor(instance_id)
+
+    def _normalize_backend_runtime_metadata(
+        self,
+        metadata: Mapping[str, Any],
+        instance_id: str,
+        node_id: str,
+    ) -> Dict[str, Any]:
+        payload = dict(metadata)
+        payload.setdefault("instance_id", instance_id)
+        payload.setdefault("node_id", node_id)
+        provider = str(
+            payload.get("risk_provider")
+            or payload.get("provider")
+            or payload.get("backend")
+            or "backend_runtime"
+        )
+        normalized = normalize_risk_metadata(
+            payload,
+            source="backend_runtime",
+            provider=provider,
+        )
+        row = dict(payload)
+        row.update(normalized)
+        row["instance_id"] = instance_id
+        row["node_id"] = node_id
+        return row
+
     async def _collect_backend_runtime_metadata(self) -> List[Dict[str, Any]]:
         if not self.enable_backend_runtime_metadata:
             return []
@@ -265,7 +317,7 @@ class FcfsScheduler(SllmScheduler):
         for instances in model_instances.values():
             for instance_id, node_id in instances.items():
                 try:
-                    actor = ray.get_actor(str(instance_id))
+                    actor = self._get_backend_actor(str(instance_id))
                     metadata = await self._call_actor_method(
                         actor,
                         "get_runtime_metadata",
@@ -280,11 +332,22 @@ class FcfsScheduler(SllmScheduler):
                     continue
                 if not isinstance(metadata, Mapping):
                     continue
-                payload = dict(metadata)
-                payload.setdefault("instance_id", str(instance_id))
-                payload.setdefault("node_id", str(node_id))
-                metadata_rows.append(payload)
+                metadata_rows.append(
+                    self._normalize_backend_runtime_metadata(
+                        metadata,
+                        instance_id=str(instance_id),
+                        node_id=str(node_id),
+                    )
+                )
         return metadata_rows
+
+    @staticmethod
+    def _positive_int_value(payload: Mapping[str, Any], key: str) -> Optional[int]:
+        try:
+            value = int(payload.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
 
     def _merge_backend_runtime_metadata(
         self,
@@ -322,6 +385,9 @@ class FcfsScheduler(SllmScheduler):
             loading_costs = []
             free_gpu_values = []
             total_gpu_values = []
+            metadata_sources = []
+            metadata_providers = []
+            confidence_values = []
             for row in rows:
                 try:
                     if row.get("spot_risk") is not None:
@@ -338,8 +404,14 @@ class FcfsScheduler(SllmScheduler):
                         total_gpu = int(row["total_gpu"])
                         if total_gpu > 0:
                             total_gpu_values.append(total_gpu)
+                    if row.get("risk_confidence") is not None:
+                        confidence_values.append(float(row["risk_confidence"]))
                 except (TypeError, ValueError):
                     continue
+                if row.get("risk_metadata_source"):
+                    metadata_sources.append(str(row["risk_metadata_source"]))
+                if row.get("risk_provider"):
+                    metadata_providers.append(str(row["risk_provider"]))
 
             if spot_risks:
                 node_info["spot_risk"] = max(spot_risks)
@@ -348,9 +420,21 @@ class FcfsScheduler(SllmScheduler):
             if loading_costs:
                 node_info["loading_cost"] = max(loading_costs)
             if free_gpu_values:
-                node_info["free_gpu"] = max(free_gpu_values)
+                node_info["backend_reported_free_gpu"] = max(free_gpu_values)
             if total_gpu_values:
-                node_info["total_gpu"] = max(total_gpu_values)
+                node_info["backend_reported_total_gpu"] = max(total_gpu_values)
+                if self._positive_int_value(node_info, "total_gpu") is None:
+                    node_info["total_gpu"] = max(total_gpu_values)
+            if metadata_sources:
+                node_info["risk_metadata_source"] = ",".join(
+                    sorted(set(metadata_sources))
+                )
+            if metadata_providers:
+                node_info["risk_provider"] = ",".join(
+                    sorted(set(metadata_providers))
+                )
+            if confidence_values:
+                node_info["risk_confidence"] = max(confidence_values)
 
             node_info.update(self._configured_node_risk(str(node_id)))
 

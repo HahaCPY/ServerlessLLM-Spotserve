@@ -156,6 +156,9 @@ def make_risk_aware_scheduling_event(
             "remaining_lifetime_s", 0.0
         ),
         "selected_loading_cost": selected.get("loading_cost", 0.0),
+        "selected_metadata_source": selected.get("metadata_source", ""),
+        "selected_provider": selected.get("provider", ""),
+        "selected_confidence": selected.get("confidence", 0.0),
         "decision": decision,
     }
 

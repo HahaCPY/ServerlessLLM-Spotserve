@@ -61,3 +61,17 @@ def test_vllm_runtime_metadata_can_feed_risk_score():
     assert score.total_gpu == 4
     assert score.loading_cost == 8.0
     assert score.spot_risk == 0.2
+
+
+def test_vllm_runtime_metadata_omits_unknown_spot_signals():
+    metadata = get_vllm_runtime_metadata(
+        model_name="vllm-dense",
+        backend_config={"tensor_parallel_size": 1},
+        instance_id="vllm-dense-0",
+        node_id="node-0",
+        runtime_metadata={"load_time_s": 3.0},
+    )
+
+    assert metadata["loading_cost"] == 3.0
+    assert "spot_risk" not in metadata
+    assert "remaining_lifetime_s" not in metadata

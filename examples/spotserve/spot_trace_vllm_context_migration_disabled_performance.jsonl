@@ -1,1 +1,1 @@
-{"time": 3.0, "event": "preempt", "instance_selector": "busy", "model_name": "vllm-context-migration-disabled-perf"}
+{"time": 1.5, "event": "preempt", "instance_selector": "busy", "model_name": "vllm-context-migration-disabled-perf"}

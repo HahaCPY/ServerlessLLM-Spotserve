@@ -65,13 +65,18 @@ Environment overrides:
   SPOTSERVE_VLLM_DENSE_MODEL_PATH
                             Optional container-local HF snapshot path to verify.
   SPOTSERVE_VLLM_MOE_MODEL  MoE HF model id or container-local path.
-                            Default: Qwen/Qwen1.5-MoE-A2.7B
+                            Default: /models/Qwen1.5-MoE-A2.7B
   SPOTSERVE_VLLM_MOE_LOAD_FORMAT
                             vLLM load_format for MoE direct load. Default: auto
   SPOTSERVE_VLLM_MOE_TP     MoE tensor_parallel_size override. Default: 1
   SPOTSERVE_VLLM_MOE_MODEL_PATH
                             Optional container-local MoE snapshot path to verify.
-  MODEL_FOLDER               Host model directory mounted as /models. Default: <repo>/model
+  SPOTSERVE_DEFAULT_MODEL_FOLDER
+                            Host model dir used when MODEL_FOLDER is unset.
+                            Default: /work/spotserve-models if present,
+                            otherwise <repo>/model
+  MODEL_FOLDER               Host model directory mounted as /models.
+                            Default: SPOTSERVE_DEFAULT_MODEL_FOLDER
 EOF
 }
 
@@ -150,7 +155,7 @@ CONTEXT_MIGRATION_LOAD_FORMAT="${SPOTSERVE_CONTEXT_MIGRATION_LOAD_FORMAT:-$REPAR
 STATEFUL_RECOVERY_MODEL_PATH="${SPOTSERVE_STATEFUL_RECOVERY_MODEL_PATH:-$CONTEXT_MIGRATION_MODEL_PATH}"
 STATEFUL_RECOVERY_LOAD_FORMAT="${SPOTSERVE_STATEFUL_RECOVERY_LOAD_FORMAT:-$CONTEXT_MIGRATION_LOAD_FORMAT}"
 VLLM_DENSE_MODEL_PATH="${SPOTSERVE_VLLM_DENSE_MODEL_PATH:-}"
-VLLM_MOE_MODEL="${SPOTSERVE_VLLM_MOE_MODEL:-Qwen/Qwen1.5-MoE-A2.7B}"
+VLLM_MOE_MODEL="${SPOTSERVE_VLLM_MOE_MODEL:-/models/Qwen1.5-MoE-A2.7B}"
 VLLM_MOE_LOAD_FORMAT="${SPOTSERVE_VLLM_MOE_LOAD_FORMAT:-auto}"
 VLLM_MOE_TP="${SPOTSERVE_VLLM_MOE_TP:-1}"
 VLLM_MOE_MODEL_PATH="${SPOTSERVE_VLLM_MOE_MODEL_PATH:-}"
@@ -159,7 +164,11 @@ HEAD_SLLM="/opt/venvs/head/bin/sllm"
 HEAD_RAY="/opt/venvs/head/bin/ray"
 WORKER_PYTHON="/opt/venvs/worker/bin/python"
 
-MODEL_FOLDER="${MODEL_FOLDER:-${ROOT_DIR}/model}"
+DEFAULT_MODEL_FOLDER="${SPOTSERVE_DEFAULT_MODEL_FOLDER:-/work/spotserve-models}"
+if [[ ! -d "$DEFAULT_MODEL_FOLDER" ]]; then
+  DEFAULT_MODEL_FOLDER="${ROOT_DIR}/model"
+fi
+MODEL_FOLDER="${MODEL_FOLDER:-$DEFAULT_MODEL_FOLDER}"
 export MODEL_FOLDER
 export HF_CACHE_DIR
 
@@ -394,15 +403,17 @@ EOF
       sleep 2
     done
   fi
-  if [[ -n "$VLLM_MOE_MODEL_PATH" ]]; then
+  if [[ "$DEPLOY_SET" == "vllm-moe" || "$DEPLOY_SET" == "all" ]] &&
+      [[ -n "$VLLM_MOE_MODEL_PATH" || "$VLLM_MOE_MODEL" == /* ]]; then
+    VLLM_MOE_MODEL_TO_CHECK="${VLLM_MOE_MODEL_PATH:-$VLLM_MOE_MODEL}"
     for attempt in $(seq 1 90); do
-      if podman exec "$WORKER_CONTAINER" test -f "${VLLM_MOE_MODEL_PATH}/config.json"; then
+      if podman exec "$WORKER_CONTAINER" test -f "${VLLM_MOE_MODEL_TO_CHECK}/config.json"; then
         break
       fi
       if [[ "$attempt" -eq 90 ]]; then
         cat >&2 <<EOF
 vLLM MoE model is not visible in ${WORKER_CONTAINER}.
-Expected: ${VLLM_MOE_MODEL_PATH}/config.json
+Expected: ${VLLM_MOE_MODEL_TO_CHECK}/config.json
 Host MODEL_FOLDER is: ${MODEL_FOLDER}
 Set SPOTSERVE_VLLM_MOE_MODEL_PATH only when you have a container-local
 Hugging Face snapshot path with config/tokenizer/weight files.
@@ -733,7 +744,9 @@ cd ${WORKDIR_IN_CONTAINER} &&
 ${HEAD_PYTHON} benchmarks/spotserve/run_benchmark.py \\
   --config benchmarks/spotserve/benchmark_matrix_reparallelization.yaml \\
   --endpoint http://127.0.0.1:8343/v1/chat/completions \\
-  --request-timeout 120
+  --request-timeout 120 \\
+  --ray-address auto \\
+  --ray-namespace sllm
 '
 EOF
 fi
@@ -748,7 +761,9 @@ cd ${WORKDIR_IN_CONTAINER} &&
 ${HEAD_PYTHON} benchmarks/spotserve/run_benchmark.py \\
   --config benchmarks/spotserve/benchmark_matrix_reparallelization_performance.yaml \\
   --endpoint http://127.0.0.1:8343/v1/chat/completions \\
-  --request-timeout 180
+  --request-timeout 180 \\
+  --ray-address auto \\
+  --ray-namespace sllm
 '
 EOF
 fi
@@ -763,7 +778,9 @@ cd ${WORKDIR_IN_CONTAINER} &&
 ${HEAD_PYTHON} benchmarks/spotserve/run_benchmark.py \\
   --config benchmarks/spotserve/benchmark_matrix_context_migration_performance.yaml \\
   --endpoint http://127.0.0.1:8343/v1/chat/completions \\
-  --request-timeout 240
+  --request-timeout 240 \\
+  --ray-address auto \\
+  --ray-namespace sllm
 '
 EOF
 fi
@@ -778,7 +795,9 @@ cd ${WORKDIR_IN_CONTAINER} &&
 ${HEAD_PYTHON} benchmarks/spotserve/run_benchmark.py \\
   --config benchmarks/spotserve/benchmark_matrix_stateful_recovery_performance.yaml \\
   --endpoint http://127.0.0.1:8343/v1/chat/completions \\
-  --request-timeout 240
+  --request-timeout 240 \\
+  --ray-address auto \\
+  --ray-namespace sllm
 '
 EOF
 fi

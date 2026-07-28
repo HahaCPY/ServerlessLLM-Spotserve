@@ -400,6 +400,10 @@ def summarize_risk_aware_scheduling_metrics(
         float(row.get("selected_score", 0.0) or 0.0)
         for row in scheduling_rows
     ]
+    selected_confidences = [
+        float(row.get("selected_confidence", 0.0) or 0.0)
+        for row in scheduling_rows
+    ]
     latest_decision = (
         scheduling_rows[-1].get("decision") if scheduling_rows else None
     )
@@ -418,6 +422,19 @@ def summarize_risk_aware_scheduling_metrics(
             scheduling_rows[-1].get("selected_node_id")
             if scheduling_rows
             else ""
+        ),
+        "risk_scheduling_latest_metadata_source": (
+            scheduling_rows[-1].get("selected_metadata_source")
+            if scheduling_rows
+            else ""
+        ),
+        "risk_scheduling_latest_provider": (
+            scheduling_rows[-1].get("selected_provider")
+            if scheduling_rows
+            else ""
+        ),
+        "risk_scheduling_avg_selected_confidence": (
+            mean(selected_confidences) if selected_confidences else 0.0
         ),
         "risk_scheduling_latest_decision": (
             json.dumps(latest_decision, sort_keys=True)

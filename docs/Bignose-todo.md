@@ -222,8 +222,9 @@ worker node metadata
 The scheduler can use config/synthetic metadata today. `RiskMetadataProvider`
 also supports a production callable (`module:callable`) plus JSON/env adapters;
 all values are normalized, bounded, and tagged with source/provider/time/
-confidence. A conservative provider is used when no authoritative source is
-available.
+confidence. Live backend actor rows are normalized as
+`risk_metadata_source=backend_runtime` before ranking. A conservative provider
+is used when no authoritative source is available.
 
 Bignose/runtime implementation:
 
@@ -235,7 +236,8 @@ Bignose/runtime implementation:
 - ~~provide loading cost / model load time when known.~~ Provider aliases are
   normalized into the scheduler schema.
 - ~~keep unknown risk/lifetime conservative instead of fabricating values.~~
-  Unknown values use conservative defaults with confidence `0.0`.
+  Unknown risk/lifetime fields are omitted and tagged with confidence `0.0`;
+  scheduler defaults handle the ranking fallback.
 
 The host does not expose a cloud spot-risk service, so production predictor
 quality is intentionally not claimed here. A deployment supplies one through
@@ -257,6 +259,10 @@ load_time_s
 spot_risk
 remaining_lifetime_s
 ```
+
+Backend GPU counts are treated as observations only. Ray scheduler capacity
+remains the source of truth for `free_gpu` during allocation; backend rows are
+preserved as `backend_reported_free_gpu` / `backend_reported_total_gpu`.
 
 If no cloud provider or risk predictor is available, CPY can continue using
 `scheduler_config.node_risk` or synthetic benchmark metadata. Bignose does not

@@ -12,7 +12,7 @@
     "keep_alive": 60
   },
   "backend_config": {
-    "pretrained_model_name_or_path": "Qwen/Qwen1.5-MoE-A2.7B",
+    "pretrained_model_name_or_path": "/models/Qwen1.5-MoE-A2.7B",
     "load_format": "auto",
     "torch_dtype": "float16",
     "gpu_memory_utilization": 0.9,

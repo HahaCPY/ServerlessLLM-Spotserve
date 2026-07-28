@@ -1,4 +1,5 @@
 from sllm.spot.risk_aware_scheduling import (
+    node_risk_score,
     plan_risk_aware_scheduling,
     rank_nodes_by_spot_risk,
 )
@@ -72,3 +73,24 @@ def test_risk_aware_plan_reports_no_capacity():
     assert decision.action == "no_capacity"
     assert decision.selected_node_id is None
     assert decision.candidates == []
+
+
+def test_risk_score_exposes_backend_runtime_provenance():
+    score = node_risk_score(
+        node_id="node-0",
+        node_info={
+            "free_gpu": 1,
+            "total_gpu": 1,
+            "state": "ready",
+            "spot_risk": 0.4,
+            "loading_cost": 8,
+            "risk_metadata_source": "backend_runtime",
+            "risk_provider": "vllm",
+            "risk_confidence": 0.75,
+        },
+        requested_gpus=1,
+    )
+
+    assert score.metadata_source == "backend_runtime"
+    assert score.provider == "vllm"
+    assert score.confidence == 0.75

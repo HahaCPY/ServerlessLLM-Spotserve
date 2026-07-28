@@ -189,13 +189,17 @@ Status:
 - The scheduler queries `ray.get_actor(instance_id).get_runtime_metadata()`
   for allocated instances, merges metadata into worker-node info, and then
   feeds the result to `node_risk_score()`.
+- Backend actor lookup falls back to the `models` namespace and runtime rows
+  are normalized with `risk_metadata_source=backend_runtime`.
+- Ray worker-node `free_gpu` remains authoritative; backend GPU counts are
+  preserved as observations and do not create phantom allocation capacity.
 
 Remaining integration gap:
 
 There is still no real cloud spot provider integration or production risk
 prediction model. Backend actor metadata can expose loading cost and resource
-profile today; spot risk / lifetime remain conservative defaults unless a
-provider or config supplies them.
+profile today; spot risk / lifetime are omitted unless a provider, config, or
+backend runtime source supplies them.
 
 Synthetic validation:
 
