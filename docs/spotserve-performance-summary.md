@@ -3,9 +3,8 @@
 Last updated: 2026-07-28
 
 This page is intentionally short. It keeps only the commands needed to rerun
-each version's benchmark path and a compact performance summary. V6 and V7 were
-refreshed after the latest backend switch; V8 still needs a target new-backend
-performance rerun.
+each version's benchmark path and a compact performance summary. V6, V7, and
+V8 were refreshed after the latest backend switch.
 
 ## Performance Commands
 
@@ -188,7 +187,10 @@ cd /tmp/spotserve-work &&
 V8 stateful recovery performance:
 
 ```bash
-MODEL_FOLDER="$PWD/model" scripts/prepare_spotserve.sh --skip-build --deploy-set stateful-recovery-performance
+MODEL_FOLDER=/work/spotserve-models \
+SPOTSERVE_STATEFUL_RECOVERY_MODEL_PATH=/models/Qwen2-MoE-Tiny \
+SPOTSERVE_STATEFUL_RECOVERY_LOAD_FORMAT=auto \
+scripts/prepare_spotserve.sh --skip-build --deploy-set stateful-recovery-performance
 
 podman exec sllm_head bash -lc '
 cd /tmp/spotserve-work &&
@@ -220,7 +222,7 @@ python scripts/run_scheduler_benchmark.py \
 | V5 | `benchmark_matrix_vllm_moe.yaml`, `benchmark_matrix_vllm_dense_vs_moe.yaml` | MoE compatibility milestone; no MoE-specific speedup claim. | Rerun after backend/model changes. |
 | V6 | `benchmark_matrix_reparallelization_performance.yaml` | Shared Qwen2 run keeps both versions at 100% success; reparallelization executes once, succeeds, and lowers overall p95. Post-replan p95 stays near parity. | Refreshed 2026-07-27. |
 | V7 | `benchmark_matrix_context_migration_performance.yaml` | Shared Qwen2 MoE run keeps both versions at 100% success; preemption is injected, one context-migration plan executes, and one KV migration succeeds. | Refreshed 2026-07-28. |
-| V8 | `benchmark_matrix_stateful_recovery_performance.yaml` | Old backend record showed stateful recovery beating token replay with no fallback. | Needs rerun with new backend. |
+| V8 | `benchmark_matrix_stateful_recovery_performance.yaml` | Shared Qwen2 MoE run keeps both versions at 100% success; stateful recovery restores once, restores 16 tokens, and has no fallback. | Refreshed 2026-07-28. |
 | V9 | `risk_aware_scheduling_synthetic.json` | Placement-quality improvement: lower-risk / longer-lived node selection. | Synthetic result; live latency/SLO impact still requires a real workload. |
 
 | Metric | Baseline | Applied | Result | Status |
@@ -235,8 +237,11 @@ python scripts/run_scheduler_benchmark.py \
 | V7 MoE migration-window p95 | Context migration disabled | Context migration applied | `34090.02ms -> 1023.38ms` | Migration window improved by `33066.64ms`. |
 | V7 MoE post-migration p95 | Context migration disabled | Context migration applied | `1021.80ms -> 1042.07ms` | Near parity after migration. |
 | V7 MoE migration signals | Context migration disabled | Context migration applied | `0 -> 1 context migration, 1 plan, 1 KV success, 245 KV tokens` | KV migration path verified; reusable blocks stayed `0`. |
-| V8 overall p95 | Token replay | Stateful recovery | `63540.97ms -> 2904.41ms` | Old backend; replace after rerun. |
-| V8 failure-window p95 | Token replay | Stateful recovery | `63540.97ms -> 2904.41ms` | Old backend; replace after rerun. |
+| V8 MoE success rate | Token replay | Stateful recovery | `100.00% -> 100.00%` | New backend, `3/3 -> 3/3`. |
+| V8 MoE overall p95 | Token replay | Stateful recovery | `48887.83ms -> 3302.37ms` | Stateful recovery reduces overall p95 by `45585.46ms`. |
+| V8 MoE failure-window p95 | Token replay | Stateful recovery | `48887.83ms -> 3302.37ms` | Failure-window p95 improves by `93.25%`. |
+| V8 MoE post-recovery p95 | Token replay | Stateful recovery | `1080.67ms -> 1060.02ms` | Post-recovery latency improves slightly. |
+| V8 MoE restore signals | Token replay | Stateful recovery | `0 -> 1 restore, 16 restored tokens, 0 fallback` | Stateful restore path verified. |
 
 Notes:
 
@@ -254,3 +259,5 @@ Notes:
 - The 2026-07-28 V7 MoE table uses shared `Qwen2-MoE-Tiny` with
   `SPOTSERVE_CONTEXT_MIGRATION_LOAD_FORMAT=auto`; this run migrated KV tokens
   but did not report reusable context blocks.
+- The 2026-07-28 V8 MoE table uses shared `Qwen2-MoE-Tiny` with
+  `SPOTSERVE_STATEFUL_RECOVERY_LOAD_FORMAT=auto`.
