@@ -31,7 +31,10 @@ from sllm.spot.risk_metadata_provider import (
     build_risk_metadata_provider,
     normalize_risk_metadata,
 )
-from sllm.spot.risk_aware_scheduling import plan_risk_aware_scheduling
+from sllm.spot.risk_aware_scheduling import (
+    node_risk_score,
+    plan_risk_aware_scheduling,
+)
 from sllm.utils import NodeState, get_worker_nodes
 
 from .scheduler_utils import SllmScheduler
@@ -43,8 +46,30 @@ class FcfsScheduler(SllmScheduler):
     def __init__(self, scheduler_config: Optional[Mapping] = None):
         super().__init__()
         self.scheduler_config = dict(scheduler_config or {})
+        self.latest_scheduling_decision = None
+        self.risk_metadata_provider = None
+        self.enable_spot_risk_aware = False
+        self.enable_backend_runtime_metadata = False
+        self.backend_actor_namespaces = []
+        self.runtime_metadata_timeout_s = 1.0
+        self.metrics_writer = None
+        self._configure_features_from_scheduler_config()
+
+        self.queue_lock = asyncio.Lock()
+        self.model_loading_queues = {}
+
+        self.metadata_lock = asyncio.Lock()
+        self.worker_nodes = {}
+        self.model_instance = {}
+
+        self.loop = asyncio.get_running_loop()
+
+        self.running_lock = asyncio.Lock()
+        self.running = False
+
+    def _configure_features_from_scheduler_config(self):
         # Provider output is collected for every node when available, even if
-        # risk-aware ordering is disabled.  The ranking policy can therefore
+        # risk-aware ordering is disabled. The ranking policy can therefore
         # consume the same provenance-bearing metadata without changing the
         # conservative fallback behavior.
         self.risk_metadata_provider = build_risk_metadata_provider(
@@ -73,23 +98,10 @@ class FcfsScheduler(SllmScheduler):
                 or 1.0
             ),
         )
-        self.latest_scheduling_decision = None
         metrics_path = self.scheduler_config.get("metrics_path")
         self.metrics_writer = (
             JsonlMetricsWriter(metrics_path) if metrics_path else None
         )
-
-        self.queue_lock = asyncio.Lock()
-        self.model_loading_queues = {}
-
-        self.metadata_lock = asyncio.Lock()
-        self.worker_nodes = {}
-        self.model_instance = {}
-
-        self.loop = asyncio.get_running_loop()
-
-        self.running_lock = asyncio.Lock()
-        self.running = False
 
     def _ensure_node_metadata(
         self,
@@ -190,6 +202,18 @@ class FcfsScheduler(SllmScheduler):
         worker_nodes: Mapping,
     ):
         if not self.enable_spot_risk_aware:
+            self.latest_scheduling_decision = self._health_only_decision(
+                model_name,
+                num_gpus,
+                worker_nodes,
+            )
+            self._emit_metric(
+                make_risk_aware_scheduling_event(
+                    model=model_name,
+                    policy="health_only",
+                    decision=self.latest_scheduling_decision,
+                )
+            )
             return list(worker_nodes.items())
 
         decision = plan_risk_aware_scheduling(
@@ -219,6 +243,37 @@ class FcfsScheduler(SllmScheduler):
         )
         return ranked
 
+    def _health_only_decision(
+        self,
+        model_name: str,
+        num_gpus: int,
+        worker_nodes: Mapping,
+    ) -> Dict[str, Any]:
+        selected_node_id = None
+        candidates = []
+        for node_id, node_info in worker_nodes.items():
+            candidate = node_risk_score(
+                str(node_id),
+                node_info,
+                num_gpus,
+                scheduler_config=self.scheduler_config,
+            ).to_dict()
+            candidates.append(candidate)
+            if selected_node_id is not None:
+                continue
+            if not self._node_is_ready(node_info):
+                continue
+            if int(node_info.get("free_gpu", 0) or 0) >= num_gpus:
+                selected_node_id = str(node_id)
+        return {
+            "action": "allocate" if selected_node_id is not None else "no_capacity",
+            "model_name": model_name,
+            "requested_gpus": num_gpus,
+            "selected_node_id": selected_node_id,
+            "candidates": candidates,
+            "reason": "health_only",
+        }
+
     async def mark_node_preempting(self, node_id: str):
         return await self._mark_node_state(node_id, NodeState.PREEMPTING)
 
@@ -246,6 +301,25 @@ class FcfsScheduler(SllmScheduler):
             return {
                 "node_id": node_id,
                 "risk_metadata": dict(risk_metadata),
+            }
+
+    async def update_scheduler_config(
+        self,
+        scheduler_config: Mapping,
+        replace: bool = False,
+    ):
+        async with self.metadata_lock:
+            if replace:
+                self.scheduler_config = dict(scheduler_config or {})
+            else:
+                self.scheduler_config.update(dict(scheduler_config or {}))
+            self._configure_features_from_scheduler_config()
+            return {
+                "enable_spot_risk_aware": self.enable_spot_risk_aware,
+                "enable_backend_runtime_metadata": (
+                    self.enable_backend_runtime_metadata
+                ),
+                "metrics_path": self.scheduler_config.get("metrics_path", ""),
             }
 
     async def _call_actor_method(

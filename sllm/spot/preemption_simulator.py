@@ -20,6 +20,10 @@ def _is_ready_instance_state(state: dict) -> bool:
     return state.get("pool") == "ready" and state.get("state") == "ready"
 
 
+def _is_preempting_instance_state(state: dict) -> bool:
+    return state.get("state") == "preempting"
+
+
 def _instance_concurrency(state: dict) -> int:
     try:
         return int(state.get("concurrency", 0) or 0)
@@ -41,12 +45,12 @@ async def _resolve_instance_id(event: SpotEvent):
 
     router = ray.get_actor(event.model_name, namespace="models")
     states = await router.get_instance_states.remote()
-    ready_instances = [
-        (instance_id, state)
-        for instance_id, state in states.items()
-        if _is_ready_instance_state(state)
-    ]
     if event.instance_selector in ("active", "active_context", "busy"):
+        ready_instances = [
+            (instance_id, state)
+            for instance_id, state in states.items()
+            if _is_ready_instance_state(state)
+        ]
         ready_instances = [
             (instance_id, state)
             for instance_id, state in ready_instances
@@ -56,7 +60,19 @@ async def _resolve_instance_id(event: SpotEvent):
             ready_instances,
             key=lambda item: (-_instance_concurrency(item[1]), item[0]),
         )
+    elif event.instance_selector in ("preempting", "preempted"):
+        ready_instances = [
+            (instance_id, state)
+            for instance_id, state in states.items()
+            if _is_preempting_instance_state(state)
+        ]
+        ready_instances = sorted(ready_instances, key=lambda item: item[0])
     elif event.instance_selector in (None, "ready"):
+        ready_instances = [
+            (instance_id, state)
+            for instance_id, state in states.items()
+            if _is_ready_instance_state(state)
+        ]
         ready_instances = sorted(ready_instances, key=lambda item: item[0])
     else:
         raise RuntimeError(

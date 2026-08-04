@@ -1,0 +1,52 @@
+{
+  "model": "vllm-spotserve-core-applied-perf",
+  "backend": "vllm",
+  "router_num_cpus": 0,
+  "num_cpus": 1,
+  "num_gpus": 1,
+  "auto_scaling_config": {
+    "metric": "concurrency",
+    "target": 1,
+    "min_instances": 2,
+    "max_instances": 2,
+    "keep_alive": 180
+  },
+  "backend_config": {
+    "pretrained_model_name_or_path": "/models/vllm/vllm-dense-baseline",
+    "load_format": "serverless_llm",
+    "torch_dtype": "float16",
+    "gpu_memory_utilization": 0.20,
+    "max_model_len": 512,
+    "max_num_seqs": 2,
+    "tensor_parallel_size": 1,
+    "pipeline_parallel_size": 1,
+    "enable_prefix_caching": true,
+    "enforce_eager": true,
+    "trace_debug": true,
+    "trust_remote_code": true,
+    "kv_transfer_config": {
+      "kv_connector": "NixlConnector",
+      "kv_role": "kv_both"
+    }
+  },
+  "router_config": {
+    "recovery_policy": "stateful_recovery",
+    "max_retries": 2,
+    "enable_context_migration": true,
+    "enable_kv_cache_migration": true,
+    "count_preempting_toward_capacity": true,
+    "context_migration_config": {
+      "require_target_runtime_reuse": true,
+      "target_capacity": 1,
+      "target_warmup_cost": 1.0,
+      "planner_config": {
+        "base_migration_cost": 0.0,
+        "token_transfer_cost": 1.0,
+        "context_block_transfer_cost": 4.0,
+        "cross_node_penalty": 10.0,
+        "unmatched_penalty": 1000000.0
+      }
+    },
+    "metrics_path": "/tmp/spotserve-work/results/spotserve_core_performance/vllm-spotserve-core-applied-router.jsonl"
+  }
+}

@@ -8,7 +8,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, NamedTuple, Optional, TextIO
+from typing import Any, Dict, List, Mapping, NamedTuple, Optional, TextIO
 from urllib import error, request
 
 
@@ -278,6 +278,50 @@ def deploy_config_over_http(
         )
 
 
+def clear_metrics_file(path_value: Any) -> None:
+    if not path_value:
+        return
+    path = Path(str(path_value))
+    try:
+        if path.exists():
+            path.unlink()
+    except Exception as exc:
+        print(
+            f"[benchmark cleanup warning] Could not remove metrics file "
+            f"{path}: {exc}",
+            file=sys.stderr,
+        )
+
+
+async def apply_scheduler_config(
+    scheduler_config: Optional[Mapping[str, Any]],
+    replace: bool,
+    ray_address: str,
+    ray_namespace: str,
+) -> Optional[Dict[str, Any]]:
+    if scheduler_config is None:
+        return None
+    try:
+        import ray
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "Ray is required to update the live scheduler config."
+        ) from exc
+
+    if not ray.is_initialized():
+        ray.init(
+            address=ray_address,
+            namespace=ray_namespace,
+            ignore_reinit_error=True,
+        )
+    scheduler = ray.get_actor("model_loading_scheduler")
+    result_ref = scheduler.update_scheduler_config.remote(
+        dict(scheduler_config),
+        replace=replace,
+    )
+    return await asyncio.to_thread(ray.get, result_ref)
+
+
 def delete_model_over_http(
     endpoint: str,
     model_name: str,
@@ -343,6 +387,10 @@ def check_endpoint_ready(endpoint: str, model_names: List[str], timeout_s: float
 
 def is_ready_instance_state(state: Dict[str, Any]) -> bool:
     return state.get("pool") == "ready" and state.get("state") == "ready"
+
+
+def is_preempting_instance_state(state: Dict[str, Any]) -> bool:
+    return state.get("state") == "preempting"
 
 
 def instance_concurrency(state: Dict[str, Any]) -> int:
@@ -424,12 +472,12 @@ async def resolve_trace_instance_id(
     states = await get_model_instance_states(
         event.model_name, ray_address, ray_namespace
     )
-    ready_instances = [
-        (instance_id, state)
-        for instance_id, state in states.items()
-        if is_ready_instance_state(state)
-    ]
     if selector in ("active", "active_context", "busy"):
+        ready_instances = [
+            (instance_id, state)
+            for instance_id, state in states.items()
+            if is_ready_instance_state(state)
+        ]
         ready_instances = [
             (instance_id, state)
             for instance_id, state in ready_instances
@@ -439,7 +487,19 @@ async def resolve_trace_instance_id(
             ready_instances,
             key=lambda item: (-instance_concurrency(item[1]), item[0]),
         )
+    elif selector in ("preempting", "preempted"):
+        ready_instances = [
+            (instance_id, state)
+            for instance_id, state in states.items()
+            if is_preempting_instance_state(state)
+        ]
+        ready_instances = sorted(ready_instances, key=lambda item: item[0])
     elif selector in (None, "ready"):
+        ready_instances = [
+            (instance_id, state)
+            for instance_id, state in states.items()
+            if is_ready_instance_state(state)
+        ]
         ready_instances = sorted(ready_instances, key=lambda item: item[0])
     else:
         raise RuntimeError(f"Unsupported instance_selector: {selector}")
@@ -683,6 +743,22 @@ async def run_one(
         json.dumps(metadata, indent=2, sort_keys=True),
         encoding="utf-8",
     )
+
+    clear_metrics_file(run_config.get("router_metrics_path"))
+    scheduler_config = run_config.get("scheduler_config")
+    if scheduler_config:
+        clear_metrics_file(scheduler_config.get("metrics_path"))
+    scheduler_update = await apply_scheduler_config(
+        scheduler_config,
+        bool(run_config.get("replace_scheduler_config", False)),
+        ray_address,
+        ray_namespace,
+    )
+    if scheduler_update is not None:
+        (run_dir / "scheduler_update.json").write_text(
+            json.dumps(scheduler_update, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
 
     deleted_before_run = False
     for model_name in run_config.get("delete_models_before_run", []):

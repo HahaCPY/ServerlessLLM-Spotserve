@@ -493,7 +493,7 @@ def analyze_run(run_dir: Path) -> Dict[str, Any]:
         **summarize_context_migration_metrics(router_metric_rows_in_window),
         **summarize_state_recovery_metrics(router_metric_rows_in_window),
         **summarize_risk_aware_scheduling_metrics(
-            router_metric_rows_in_window
+            router_metric_rows
         ),
     }
     (run_dir / "summary.json").write_text(

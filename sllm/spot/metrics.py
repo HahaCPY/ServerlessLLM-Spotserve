@@ -141,7 +141,15 @@ def make_risk_aware_scheduling_event(
     decision: Dict[str, Any],
 ) -> Dict[str, Any]:
     candidates = decision.get("candidates", [])
-    selected = candidates[0] if candidates else {}
+    selected_node_id = decision.get("selected_node_id")
+    selected = next(
+        (
+            candidate
+            for candidate in candidates
+            if candidate.get("node_id") == selected_node_id
+        ),
+        candidates[0] if candidates else {},
+    )
     return {
         "type": "risk_aware_scheduling",
         "model": model,

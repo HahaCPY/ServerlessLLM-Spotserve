@@ -1,0 +1,119 @@
+{
+  "endpoint": "http://127.0.0.1:8343/v1/chat/completions",
+  "output_dir": "results/spotserve_core_performance",
+  "runs": [
+    {
+      "name": "vllm-spotserve-core-baseline",
+      "model": "vllm-spotserve-core-baseline-perf",
+      "backend": "vllm",
+      "policy": "generated_token_replay",
+      "deploy_config": "examples/spotserve/config-vllm-spotserve-core-baseline-performance.json",
+      "delete_models_before_run": [
+        "vllm-spotserve-core-baseline-perf",
+        "vllm-spotserve-core-applied-perf"
+      ],
+      "delete_settle_s": 15,
+      "delete_after_run": true,
+      "workload": "benchmarks/spotserve/workloads/spotserve_core_vllm_performance.jsonl",
+      "trace": "examples/spotserve/spot_trace_vllm_core_baseline_performance.jsonl",
+      "min_ready_instances": 2,
+      "ready_timeout_s": 600,
+      "router_metrics_path": "/tmp/spotserve-work/results/spotserve_core_performance/vllm-spotserve-core-baseline-router.jsonl",
+      "replace_scheduler_config": true,
+      "scheduler_config": {
+        "enable_spot_risk_aware": false,
+        "metrics_path": "/tmp/spotserve-work/results/spotserve_core_performance/vllm-spotserve-core-baseline-router.jsonl",
+        "node_risk": {
+          "0": {
+            "spot_risk": 0.9,
+            "remaining_lifetime_s": 300,
+            "loading_cost": 5,
+            "risk_metadata_source": "benchmark",
+            "risk_provider": "synthetic_live"
+          },
+          "1": {
+            "spot_risk": 0.1,
+            "remaining_lifetime_s": 3200,
+            "loading_cost": 15,
+            "risk_metadata_source": "benchmark",
+            "risk_provider": "synthetic_live"
+          }
+        }
+      }
+    },
+    {
+      "name": "vllm-spotserve-core-applied",
+      "model": "vllm-spotserve-core-applied-perf",
+      "backend": "vllm",
+      "policy": "stateful_recovery",
+      "deploy_config": "examples/spotserve/config-vllm-spotserve-core-applied-performance.json",
+      "delete_models_before_run": [
+        "vllm-spotserve-core-baseline-perf",
+        "vllm-spotserve-core-applied-perf"
+      ],
+      "delete_settle_s": 15,
+      "delete_after_run": true,
+      "workload": "benchmarks/spotserve/workloads/spotserve_core_vllm_performance.jsonl",
+      "trace": "examples/spotserve/spot_trace_vllm_core_applied_performance.jsonl",
+      "min_ready_instances": 2,
+      "ready_timeout_s": 600,
+      "router_metrics_path": "/tmp/spotserve-work/results/spotserve_core_performance/vllm-spotserve-core-applied-router.jsonl",
+      "replace_scheduler_config": true,
+      "scheduler_config": {
+        "enable_spot_risk_aware": true,
+        "risk_weight": 1.0,
+        "lifetime_weight": 0.8,
+        "loading_cost_weight": 0.6,
+        "free_gpu_weight": 0.05,
+        "max_remaining_lifetime_s": 3600,
+        "max_loading_cost": 60,
+        "metrics_path": "/tmp/spotserve-work/results/spotserve_core_performance/vllm-spotserve-core-applied-router.jsonl",
+        "node_risk": {
+          "0": {
+            "spot_risk": 0.9,
+            "remaining_lifetime_s": 300,
+            "loading_cost": 5,
+            "risk_metadata_source": "benchmark",
+            "risk_provider": "synthetic_live"
+          },
+          "1": {
+            "spot_risk": 0.1,
+            "remaining_lifetime_s": 3200,
+            "loading_cost": 15,
+            "risk_metadata_source": "benchmark",
+            "risk_provider": "synthetic_live"
+          }
+        }
+      }
+    }
+  ],
+  "comparisons": [
+    {
+      "name": "spotserve-core-applied-vs-baseline",
+      "baseline": "vllm-spotserve-core-baseline",
+      "candidate": "vllm-spotserve-core-applied",
+      "fields": [
+        "success_rate",
+        "latency_p95_ms",
+        "throughput_req_s",
+        "phase_migration_window_success_rate",
+        "phase_migration_window_latency_p95_ms",
+        "phase_post_migration_success_rate",
+        "phase_post_migration_latency_p95_ms",
+        "phase_failure_window_success_rate",
+        "phase_failure_window_latency_p95_ms",
+        "phase_post_recovery_success_rate",
+        "phase_post_recovery_latency_p95_ms",
+        "context_migration_events",
+        "context_migration_plan_count",
+        "kv_cache_migration_successes",
+        "state_restore_attempts_total",
+        "state_restore_successes_total",
+        "state_restore_fallback_count",
+        "risk_scheduling_events",
+        "risk_scheduling_allocations",
+        "risk_scheduling_avg_selected_risk"
+      ]
+    }
+  ]
+}

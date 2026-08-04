@@ -1,0 +1,2 @@
+{"time": 1.5, "event": "preempt", "instance_selector": "busy", "model_name": "vllm-spotserve-core-applied-perf"}
+{"time": 52.0, "event": "recover", "instance_selector": "preempting", "model_name": "vllm-spotserve-core-applied-perf"}
