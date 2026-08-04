@@ -909,6 +909,18 @@ ${HEAD_PYTHON} benchmarks/spotserve/run_benchmark.py \\
   --ray-address auto \\
   --ray-namespace sllm
 '
+
+Run the multi-trace SpotServe core performance sweep with:
+
+podman exec ${CONTAINER} bash -lc '
+cd ${WORKDIR_IN_CONTAINER} &&
+${HEAD_PYTHON} benchmarks/spotserve/run_benchmark.py \\
+  --config benchmarks/spotserve/benchmark_matrix_spotserve_core_trace_sweep.yaml \\
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \\
+  --request-timeout 300 \\
+  --ray-address auto \\
+  --ray-namespace sllm
+'
 EOF
 fi
 

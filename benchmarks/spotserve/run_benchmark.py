@@ -271,10 +271,17 @@ def post_json(
 
 
 def deploy_config_over_http(
-    endpoint: str, config_path: str, timeout_s: float
+    endpoint: str,
+    config_path: str,
+    timeout_s: float,
+    router_metrics_path: Optional[str] = None,
 ) -> None:
     base_url = base_url_from_chat_endpoint(endpoint)
     payload = load_config(Path(config_path))
+    if router_metrics_path:
+        payload.setdefault("router_config", {})["metrics_path"] = str(
+            router_metrics_path
+        )
     result = post_json(f"{base_url}/register", payload, timeout_s)
     if not result.get("success"):
         raise RuntimeError(
@@ -783,7 +790,12 @@ async def run_one(
 
     deploy_config = run_config.get("deploy_config")
     if deploy_config:
-        deploy_config_over_http(endpoint, deploy_config, request_timeout_s)
+        deploy_config_over_http(
+            endpoint,
+            deploy_config,
+            request_timeout_s,
+            router_metrics_path=run_config.get("router_metrics_path"),
+        )
 
     trace_replayer = None
     try:
@@ -872,9 +884,18 @@ async def main_async(args):
         try:
             summaries = generate_reports(produced_runs)
             write_combined_summary(output_root, summaries)
-            comparisons = build_comparisons(
-                config.get("comparisons", []), summaries
-            )
+            comparison_configs = config.get("comparisons", [])
+            if config.get("comparison_fields"):
+                comparison_configs = [
+                    {
+                        **comparison,
+                        "fields": comparison.get(
+                            "fields", config["comparison_fields"]
+                        ),
+                    }
+                    for comparison in comparison_configs
+                ]
+            comparisons = build_comparisons(comparison_configs, summaries)
             write_comparisons(output_root, comparisons)
         except Exception as exc:
             print(f"[benchmark report warning] {exc}", file=sys.stderr)

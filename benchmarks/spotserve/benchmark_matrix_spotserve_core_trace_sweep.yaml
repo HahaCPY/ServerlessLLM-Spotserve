@@ -1,0 +1,584 @@
+{
+  "endpoint": "http://127.0.0.1:8343/v1/chat/completions",
+  "output_dir": "results/spotserve_core_trace_sweep",
+  "comparison_fields": [
+    "success_rate",
+    "latency_p95_ms",
+    "throughput_req_s",
+    "failed_attempts_total",
+    "retry_count_total",
+    "recovered_tokens_total",
+    "recovery_fallback_count",
+    "instance_state_rows",
+    "instances_marked_preempting",
+    "instances_marked_ready",
+    "instances_marked_dead",
+    "phase_migration_window_success_rate",
+    "phase_migration_window_latency_p95_ms",
+    "phase_post_migration_success_rate",
+    "phase_post_migration_latency_p95_ms",
+    "phase_failure_window_success_rate",
+    "phase_failure_window_latency_p95_ms",
+    "phase_post_recovery_success_rate",
+    "phase_post_recovery_latency_p95_ms",
+    "context_migration_events",
+    "context_migration_plan_count",
+    "kv_cache_migration_successes",
+    "state_restore_attempts_total",
+    "state_restore_successes_total",
+    "state_restore_fallback_count",
+    "risk_scheduling_events",
+    "risk_scheduling_allocations",
+    "risk_scheduling_avg_selected_risk"
+  ],
+  "runs": [
+    {
+      "name": "vllm-core-busy-recover-baseline",
+      "trace_scenario": "busy-recover",
+      "model": "vllm-spotserve-core-baseline-perf",
+      "backend": "vllm",
+      "policy": "generated_token_replay",
+      "deploy_config": "examples/spotserve/config-vllm-spotserve-core-baseline-performance.json",
+      "delete_models_before_run": [
+        "vllm-spotserve-core-baseline-perf",
+        "vllm-spotserve-core-applied-perf"
+      ],
+      "delete_settle_s": 15,
+      "delete_after_run": true,
+      "workload": "benchmarks/spotserve/workloads/spotserve_core_vllm_performance.jsonl",
+      "trace": "examples/spotserve/spot_trace_vllm_core_performance.jsonl",
+      "min_ready_instances": 2,
+      "ready_timeout_s": 600,
+      "router_metrics_path": "/tmp/spotserve-work/results/spotserve_core_trace_sweep/vllm-core-busy-recover-baseline-router.jsonl",
+      "replace_scheduler_config": true,
+      "scheduler_config": {
+        "enable_spot_risk_aware": false,
+        "metrics_path": "/tmp/spotserve-work/results/spotserve_core_trace_sweep/vllm-core-busy-recover-baseline-router.jsonl",
+        "node_risk": {
+          "0": {
+            "spot_risk": 0.9,
+            "remaining_lifetime_s": 300,
+            "loading_cost": 5,
+            "risk_metadata_source": "benchmark",
+            "risk_provider": "synthetic_live"
+          },
+          "1": {
+            "spot_risk": 0.1,
+            "remaining_lifetime_s": 3200,
+            "loading_cost": 15,
+            "risk_metadata_source": "benchmark",
+            "risk_provider": "synthetic_live"
+          }
+        }
+      }
+    },
+    {
+      "name": "vllm-core-busy-recover-applied",
+      "trace_scenario": "busy-recover",
+      "model": "vllm-spotserve-core-applied-perf",
+      "backend": "vllm",
+      "policy": "stateful_recovery",
+      "deploy_config": "examples/spotserve/config-vllm-spotserve-core-applied-performance.json",
+      "delete_models_before_run": [
+        "vllm-spotserve-core-baseline-perf",
+        "vllm-spotserve-core-applied-perf"
+      ],
+      "delete_settle_s": 15,
+      "delete_after_run": true,
+      "workload": "benchmarks/spotserve/workloads/spotserve_core_vllm_performance.jsonl",
+      "trace": "examples/spotserve/spot_trace_vllm_core_performance.jsonl",
+      "min_ready_instances": 2,
+      "ready_timeout_s": 600,
+      "router_metrics_path": "/tmp/spotserve-work/results/spotserve_core_trace_sweep/vllm-core-busy-recover-applied-router.jsonl",
+      "replace_scheduler_config": true,
+      "scheduler_config": {
+        "enable_spot_risk_aware": true,
+        "risk_weight": 1.0,
+        "lifetime_weight": 0.8,
+        "loading_cost_weight": 0.6,
+        "free_gpu_weight": 0.05,
+        "max_remaining_lifetime_s": 3600,
+        "max_loading_cost": 60,
+        "metrics_path": "/tmp/spotserve-work/results/spotserve_core_trace_sweep/vllm-core-busy-recover-applied-router.jsonl",
+        "node_risk": {
+          "0": {
+            "spot_risk": 0.9,
+            "remaining_lifetime_s": 300,
+            "loading_cost": 5,
+            "risk_metadata_source": "benchmark",
+            "risk_provider": "synthetic_live"
+          },
+          "1": {
+            "spot_risk": 0.1,
+            "remaining_lifetime_s": 3200,
+            "loading_cost": 15,
+            "risk_metadata_source": "benchmark",
+            "risk_provider": "synthetic_live"
+          }
+        }
+      }
+    },
+    {
+      "name": "vllm-core-fast-recover-baseline",
+      "trace_scenario": "fast-recover",
+      "model": "vllm-spotserve-core-baseline-perf",
+      "backend": "vllm",
+      "policy": "generated_token_replay",
+      "deploy_config": "examples/spotserve/config-vllm-spotserve-core-baseline-performance.json",
+      "delete_models_before_run": [
+        "vllm-spotserve-core-baseline-perf",
+        "vllm-spotserve-core-applied-perf"
+      ],
+      "delete_settle_s": 15,
+      "delete_after_run": true,
+      "workload": "benchmarks/spotserve/workloads/spotserve_core_vllm_performance.jsonl",
+      "trace": "examples/spotserve/spot_trace_vllm_core_fast_recover.jsonl",
+      "min_ready_instances": 2,
+      "ready_timeout_s": 600,
+      "router_metrics_path": "/tmp/spotserve-work/results/spotserve_core_trace_sweep/vllm-core-fast-recover-baseline-router.jsonl",
+      "replace_scheduler_config": true,
+      "scheduler_config": {
+        "enable_spot_risk_aware": false,
+        "metrics_path": "/tmp/spotserve-work/results/spotserve_core_trace_sweep/vllm-core-fast-recover-baseline-router.jsonl",
+        "node_risk": {
+          "0": {
+            "spot_risk": 0.9,
+            "remaining_lifetime_s": 300,
+            "loading_cost": 5,
+            "risk_metadata_source": "benchmark",
+            "risk_provider": "synthetic_live"
+          },
+          "1": {
+            "spot_risk": 0.1,
+            "remaining_lifetime_s": 3200,
+            "loading_cost": 15,
+            "risk_metadata_source": "benchmark",
+            "risk_provider": "synthetic_live"
+          }
+        }
+      }
+    },
+    {
+      "name": "vllm-core-fast-recover-applied",
+      "trace_scenario": "fast-recover",
+      "model": "vllm-spotserve-core-applied-perf",
+      "backend": "vllm",
+      "policy": "stateful_recovery",
+      "deploy_config": "examples/spotserve/config-vllm-spotserve-core-applied-performance.json",
+      "delete_models_before_run": [
+        "vllm-spotserve-core-baseline-perf",
+        "vllm-spotserve-core-applied-perf"
+      ],
+      "delete_settle_s": 15,
+      "delete_after_run": true,
+      "workload": "benchmarks/spotserve/workloads/spotserve_core_vllm_performance.jsonl",
+      "trace": "examples/spotserve/spot_trace_vllm_core_fast_recover.jsonl",
+      "min_ready_instances": 2,
+      "ready_timeout_s": 600,
+      "router_metrics_path": "/tmp/spotserve-work/results/spotserve_core_trace_sweep/vllm-core-fast-recover-applied-router.jsonl",
+      "replace_scheduler_config": true,
+      "scheduler_config": {
+        "enable_spot_risk_aware": true,
+        "risk_weight": 1.0,
+        "lifetime_weight": 0.8,
+        "loading_cost_weight": 0.6,
+        "free_gpu_weight": 0.05,
+        "max_remaining_lifetime_s": 3600,
+        "max_loading_cost": 60,
+        "metrics_path": "/tmp/spotserve-work/results/spotserve_core_trace_sweep/vllm-core-fast-recover-applied-router.jsonl",
+        "node_risk": {
+          "0": {
+            "spot_risk": 0.9,
+            "remaining_lifetime_s": 300,
+            "loading_cost": 5,
+            "risk_metadata_source": "benchmark",
+            "risk_provider": "synthetic_live"
+          },
+          "1": {
+            "spot_risk": 0.1,
+            "remaining_lifetime_s": 3200,
+            "loading_cost": 15,
+            "risk_metadata_source": "benchmark",
+            "risk_provider": "synthetic_live"
+          }
+        }
+      }
+    },
+    {
+      "name": "vllm-core-slow-recover-baseline",
+      "trace_scenario": "slow-recover",
+      "model": "vllm-spotserve-core-baseline-perf",
+      "backend": "vllm",
+      "policy": "generated_token_replay",
+      "deploy_config": "examples/spotserve/config-vllm-spotserve-core-baseline-performance.json",
+      "delete_models_before_run": [
+        "vllm-spotserve-core-baseline-perf",
+        "vllm-spotserve-core-applied-perf"
+      ],
+      "delete_settle_s": 15,
+      "delete_after_run": true,
+      "workload": "benchmarks/spotserve/workloads/spotserve_core_vllm_performance.jsonl",
+      "trace": "examples/spotserve/spot_trace_vllm_core_slow_recover.jsonl",
+      "min_ready_instances": 2,
+      "ready_timeout_s": 600,
+      "router_metrics_path": "/tmp/spotserve-work/results/spotserve_core_trace_sweep/vllm-core-slow-recover-baseline-router.jsonl",
+      "replace_scheduler_config": true,
+      "scheduler_config": {
+        "enable_spot_risk_aware": false,
+        "metrics_path": "/tmp/spotserve-work/results/spotserve_core_trace_sweep/vllm-core-slow-recover-baseline-router.jsonl",
+        "node_risk": {
+          "0": {
+            "spot_risk": 0.9,
+            "remaining_lifetime_s": 300,
+            "loading_cost": 5,
+            "risk_metadata_source": "benchmark",
+            "risk_provider": "synthetic_live"
+          },
+          "1": {
+            "spot_risk": 0.1,
+            "remaining_lifetime_s": 3200,
+            "loading_cost": 15,
+            "risk_metadata_source": "benchmark",
+            "risk_provider": "synthetic_live"
+          }
+        }
+      }
+    },
+    {
+      "name": "vllm-core-slow-recover-applied",
+      "trace_scenario": "slow-recover",
+      "model": "vllm-spotserve-core-applied-perf",
+      "backend": "vllm",
+      "policy": "stateful_recovery",
+      "deploy_config": "examples/spotserve/config-vllm-spotserve-core-applied-performance.json",
+      "delete_models_before_run": [
+        "vllm-spotserve-core-baseline-perf",
+        "vllm-spotserve-core-applied-perf"
+      ],
+      "delete_settle_s": 15,
+      "delete_after_run": true,
+      "workload": "benchmarks/spotserve/workloads/spotserve_core_vllm_performance.jsonl",
+      "trace": "examples/spotserve/spot_trace_vllm_core_slow_recover.jsonl",
+      "min_ready_instances": 2,
+      "ready_timeout_s": 600,
+      "router_metrics_path": "/tmp/spotserve-work/results/spotserve_core_trace_sweep/vllm-core-slow-recover-applied-router.jsonl",
+      "replace_scheduler_config": true,
+      "scheduler_config": {
+        "enable_spot_risk_aware": true,
+        "risk_weight": 1.0,
+        "lifetime_weight": 0.8,
+        "loading_cost_weight": 0.6,
+        "free_gpu_weight": 0.05,
+        "max_remaining_lifetime_s": 3600,
+        "max_loading_cost": 60,
+        "metrics_path": "/tmp/spotserve-work/results/spotserve_core_trace_sweep/vllm-core-slow-recover-applied-router.jsonl",
+        "node_risk": {
+          "0": {
+            "spot_risk": 0.9,
+            "remaining_lifetime_s": 300,
+            "loading_cost": 5,
+            "risk_metadata_source": "benchmark",
+            "risk_provider": "synthetic_live"
+          },
+          "1": {
+            "spot_risk": 0.1,
+            "remaining_lifetime_s": 3200,
+            "loading_cost": 15,
+            "risk_metadata_source": "benchmark",
+            "risk_provider": "synthetic_live"
+          }
+        }
+      }
+    },
+    {
+      "name": "vllm-core-no-recover-baseline",
+      "trace_scenario": "no-recover",
+      "model": "vllm-spotserve-core-baseline-perf",
+      "backend": "vllm",
+      "policy": "generated_token_replay",
+      "deploy_config": "examples/spotserve/config-vllm-spotserve-core-baseline-performance.json",
+      "delete_models_before_run": [
+        "vllm-spotserve-core-baseline-perf",
+        "vllm-spotserve-core-applied-perf"
+      ],
+      "delete_settle_s": 15,
+      "delete_after_run": true,
+      "workload": "benchmarks/spotserve/workloads/spotserve_core_vllm_performance.jsonl",
+      "trace": "examples/spotserve/spot_trace_vllm_core_no_recover.jsonl",
+      "min_ready_instances": 2,
+      "ready_timeout_s": 600,
+      "router_metrics_path": "/tmp/spotserve-work/results/spotserve_core_trace_sweep/vllm-core-no-recover-baseline-router.jsonl",
+      "replace_scheduler_config": true,
+      "scheduler_config": {
+        "enable_spot_risk_aware": false,
+        "metrics_path": "/tmp/spotserve-work/results/spotserve_core_trace_sweep/vllm-core-no-recover-baseline-router.jsonl",
+        "node_risk": {
+          "0": {
+            "spot_risk": 0.9,
+            "remaining_lifetime_s": 300,
+            "loading_cost": 5,
+            "risk_metadata_source": "benchmark",
+            "risk_provider": "synthetic_live"
+          },
+          "1": {
+            "spot_risk": 0.1,
+            "remaining_lifetime_s": 3200,
+            "loading_cost": 15,
+            "risk_metadata_source": "benchmark",
+            "risk_provider": "synthetic_live"
+          }
+        }
+      }
+    },
+    {
+      "name": "vllm-core-no-recover-applied",
+      "trace_scenario": "no-recover",
+      "model": "vllm-spotserve-core-applied-perf",
+      "backend": "vllm",
+      "policy": "stateful_recovery",
+      "deploy_config": "examples/spotserve/config-vllm-spotserve-core-applied-performance.json",
+      "delete_models_before_run": [
+        "vllm-spotserve-core-baseline-perf",
+        "vllm-spotserve-core-applied-perf"
+      ],
+      "delete_settle_s": 15,
+      "delete_after_run": true,
+      "workload": "benchmarks/spotserve/workloads/spotserve_core_vllm_performance.jsonl",
+      "trace": "examples/spotserve/spot_trace_vllm_core_no_recover.jsonl",
+      "min_ready_instances": 2,
+      "ready_timeout_s": 600,
+      "router_metrics_path": "/tmp/spotserve-work/results/spotserve_core_trace_sweep/vllm-core-no-recover-applied-router.jsonl",
+      "replace_scheduler_config": true,
+      "scheduler_config": {
+        "enable_spot_risk_aware": true,
+        "risk_weight": 1.0,
+        "lifetime_weight": 0.8,
+        "loading_cost_weight": 0.6,
+        "free_gpu_weight": 0.05,
+        "max_remaining_lifetime_s": 3600,
+        "max_loading_cost": 60,
+        "metrics_path": "/tmp/spotserve-work/results/spotserve_core_trace_sweep/vllm-core-no-recover-applied-router.jsonl",
+        "node_risk": {
+          "0": {
+            "spot_risk": 0.9,
+            "remaining_lifetime_s": 300,
+            "loading_cost": 5,
+            "risk_metadata_source": "benchmark",
+            "risk_provider": "synthetic_live"
+          },
+          "1": {
+            "spot_risk": 0.1,
+            "remaining_lifetime_s": 3200,
+            "loading_cost": 15,
+            "risk_metadata_source": "benchmark",
+            "risk_provider": "synthetic_live"
+          }
+        }
+      }
+    },
+    {
+      "name": "vllm-core-dead-after-preempt-baseline",
+      "trace_scenario": "dead-after-preempt",
+      "model": "vllm-spotserve-core-baseline-perf",
+      "backend": "vllm",
+      "policy": "generated_token_replay",
+      "deploy_config": "examples/spotserve/config-vllm-spotserve-core-baseline-performance.json",
+      "delete_models_before_run": [
+        "vllm-spotserve-core-baseline-perf",
+        "vllm-spotserve-core-applied-perf"
+      ],
+      "delete_settle_s": 15,
+      "delete_after_run": true,
+      "workload": "benchmarks/spotserve/workloads/spotserve_core_vllm_performance.jsonl",
+      "trace": "examples/spotserve/spot_trace_vllm_core_dead_after_preempt.jsonl",
+      "min_ready_instances": 2,
+      "ready_timeout_s": 600,
+      "router_metrics_path": "/tmp/spotserve-work/results/spotserve_core_trace_sweep/vllm-core-dead-after-preempt-baseline-router.jsonl",
+      "replace_scheduler_config": true,
+      "scheduler_config": {
+        "enable_spot_risk_aware": false,
+        "metrics_path": "/tmp/spotserve-work/results/spotserve_core_trace_sweep/vllm-core-dead-after-preempt-baseline-router.jsonl",
+        "node_risk": {
+          "0": {
+            "spot_risk": 0.9,
+            "remaining_lifetime_s": 300,
+            "loading_cost": 5,
+            "risk_metadata_source": "benchmark",
+            "risk_provider": "synthetic_live"
+          },
+          "1": {
+            "spot_risk": 0.1,
+            "remaining_lifetime_s": 3200,
+            "loading_cost": 15,
+            "risk_metadata_source": "benchmark",
+            "risk_provider": "synthetic_live"
+          }
+        }
+      }
+    },
+    {
+      "name": "vllm-core-dead-after-preempt-applied",
+      "trace_scenario": "dead-after-preempt",
+      "model": "vllm-spotserve-core-applied-perf",
+      "backend": "vllm",
+      "policy": "stateful_recovery",
+      "deploy_config": "examples/spotserve/config-vllm-spotserve-core-applied-performance.json",
+      "delete_models_before_run": [
+        "vllm-spotserve-core-baseline-perf",
+        "vllm-spotserve-core-applied-perf"
+      ],
+      "delete_settle_s": 15,
+      "delete_after_run": true,
+      "workload": "benchmarks/spotserve/workloads/spotserve_core_vllm_performance.jsonl",
+      "trace": "examples/spotserve/spot_trace_vllm_core_dead_after_preempt.jsonl",
+      "min_ready_instances": 2,
+      "ready_timeout_s": 600,
+      "router_metrics_path": "/tmp/spotserve-work/results/spotserve_core_trace_sweep/vllm-core-dead-after-preempt-applied-router.jsonl",
+      "replace_scheduler_config": true,
+      "scheduler_config": {
+        "enable_spot_risk_aware": true,
+        "risk_weight": 1.0,
+        "lifetime_weight": 0.8,
+        "loading_cost_weight": 0.6,
+        "free_gpu_weight": 0.05,
+        "max_remaining_lifetime_s": 3600,
+        "max_loading_cost": 60,
+        "metrics_path": "/tmp/spotserve-work/results/spotserve_core_trace_sweep/vllm-core-dead-after-preempt-applied-router.jsonl",
+        "node_risk": {
+          "0": {
+            "spot_risk": 0.9,
+            "remaining_lifetime_s": 300,
+            "loading_cost": 5,
+            "risk_metadata_source": "benchmark",
+            "risk_provider": "synthetic_live"
+          },
+          "1": {
+            "spot_risk": 0.1,
+            "remaining_lifetime_s": 3200,
+            "loading_cost": 15,
+            "risk_metadata_source": "benchmark",
+            "risk_provider": "synthetic_live"
+          }
+        }
+      }
+    },
+    {
+      "name": "vllm-core-double-preempt-baseline",
+      "trace_scenario": "double-preempt",
+      "model": "vllm-spotserve-core-baseline-perf",
+      "backend": "vllm",
+      "policy": "generated_token_replay",
+      "deploy_config": "examples/spotserve/config-vllm-spotserve-core-baseline-performance.json",
+      "delete_models_before_run": [
+        "vllm-spotserve-core-baseline-perf",
+        "vllm-spotserve-core-applied-perf"
+      ],
+      "delete_settle_s": 15,
+      "delete_after_run": true,
+      "workload": "benchmarks/spotserve/workloads/spotserve_core_vllm_performance.jsonl",
+      "trace": "examples/spotserve/spot_trace_vllm_core_double_preempt.jsonl",
+      "min_ready_instances": 2,
+      "ready_timeout_s": 600,
+      "router_metrics_path": "/tmp/spotserve-work/results/spotserve_core_trace_sweep/vllm-core-double-preempt-baseline-router.jsonl",
+      "replace_scheduler_config": true,
+      "scheduler_config": {
+        "enable_spot_risk_aware": false,
+        "metrics_path": "/tmp/spotserve-work/results/spotserve_core_trace_sweep/vllm-core-double-preempt-baseline-router.jsonl",
+        "node_risk": {
+          "0": {
+            "spot_risk": 0.9,
+            "remaining_lifetime_s": 300,
+            "loading_cost": 5,
+            "risk_metadata_source": "benchmark",
+            "risk_provider": "synthetic_live"
+          },
+          "1": {
+            "spot_risk": 0.1,
+            "remaining_lifetime_s": 3200,
+            "loading_cost": 15,
+            "risk_metadata_source": "benchmark",
+            "risk_provider": "synthetic_live"
+          }
+        }
+      }
+    },
+    {
+      "name": "vllm-core-double-preempt-applied",
+      "trace_scenario": "double-preempt",
+      "model": "vllm-spotserve-core-applied-perf",
+      "backend": "vllm",
+      "policy": "stateful_recovery",
+      "deploy_config": "examples/spotserve/config-vllm-spotserve-core-applied-performance.json",
+      "delete_models_before_run": [
+        "vllm-spotserve-core-baseline-perf",
+        "vllm-spotserve-core-applied-perf"
+      ],
+      "delete_settle_s": 15,
+      "delete_after_run": true,
+      "workload": "benchmarks/spotserve/workloads/spotserve_core_vllm_performance.jsonl",
+      "trace": "examples/spotserve/spot_trace_vllm_core_double_preempt.jsonl",
+      "min_ready_instances": 2,
+      "ready_timeout_s": 600,
+      "router_metrics_path": "/tmp/spotserve-work/results/spotserve_core_trace_sweep/vllm-core-double-preempt-applied-router.jsonl",
+      "replace_scheduler_config": true,
+      "scheduler_config": {
+        "enable_spot_risk_aware": true,
+        "risk_weight": 1.0,
+        "lifetime_weight": 0.8,
+        "loading_cost_weight": 0.6,
+        "free_gpu_weight": 0.05,
+        "max_remaining_lifetime_s": 3600,
+        "max_loading_cost": 60,
+        "metrics_path": "/tmp/spotserve-work/results/spotserve_core_trace_sweep/vllm-core-double-preempt-applied-router.jsonl",
+        "node_risk": {
+          "0": {
+            "spot_risk": 0.9,
+            "remaining_lifetime_s": 300,
+            "loading_cost": 5,
+            "risk_metadata_source": "benchmark",
+            "risk_provider": "synthetic_live"
+          },
+          "1": {
+            "spot_risk": 0.1,
+            "remaining_lifetime_s": 3200,
+            "loading_cost": 15,
+            "risk_metadata_source": "benchmark",
+            "risk_provider": "synthetic_live"
+          }
+        }
+      }
+    }
+  ],
+  "comparisons": [
+    {
+      "name": "busy-recover-applied-vs-baseline",
+      "baseline": "vllm-core-busy-recover-baseline",
+      "candidate": "vllm-core-busy-recover-applied"
+    },
+    {
+      "name": "fast-recover-applied-vs-baseline",
+      "baseline": "vllm-core-fast-recover-baseline",
+      "candidate": "vllm-core-fast-recover-applied"
+    },
+    {
+      "name": "slow-recover-applied-vs-baseline",
+      "baseline": "vllm-core-slow-recover-baseline",
+      "candidate": "vllm-core-slow-recover-applied"
+    },
+    {
+      "name": "no-recover-applied-vs-baseline",
+      "baseline": "vllm-core-no-recover-baseline",
+      "candidate": "vllm-core-no-recover-applied"
+    },
+    {
+      "name": "dead-after-preempt-applied-vs-baseline",
+      "baseline": "vllm-core-dead-after-preempt-baseline",
+      "candidate": "vllm-core-dead-after-preempt-applied"
+    },
+    {
+      "name": "double-preempt-applied-vs-baseline",
+      "baseline": "vllm-core-double-preempt-baseline",
+      "candidate": "vllm-core-double-preempt-applied"
+    }
+  ]
+}

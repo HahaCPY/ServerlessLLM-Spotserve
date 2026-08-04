@@ -230,6 +230,25 @@ cd /tmp/spotserve-work &&
 '
 ```
 
+V7-V9 SpotServe core multi-trace sweep:
+
+```bash
+MODEL_FOLDER=/work/spotserve-models \
+SPOTSERVE_CORE_MODEL_PATH=/models/Qwen2-MoE-Tiny \
+SPOTSERVE_CORE_LOAD_FORMAT=auto \
+scripts/prepare_spotserve.sh --skip-build --deploy-set spotserve-core-performance
+
+podman exec sllm_head bash -lc '
+cd /tmp/spotserve-work &&
+/opt/venvs/head/bin/python benchmarks/spotserve/run_benchmark.py \
+  --config benchmarks/spotserve/benchmark_matrix_spotserve_core_trace_sweep.yaml \
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \
+  --request-timeout 300 \
+  --ray-address auto \
+  --ray-namespace sllm
+'
+```
+
 ## Performance Summary
 
 | Version | Benchmark | Current claim | Refresh status |
@@ -244,6 +263,7 @@ cd /tmp/spotserve-work &&
 | V8 | `benchmark_matrix_stateful_recovery_performance.yaml` | Shared Qwen2 MoE run keeps both versions at 100% success; stateful recovery restores once, restores 16 tokens, and has no fallback. | Refreshed 2026-07-28. |
 | V9 | `risk_aware_scheduling_synthetic.json` | Placement-quality improvement: lower-risk / longer-lived node selection. | Synthetic result; live latency/SLO impact still requires a real workload. |
 | V7-V9 core | `benchmark_matrix_spotserve_core_performance.yaml` | One live matrix deploys baseline and applied variants of the same model. Applied enables context/KV migration, stateful recovery, and risk-aware scheduling together. | Refreshed 2026-08-04. |
+| V7-V9 trace sweep | `benchmark_matrix_spotserve_core_trace_sweep.yaml` | Runs the same baseline/applied core pair across busy-recover, fast-recover, slow-recover, no-recover, dead-after-preempt, and double-preempt traces. | Pending run. |
 
 | Metric | Baseline | Applied | Result | Status |
 |---|---|---|---|---|
@@ -292,6 +312,10 @@ Notes:
   `context_migration_events > 0`, `state_restore_successes_total > 0`, and
   `risk_scheduling_events > 0` before claiming that all three core paths ran
   together.
+- For the V7-V9 trace sweep, baseline and applied use the same trace file
+  inside each scenario. The benchmark runner fills in each run's model name at
+  replay time. After the sweep, compare scenarios in
+  `results/spotserve_core_trace_sweep/latest_comparisons.json`.
 - V9 scheduling affects model placement/loading, not per-token decoding. On a
   single worker node it can emit the scheduling decision but may not improve
   placement risk until multiple worker nodes are available.
