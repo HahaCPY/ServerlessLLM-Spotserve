@@ -120,6 +120,7 @@ async def replay_trace(
     trace_path: str,
     speedup: float = 1.0,
     controller_name: str = "controller",
+    model_name: str | None = None,
 ):
     if ray is None:
         raise RuntimeError(
@@ -129,7 +130,7 @@ async def replay_trace(
     if speedup <= 0:
         raise ValueError("speedup must be positive")
 
-    events = load_spot_trace(trace_path)
+    events = load_spot_trace(trace_path, default_model_name=model_name)
     controller = ray.get_actor(controller_name)
     replay_started_at = time.monotonic()
     last_event_time = 0.0
@@ -156,6 +157,14 @@ def main():
     parser.add_argument("--ray-address", default="auto")
     parser.add_argument("--ray-namespace", default="sllm")
     parser.add_argument("--controller-name", default="controller")
+    parser.add_argument(
+        "--model-name",
+        default=None,
+        help=(
+            "Default model name for trace events that select instances but "
+            "do not include model_name."
+        ),
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
@@ -175,6 +184,7 @@ def main():
             trace_path=args.trace,
             speedup=args.speedup,
             controller_name=args.controller_name,
+            model_name=args.model_name,
         )
     )
     logger.info("Trace replay finished: %s", result)

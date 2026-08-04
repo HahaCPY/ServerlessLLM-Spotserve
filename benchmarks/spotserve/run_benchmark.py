@@ -66,7 +66,10 @@ def load_jsonl(path: Path) -> List[Dict[str, Any]]:
     return sorted(rows, key=lambda row: float(row.get("time", 0.0)))
 
 
-def load_spot_trace_events(path: Path) -> List[BenchmarkSpotEvent]:
+def load_spot_trace_events(
+    path: Path,
+    default_model_name: Optional[str] = None,
+) -> List[BenchmarkSpotEvent]:
     rows = load_jsonl(path)
     events = []
     for row in rows:
@@ -90,9 +93,10 @@ def load_spot_trace_events(path: Path) -> List[BenchmarkSpotEvent]:
                 f"{path}: spot event must target node_id, instance_id, "
                 "instance_index, or instance_selector"
             )
+        model_name = row.get("model_name") or default_model_name
         if (
             instance_index is not None or instance_selector is not None
-        ) and row.get("model_name") is None:
+        ) and model_name is None:
             raise ValueError(
                 f"{path}: instance-selected spot events require model_name"
             )
@@ -101,7 +105,7 @@ def load_spot_trace_events(path: Path) -> List[BenchmarkSpotEvent]:
                 time=float(row.get("time", 0.0)),
                 event=event,
                 node_id=row.get("node_id"),
-                model_name=row.get("model_name"),
+                model_name=model_name,
                 instance_id=row.get("instance_id"),
                 instance_index=instance_index,
                 instance_selector=instance_selector,
@@ -560,6 +564,7 @@ def start_ray_trace_replayer(
     ray_address: str = "auto",
     ray_namespace: str = "sllm",
     controller_name: str = "controller",
+    model_name: Optional[str] = None,
 ) -> Optional[TraceProcess]:
     if not trace_path:
         return None
@@ -574,22 +579,25 @@ def start_ray_trace_replayer(
         return None
 
     log_file = log_path.open("w", encoding="utf-8")
+    command = [
+        sys.executable,
+        "-m",
+        "sllm.spot.preemption_simulator",
+        "--trace",
+        trace_path,
+        "--speedup",
+        str(speedup),
+        "--ray-address",
+        ray_address,
+        "--ray-namespace",
+        ray_namespace,
+        "--controller-name",
+        controller_name,
+    ]
+    if model_name:
+        command.extend(["--model-name", model_name])
     process = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "sllm.spot.preemption_simulator",
-            "--trace",
-            trace_path,
-            "--speedup",
-            str(speedup),
-            "--ray-address",
-            ray_address,
-            "--ray-namespace",
-            ray_namespace,
-            "--controller-name",
-            controller_name,
-        ],
+        command,
         stdout=log_file,
         stderr=subprocess.STDOUT,
     )
@@ -604,11 +612,15 @@ async def replay_trace_over_http(
     timeout_s: float,
     ray_address: str,
     ray_namespace: str,
+    model_name: Optional[str] = None,
 ) -> None:
     if speedup <= 0:
         raise ValueError("speedup must be positive")
 
-    events = load_spot_trace_events(Path(trace_path))
+    events = load_spot_trace_events(
+        Path(trace_path),
+        default_model_name=model_name,
+    )
     spot_endpoint = f"{base_url_from_chat_endpoint(endpoint)}/spot/event"
     replay_started_at = time.monotonic()
     last_event_time = 0.0
@@ -661,6 +673,7 @@ def start_http_trace_replayer(
     timeout_s: float,
     ray_address: str,
     ray_namespace: str,
+    model_name: Optional[str] = None,
 ) -> Optional[TraceTask]:
     if not trace_path:
         return None
@@ -673,6 +686,7 @@ def start_http_trace_replayer(
             timeout_s=timeout_s,
             ray_address=ray_address,
             ray_namespace=ray_namespace,
+            model_name=model_name,
         )
     )
     return TraceTask(task=task, log_path=log_path)
@@ -791,6 +805,7 @@ async def run_one(
                     ray_address=ray_address,
                     ray_namespace=ray_namespace,
                     controller_name=controller_name,
+                    model_name=run_config["model"],
                 )
             else:
                 trace_replayer = start_http_trace_replayer(
@@ -801,6 +816,7 @@ async def run_one(
                     request_timeout_s,
                     ray_address,
                     ray_namespace,
+                    model_name=run_config["model"],
                 )
         rows = await send_workload(
             endpoint, run_config["model"], workload, request_timeout_s

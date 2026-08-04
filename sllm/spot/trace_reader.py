@@ -47,7 +47,11 @@ class SpotEvent:
             )
 
 
-def _event_from_dict(raw_event: dict, source: str) -> SpotEvent:
+def _event_from_dict(
+    raw_event: dict,
+    source: str,
+    default_model_name: Optional[str] = None,
+) -> SpotEvent:
     try:
         event_time = float(raw_event["time"])
         event_type = str(raw_event["event"])
@@ -56,11 +60,12 @@ def _event_from_dict(raw_event: dict, source: str) -> SpotEvent:
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{source}: invalid event time") from exc
 
+    model_name = raw_event.get("model_name") or default_model_name
     return SpotEvent(
         time=event_time,
         event=event_type,
         node_id=raw_event.get("node_id"),
-        model_name=raw_event.get("model_name"),
+        model_name=model_name,
         instance_id=raw_event.get("instance_id"),
         instance_index=(
             int(raw_event["instance_index"])
@@ -71,7 +76,10 @@ def _event_from_dict(raw_event: dict, source: str) -> SpotEvent:
     )
 
 
-def load_spot_trace(trace_path: str | Path) -> List[SpotEvent]:
+def load_spot_trace(
+    trace_path: str | Path,
+    default_model_name: Optional[str] = None,
+) -> List[SpotEvent]:
     path = Path(trace_path)
     if path.suffix != ".jsonl":
         raise ValueError("Only JSONL spot traces are supported")
@@ -89,7 +97,11 @@ def load_spot_trace(trace_path: str | Path) -> List[SpotEvent]:
                     f"{path}:{line_number}: invalid JSONL event"
                 ) from exc
             events.append(
-                _event_from_dict(raw_event, f"{path}:{line_number}")
+                _event_from_dict(
+                    raw_event,
+                    f"{path}:{line_number}",
+                    default_model_name=default_model_name,
+                )
             )
 
     return sorted(events, key=lambda event: event.time)
