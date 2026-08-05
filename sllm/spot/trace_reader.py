@@ -34,7 +34,7 @@ class SpotEvent:
             and self.instance_selector is None
         ):
             raise ValueError(
-                "Spot event must target node_id, instance_id, or "
+                "Spot event must target node_id or instance_id, or "
                 "instance_index/instance_selector"
             )
         if (
