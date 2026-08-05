@@ -187,6 +187,12 @@ class RoundRobinRouter(SllmRouter):
 
         self.recovery_tokens_by_instance: Dict[str, List[List[int]]] = {}
         self.recovery_state_by_instance: Dict[str, Dict[str, Any]] = {}
+        # Requests currently executing on a backend.  V6 uses this registry
+        # to snapshot and abort an in-flight request before switching the
+        # active deployment; the original external request_id is retained for
+        # the retry on the new worker.
+        self.inflight_requests: Dict[str, Dict[str, Any]] = {}
+        self.inflight_requests_lock = asyncio.Lock()
         self.auto_scaler = None
         logger.info(f"Created new handler for model {self.model_name}")
 
@@ -206,6 +212,108 @@ class RoundRobinRouter(SllmRouter):
         await self._call_backend_method(backend_instance, method_name)
         if hasattr(backend_instance, "_ray_actor_id"):
             ray.kill(backend_instance)
+
+    async def _track_inflight_request(
+        self,
+        request_id: str,
+        request_data: dict,
+        action: str,
+        instance: InstanceHandle,
+    ):
+        async with self.inflight_requests_lock:
+            entry = self.inflight_requests.get(request_id)
+            if entry is None:
+                entry = {
+                    "request_id": request_id,
+                    "request_data": copy.deepcopy(request_data),
+                    "action": action,
+                    "instance": instance,
+                    "instance_id": instance.instance_id,
+                    "migration_state": None,
+                    "migration_requested": False,
+                }
+                self.inflight_requests[request_id] = entry
+            else:
+                entry["instance"] = instance
+                entry["instance_id"] = instance.instance_id
+        return entry
+
+    async def _untrack_inflight_request(self, request_id: str):
+        async with self.inflight_requests_lock:
+            self.inflight_requests.pop(request_id, None)
+
+    async def _prepare_reparallelization_requests(
+        self, deployment: VllmDeployment
+    ) -> Dict[str, Any]:
+        """Snapshot and interrupt requests before V6 switches deployments.
+
+        The backend owns the actual engine abort.  Once the abort response is
+        returned, the request coroutine receives a migration marker and
+        retries on the new ready deployment using the captured V8 state (or a
+        token replay fallback).  Requests for which the backend has no abort
+        hook are left running so the normal drain path remains safe.
+        """
+        old_instance_ids = set(deployment.instances)
+        async with self.inflight_requests_lock:
+            entries = [
+                entry
+                for entry in self.inflight_requests.values()
+                if entry.get("instance_id") in old_instance_ids
+            ]
+
+        summary = {
+            "attempted": len(entries),
+            "state_exported": 0,
+            "abort_requested": 0,
+            "migratable": 0,
+            "unsupported": 0,
+            "request_ids": sorted(
+                str(entry.get("request_id")) for entry in entries
+            ),
+        }
+        for entry in entries:
+            instance = entry.get("instance")
+            if instance is None or instance.backend_instance is None:
+                summary["unsupported"] += 1
+                continue
+
+            # Export before abort so the connector still sees the live request
+            # and its block table/lease metadata.
+            state = await self._capture_inference_state(
+                instance,
+                request_data=entry.get("request_data", {}),
+            )
+            entry["migration_state"] = state
+            if state is not None:
+                summary["state_exported"] += 1
+
+            try:
+                abort_result = await self._call_backend_method(
+                    instance.backend_instance,
+                    "abort_request",
+                    request_id=entry["request_id"],
+                    reason="reparallelization",
+                )
+            except (AttributeError, NotImplementedError):
+                summary["unsupported"] += 1
+                continue
+            except Exception:
+                logger.exception(
+                    "Could not abort request %s for re-parallelization",
+                    entry["request_id"],
+                )
+                summary["unsupported"] += 1
+                continue
+
+            if not isinstance(abort_result, dict) or not abort_result.get(
+                "aborted", False
+            ):
+                summary["unsupported"] += 1
+                continue
+            entry["migration_requested"] = True
+            summary["abort_requested"] += 1
+            summary["migratable"] += 1
+        return summary
 
     async def start(
         self, auto_scaling_config: Dict[str, int], mode: str = "inference"
@@ -244,6 +352,7 @@ class RoundRobinRouter(SllmRouter):
             resource_requirements=self.resource_requirements,
             scheduler=scheduler,
             traffic_switcher=self._switch_vllm_deployment,
+            request_migrator=self._prepare_reparallelization_requests,
             max_queue_length=max(
                 1, int(self.auto_scaling_config.get("target", 1) or 1)
             ),
@@ -505,6 +614,11 @@ class RoundRobinRouter(SllmRouter):
                         "status": "applied",
                         "instance_ids": sorted(deployment.instances),
                         "parallel_plan": plan.to_dict(),
+                        "request_migration": getattr(
+                            self.vllm_deployment_adapter,
+                            "last_request_migration",
+                            None,
+                        ),
                     }
                 except Exception as exc:
                     logger.exception(
@@ -1294,6 +1408,9 @@ class RoundRobinRouter(SllmRouter):
         self, request_data: dict, state: InferenceState
     ) -> dict:
         restore_request = copy.deepcopy(request_data)
+        # Internal migration bookkeeping is consumed by the router and must
+        # never be forwarded as a vLLM SamplingParams field.
+        restore_request.pop("_completed_tokens", None)
         if state.tokens:
             restore_request["input_tokens"] = list(state.tokens)
         completed_tokens = state.completed_tokens
@@ -1515,6 +1632,9 @@ class RoundRobinRouter(SllmRouter):
                 return {"error": "Instance stopped"}
 
         request_id = request_data.get("request_id", f"req-{uuid.uuid4()}")
+        # Make the router's external ID the connector/backend ID as well.  It
+        # is the key used by export/abort/restore during a live replan.
+        request_data.setdefault("request_id", request_id)
         request_start = time.time()
         attempts = 0
         failed_attempts = 0
@@ -1528,6 +1648,8 @@ class RoundRobinRouter(SllmRouter):
         state_restore_successes = 0
         state_restore_fallback = False
         state_restored_tokens = 0
+        force_state_recovery = False
+        force_retry_budget = 0
 
         async with self.request_count_lock:
             self.request_count += 1
@@ -1544,15 +1666,24 @@ class RoundRobinRouter(SllmRouter):
                         await self._allocate_instance_for_request()
                     )
                     assigned_instances.append(instance_id)
+                    inflight = await self._track_inflight_request(
+                        request_id,
+                        request_data,
+                        action,
+                        instance,
+                    )
                     logger.info(
                         f"{request_data}, type: {type(request_data)}, "
                         f"attempt: {attempts}"
                     )
                     state_snapshot = None
                     if (
-                        self.recovery_policy
-                        == RecoveryPolicy.STATEFUL_RECOVERY
-                        and recovery_state is not None
+                        recovery_state is not None
+                        and (
+                            self.recovery_policy
+                            == RecoveryPolicy.STATEFUL_RECOVERY
+                            or force_state_recovery
+                        )
                     ):
                         (
                             state_snapshot,
@@ -1586,6 +1717,7 @@ class RoundRobinRouter(SllmRouter):
                                 replay_tokens,
                                 recovery_state.completed_tokens,
                             )
+                        force_state_recovery = False
 
                     result = await self._call_backend(
                         instance,
@@ -1613,6 +1745,10 @@ class RoundRobinRouter(SllmRouter):
                             recovery_fallback = True
                     logger.info("Finished processing request")
 
+                    reparallelized = (
+                        isinstance(result, dict)
+                        and result.get("_spotserve_reparallelization")
+                    )
                     if not self._result_is_preempted(
                         result
                     ) and not self._result_is_error(result):
@@ -1643,7 +1779,23 @@ class RoundRobinRouter(SllmRouter):
                         return result
 
                     failed_attempts += 1
-                    if self._result_is_preempted(result):
+                    if reparallelized:
+                        migration_state = inflight.get("migration_state")
+                        recovery_state = migration_state
+                        recovery_state_source_instance_id = instance_id
+                        force_state_recovery = migration_state is not None
+                        force_retry_budget = max(force_retry_budget, 1)
+                        replay_tokens = (
+                            [list(migration_state.tokens)]
+                            if migration_state is not None
+                            and migration_state.tokens
+                            else None
+                        )
+                        if migration_state is not None:
+                            request_data["_completed_tokens"] = (
+                                migration_state.completed_tokens
+                            )
+                    elif self._result_is_preempted(result):
                         await self._set_instance_state(
                             instance,
                             InstanceState.PREEMPTING,
@@ -1710,7 +1862,12 @@ class RoundRobinRouter(SllmRouter):
                     ):
                         recovery_fallback = True
 
-                    if not self._should_retry(attempts - 1):
+                    should_retry = self._should_retry(
+                        attempts - 1
+                    ) or force_retry_budget > 0
+                    if force_retry_budget > 0:
+                        force_retry_budget -= 1
+                    if not should_retry:
                         self._emit_metric(
                             make_request_event(
                                 request_id=request_id,
@@ -1846,6 +2003,7 @@ class RoundRobinRouter(SllmRouter):
                     if instance is not None:
                         await self._release_instance_request(instance)
         finally:
+            await self._untrack_inflight_request(request_id)
             async with self.request_count_lock:
                 self.request_count -= 1
 

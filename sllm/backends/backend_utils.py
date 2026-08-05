@@ -109,3 +109,13 @@ class SllmBackend(ABC):
             "restored": False,
             "reason": "backend_state_restore_unsupported",
         }
+
+    async def abort_request(
+        self, request_id: str, reason: str = "preempted"
+    ) -> Dict[str, Any]:
+        """Optional controlled abort used by live re-parallelization."""
+        return {
+            "aborted": False,
+            "request_id": request_id,
+            "reason": "backend_abort_unsupported",
+        }

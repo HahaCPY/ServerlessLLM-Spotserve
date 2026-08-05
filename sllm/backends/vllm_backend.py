@@ -168,7 +168,7 @@ class LLMEngineStatusDict:
 
     async def delete_request(self, request_id: str):
         async with self.lock:
-            del self.status_dict[request_id]
+            self.status_dict.pop(request_id, None)
 
     async def return_all_results(self) -> List[Union[RequestOutput, str]]:
         async with self.lock:
@@ -204,6 +204,7 @@ class VllmBackend(SllmBackend):
         self.request_trace = LLMEngineStatusDict()
         self.pending_kv_restores: Dict[str, int] = {}
         self._forced_failures_seen = set()
+        self.abort_reasons: Dict[str, str] = {}
         # if trace_debug is True, request trace will not be deleted after completion
         self.trace_debug = backend_config.get("trace_debug", False)
         self.enforce_eager = backend_config.get("enforce_eager", False)
@@ -240,7 +241,11 @@ class VllmBackend(SllmBackend):
         filtered_engine_config["enable_prefix_caching"] = (
             self.enable_prefix_caching
         )
-        filtered_engine_config["task"] = self.task
+        # ``task`` is not present in every patched/upstream vLLM release.
+        # Keep the backend compatible with runtimes whose AsyncEngineArgs
+        # predates the task field instead of making actor creation fail.
+        if "task" in async_engine_fields:
+            filtered_engine_config["task"] = self.task
 
         logger.info(
             f"Creating new VLLM engine with config: {filtered_engine_config}"
@@ -534,17 +539,36 @@ class VllmBackend(SllmBackend):
 
         # TODO stream results
 
-        # Non-stream case
+        # Non-stream case.  A V6 replan can abort this generator after the
+        # router has exported the request state.  Return a structured marker
+        # so the original request coroutine retries on the new deployment
+        # instead of surfacing an engine cancellation to the client.
         final_output = None
-        async for response_output in results_generator:
-            final_output = response_output
-            await self.request_trace.update_status(request_id, response_output)
-            if self._forced_failure_ready(forced_failure, response_output):
-                return await self._forced_failure_result(
-                    state_request_data, forced_failure, response_output
+        try:
+            async for response_output in results_generator:
+                final_output = response_output
+                await self.request_trace.update_status(
+                    request_id, response_output
                 )
+                if self._forced_failure_ready(forced_failure, response_output):
+                    return await self._forced_failure_result(
+                        state_request_data, forced_failure, response_output
+                    )
+        except BaseException:
+            reason = self.abort_reasons.pop(request_id, None)
+            if reason is not None:
+                return await self._reparallelization_abort_result(
+                    request_id, reason
+                )
+            raise
 
-        assert final_output is not None
+        reason = self.abort_reasons.pop(request_id, None)
+        if reason is not None:
+            return await self._reparallelization_abort_result(
+                request_id, reason, final_output
+            )
+        if final_output is None:
+            raise RuntimeError("vLLM returned no final output")
 
         if not self.trace_debug:
             await self.request_trace.delete_request(request_id)
@@ -566,6 +590,56 @@ class VllmBackend(SllmBackend):
                 ),
             }
         return response
+
+    async def _reparallelization_abort_result(
+        self,
+        request_id: str,
+        reason: str,
+        final_output: Optional[RequestOutput] = None,
+    ) -> Dict[str, Any]:
+        """Build a retry marker after V6 exported and aborted a request."""
+        if final_output is None:
+            results = await self.request_trace.return_all_results()
+            for result in results:
+                if isinstance(result, RequestOutput) and result.request_id == request_id:
+                    final_output = result
+                    break
+
+        current_output: List[List[int]] = []
+        if final_output is not None:
+            prompt_tokens = list(final_output.prompt_token_ids or [])
+            generated_tokens = list(
+                final_output.outputs[0].token_ids or []
+            ) if final_output.outputs else []
+            tokens = prompt_tokens + generated_tokens
+            if tokens:
+                current_output = [tokens]
+
+        await self.request_trace.delete_request(request_id)
+        return {
+            "preempted": True,
+            "_spotserve_reparallelization": reason == "reparallelization",
+            "request_id": request_id,
+            "current_output": current_output,
+            "completed_tokens": len(current_output[0]) if current_output else 0,
+            "reason": reason,
+        }
+
+    async def abort_request(
+        self, request_id: str, reason: str = "preempted"
+    ) -> Dict[str, Any]:
+        """Abort one live request for a controlled deployment transition."""
+        request_id = str(request_id)
+        if self.engine is None:
+            return {"aborted": False, "reason": "engine_not_initialized"}
+        self.abort_reasons[request_id] = str(reason)
+        try:
+            await self.engine.abort(request_id)
+        except Exception as exc:
+            self.abort_reasons.pop(request_id, None)
+            logger.info("Could not abort request %s: %s", request_id, exc)
+            return {"aborted": False, "reason": str(exc)}
+        return {"aborted": True, "request_id": request_id, "reason": reason}
 
     async def shutdown(self):
         """Abort all requests and shutdown the backend."""

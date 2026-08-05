@@ -57,7 +57,13 @@ class ReparallelizationExecutor:
 
         old = self.current
         if old is not None:
-            await _call(self.drain, old)
+            try:
+                await _call(self.drain, old)
+            except Exception:
+                # A failed drain/migration must not leak the newly created
+                # target deployment or leave it serving without a switch.
+                await _call(self.stop, target)
+                raise
         try:
             await _call(self.switch_traffic, target, plan)
         except Exception:

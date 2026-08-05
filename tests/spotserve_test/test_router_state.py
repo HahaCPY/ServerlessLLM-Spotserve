@@ -3,6 +3,8 @@ import json
 import pytest
 
 from sllm.routers.roundrobin_router import RoundRobinRouter
+from sllm.spot.reparallelization import ParallelPlan
+from sllm.spot.vllm_deployment_adapter import VllmDeployment
 from sllm.utils import InstanceHandle, InstanceState
 
 
@@ -167,6 +169,16 @@ class FakeRouterEmbeddedStateBackend(FakeRouterRestoreBackend):
                 },
             }
         return await super().generate(request_data)
+
+
+class FakeReparallelizationBackend(FakeRouterRestoreBackend):
+    def __init__(self):
+        super().__init__()
+        self.abort_calls = []
+
+    async def abort_request(self, request_id, reason="preempted"):
+        self.abort_calls.append((request_id, reason))
+        return {"aborted": True, "request_id": request_id, "reason": reason}
 
 
 @pytest.mark.asyncio
@@ -773,3 +785,49 @@ async def test_router_uses_embedded_preempted_inference_state(tmp_path):
     assert result.get("usage", {}).get("completion_tokens") == 2, result
     assert source_backend.export_calls == 0
     assert target_backend.restore_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_replan_snapshots_and_aborts_inflight_request():
+    router = RoundRobinRouter(
+        model_name="test-model",
+        resource_requirements={"num_cpus": 1, "num_gpus": 1},
+        backend="vllm",
+        backend_config={},
+        router_config={},
+    )
+    backend = FakeReparallelizationBackend()
+    source = InstanceHandle(
+        instance_id="instance-source",
+        max_queue_length=1,
+        num_gpu=1,
+        node_id="node-source",
+        backend_instance=backend,
+    )
+    await source.mark_ready(node_id="node-source")
+    await router._track_inflight_request(
+        "req-migrate",
+        {"request_id": "req-migrate", "max_tokens": 8},
+        "generate",
+        source,
+    )
+    plan = ParallelPlan(
+        model_name="test-model",
+        backend="vllm",
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
+        data_parallel_size=1,
+        num_replicas=1,
+        num_gpus=1,
+        target_nodes=["node-target"],
+    )
+    deployment = VllmDeployment(
+        plan=plan,
+        instances={source.instance_id: source},
+    )
+
+    summary = await router._prepare_reparallelization_requests(deployment)
+
+    assert summary["migratable"] == 1
+    assert summary["state_exported"] == 1
+    assert backend.abort_calls == [("req-migrate", "reparallelization")]

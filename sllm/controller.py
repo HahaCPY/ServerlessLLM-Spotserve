@@ -391,8 +391,12 @@ class SllmController:
             router = self.request_routers.pop(model_name)
             self.registered_models.pop(model_name)
 
-        # if router is not None:
-        #     deleted_instance_id = await router.shutdown.remote()
+        # Stop the router's workers before dropping the controller reference.
+        # Merely removing the router from the registry leaks its vLLM actors
+        # (and their Ray GPU reservations), which can prevent a subsequent
+        # target deployment from applying a newly selected ParallelPlan.
+        if router is not None:
+            await router.shutdown.remote()
         del router
 
     async def get_models(self):

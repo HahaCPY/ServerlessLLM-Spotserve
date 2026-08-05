@@ -21,7 +21,7 @@ V9: CPY risk-aware scheduler and the provider metadata adapter are done; real
 
 | Version | CPY / ServerlessLLM status | Bignose / runtime status | What can be claimed now |
 |---|---|---|---|
-| V6 Dynamic Reparallelization | Planner, `ParallelPlan`, spot-event replanning, metrics | `VllmDeploymentAdapter` creates target-node vLLM Ray actors, waits for readiness, switches traffic, drains/stops old actors | Live vLLM container smoke applies TP1/PP1 plan after preemption; single-worker smoke uses explicit stop-before-recreate |
+| V6 Dynamic Reparallelization | Planner, `ParallelPlan`, spot-event replanning, metrics | `VllmDeploymentAdapter` creates target-node vLLM Ray actors, snapshots/aborts in-flight requests, switches traffic, drains/stops old actors | Live vLLM container smoke applies TP1/PP1 plan after preemption; single-worker smoke uses explicit stop-before-recreate; request migration has dependency-light restore smoke |
 | V7 Low-cost Context Migration | Router calls backend `get_context_metadata()`, plans migration, optional `resume_kv_cache()` warmup | Router derives target-specific maps from matching target token/block metadata; empty when unproven | Live same-host GPU target-reuse benchmarks pass for tiny MoE and Qwen1.5-MoE TP2 |
 | V8 Stateful Restore | Router recovery path calls export/restore and falls back safely | Same-node vLLM runtime export/attach and ID/lease tracking validated in dual-engine harness | Tiny and Qwen1.5-MoE TP2 restore pass; GPU container/head/worker/NIXL smoke pass; cross-node validation pending |
 | V9 Risk-aware Scheduling | Scheduler can rank by risk and query backend actor metadata | `RiskMetadataProvider` supports callable provider, JSON/env integration, provenance, normalization, and conservative fallback | Real provider-shaped fields are preserved when available; unknown nodes remain conservative |
@@ -81,7 +81,10 @@ Bignose/runtime implementation:
 - ~~create or reconfigure vLLM workers with the selected TP / DP / PP / EP shape.~~ `VllmDeploymentAdapter` starts real `start_instance` actors with the selected shape.
 - ~~drain or stop old workers safely.~~ The adapter drains active requests, then stops and deallocates old actors.
 - ~~switch router traffic only after target workers are ready.~~ Router traffic is switched only after readiness checks pass.
-- coordinate with V7/V8 if in-flight request state must be migrated/restored.
+- ~~coordinate with V7/V8 if in-flight request state must be migrated/restored.~~
+  Before traffic switch, the router exports each tracked request, asks the old
+  backend to abort it, and retries it on the new deployment with V8 restore or
+  token replay fallback while retaining the external request ID.
 
 The live smoke validates the deployment lifecycle. It is a control-plane
 replan benchmark, not a claim about end-to-end latency improvement. The default
@@ -383,7 +386,8 @@ Minimum tests or live checks before claiming vLLM true KV restore:
 
 Current validation status (2026-07-19):
 
-- ServerlessLLM router/backend/state-restore suite: 31 passed.
+- ServerlessLLM router/backend/state-restore baseline suite: 31 passed;
+  current full `tests/spotserve_test` run: 78 passed, 1 skipped.
 - Same-node tiny dual-engine NIXL harness: passed.
 - Same-node Qwen1.5-MoE-A2.7B dual-engine TP2 harness: passed with five source
   blocks, 65 source computed tokens, 5 restored blocks,
@@ -427,6 +431,12 @@ Current validation status (2026-07-19):
   On the default single-worker compose setup, interpret this as
   adapter/recreate overhead plus post-replan steady-state behavior, not as a
   production latency-improvement claim.
+- V6 in-flight request migration smoke (2026-07-28): a long-running request
+  retained its external request ID while the router exported state, aborted the
+  old backend request, allocated the target instance, and completed through
+  target restore. The full `tests/spotserve_test` suite passed 78 tests with
+  one environment skip. A real GPU long-request run is still pending because
+  the current session has no usable NVIDIA driver.
 - V9 provider metadata validation (2026-07-19): callable/config-shaped provider
   fields were normalized and bounded, provenance/confidence were retained, and
   an unknown node (or empty provider response) selected the conservative
@@ -513,13 +523,21 @@ Bignose runtime work is done when:
 ## Completed Core Work
 
 The following Bignose runtime tasks are completed and validated as of
-2026-07-19:
+2026-07-28:
 
-- **V6 executor:** `ReparallelizationExecutor` is connected to the concrete
+- **V6 executor and request migration:** `ReparallelizationExecutor` is connected to the concrete
   `VllmDeploymentAdapter`. A live ServerlessLLM GPU smoke applied a selected
   `ParallelPlan` (TP1/PP1) after preemption, created the target vLLM worker,
   switched traffic, drained/stopped the old worker, and served a successful
-  inference request.
+  inference request. In-flight requests now export state, abort on the old
+  backend, and retry on the target with the same external request ID.
+- **V6 real MoE planner application (2026-07-28):** with
+  `Qwen2-MoE-Tiny` from `/work/spotserve-models`, an isolated three-GPU Ray
+  smoke sent a node-0 preemption through `RoundRobinRouter`. The planner
+  selected TP2 on node-1, `execution.status` was `applied`, the target actor
+  passed readiness, traffic switched, the source actor was stopped, and a
+  target request completed. The repeatable smoke is
+  `tests/spotserve_test/run_real_moe_replan_smoke.py`.
 - **V7 target-specific KV reuse:** live CUDA engines reported real block
   metadata and target-specific reuse:
   `reusable_tokens_by_target={"vllm-target": 64}` and
@@ -542,6 +560,7 @@ The following Bignose runtime tasks are completed and validated as of
   V6 deployment smoke, and V9 provider/scheduler smoke have passed.
 
 The remaining non-completed items are external deployment validations: a
-positive cross-node NIXL restore, production cloud risk-provider quality, and
-production latency/SLO benchmarking. These are intentionally not marked as
-completed by the runtime implementation.
+positive cross-node NIXL restore, a real GPU long-request in-flight migration
+run (the target replan itself is now GPU-validated), production cloud
+risk-provider quality, and production latency/SLO benchmarking. These are
+intentionally not marked as completed by the runtime implementation.

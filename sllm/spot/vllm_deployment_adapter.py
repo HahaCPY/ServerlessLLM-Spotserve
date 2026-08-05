@@ -3,7 +3,8 @@
 The planner is intentionally runtime-neutral.  This adapter is the deployment
 boundary used by the router: it allocates Ray worker resources, starts real
 ``VllmBackend`` actors with the planned parallel shape, waits for engine
-initialisation, and releases the old deployment only after traffic switches.
+initialisation, snapshots/aborts tracked requests, and releases the old
+deployment only after traffic switches.
 """
 
 import asyncio
@@ -52,6 +53,7 @@ class VllmDeploymentAdapter:
         resource_requirements: Mapping[str, int],
         scheduler: Any,
         traffic_switcher: MaybeAsync,
+        request_migrator: Optional[MaybeAsync] = None,
         max_queue_length: int = 1,
         drain_timeout_s: float = 30.0,
     ) -> None:
@@ -60,6 +62,8 @@ class VllmDeploymentAdapter:
         self.resource_requirements = dict(resource_requirements)
         self.scheduler = scheduler
         self.traffic_switcher = traffic_switcher
+        self.request_migrator = request_migrator
+        self.last_request_migration: Optional[Dict[str, Any]] = None
         self.max_queue_length = max(1, int(max_queue_length))
         self.drain_timeout_s = max(0.1, float(drain_timeout_s))
 
@@ -202,8 +206,15 @@ class VllmDeploymentAdapter:
     async def drain_workers(self, deployment: Optional[VllmDeployment]) -> None:
         if deployment is None:
             return
+        self.last_request_migration = None
+        # Stop new allocations first; tracked requests already running on the
+        # old handles remain visible to the migration callback below.
         for handle in deployment.instances.values():
             await handle.mark_draining()
+        if self.request_migrator is not None:
+            self.last_request_migration = await _call(
+                self.request_migrator, deployment
+            )
         deadline = asyncio.get_running_loop().time() + self.drain_timeout_s
         while asyncio.get_running_loop().time() < deadline:
             if all(handle.concurrency <= 0 for handle in deployment.instances.values()):

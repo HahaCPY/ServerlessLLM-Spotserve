@@ -134,7 +134,15 @@ class ConservativeRiskMetadataProvider:
     """No-provider fallback; ranking code supplies safe defaults."""
 
     def collect(self, node_id: str, node_info: Mapping[str, Any]):
-        return normalize_risk_metadata({}, source="conservative")
+        return normalize_risk_metadata(
+            {
+                "spot_risk": 0.0,
+                "remaining_lifetime_s": 0.0,
+                "loading_cost": 0.0,
+                "confidence": 0.0,
+            },
+            source="conservative",
+        )
 
 
 class EnvironmentRiskMetadataProvider:
