@@ -10,9 +10,9 @@ V6: CPY planner and the concrete vLLM deployment adapter are done; a live
     container replan applies a ParallelPlan through the vLLM adapter.
 V7: CPY live context-migration path calls vLLM backend; target-specific reuse is
     derived only when matching runtime prefix evidence is available.
-V8: CPY recovery path and same-node NIXL export/attach are validated; GPU
-    container deployment smoke is now complete, while cross-node transport
-    remains pending.
+V8: CPY recovery path and same-node NIXL export/attach are validated; a
+    two-container cross-node transport simulation is also complete, while
+    physical cross-node transport remains pending.
 V9: CPY risk-aware scheduler and the provider metadata adapter are done; real
     production risk quality remains provider/deployment-specific.
 ```
@@ -23,7 +23,7 @@ V9: CPY risk-aware scheduler and the provider metadata adapter are done; real
 |---|---|---|---|
 | V6 Dynamic Reparallelization | Planner, `ParallelPlan`, spot-event replanning, metrics | `VllmDeploymentAdapter` creates target-node vLLM Ray actors, snapshots/aborts in-flight requests, switches traffic, drains/stops old actors | Live vLLM container smoke applies TP1/PP1 plan after preemption; single-worker smoke uses explicit stop-before-recreate; request migration has dependency-light restore smoke |
 | V7 Low-cost Context Migration | Router calls backend `get_context_metadata()`, plans migration, optional `resume_kv_cache()` warmup | Router derives target-specific maps from matching target token/block metadata; empty when unproven | Live same-host GPU target-reuse benchmarks pass for tiny MoE and Qwen1.5-MoE TP2 |
-| V8 Stateful Restore | Router recovery path calls export/restore and falls back safely | Same-node vLLM runtime export/attach and ID/lease tracking validated in dual-engine harness | Tiny and Qwen1.5-MoE TP2 restore pass; GPU container/head/worker/NIXL smoke pass; cross-node validation pending |
+| V8 Stateful Restore | Router recovery path calls export/restore and falls back safely | Same-node vLLM runtime export/attach and ID/lease tracking validated in dual-engine harness; separate source/target containers now exercise the networked NIXL path | Tiny and Qwen1.5-MoE TP2 restore pass; cross-container same-host simulation passes; physical cross-node validation pending |
 | V9 Risk-aware Scheduling | Scheduler can rank by risk and query backend actor metadata | `RiskMetadataProvider` supports callable provider, JSON/env integration, provenance, normalization, and conservative fallback | Real provider-shaped fields are preserved when available; unknown nodes remain conservative |
 
 ## Current Backend Contract
@@ -175,6 +175,58 @@ The harness exports non-empty KV blocks, stages target metadata, completes the
 NIXL read, and reports `state_restore_successes_total=1` and
 `state_restore_fallback_count=0` for both the tiny model and the Qwen1.5-MoE
 TP2 run. This is still a same-host result, not cross-node validation.
+
+The requested cross-machine behavior is now simulated with two independent
+Podman containers. `source-node` and `target-node` have separate network
+namespaces/hostnames and separate GPU assignments (`--device ...=0` and
+`--device ...=1`); NIXL performs its TCP side-channel handshake and transfers
+five live KV blocks between them. This validates the container/deployment
+packaging and networked NIXL protocol, but both containers still share one
+physical host, so it does not turn on `can_restore_cross_node`.
+
+The repeatable setup is `tests/spotserve_test/Containerfile.cross-container`
+and the runner `tests/spotserve_test/run_cross_container_nixl_smoke.py`:
+
+```bash
+podman build -t localhost/spotserve-python312-nixl:latest \
+  -f tests/spotserve_test/Containerfile.cross-container .
+PYTHONPATH=. /work/containers/s112060021/Qwen3/vllm/.venv/bin/python \
+  tests/spotserve_test/run_cross_container_nixl_smoke.py \
+  --source-gpu 0 --target-gpu 1 --timeout-s 360
+```
+
+For a more realistic spot event, the three-container runner
+`tests/spotserve_test/run_cross_container_preemption_smoke.py` adds an
+observer worker on a third GPU. The controller sends a preemption notice,
+exports/aborts the active source request, stages it on the target, waits for
+the target's first token (the NIXL pull), then sends `SIGTERM` to source. The
+target must emit another token after source has stopped while observer remains
+healthy. Target selection is deterministic in this test controller; planner
+selection is validated separately by the V6 Ray smoke.
+
+```bash
+PYTHONPATH=. /work/containers/s112060021/Qwen3/vllm/.venv/bin/python \
+  tests/spotserve_test/run_cross_container_preemption_smoke.py \
+  --source-gpu 0 --target-gpu 1 --observer-gpu 2 \
+  --token-delay-s 0.10 --timeout-s 360
+```
+
+The four-GPU fleet churn runner
+`tests/spotserve_test/run_four_container_fleet_churn_smoke.py` starts three
+workers, leaves one GPU slot available, and applies seeded random `add` /
+`preempt` events. A preempted slot can be replaced by a new container, while
+the active source migration is forced once per run. With seed `1`, the live
+fleet reached four containers, preempted the newly added slot, migrated five
+KV blocks from source to target, stopped source with `SIGTERM`, and started a
+replacement source container; target continued decoding with one restore and
+zero fallback.
+
+```bash
+PYTHONPATH=. /work/containers/s112060021/Qwen3/vllm/.venv/bin/python \
+  tests/spotserve_test/run_four_container_fleet_churn_smoke.py \
+  --seed 1 --events 3 --gpus 0 1 2 3 \
+  --token-delay-s 0.10 --timeout-s 360
+```
 
 Bignose/runtime TODO for V8 true KV restore:
 
@@ -384,10 +436,10 @@ Minimum tests or live checks before claiming vLLM true KV restore:
   path being claimed.
 - restored vLLM path reports `restored_blocks > 0`.
 
-Current validation status (2026-07-19):
+Current validation status (2026-08-09):
 
 - ServerlessLLM router/backend/state-restore baseline suite: 31 passed;
-  current full `tests/spotserve_test` run: 78 passed, 1 skipped.
+  current full `tests/spotserve_test` run: 93 passed, 1 skipped.
 - Same-node tiny dual-engine NIXL harness: passed.
 - Same-node Qwen1.5-MoE-A2.7B dual-engine TP2 harness: passed with five source
   blocks, 65 source computed tokens, 5 restored blocks,
@@ -431,12 +483,16 @@ Current validation status (2026-07-19):
   On the default single-worker compose setup, interpret this as
   adapter/recreate overhead plus post-replan steady-state behavior, not as a
   production latency-improvement claim.
-- V6 in-flight request migration smoke (2026-07-28): a long-running request
-  retained its external request ID while the router exported state, aborted the
-  old backend request, allocated the target instance, and completed through
-  target restore. The full `tests/spotserve_test` suite passed 78 tests with
-  one environment skip. A real GPU long-request run is still pending because
-  the current session has no usable NVIDIA driver.
+- V6 in-flight request migration smoke (2026-08-09): a real Qwen2-MoE-Tiny
+  GPU request exposed live metadata (`65` tokens, `5` KV blocks), then a
+  planner-selected TP1 -> TP2 target was created and traffic switched. The
+  router reported `attempted=1`, `state_exported=1`, `abort_requested=1`, and
+  `migratable=1`; the request retried on the target and completed with its
+  original external request ID. The repeatable test is
+  `tests/spotserve_test/run_real_inflight_replan_smoke.py`. The script uses
+  the explicit test-only `SPOTSERVE_TEST_TOKEN_DELAY_S` pacing knob (default
+  zero in production) so the tiny model remains in flight while the TP2
+  engine loads.
 - V9 provider metadata validation (2026-07-19): callable/config-shaped provider
   fields were normalized and bounded, provenance/confidence were retained, and
   an unknown node (or empty provider response) selected the conservative
@@ -447,8 +503,39 @@ Current validation status (2026-07-19):
   environment passed provider metadata through `FcfsScheduler`; node `node-1`
   retained provider risk `0.12`, while unknown `node-x` retained conservative
   provenance and confidence `0.0`.
-- Cross-node positive restore is not complete because a second node is not
-  available; the capability remains explicitly `can_restore_cross_node=false`.
+- Physical cross-node positive restore is not complete because a second node
+  is not available; the capability remains explicitly
+  `can_restore_cross_node=false`.
+- Cross-node preflight (2026-08-09): this host has four local RTX 5070 Ti GPUs;
+  InfiniBand neighbors are reachable, but no remote GPU worker/PBS allocation
+  or SSH execution permission is available from this environment. Therefore
+  a positive cross-machine NIXL result cannot be produced here, and the
+  conservative cross-node flag remains disabled.
+- Cross-container cross-node simulation (2026-08-09):
+  `tests/spotserve_test/run_cross_container_nixl_smoke.py` ran source and
+  target as separate containers (`source-node`/`target-node`) on an isolated
+  Podman network with GPUs 0 and 1. The real NIXL path exported five source
+  blocks, staged/restored all five on the target, generated token `[46705]`,
+  and reported `state_restore_successes_total=1` with
+  `state_restore_fallback_count=0` (`elapsed_s=157.06`). This is a positive
+  container-level transport simulation only; physical cross-node capability
+  remains disabled.
+- Cross-container spot-preemption simulation (2026-08-09):
+  `run_cross_container_preemption_smoke.py` used three GPU containers
+  (source=GPU0, target=GPU1, observer=GPU2). The source exposed five KV blocks;
+  the target staged all five and pulled the first token before the controller
+  sent source `SIGTERM`. Source stopped successfully, target continued decoding,
+  observer stayed healthy, and the grace-period handoff took `0.816s` with
+  `state_restore_successes_total=1` and zero fallback. This models a
+  preemption notice plus migration grace period on one physical host.
+- Four-GPU fleet churn simulation (2026-08-09):
+  `run_four_container_fleet_churn_smoke.py --seed 1 --events 3` reached
+  `max_live_containers=4` on GPUs 0/1/2/3. The seeded random sequence added
+  slot 3, preempted it, then preempted the active source and added a source
+  replacement. Five KV blocks were staged, target continued after source
+  `SIGTERM`, and the run reported one restore success with zero fallback.
+  This validates the four-container capacity limit and worker churn; it is
+  still a same-host simulation and target selection is test-controller-driven.
 
 Useful validation commands depend on the deployment, but the expected signals
 are:
@@ -496,9 +583,10 @@ Do not claim without additional deployment evidence:
 - V7 achieves true low-cost KV block context migration in a live target-reuse
   benchmark (same-host GPU evidence is complete; cross-node latency remains
   unmeasured).
-- V8 restores real vLLM KV cache state through the containerized dual-engine
-  NIXL path.  A deployed-router recovery event and cross-node restore still
-  require a second live worker/node.
+- V8 restores real vLLM KV cache state through a physical cross-node or
+  deployed-router recovery path. The containerized two-node simulation is
+  complete, but a second physical worker/node and a live router recovery event
+  are still required for that stronger claim.
 - V9 production cloud spot-risk prediction quality; the provider hook is live,
   but this host has no cloud predictor endpoint.
 - latency improvements from KV migration/restore, unless the benchmark shows
@@ -523,7 +611,7 @@ Bignose runtime work is done when:
 ## Completed Core Work
 
 The following Bignose runtime tasks are completed and validated as of
-2026-07-28:
+2026-08-09:
 
 - **V6 executor and request migration:** `ReparallelizationExecutor` is connected to the concrete
   `VllmDeploymentAdapter`. A live ServerlessLLM GPU smoke applied a selected
@@ -547,6 +635,33 @@ The following Bignose runtime tasks are completed and validated as of
   `runtime_state`; target attach completed through NIXL; restored blocks were
   reported with `state_restore_successes_total=1` and
   `state_restore_fallback_count=0` in the validated same-node harness.
+- **V8 cross-container transport simulation (2026-08-09):** source and target
+  ran in separate Podman containers with distinct hostnames/network namespaces
+  and GPU assignments. The NIXL handshake transferred five live KV blocks;
+  target attach completed and generated `[46705]`, with
+  `state_restore_successes_total=1` and zero fallback. This validates the
+  packaged network path while keeping the physical cross-node capability flag
+  disabled.
+- **V6/V8 preemption grace-period simulation (2026-08-09):** three GPU
+  containers modeled source, replacement target, and an unrelated observer.
+  After source export/abort and target's first NIXL-pulled token, the
+  controller sent source `SIGTERM`; source stopped, target continued decoding,
+  and observer remained healthy. The measured handoff grace period was
+  `0.816s`, with five staged blocks, one restore success, and zero fallback.
+  This validates failure ordering; target selection itself remains a separate
+  planner test.
+- **Four-container fleet churn (2026-08-09):** a seeded random controller
+  exercised worker `add` and `preempt` events with a hard maximum of four live
+  GPU containers. The run reached all four containers, reused a freed GPU slot,
+  completed the active source-to-target NIXL handoff, and started a replacement
+  source worker after `SIGTERM`; target continued with one restore and zero
+  fallback. This is a container-level churn test, not physical cross-node
+  isolation or an automatic planner-selection benchmark.
+- **V6/V8 live GPU migration:** the integrated planner smoke now observes a
+  real in-flight request during target creation and completes after the
+  source abort/target retry. A separate two-process NIXL harness confirms
+  actual same-node KV transfer (`source_computed_tokens=66`, `5` blocks,
+  `state_restore_successes_total=1`, `fallback=0`).
 - **V9 risk metadata:** callable provider, JSON/file, and environment inputs
   are normalized, bounded, and tagged with provider/source/time/confidence.
   `FcfsScheduler` preserves authoritative Ray capacity and falls back to
@@ -560,7 +675,6 @@ The following Bignose runtime tasks are completed and validated as of
   V6 deployment smoke, and V9 provider/scheduler smoke have passed.
 
 The remaining non-completed items are external deployment validations: a
-positive cross-node NIXL restore, a real GPU long-request in-flight migration
-run (the target replan itself is now GPU-validated), production cloud
-risk-provider quality, and production latency/SLO benchmarking. These are
-intentionally not marked as completed by the runtime implementation.
+positive cross-node NIXL restore, production cloud risk-provider quality, and
+production latency/SLO benchmarking. These are intentionally not marked as
+completed by the runtime implementation.

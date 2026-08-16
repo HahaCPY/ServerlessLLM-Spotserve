@@ -56,6 +56,7 @@ class VllmDeploymentAdapter:
         request_migrator: Optional[MaybeAsync] = None,
         max_queue_length: int = 1,
         drain_timeout_s: float = 30.0,
+        migration_completion_waiter: Optional[MaybeAsync] = None,
     ) -> None:
         self.model_name = model_name
         self.backend_config = dict(backend_config)
@@ -66,6 +67,19 @@ class VllmDeploymentAdapter:
         self.last_request_migration: Optional[Dict[str, Any]] = None
         self.max_queue_length = max(1, int(max_queue_length))
         self.drain_timeout_s = max(0.1, float(drain_timeout_s))
+        self.migration_completion_waiter = migration_completion_waiter
+
+    async def wait_for_migration_completion(
+        self, deployment: Optional[VllmDeployment]
+    ) -> None:
+        """Keep source NIXL agents alive until target retries attach."""
+        if deployment is None or self.migration_completion_waiter is None:
+            return
+        await _call(
+            self.migration_completion_waiter,
+            deployment,
+            timeout_s=self.drain_timeout_s,
+        )
 
     def _plan_backend_config(self, plan: ParallelPlan) -> Dict[str, Any]:
         config = dict(self.backend_config)

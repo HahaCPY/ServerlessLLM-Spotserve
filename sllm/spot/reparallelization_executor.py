@@ -39,8 +39,14 @@ class ReparallelizationExecutor:
     stop: MaybeAsync
     current: Optional[Any] = None
     stop_current_before_create: bool = False
+    wait_for_migration: Optional[MaybeAsync] = None
+    migrate_before_create: bool = False
 
     async def apply(self, plan: ParallelPlan) -> Any:
+        prepared_old = None
+        if self.migrate_before_create and self.current is not None:
+            prepared_old = self.current
+            await _call(self.drain, prepared_old)
         if self.stop_current_before_create and self.current is not None:
             old = self.current
             await _call(self.drain, old)
@@ -56,7 +62,7 @@ class ReparallelizationExecutor:
             raise
 
         old = self.current
-        if old is not None:
+        if old is not None and old is not prepared_old:
             try:
                 await _call(self.drain, old)
             except Exception:
@@ -72,5 +78,7 @@ class ReparallelizationExecutor:
             raise
         self.current = target
         if old is not None:
+            if self.wait_for_migration is not None:
+                await _call(self.wait_for_migration, old)
             await _call(self.stop, old)
         return target

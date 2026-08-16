@@ -279,10 +279,36 @@ class RoundRobinRouter(SllmRouter):
 
             # Export before abort so the connector still sees the live request
             # and its block table/lease metadata.
-            state = await self._capture_inference_state(
-                instance,
-                request_data=entry.get("request_data", {}),
+            logger.info(
+                "Exporting live inference state for %s before re-parallelization",
+                entry["request_id"],
             )
+            try:
+                # A connector utility must not stall the whole deployment
+                # switch.  If a runtime cannot answer while its output loop
+                # is coalescing, fall back to the token snapshot path and
+                # still issue the controlled abort.
+                state = await asyncio.wait_for(
+                    self._capture_inference_state(
+                        instance,
+                        request_data=entry.get("request_data", {}),
+                    ),
+                    timeout=float(
+                        self.reparallelization_config.get(
+                            "state_export_timeout_s", 30.0
+                        )
+                    ),
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Timed out exporting live state for %s; using token fallback",
+                    entry["request_id"],
+                )
+                state = await self._capture_inference_state(
+                    instance,
+                    request_data=entry.get("request_data", {}),
+                    current_output=await self._capture_current_tokens(instance),
+                )
             entry["migration_state"] = state
             if state is not None:
                 summary["state_exported"] += 1
@@ -310,6 +336,10 @@ class RoundRobinRouter(SllmRouter):
             ):
                 summary["unsupported"] += 1
                 continue
+            logger.info(
+                "Aborted live request %s for re-parallelization",
+                entry["request_id"],
+            )
             entry["migration_requested"] = True
             summary["abort_requested"] += 1
             summary["migratable"] += 1
@@ -360,6 +390,7 @@ class RoundRobinRouter(SllmRouter):
                 self.reparallelization_config.get("drain_timeout_s", 30.0)
                 or 30.0
             ),
+            migration_completion_waiter=self._wait_for_reparallelization_requests,
         )
         self.reparallelization_executor = ReparallelizationExecutor(
             self.vllm_deployment_adapter.create_workers,
@@ -372,8 +403,35 @@ class RoundRobinRouter(SllmRouter):
                     "allow_stop_before_recreate", False
                 )
             ),
+            wait_for_migration=self.vllm_deployment_adapter.wait_for_migration_completion,
+            migrate_before_create=bool(
+                self.reparallelization_config.get(
+                    "migrate_before_create", False
+                )
+            ),
         )
         return True
+
+    async def _wait_for_reparallelization_requests(
+        self, deployment: VllmDeployment, timeout_s: float
+    ) -> None:
+        """Wait for migrated request retries before closing source NIXL."""
+        adapter = self.vllm_deployment_adapter
+        summary = getattr(adapter, "last_request_migration", None) or {}
+        request_ids = {str(item) for item in summary.get("request_ids", [])}
+        if not request_ids:
+            return
+        deadline = asyncio.get_running_loop().time() + max(0.1, timeout_s)
+        while asyncio.get_running_loop().time() < deadline:
+            async with self.inflight_requests_lock:
+                active = request_ids.intersection(self.inflight_requests)
+            if not active:
+                return
+            await asyncio.sleep(0.1)
+        logger.warning(
+            "Timed out waiting for %d migrated requests before source stop",
+            len(active),
+        )
 
     async def _switch_vllm_deployment(
         self, deployment: VllmDeployment, plan: ParallelPlan
@@ -587,8 +645,15 @@ class RoundRobinRouter(SllmRouter):
         self.reparallelization_worker_nodes = worker_nodes
 
         model_config = {
+            "model": self.model_name,
             "backend": self.backend,
             "num_gpus": self.resource_requirements.get("num_gpus", 1),
+            # Capability negotiation needs the concrete model/runtime
+            # configuration.  Without this field the planner falls back to
+            # the runtime-neutral candidate generator, which intentionally
+            # uses expert_parallel_size=1 and can never select a live EP
+            # shape for a MoE model.
+            "backend_config": dict(self.backend_config),
         }
         decision = plan_dynamic_reparallelization(
             model_name=self.model_name,

@@ -1,0 +1,8 @@
+# Two-container TP2 trace for Qwen1.5-MoE-A2.7B.
+# slot-0 is the source group (GPU 0+1); slot-1 is the target group
+# (GPU 2+3).  Only add/remove/DONE are used; removing slot-0 triggers the
+# migration boundary in the runner.
+{"time_ms": 0, "event": "add", "nodes": ["node-0", "node-1"]}
+{"time_ms": 90000, "event": "remove", "nodes": ["node-0"]}
+{"time_ms": 150000, "event": "add", "nodes": ["node-0"]}
+{"time_ms": 210000, "event": "DONE", "nodes": []}

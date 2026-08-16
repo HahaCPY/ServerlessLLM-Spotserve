@@ -1,0 +1,5 @@
+# Focused same-host trace: start source plus target, remove source once, then
+# finish. It isolates one long-context preemption/migration comparison.
+{"time_ms": 0, "event": "add", "nodes": ["node-0", "node-1", "node-2"]}
+{"time_ms": 60000, "event": "remove", "nodes": ["node-0"]}
+{"time_ms": 90000, "event": "DONE", "nodes": []}

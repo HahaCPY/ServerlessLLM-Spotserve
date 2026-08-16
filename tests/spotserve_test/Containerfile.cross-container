@@ -1,0 +1,9 @@
+FROM docker.io/library/python:3.12-slim
+
+# vLLM's FlashInfer/Triton startup path compiles CUDA extensions.  Keeping
+# these host-toolchain packages in the image makes each simulated node
+# reproducible instead of installing packages after the container starts.
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc g++ ninja-build \
+    && rm -rf /var/lib/apt/lists/*

@@ -36,6 +36,10 @@ from vllm import (
     RequestOutput,
     SamplingParams,
 )
+try:
+    from vllm.sampling_params import RequestOutputKind
+except ImportError:
+    RequestOutputKind = None
 from vllm.inputs import TokensPrompt
 try:
     from vllm.utils import Counter
@@ -205,6 +209,21 @@ class VllmBackend(SllmBackend):
         self.pending_kv_restores: Dict[str, int] = {}
         self._forced_failures_seen = set()
         self.abort_reasons: Dict[str, str] = {}
+        # Test-only pacing lets a live-migration smoke keep a real GPU request
+        # active while a replacement engine is loading.  It is disabled by
+        # default and never changes production behavior.
+        try:
+            self.test_token_delay_s = max(
+                0.0,
+                float(
+                    os.getenv(
+                        "SPOTSERVE_TEST_TOKEN_DELAY_S",
+                        backend_config.get("test_token_delay_s", 0.0),
+                    )
+                ),
+            )
+        except (TypeError, ValueError):
+            self.test_token_delay_s = 0.0
         # if trace_debug is True, request trace will not be deleted after completion
         self.trace_debug = backend_config.get("trace_debug", False)
         self.enforce_eager = backend_config.get("enforce_eager", False)
@@ -512,6 +531,35 @@ class VllmBackend(SllmBackend):
         request_id: str = request_data.pop(
             "request_id", f"chatcmpl-{uuid.uuid4()}"
         )
+        # Test-only observability for deterministic migration experiments.
+        # The private request flag is removed before SamplingParams is built,
+        # so it cannot change production sampling semantics or leak into the
+        # public response unless explicitly requested by a smoke test.
+        return_token_ids = bool(
+            request_data.pop("_spotserve_return_token_ids", False)
+        )
+        request_token_delay_s = request_data.pop(
+            "_spotserve_token_delay_s", self.test_token_delay_s
+        )
+        try:
+            request_token_delay_s = max(0.0, float(request_token_delay_s))
+        except (TypeError, ValueError):
+            request_token_delay_s = self.test_token_delay_s
+        # A replay/restore request already carries the exported prefix as
+        # input_tokens.  Do not apply the synthetic source hold to that retry;
+        # it is only there to create a preemption window on the original
+        # prompt request.
+        if has_input_tokens:
+            request_token_delay_s = 0.0
+        # Keep migration requests genuinely in-flight.  DELTA output prevents
+        # the engine from materializing the full sequence before the planner
+        # exports its KV lease, while leaving normal requests unchanged.
+        if (
+            request_token_delay_s > 0
+            and not has_input_tokens
+            and RequestOutputKind is not None
+        ):
+            request_data.setdefault("output_kind", RequestOutputKind.DELTA)
         forced_failure = self._pop_spotserve_request_controls(
             request_data,
             request_id,
@@ -550,6 +598,16 @@ class VllmBackend(SllmBackend):
                 await self.request_trace.update_status(
                     request_id, response_output
                 )
+                if request_token_delay_s > 0:
+                    # Keep the test-only hold interruptible.  A real abort
+                    # must wake the backend quickly so the router can switch
+                    # traffic instead of waiting for the whole synthetic
+                    # delay during actor shutdown.
+                    remaining = request_token_delay_s
+                    while remaining > 0 and request_id not in self.abort_reasons:
+                        interval = min(0.1, remaining)
+                        await asyncio.sleep(interval)
+                        remaining -= interval
                 if self._forced_failure_ready(forced_failure, response_output):
                     return await self._forced_failure_result(
                         state_request_data, forced_failure, response_output
@@ -589,6 +647,13 @@ class VllmBackend(SllmBackend):
                     else "nixl_kv_attach_empty"
                 ),
             }
+        if return_token_ids:
+            response["_spotserve_token_ids"] = list(
+                final_output.outputs[0].token_ids or []
+            )
+            response["_spotserve_prompt_token_ids"] = list(
+                final_output.prompt_token_ids or []
+            )
         return response
 
     async def _reparallelization_abort_result(
@@ -665,9 +730,20 @@ class VllmBackend(SllmBackend):
             if self.status.value >= BackendStatus.STOPPING.value:
                 return
             self.status = BackendStatus.STOPPING
-        while await self.request_trace.request_count() > 0:
+        deadline = time.monotonic() + max(
+            5.0,
+            float(self.backend_config.get("stop_timeout_s", 30.0) or 30.0),
+        )
+        while (
+            await self.request_trace.request_count() > 0
+            and time.monotonic() < deadline
+        ):
             logger.info("Waiting for all requests to finish")
             await asyncio.sleep(1)
+        if await self.request_trace.request_count() > 0:
+            logger.warning(
+                "Stopping vLLM backend with unfinished requests after timeout"
+            )
         logger.info("All requests finished. Shutting down the backend.")
         await self.shutdown()
 
@@ -745,6 +821,61 @@ class VllmBackend(SllmBackend):
             )
         return metadata
 
+    async def get_request_kv_metadata(
+        self,
+        request_id: str,
+        instance_id: str = "",
+        node_id: str = "",
+    ) -> Dict[str, Any]:
+        """Return one live request's connector metadata.
+
+        The vLLM frontend keeps an external request ID to internal sequence
+        ID map.  Querying that map directly is important during a replan:
+        ``get_all_request_kv_metadata`` can legitimately return an empty
+        list while another output is being coalesced, even though this
+        request still owns live KV blocks.
+        """
+        async with self.status_lock:
+            if self.status != BackendStatus.RUNNING:
+                return {"request_id": request_id, "found": False}
+
+        live = await self._call_runtime_hook(
+            ("get_request_kv_metadata", "get_kv_cache_metadata"),
+            request_id=str(request_id),
+        )
+        if isinstance(live, dict):
+            payload = dict(live)
+            payload.setdefault("request_id", str(request_id))
+            if not payload.get("found", True):
+                return payload
+            return get_vllm_context_metadata(
+                model_name=self.model_name,
+                instance_id=instance_id or self.model_name,
+                node_id=node_id,
+                runtime_metadata={
+                    **payload,
+                    "supports_state_export": await self.supports_state_restore(),
+                    "supports_state_restore": await self.supports_state_restore(),
+                },
+            )
+
+        # Fallback for runtimes exposing only the request trace.  This path is
+        # still useful for token replay, but it is deliberately conservative
+        # about KV capability fields.
+        results = await self.request_trace.return_all_results()
+        for result in results:
+            if not isinstance(result, RequestOutput):
+                continue
+            if str(result.request_id) != str(request_id):
+                continue
+            return get_vllm_context_metadata(
+                model_name=self.model_name,
+                instance_id=instance_id or self.model_name,
+                node_id=node_id,
+                runtime_metadata=await self._request_runtime_metadata(result),
+            )
+        return {"request_id": str(request_id), "found": False}
+
     async def resume_kv_cache(self, request_datas: List[List[int]]) -> None:
         async with self.status_lock:
             if self.status != BackendStatus.RUNNING:
@@ -778,6 +909,34 @@ class VllmBackend(SllmBackend):
             )
             is not None
         )
+
+    async def get_state_restore_diagnostics(self) -> Dict[str, Any]:
+        """Expose the live engine capability probe for smoke-test diagnosis."""
+        advertised = self._runtime_hook("supports_state_restore")
+        exporter = self._runtime_hook(
+            "export_inference_state", "export_kv_cache_state"
+        )
+        restorer = self._runtime_hook(
+            "restore_inference_state", "restore_kv_cache_state"
+        )
+        advertised_value = None
+        advertised_error = None
+        if advertised is not None:
+            try:
+                advertised_value = bool(await _maybe_await(advertised()))
+            except Exception as exc:
+                advertised_error = repr(exc)
+        return {
+            "supports_state_restore": await self.supports_state_restore(),
+            "advertised_support": advertised_value,
+            "advertised_error": advertised_error,
+            "export_hook": getattr(exporter, "__qualname__", repr(exporter))
+            if exporter is not None
+            else None,
+            "restore_hook": getattr(restorer, "__qualname__", repr(restorer))
+            if restorer is not None
+            else None,
+        }
 
     async def export_inference_state(
         self,
@@ -822,6 +981,7 @@ class VllmBackend(SllmBackend):
         if not await self.supports_state_restore():
             return fallback
 
+        export_error = None
         try:
             exported = await self._call_runtime_hook(
                 ("export_inference_state", "export_kv_cache_state"),
@@ -829,9 +989,10 @@ class VllmBackend(SllmBackend):
                 request_data=request_data,
                 runtime_metadata=runtime_metadata,
             )
-        except Exception:
+        except Exception as exc:
             logger.exception("vLLM KV state export failed")
             exported = None
+            export_error = repr(exc)
         if (
             not isinstance(exported, dict)
             or exported.get("supports_restore") is not True
@@ -840,6 +1001,12 @@ class VllmBackend(SllmBackend):
             or not exported["runtime_state"]
         ):
             fallback["metadata"]["reason"] = "vllm_kv_export_failed"
+            if isinstance(exported, dict) and exported.get("error"):
+                fallback["metadata"]["export_error"] = exported["error"]
+            if isinstance(exported, dict) and exported.get("reason"):
+                fallback["metadata"]["export_reason"] = exported["reason"]
+            elif export_error is not None:
+                fallback["metadata"]["export_error"] = export_error
             return fallback
 
         state = dict(fallback)

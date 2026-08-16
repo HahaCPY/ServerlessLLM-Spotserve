@@ -1,0 +1,11 @@
+# Same-host trace for the four-container-capability smoke.
+# The host currently has GPUs 0, 1 and 3 available; slot-2 maps to GPU 3.
+# Times are milliseconds and are accelerated by the runner.  The first add
+# records the initial fleet, then an observer is removed/re-added, the active
+# source is preempted and replaced, and the trace ends with DONE.
+{"time_ms": 0, "event": "add", "nodes": ["slot-0", "slot-1", "slot-2"]}
+{"time_ms": 10000, "event": "remove", "nodes": ["slot-2"]}
+{"time_ms": 20000, "event": "add", "nodes": ["slot-2"]}
+{"time_ms": 30000, "event": "preempt", "nodes": ["slot-0"]}
+{"time_ms": 40000, "event": "add", "nodes": ["slot-0"]}
+{"time_ms": 50000, "event": "DONE", "nodes": []}
