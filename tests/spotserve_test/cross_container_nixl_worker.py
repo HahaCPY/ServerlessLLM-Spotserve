@@ -32,6 +32,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument(
+        "--kv-transfer-mode",
+        choices=("nixl", "none"),
+        default="nixl",
+        help="Use the NIXL connector or run without a KV transfer connector.",
+    )
+    parser.add_argument(
         "--max-model-len",
         type=int,
         default=256,
@@ -53,7 +59,7 @@ async def main() -> None:
     from vllm.v1.engine.async_llm import AsyncLLM
 
     role = "kv_producer" if args.role == "source" else "kv_consumer"
-    engine_args = AsyncEngineArgs(
+    engine_kwargs = dict(
         model=args.model,
         tensor_parallel_size=max(int(args.tensor_parallel_size), 1),
         enforce_eager=True,
@@ -66,12 +72,14 @@ async def main() -> None:
         # container.  Triton is still a real CUDA execution backend and
         # keeps the cross-container test focused on NIXL transport.
         moe_backend="triton",
-        kv_transfer_config=KVTransferConfig(
+    )
+    if args.kv_transfer_mode == "nixl":
+        engine_kwargs["kv_transfer_config"] = KVTransferConfig(
             kv_connector="NixlConnector",
             kv_role=role,
             kv_buffer_device="cuda",
-        ),
-    )
+        )
+    engine_args = AsyncEngineArgs(**engine_kwargs)
     engine = AsyncLLM.from_engine_args(engine_args)
     conn = None
     generation_tasks: dict[str, asyncio.Task] = {}
