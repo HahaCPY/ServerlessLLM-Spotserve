@@ -132,6 +132,19 @@ class FakeRouterRestoreBackend:
     async def supports_state_restore(self):
         return True
 
+    async def get_runtime_metadata(self, instance_id="", node_id=""):
+        return {
+            "instance_id": instance_id,
+            "node_id": node_id,
+            "backend": "vllm",
+            "model_name": "test-model",
+            "model_resource_profile": {
+                "tensor_parallel_size": 1,
+                "pipeline_parallel_size": 1,
+                "expert_parallel_enabled": False,
+            },
+        }
+
     async def restore_inference_state(self, state, request_data=None):
         self.restore_calls += 1
         return {
@@ -412,6 +425,46 @@ async def test_router_records_reparallelization_decision(tmp_path):
     ]
     assert rows[-1]["type"] == "reparallelization"
     assert rows[-1]["parallel_plan"] == replanning["parallel_plan"]
+
+
+@pytest.mark.asyncio
+async def test_router_replans_when_capacity_is_added_mid_run(tmp_path):
+    metrics_path = tmp_path / "router-add-metrics.jsonl"
+    router = RoundRobinRouter(
+        model_name="test-model",
+        resource_requirements={"num_cpus": 1, "num_gpus": 1},
+        backend="dummy",
+        backend_config={},
+        router_config={
+            "metrics_path": str(metrics_path),
+            "enable_reparallelization": True,
+            "reparallelization_config": {
+                "model_gpu_requirement": 1,
+                "target_replica_gpus": 2,
+                "max_tensor_parallel_size": 2,
+                "synthetic_worker_nodes": {
+                    "node-0": {
+                        "free_gpu": 1,
+                        "total_gpu": 1,
+                        "state": "ready",
+                    }
+                },
+            },
+        },
+    )
+
+    result = await router.handle_add(
+        "node-1", {"free_gpu": 1, "total_gpu": 1}
+    )
+
+    replanning = result["reparallelization"]
+    assert result["event"] == "add"
+    assert replanning["action"] == "reparallelize"
+    assert replanning["parallel_plan"]["num_gpus"] == 2
+    assert replanning["parallel_plan"]["target_nodes"] == [
+        "node-0",
+        "node-1",
+    ]
 
 
 @pytest.mark.asyncio
@@ -736,6 +789,73 @@ async def test_router_stateful_restore_end_to_end_records_no_fallback(tmp_path):
     assert request_row["state_restore_attempts"] == 1
     assert request_row["state_restore_successes"] == 1
     assert request_row["state_restore_fallback"] is False
+
+
+@pytest.mark.asyncio
+async def test_router_planner_reserves_compatible_target_before_state_restore(
+    tmp_path,
+):
+    metrics_path = tmp_path / "planner-state-recovery.jsonl"
+    router = RoundRobinRouter(
+        model_name="test-model",
+        resource_requirements={"num_cpus": 1, "num_gpus": 0},
+        backend="vllm",
+        backend_config={},
+        router_config={
+            "metrics_path": str(metrics_path),
+            "recovery_policy": "stateful_recovery",
+            "max_retries": 1,
+            "enable_stateful_target_planner": True,
+        },
+    )
+    source_backend = FakeRouterRestoreBackend(source=True)
+    target_backend = FakeRouterRestoreBackend()
+    source = InstanceHandle(
+        instance_id="instance-source",
+        max_queue_length=1,
+        num_gpu=0,
+        backend_instance=source_backend,
+    )
+    target = InstanceHandle(
+        instance_id="instance-target",
+        max_queue_length=1,
+        num_gpu=0,
+        backend_instance=target_backend,
+    )
+    await source.mark_ready(node_id="node-shared")
+    await target.mark_ready(node_id="node-shared")
+    router.ready_inference_instances[source.instance_id] = source
+    router.ready_inference_instances[target.instance_id] = target
+
+    allocations = iter([source])
+
+    async def allocate_source_only():
+        try:
+            instance = next(allocations)
+        except StopIteration as exc:
+            raise AssertionError(
+                "stateful recovery fell back to round-robin allocation"
+            ) from exc
+        return instance.instance_id, instance
+
+    router._allocate_instance_for_request = allocate_source_only
+    router.running = True
+    result = await router.inference(
+        {"request_id": "req-planner-restore", "max_tokens": 2},
+        "generate",
+    )
+
+    assert result.get("usage", {}).get("completion_tokens") == 2, result
+    assert target_backend.restore_calls == 1
+    rows = [
+        json.loads(line)
+        for line in metrics_path.read_text(encoding="utf-8").splitlines()
+    ]
+    state_row = next(row for row in rows if row["type"] == "state_recovery")
+    assert state_row["target_instance_id"] == "instance-target"
+    assert state_row["reason"] == (
+        "planner_selected_compatible_ready_target"
+    )
 
 
 @pytest.mark.asyncio

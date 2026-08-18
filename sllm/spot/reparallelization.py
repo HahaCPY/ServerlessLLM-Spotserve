@@ -135,6 +135,7 @@ def apply_spot_event_to_worker_nodes(
     worker_nodes: Mapping[str, Mapping[str, Any]],
     event: str,
     node_id: Optional[str] = None,
+    node_info: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     nodes = {str(key): dict(value) for key, value in worker_nodes.items()}
     if node_id is None:
@@ -148,7 +149,19 @@ def apply_spot_event_to_worker_nodes(
             "total_gpu": 0,
         },
     )
-    if event == "preempt":
+    if node_info:
+        # A capacity-add trace may carry the newly discovered GPU count and
+        # address.  Preserve those fields while changing only the lifecycle
+        # state below.
+        node.update(dict(node_info))
+    if event == "add":
+        node.setdefault("free_gpu", node.get("total_gpu", 0))
+        node.setdefault("total_gpu", node.get("free_gpu", 0))
+        node["state"] = READY
+    elif event == "remove":
+        node["state"] = DEAD
+        node["free_gpu"] = 0
+    elif event == "preempt":
         node["state"] = PREEMPTING
     elif event == "recover":
         node["state"] = READY

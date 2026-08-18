@@ -283,6 +283,33 @@ class FcfsScheduler(SllmScheduler):
     async def mark_node_dead(self, node_id: str):
         return await self._mark_node_state(node_id, NodeState.DEAD)
 
+    async def add_worker_node(
+        self, node_id: str, node_info: Optional[Mapping[str, Any]] = None
+    ):
+        """Register capacity discovered while the service is running."""
+        async with self.metadata_lock:
+            previous = dict(self.worker_nodes.get(str(node_id), {}))
+            updated = {
+                **previous,
+                **dict(node_info or {}),
+                "state": NodeState.READY.value,
+            }
+            updated.setdefault("ray_node_id", None)
+            updated.setdefault("address", None)
+            updated.setdefault("free_gpu", updated.get("total_gpu", 0))
+            updated.setdefault("total_gpu", updated.get("free_gpu", 0))
+            self.worker_nodes[str(node_id)] = self._ensure_node_metadata(
+                updated, node_id=str(node_id)
+            )
+            return {
+                "node_id": str(node_id),
+                "node": dict(self.worker_nodes[str(node_id)]),
+            }
+
+    async def remove_worker_node(self, node_id: str):
+        """Keep a removed node in metadata as DEAD for conservative replans."""
+        return await self._mark_node_state(node_id, NodeState.DEAD)
+
     async def update_node_risk(self, node_id: str, risk_metadata: Mapping):
         async with self.metadata_lock:
             if node_id not in self.worker_nodes:

@@ -27,7 +27,8 @@ Implemented:
 - GPU availability summary by node state
 - candidate TP / DP / PP configuration generation
 - target-node selection for the selected plan
-- router-side replanning after `preempt`, `recover`, and `dead` events
+- router-side replanning after `add`, `remove`, `preempt`, `recover`, and
+  `dead` events
 - JSONL replanning metrics
 - benchmark summary fields for replanning decisions and execution status
 - vLLM deployment adapter path for applying a selected `ParallelPlan`
@@ -38,8 +39,10 @@ Out of scope:
 - in-place vLLM internal repartitioning
 - MoE expert placement optimization
 - CUDA kernels
-- KV cache migration during V6 replan
-- request-state migration during V6 replan
+- V6 itself does not implement in-place KV repartitioning; the V8 stateful
+  recovery path supplies compatible KV restore when available
+- V6 itself does not define a second request-state format; the router's
+  stateful recovery path carries the live request across the deployment switch
 
 ## Shared Interface
 
@@ -150,10 +153,19 @@ Router replanning is opt-in:
 When enabled, the router replans after:
 
 ```text
+handle_add()
+handle_remove()
 handle_preemption()
 handle_recover()
 handle_dead()
 ```
+
+The plan is not fixed for the lifetime of a request. A capacity event runs the
+planner again. If the selected `ParallelPlan` changes shape or target
+placement, the vLLM executor creates the new ready deployment, exports and
+aborts tracked requests, switches traffic, and lets those requests retry on
+the new deployment. If the selected plan is unchanged, the current workers
+and in-flight requests stay in place.
 
 The event handler still returns the original instance-state result, but now
 also includes:

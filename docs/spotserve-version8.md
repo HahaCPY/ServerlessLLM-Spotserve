@@ -223,10 +223,20 @@ Configure:
 {
   "router_config": {
     "recovery_policy": "stateful_recovery",
-    "max_retries": 2
+    "max_retries": 2,
+    "enable_stateful_target_planner": true
   }
 }
 ```
+
+Before a stateful retry, the router now asks the recovery target planner to
+reserve an already-ready target whose model, TP/PP/EP and KV-cache metadata are
+compatible with the exported state.  The selected target is then passed to
+`restore_inference_state`; the planner does not create an engine or change the
+parallel shape.  If no compatible target is available, the normal allocator is
+used and the existing token-replay fallback remains explicit.  Changing TP/EP
+still belongs to the separate re-parallelization path and is not claimed as a
+direct NIXL restore.
 
 When a request fails:
 

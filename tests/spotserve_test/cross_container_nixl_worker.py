@@ -30,6 +30,12 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Optional vLLM CPU weight offload for models larger than one GPU.",
     )
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.08,
+        help="Fraction of each GPU memory available to the vLLM executor.",
+    )
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument(
         "--kv-transfer-mode",
@@ -63,7 +69,9 @@ async def main() -> None:
         model=args.model,
         tensor_parallel_size=max(int(args.tensor_parallel_size), 1),
         enforce_eager=True,
-        gpu_memory_utilization=0.08,
+        gpu_memory_utilization=min(
+            max(float(args.gpu_memory_utilization), 0.01), 0.99
+        ),
         cpu_offload_gb=max(float(args.cpu_offload_gb), 0.0),
         max_model_len=max(int(args.max_model_len), 256),
         max_num_seqs=2,
@@ -83,6 +91,7 @@ async def main() -> None:
     engine = AsyncLLM.from_engine_args(engine_args)
     conn = None
     generation_tasks: dict[str, asyncio.Task] = {}
+    pause_events: dict[str, asyncio.Event] = {}
     send_lock = asyncio.Lock()
 
     async def send(payload: dict) -> None:
@@ -90,10 +99,13 @@ async def main() -> None:
             conn.send(payload)
 
     async def generate(request_id: str, token_ids: list[int]) -> None:
+        pause_event = asyncio.Event()
+        pause_events[request_id] = pause_event
         try:
             params = SamplingParams(
                 temperature=0,
                 max_tokens=256,
+                min_tokens=256,
                 ignore_eos=True,
             )
             generator = engine.generate(
@@ -122,6 +134,11 @@ async def main() -> None:
                             "simulated": True,
                         }
                     )
+                    # Keep the request genuinely active until the host has
+                    # exported/aborted it (source) or explicitly resumes it
+                    # (target).  Without this barrier a short prompt can
+                    # finish before the control plane reaches export().
+                    await pause_event.wait()
                 if args.token_delay_s > 0:
                     await asyncio.sleep(args.token_delay_s)
         except asyncio.CancelledError:
@@ -134,6 +151,8 @@ async def main() -> None:
                     "traceback": traceback.format_exc(),
                 }
             )
+        finally:
+            pause_events.pop(request_id, None)
 
     try:
         conn = await asyncio.to_thread(
@@ -162,9 +181,35 @@ async def main() -> None:
                 await send({"event": "generate_started", "request_id": request_id})
             elif op == "metadata":
                 result = await engine.get_request_kv_metadata(request_id)
+                if not result.get("found", False):
+                    # AsyncLLM keeps an external->internal request mapping in
+                    # the output processor.  A request can still be live in
+                    # EngineCore while that mapping is briefly unavailable;
+                    # expose the live sequence id so export can use it.
+                    for candidate in await engine.get_all_request_kv_metadata():
+                        if candidate.get("found", False):
+                            result = candidate
+                            break
                 await send({"event": "metadata", "result": result})
             elif op == "export":
                 result = await engine.export_inference_state(request_id)
+                if not result.get("supports_restore", False):
+                    live = await engine.get_all_request_kv_metadata()
+                    for candidate in live:
+                        if not candidate.get("found", False):
+                            continue
+                        sequence_id = candidate.get("sequence_id")
+                        if not sequence_id:
+                            continue
+                        result = await engine.export_inference_state(
+                            str(sequence_id)
+                        )
+                        if result.get("supports_restore", False):
+                            # Preserve the host-visible request id while the
+                            # connector payload retains its internal source
+                            # sequence id for NIXL lookup.
+                            result["request_id"] = request_id
+                            break
                 await send({"event": "export", "result": result})
             elif op == "restore":
                 result = engine.restore_inference_state(
@@ -172,8 +217,12 @@ async def main() -> None:
                 )
                 await send({"event": "restore", "result": result})
             elif op == "abort":
+                pause_events.get(request_id, asyncio.Event()).set()
                 await engine.abort(request_id)
                 await send({"event": "aborted", "request_id": request_id})
+            elif op == "resume":
+                pause_events.get(request_id, asyncio.Event()).set()
+                await send({"event": "resumed", "request_id": request_id})
             elif op == "shutdown":
                 break
             else:

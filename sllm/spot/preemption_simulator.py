@@ -94,6 +94,17 @@ async def _resolve_instance_id(event: SpotEvent):
 
 async def _dispatch_event(controller, event: SpotEvent):
     instance_id = await _resolve_instance_id(event)
+    if event.event == "add":
+        return await controller.handle_add.remote(
+            node_id=event.node_id,
+            node_info=event.node_info or {},
+            model_name=event.model_name,
+        )
+    if event.event == "remove":
+        return await controller.handle_remove.remote(
+            node_id=event.node_id,
+            model_name=event.model_name,
+        )
     if event.event == "preempt":
         return await controller.handle_preemption.remote(
             node_id=event.node_id,

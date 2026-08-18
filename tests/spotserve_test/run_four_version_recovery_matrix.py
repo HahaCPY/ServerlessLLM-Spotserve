@@ -30,6 +30,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-model-len", type=int, default=512)
     parser.add_argument("--trace-speedup", type=float, default=1000.0)
     parser.add_argument("--token-delay-s", type=float, default=0.05)
+    parser.add_argument("--cpu-offload-gb", type=float, default=0.0)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.08)
     parser.add_argument("--timeout-s", type=float, default=360.0)
     parser.add_argument("--output", required=True)
     return parser.parse_args()
@@ -57,6 +59,8 @@ def run_cell(args: argparse.Namespace, mode: str, prompt_tokens: int,
         "--max-model-len", str(args.max_model_len),
         "--trace-speedup", str(args.trace_speedup),
         "--token-delay-s", str(args.token_delay_s),
+        "--cpu-offload-gb", str(args.cpu_offload_gb),
+        "--gpu-memory-utilization", str(args.gpu_memory_utilization),
         "--timeout-s", str(args.timeout_s),
         "--output", str(cell_path),
     ]

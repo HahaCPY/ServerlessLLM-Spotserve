@@ -43,3 +43,20 @@ def test_load_spot_trace_rejects_unknown_event(tmp_path):
 
     with pytest.raises(ValueError, match="Unsupported spot event"):
         load_spot_trace(trace_path)
+
+
+def test_load_spot_trace_accepts_capacity_events(tmp_path):
+    trace_path = tmp_path / "capacity-trace.jsonl"
+    trace_path.write_text(
+        '\n'.join([
+            '{"time": 0, "event": "add", "node_id": "node-0", '
+            '"node_info": {"total_gpu": 2, "free_gpu": 2}}',
+            '{"time": 1, "event": "remove", "node_id": "node-0"}',
+        ]),
+        encoding="utf-8",
+    )
+
+    events = load_spot_trace(trace_path)
+
+    assert [event.event for event in events] == ["add", "remove"]
+    assert events[0].node_info == {"total_gpu": 2, "free_gpu": 2}

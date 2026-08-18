@@ -333,6 +333,74 @@ class SllmController:
                 results[target_model] = {"error": str(e)}
         return results
 
+    async def handle_add(
+        self,
+        node_id: str,
+        node_info: Optional[Mapping] = None,
+        model_name: Optional[str] = None,
+    ):
+        """Tell every selected router that new capacity is available."""
+        try:
+            await self.scheduler.add_worker_node.remote(
+                node_id, dict(node_info or {})
+            )
+        except Exception as e:
+            logger.error(f"Failed to add scheduler node {node_id}: {e}")
+
+        async with self.metadata_lock:
+            if model_name is not None:
+                if model_name not in self.request_routers:
+                    raise ValueError(f"Model {model_name} not found")
+                target_routers = {model_name: self.request_routers[model_name]}
+            else:
+                target_routers = dict(self.request_routers)
+
+        results = {}
+        for target_model, request_router in target_routers.items():
+            try:
+                results[target_model] = await request_router.handle_add.remote(
+                    node_id=node_id,
+                    node_info=dict(node_info or {}),
+                )
+            except Exception as e:
+                logger.error(
+                    f"Failed to handle add for model {target_model}: {e}"
+                )
+                results[target_model] = {"error": str(e)}
+        return results
+
+    async def handle_remove(
+        self,
+        node_id: str,
+        model_name: Optional[str] = None,
+    ):
+        """Remove capacity and migrate live requests from that node."""
+        try:
+            await self.scheduler.remove_worker_node.remote(node_id)
+        except Exception as e:
+            logger.error(f"Failed to remove scheduler node {node_id}: {e}")
+
+        async with self.metadata_lock:
+            if model_name is not None:
+                if model_name not in self.request_routers:
+                    raise ValueError(f"Model {model_name} not found")
+                target_routers = {model_name: self.request_routers[model_name]}
+            else:
+                target_routers = dict(self.request_routers)
+
+        results = {}
+        for target_model, request_router in target_routers.items():
+            try:
+                results[target_model] = await request_router.handle_remove.remote(
+                    node_id=node_id
+                )
+            except Exception as e:
+                logger.error(
+                    f"Failed to handle remove for model {target_model}: {e}"
+                )
+                results[target_model] = {"error": str(e)}
+        return results
+
     async def handle_instance_dead(
         self,
         node_id: Optional[str] = None,

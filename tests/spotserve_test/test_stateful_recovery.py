@@ -4,6 +4,7 @@ from sllm.backends.dummy_backend import DummyBackend
 from sllm.spot.metrics import make_state_recovery_event
 from sllm.spot.stateful_recovery import (
     InferenceState,
+    plan_compatible_state_target,
     plan_stateful_recovery,
 )
 
@@ -57,6 +58,86 @@ def test_stateful_recovery_plan_falls_back_without_backend_restore():
     assert decision.action == "fallback_token_replay"
     assert decision.fallback_used is True
     assert decision.recovered_tokens == 3
+
+
+def test_planner_selects_only_compatible_ready_target():
+    state = InferenceState.from_tokens(
+        tokens=[1, 2, 3],
+        request_id="req-planner",
+        instance_id="source",
+        node_id="node-0",
+        backend="vllm",
+        model_name="model",
+        state_kind="vllm_kv_snapshot",
+        supports_restore=True,
+        metadata={
+            "tensor_parallel_size": 1,
+            "pipeline_parallel_size": 1,
+            "cache_block_size": 16,
+            "cache_dtype": "float16",
+            "can_restore_same_node": True,
+        },
+    )
+    decision = plan_compatible_state_target(
+        state,
+        [
+            {
+                "instance_id": "tp2-target",
+                "node_id": "node-0",
+                "ready": True,
+                "supports_state_restore": True,
+                "backend": "vllm",
+                "model_name": "model",
+                "tensor_parallel_size": 2,
+                "pipeline_parallel_size": 1,
+                "cache_block_size": 16,
+            },
+            {
+                "instance_id": "tp1-target",
+                "node_id": "node-0",
+                "ready": True,
+                "supports_state_restore": True,
+                "backend": "vllm",
+                "model_name": "model",
+                "tensor_parallel_size": 1,
+                "pipeline_parallel_size": 1,
+                "cache_block_size": 16,
+            },
+        ],
+        source_instance_id="source",
+    )
+
+    assert decision["action"] == "restore_state"
+    assert decision["target_instance_id"] == "tp1-target"
+
+
+def test_planner_rejects_cross_node_without_capability():
+    state = InferenceState.from_tokens(
+        tokens=[1],
+        request_id="req-cross-node",
+        instance_id="source",
+        node_id="node-0",
+        backend="vllm",
+        model_name="model",
+        state_kind="vllm_kv_snapshot",
+        supports_restore=True,
+        metadata={"can_restore_cross_node": False},
+    )
+    decision = plan_compatible_state_target(
+        state,
+        [{
+            "instance_id": "target",
+            "node_id": "node-1",
+            "ready": True,
+            "supports_state_restore": True,
+            "backend": "vllm",
+            "model_name": "model",
+        }],
+        source_instance_id="source",
+    )
+
+    assert decision["action"] == "fallback_token_replay"
+    assert decision["reason"] == "no_compatible_ready_target"
 
 
 def test_state_recovery_metric_contains_restore_summary():

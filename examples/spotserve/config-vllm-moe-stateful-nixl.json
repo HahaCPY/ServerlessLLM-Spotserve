@@ -33,6 +33,14 @@
   "router_config": {
     "recovery_policy": "stateful_recovery",
     "max_retries": 2,
+    "enable_stateful_target_planner": true,
+    "enable_reparallelization": true,
+    "reparallelization_config": {
+      "target_replica_gpus": 4,
+      "max_tensor_parallel_size": 4,
+      "drain_timeout_s": 30,
+      "migrate_before_create": false
+    },
     "count_preempting_toward_capacity": true,
     "metrics_path": "/tmp/spotserve-work/results/spotserve_vllm_moe/vllm-moe-stateful-nixl-router.jsonl"
   }

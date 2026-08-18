@@ -23,7 +23,7 @@ import os
 import time
 import uuid
 from dataclasses import replace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import ray
 
@@ -57,6 +57,7 @@ from sllm.spot.vllm_deployment_adapter import (
 )
 from sllm.spot.stateful_recovery import (
     InferenceState,
+    plan_compatible_state_target,
     plan_stateful_recovery,
 )
 
@@ -134,6 +135,12 @@ class RoundRobinRouter(SllmRouter):
                     ),
                 ),
             )
+        )
+        # Stateful recovery first asks the planner for an already-ready,
+        # cache-compatible target. It never changes TP/PP/EP or creates an
+        # engine; those actions remain the explicit re-parallelization path.
+        self.enable_stateful_target_planner = bool(
+            router_config.get("enable_stateful_target_planner", True)
         )
         synthetic_worker_nodes = self.reparallelization_config.get(
             "synthetic_worker_nodes", {}
@@ -630,17 +637,34 @@ class RoundRobinRouter(SllmRouter):
         node_id: Optional[str],
         instance_id: Optional[str],
         matches: List[InstanceHandle],
+        worker_node_updates: Optional[Mapping[str, Mapping[str, Any]]] = None,
     ):
         if not self.enable_reparallelization:
             return None
 
         worker_nodes = await self._snapshot_reparallelization_worker_nodes()
+        normalized_updates = {
+            str(update_node_id): dict(update)
+            for update_node_id, update in (worker_node_updates or {}).items()
+        }
+        for update_node_id, update in normalized_updates.items():
+            current = dict(worker_nodes.get(update_node_id, {}))
+            current.update(dict(update))
+            worker_nodes[update_node_id] = current
         target_node_ids = self._spot_target_node_ids(node_id, matches)
         for target_node_id in target_node_ids:
             worker_nodes = apply_spot_event_to_worker_nodes(
                 worker_nodes,
                 event,
                 target_node_id,
+                node_info=normalized_updates.get(target_node_id),
+            )
+        if event == "add" and node_id is not None and not target_node_ids:
+            worker_nodes = apply_spot_event_to_worker_nodes(
+                worker_nodes,
+                event,
+                node_id,
+                node_info=normalized_updates.get(node_id),
             )
         self.reparallelization_worker_nodes = worker_nodes
 
@@ -665,6 +689,26 @@ class RoundRobinRouter(SllmRouter):
             instance_id=instance_id,
             backend=self.backend,
         )
+        selected_plan = decision.get("parallel_plan")
+        active_deployment = self._vllm_active_deployment()
+        if (
+            decision.get("action") == "reparallelize"
+            and selected_plan is not None
+            and active_deployment is not None
+            and self._parallel_plans_match(
+                active_deployment.plan,
+                ParallelPlan.from_dict(selected_plan),
+            )
+        ):
+            # A capacity event does not automatically imply a deployment
+            # change.  Keep the current engine and in-flight requests alive
+            # when the newly selected plan is identical.
+            decision["action"] = "unchanged"
+            decision["execution"] = {
+                "status": "unchanged",
+                "parallel_plan": selected_plan,
+                "reason": "planner_selected_existing_plan",
+            }
         if decision.get("action") == "reparallelize":
             if self._ensure_vllm_reparallelization_adapter():
                 try:
@@ -711,6 +755,23 @@ class RoundRobinRouter(SllmRouter):
             f"Reparallelization decision for {self.model_name}: {decision}"
         )
         return decision
+
+    @staticmethod
+    def _parallel_plans_match(
+        left: ParallelPlan, right: ParallelPlan
+    ) -> bool:
+        """Compare deployment shape and placement, ignoring replan reason."""
+        return (
+            left.model_name == right.model_name
+            and left.backend == right.backend
+            and left.tensor_parallel_size == right.tensor_parallel_size
+            and left.pipeline_parallel_size == right.pipeline_parallel_size
+            and left.data_parallel_size == right.data_parallel_size
+            and left.expert_parallel_size == right.expert_parallel_size
+            and left.num_replicas == right.num_replicas
+            and left.num_gpus == right.num_gpus
+            and sorted(left.target_nodes) == sorted(right.target_nodes)
+        )
 
     async def _set_instance_state(
         self, instance: InstanceHandle, state: InstanceState, reason: str
@@ -1361,6 +1422,64 @@ class RoundRobinRouter(SllmRouter):
     async def mark_instance_recovered(self, instance_id: str):
         return await self.handle_recover(instance_id=instance_id)
 
+    async def handle_add(
+        self,
+        node_id: str,
+        node_info: Optional[Mapping[str, Any]] = None,
+    ):
+        """Handle a newly available worker while requests are running.
+
+        Adding capacity can change the selected TP/DP/EP plan.  The planner
+        is therefore rerun immediately; if the selected shape or placement
+        changes, the deployment executor creates the new target and migrates
+        tracked requests before switching traffic.
+        """
+        normalized_node_id = str(node_id)
+        updates = {
+            normalized_node_id: {"state": READY, **dict(node_info or {})}
+        }
+        replanning = await self._replan_after_spot_event(
+            event="add",
+            node_id=normalized_node_id,
+            instance_id=None,
+            matches=[],
+            worker_node_updates=updates,
+        )
+        return {
+            "model": self.model_name,
+            "event": "add",
+            "node_id": normalized_node_id,
+            "reparallelization": replanning,
+        }
+
+    async def handle_remove(self, node_id: str):
+        """Remove a worker node and migrate any live requests from it."""
+        matches = await self._matching_inference_instances(node_id=node_id)
+        marked_instances = []
+        for instance in matches:
+            await self._capture_current_tokens(instance)
+            await self._set_instance_state(
+                instance, InstanceState.DEAD, reason="trace_remove"
+            )
+            marked_instances.append(instance.instance_id)
+        replanning = await self._replan_after_spot_event(
+            event="remove",
+            node_id=str(node_id),
+            instance_id=None,
+            matches=matches,
+        )
+        context_migration = await self._plan_context_migration_after_spot_event(
+            event="remove",
+            matches=matches,
+        )
+        return {
+            "model": self.model_name,
+            "event": "remove",
+            "instances": marked_instances,
+            "reparallelization": replanning,
+            "context_migration": context_migration,
+        }
+
     async def handle_dead(
         self,
         node_id: Optional[str] = None,
@@ -1505,6 +1624,102 @@ class RoundRobinRouter(SllmRouter):
             )
             return False
 
+    async def _plan_stateful_recovery_target(
+        self,
+        state: InferenceState,
+        source_instance_id: str,
+    ) -> Tuple[Optional[Tuple[str, InstanceHandle]], Dict[str, Any]]:
+        """Select and reserve a compatible READY target before retry.
+
+        This is the executor boundary for the first planner-integrated NIXL
+        path.  The planner only selects an existing target; it never changes
+        the parallel shape or starts an engine.  If no target is provably
+        usable, normal allocation is left to the caller and stateful recovery
+        can fall back to token replay.
+        """
+        if not self.enable_stateful_target_planner:
+            return None, {
+                "action": "fallback_token_replay",
+                "target_instance_id": None,
+                "reason": "stateful_target_planner_disabled",
+                "candidates": [],
+            }
+
+        async with self.instance_management_lock:
+            instances = list(self.ready_inference_instances.values())
+
+        candidates: List[Dict[str, Any]] = []
+        instance_by_id: Dict[str, InstanceHandle] = {}
+        for instance in instances:
+            if instance.instance_id == source_instance_id:
+                continue
+            if not await instance.can_accept_request():
+                continue
+            if instance.backend_instance is None:
+                continue
+            supports_restore = await self._backend_supports_state_restore(
+                instance
+            )
+            if not supports_restore:
+                continue
+
+            candidate: Dict[str, Any] = {
+                "instance_id": instance.instance_id,
+                "node_id": instance.node_id or "",
+                "ready": (
+                    instance.ready and instance.state == InstanceState.READY
+                ),
+                "supports_state_restore": True,
+                "concurrency": instance.concurrency,
+                "backend": state.backend,
+                "model_name": state.model_name or self.model_name,
+            }
+            get_runtime_metadata = getattr(
+                instance.backend_instance, "get_runtime_metadata", None
+            )
+            if get_runtime_metadata is None:
+                # A vLLM target without a runtime probe cannot prove that its
+                # TP/PP/EP and KV layout match the exported state.
+                continue
+            try:
+                runtime_metadata = await self._call_backend_method(
+                    instance.backend_instance,
+                    "get_runtime_metadata",
+                    instance_id=instance.instance_id,
+                    node_id=instance.node_id or "",
+                )
+                if not isinstance(runtime_metadata, dict):
+                    continue
+                candidate.update(runtime_metadata)
+            except Exception:
+                logger.info(
+                    "Could not read runtime metadata from recovery target %s",
+                    instance.instance_id,
+                    exc_info=True,
+                )
+                continue
+            candidates.append(candidate)
+            instance_by_id[instance.instance_id] = instance
+
+        decision = plan_compatible_state_target(
+            state=state,
+            candidates=candidates,
+            source_instance_id=source_instance_id,
+        )
+        target_id = decision.get("target_instance_id")
+        if not target_id:
+            return None, decision
+        target = instance_by_id.get(str(target_id))
+        if target is None or not await target.add_requests(1):
+            decision = {
+                **decision,
+                "action": "fallback_token_replay",
+                "target_instance_id": None,
+                "reason": "target_became_busy_before_reservation",
+            }
+            return None, decision
+        return (target.instance_id, target), decision
+
     async def _restore_inference_state(
         self,
         instance: InstanceHandle,
@@ -1537,6 +1752,7 @@ class RoundRobinRouter(SllmRouter):
         target_instance: InstanceHandle,
         state: Optional[InferenceState],
         request_data: dict,
+        target_selection: Optional[Mapping[str, Any]] = None,
     ) -> Tuple[
         Optional[InferenceState],
         Optional[List[List[int]]],
@@ -1551,8 +1767,12 @@ class RoundRobinRouter(SllmRouter):
         if state is None:
             return None, None, counters, False
 
-        restore_supported = await self._backend_supports_state_restore(
-            target_instance
+        planner_allows_restore = (
+            target_selection is None
+            or target_selection.get("action") == "restore_state"
+        )
+        restore_supported = planner_allows_restore and await (
+            self._backend_supports_state_restore(target_instance)
         )
         decision = plan_stateful_recovery(
             request_id=request_id,
@@ -1560,6 +1780,11 @@ class RoundRobinRouter(SllmRouter):
             target_instance_id=target_instance.instance_id,
             state=state,
             restore_supported=restore_supported,
+            reason=str(
+                (target_selection or {}).get(
+                    "reason", "stateful_recovery"
+                )
+            ),
         )
         self._emit_metric(
             make_state_recovery_event(
@@ -1725,11 +1950,36 @@ class RoundRobinRouter(SllmRouter):
         try:
             while True:
                 instance = None
+                target_selection: Optional[Dict[str, Any]] = None
                 attempts += 1
                 try:
-                    instance_id, instance = (
-                        await self._allocate_instance_for_request()
-                    )
+                    if (
+                        recovery_state is not None
+                        and self.enable_stateful_target_planner
+                        and (
+                            self.recovery_policy
+                            == RecoveryPolicy.STATEFUL_RECOVERY
+                            or force_state_recovery
+                        )
+                    ):
+                        planned_target, target_selection = (
+                            await self._plan_stateful_recovery_target(
+                                state=recovery_state,
+                                source_instance_id=(
+                                    recovery_state_source_instance_id
+                                ),
+                            )
+                        )
+                        if planned_target is not None:
+                            instance_id, instance = planned_target
+                        else:
+                            instance_id, instance = (
+                                await self._allocate_instance_for_request()
+                            )
+                    else:
+                        instance_id, instance = (
+                            await self._allocate_instance_for_request()
+                        )
                     assigned_instances.append(instance_id)
                     inflight = await self._track_inflight_request(
                         request_id,
@@ -1763,6 +2013,7 @@ class RoundRobinRouter(SllmRouter):
                             target_instance=instance,
                             state=recovery_state,
                             request_data=request_data,
+                            target_selection=target_selection,
                         )
                         state_restore_attempts += state_counters[
                             "state_restore_attempts"

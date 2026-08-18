@@ -105,3 +105,127 @@ Rerouting 平均完整 recovery 為 21.686 秒，Modified 為 21.607 秒，只�
 ## 限制與下一步
 
 這是同一主機上的多 container 實驗，不是實體跨節點；GPU2 被占用，所以使用 0/1/3。每個 cell 只有一個長 context request、一次重複，且只觀察一次 preemption 和一個續接 token，因此這不是 production throughput benchmark。下一步應在可用 GPU 主機上增加 20 次以上重複、8 個同時長 request、隨機 remove/add trace，並記錄 p50/p95 recovery latency、throughput、fallback、完整 token sequence 一致性；若要宣稱跨節點，還需另外以真實不同 node/NIXL transport 驗證。
+
+## 較大模型追測設定
+
+模型庫目前沒有名稱完全為 `Qwen2.7B` 的模型；可用且最接近的是
+`/work/spotserve-models/Qwen1.5-MoE-A2.7B`。它的 checkpoint 約 27 GB，雖然
+active parameter 標示為 2.7B，實際載入時不能把它當成 tiny model。
+
+新增 trace：
+`examples/spotserve/spot_trace_qwen15_moe_a27b_four_version_add_remove.jsonl`
+
+這份 trace 只使用目前三張可配置的 GPU slot（0、1、3），instance 數量依序為
+`3 → 2 → 3 → 2 → 3 → 2 → 3`，最後移除 `node-0` 作為 source preemption
+點，並保留既有 target 與 spare 的語意。可用下列命令啟動單一四版本 cell：
+
+```bash
+PYTHONPATH=tests/spotserve_test \
+python tests/spotserve_test/run_four_version_recovery_smoke.py \
+  --model /work/spotserve-models/Qwen1.5-MoE-A2.7B \
+  --mode modified \
+  --trace examples/spotserve/spot_trace_qwen15_moe_a27b_four_version_add_remove.jsonl \
+  --gpus 0 1 3 --prompt-tokens 64 --max-model-len 512 \
+  --gpu-memory-utilization 0.85 --cpu-offload-gb 16
+```
+
+追測過程先修復了主機上的 NVIDIA device nodes，並確認四張 RTX 5070 Ti 都能由
+`nvidia-smi` 看見。原本的 TP1 大型模型啟動會 OOM：單卡只有 16 GiB，而完整
+checkpoint 約 26.67 GiB，CPU offload 16 GiB 仍不足。改成真正的 TP2 後，GPU0
++GPU1 各載入約 13.38 GiB，模型完成 vLLM warmup（約 151 秒），並成功回報
+`ready`、實際生成 1 個 token；這證明大型模型的 TP2 inference path 可以工作。
+
+但是當時 GPU2 仍被其他程序使用約 15.5 GiB，只剩約 319 MiB，無法建立第二個
+TP2 target。因此完整四版本矩陣尚未完成；目前已完成的是大型模型的單一 TP2
+實際 inference smoke，而不是四個 recovery policy 的 latency/成功率比較。
+
+目前四版本 harness 的原始配置仍是 tiny 用的 TP1；大型模型的正式版本應採用
+mode-specific TP2 拓撲：source=`GPU0+GPU1`、target=`GPU2+GPU3`，並讓每個 mode
+分開釋放/重用 GPU。等 GPU2 的既有程序釋放後，再用同一份 trace 跑完整四版本
+矩陣，才可以公平比較 recovery latency、重算量與 NIXL restore。
+
+## 追加：大型模型 GPU 實驗紀錄（2026-08-17）
+
+這次使用模型庫中最接近 Qwen2.7B 的
+`/work/spotserve-models/Qwen1.5-MoE-A2.7B`。主機實際是四張 RTX 5070 Ti，每張
+GPU 約 16 GiB。
+
+### 排查結果
+
+- 一開始 `/dev/nvidia*` 不存在，`nvidia-smi` 無法連線；重建 NVIDIA device
+  nodes 並重新產生目前 595.80 driver 的 CDI spec 後，container 已能使用 CUDA。
+- GPU2 仍被其他程序占用約 15.5 GiB，只剩約 319 MiB；GPU0、GPU1、GPU3 可用。
+- 因此不能同時建立大型模型所需的 source TP2（GPU0+GPU1）與 target TP2
+  （GPU2+GPU3）。
+
+### 實際測試
+
+1. **TP1 大型模型**：失敗。單張 16 GiB GPU 在載入完整約 26.67 GiB checkpoint
+   時 CUDA OOM，即使設定 16 GiB CPU offload 仍不足。
+2. **TP2 大型模型 inference smoke**：成功。使用 GPU0+GPU1，每張載入約
+   13.38 GiB；vLLM warmup 約 151 秒，worker 回報 `ready`，實際 request 成功
+   產生 1 個 token。
+3. **四版本 recovery matrix**：尚未完成。原因是第二個 TP2 target 需要 GPU2+GPU3，
+   但 GPU2 當時沒有足夠空間；不能把單一 TP2 inference 結果誤寫成四版本比較。
+
+結論：大型 Qwen MoE 的 TP2 inference 已在這台機器上驗證成功；完整四版本比較
+仍需先釋放 GPU2，再依同一份 add/remove trace 分別執行 No Recovery、Rerouting、
+Reparallelization 與 Modified/NIXL。
+
+## Qwen2-MoE-Tiny 四版本重跑（2026-08-18）
+
+這次使用目前可用的三張 GPU（GPU0、GPU1、GPU3）與
+`/work/spotserve-models/Qwen2-MoE-Tiny`，trace 為
+`examples/spotserve/spot_trace_local_three_gpu_moe_tiny.jsonl`。trace 先移除/加入
+spare，再以 `remove node-0` 模擬 source 被 preempt；每個版本使用一個 64-token
+長 request，並在獨立容器中實際啟動 vLLM。Tiny checkpoint 大小為 318,791,832 bytes
+（約 304.0 MiB）。
+
+本次成功重跑的原始報告：
+
+- No Recovery：`/tmp/four-version-tiny-no-recovery-64-rerun.json`
+- Rerouting：`/tmp/four-version-tiny-20260818-rest.rerouting.p64.r1.json`
+- Reparallelization：`/tmp/four-version-tiny-20260818-rest.reparallelization.p64.r1.json`
+
+目前這個 vLLM build 的 Modified/NIXL smoke 在 export 時偶發回報
+`request_not_active`，因此本次 trace 的 Modified cell 沒有算成成功；下表的
+Modified/NIXL 數字標為同一 Tiny、同一 GPU layout 的先前成功 NIXL reference
+（`/tmp/four-version-recovery-matrix.modified.p64.r1.json`），不是把本次失敗冒充
+成功。這也指出下一步要先把 worker 的 active request lease/ID 生命週期修穩，再做
+完整同 trace 的四版本統計。
+
+### 五項指標
+
+| Version | Recovery Time（preemption → target first output） | P99 Request Latency（單一 request 的 observed p99 proxy） | Effective Throughput（成功 output tokens / cell elapsed） | Request Success Rate | Recovery Data Movement |
+|---|---:|---:|---:|---:|---:|
+| No Recovery | failed；21.253 s | failed | 0.000 tokens/s（0/354.451 s） | 0/1 = 0% | migrated 0；reloaded 0；total 0 B |
+| Rerouting | 21.593 s | 21.613 s | 0.008 tokens/s（3/355.502 s） | 1/1 = 100% | migrated 0；reloaded 0；total 0 B |
+| Reparallelization | 208.804 s | 209.041 s | 0.006 tokens/s（3/543.433 s） | 1/1 = 100% | migrated 0；reloaded 304.0 MiB；total 304.0 MiB |
+| Modified/NIXL（成功 reference） | 21.569 s | 21.619 s | 0.017 tokens/s（3/179.258 s） | 1/1 = 100% | migrated 約 0.039 MiB；reloaded 0；total 約 0.039 MiB |
+
+計算與解讀：
+
+- 這次每個 cell 只有一個 request，所以 P99 不是統計分布，而是該 request 的
+  observed latency；正式 P99 仍需至少數十個並行 request。
+- 有效吞吐量把容器啟動、warmup 和 recovery 都算進 elapsed；成功 output token
+  以 source 首個 output、target 首個 output、target continuation 各 1 token
+  計算，因此是目前 harness 的保守值，不是高負載 production throughput。
+- Reparallelization 的 `reloaded_bytes` 使用 Tiny checkpoint 實際檔案大小；
+  Modified 的 `migrated_bytes` 是 5 個 KV blocks 的估算值（Tiny 的 2 layers、
+  2 KV heads、head dimension 32、FP16、16-token block），目前 NIXL harness
+  尚未提供 wire-level byte counter，因此標示為約值。
+- 新結果再次顯示：Reparallelization 的主要成本是約 208.8 秒的 TP2 engine
+  啟動；Rerouting 不搬 KV，但要重算 66 tokens；Modified/NIXL 成功 reference
+  則保留既有 engine，重算量為 0，且資料搬移量遠小於重新載入 checkpoint。
+
+### 本次 rerun 遇到的問題與修正
+
+1. Tiny trace 原本使用 `slot-*` 和 `preempt`，但 four-version harness 的定義是
+   `add/remove/DONE`，且實體 GPU layout 是 0/1/3；已改成明確的
+   `node-0/node-1/node-3`，並用 `remove node-0` 代表 source preemption。
+2. worker 原先只送 simulated `paused`，短 request 可能在 export 前已完成；已加入
+   pause/resume control、`min_tokens`，以及 external/internal request ID fallback。
+   目前仍有 vLLM output-processor lease race，Modified cell 需再修正後重新跑。
+3. No Recovery、Rerouting、Reparallelization 的 current-trace GPU container
+   測試均已通過；Modified/NIXL 的 NIXL path 仍以先前成功 reference 保留，不能
+   宣稱本次四格全部成功。

@@ -117,7 +117,7 @@ def create_app() -> FastAPI:
     async def spot_event_handler(request: Request):
         body = await request.json()
         event = body.get("event")
-        if event not in {"preempt", "recover", "dead"}:
+        if event not in {"add", "remove", "preempt", "recover", "dead"}:
             raise HTTPException(
                 status_code=400, detail=f"Unsupported spot event: {event}"
             )
@@ -125,7 +125,16 @@ def create_app() -> FastAPI:
         node_id = body.get("node_id")
         instance_id = body.get("instance_id")
         model_name = body.get("model_name")
-        if node_id is None and instance_id is None:
+        if event in {"add", "remove"} and node_id is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Add/remove event requires node_id",
+            )
+        if (
+            event not in {"add", "remove"}
+            and node_id is None
+            and instance_id is None
+        ):
             raise HTTPException(
                 status_code=400,
                 detail="Spot event requires node_id or instance_id",
@@ -138,7 +147,18 @@ def create_app() -> FastAPI:
             )
 
         try:
-            if event == "preempt":
+            if event == "add":
+                result = await controller.handle_add.remote(
+                    node_id=node_id,
+                    node_info=body.get("node_info", {}),
+                    model_name=model_name,
+                )
+            elif event == "remove":
+                result = await controller.handle_remove.remote(
+                    node_id=node_id,
+                    model_name=model_name,
+                )
+            elif event == "preempt":
                 result = await controller.handle_preemption.remote(
                     node_id=node_id,
                     instance_id=instance_id,

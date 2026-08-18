@@ -1,0 +1,13 @@
+# Four-version Qwen1.5-MoE-A2.7B trace for the current three-GPU smoke layout.
+# node-0 is the source, node-1 is the pre-existing reroute/NIXL target, and
+# node-3 is the spare.  The trace changes the live instance count before the
+# source removal that defines the recovery point.  Times are milliseconds and
+# are accelerated by the harness.
+{"time_ms": 0, "event": "add", "nodes": ["node-0", "node-1", "node-3"]}
+{"time_ms": 30000, "event": "remove", "nodes": ["node-3"]}
+{"time_ms": 60000, "event": "add", "nodes": ["node-3"]}
+{"time_ms": 90000, "event": "remove", "nodes": ["node-3"]}
+{"time_ms": 120000, "event": "add", "nodes": ["node-3"]}
+{"time_ms": 150000, "event": "remove", "nodes": ["node-0"]}
+{"time_ms": 180000, "event": "add", "nodes": ["node-0"]}
+{"time_ms": 210000, "event": "DONE", "nodes": []}

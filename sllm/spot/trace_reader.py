@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Iterable, List, Optional
 
 
-SUPPORTED_EVENTS = {"preempt", "recover", "dead"}
+SUPPORTED_EVENTS = {"add", "remove", "preempt", "recover", "dead"}
 
 
 @dataclass(frozen=True)
@@ -18,6 +18,7 @@ class SpotEvent:
     instance_id: Optional[str] = None
     instance_index: Optional[int] = None
     instance_selector: Optional[str] = None
+    node_info: Optional[dict] = None
 
     def __post_init__(self):
         if self.time < 0:
@@ -73,6 +74,7 @@ def _event_from_dict(
             else None
         ),
         instance_selector=raw_event.get("instance_selector"),
+        node_info=raw_event.get("node_info"),
     )
 
 

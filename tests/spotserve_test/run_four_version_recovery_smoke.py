@@ -37,6 +37,7 @@ from run_cross_container_nixl_smoke import (
     wait_event,
 )
 from run_four_container_fleet_churn_smoke import load_fleet_trace
+from run_four_container_fleet_churn_smoke import trace_slot
 
 
 MODES = ("no_recovery", "rerouting", "reparallelization", "modified")
@@ -52,6 +53,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-model-len", type=int, default=512)
     parser.add_argument("--trace-speedup", type=float, default=1000.0)
     parser.add_argument("--token-delay-s", type=float, default=0.05)
+    parser.add_argument(
+        "--cpu-offload-gb",
+        type=float,
+        default=0.0,
+        help="Optional per-worker CPU weight offload for larger checkpoints.",
+    )
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.08,
+        help="Fraction of each worker GPU memory reserved by vLLM.",
+    )
     parser.add_argument("--timeout-s", type=float, default=360.0)
     parser.add_argument("--image", default=IMAGE)
     parser.add_argument("--output", required=True)
@@ -68,7 +81,8 @@ def main() -> None:
         raise SystemExit(f"model config not found: {args.model}")
     trace_events = load_fleet_trace(args.trace)
     if not any(
-        event["event"] == "remove" and 0 in [int(str(node).replace("node-", "")) for node in event["nodes"]]
+        event["event"] == "remove"
+        and any(trace_slot(node) == 0 for node in event["nodes"])
         for event in trace_events
     ):
         raise SystemExit("trace must remove node-0 to trigger source preemption")
@@ -140,7 +154,9 @@ def main() -> None:
             "--token-delay-s",
             str(args.token_delay_s),
             "--cpu-offload-gb",
-            "0.0",
+            str(max(float(args.cpu_offload_gb), 0.0)),
+            "--gpu-memory-utilization",
+            str(min(max(float(args.gpu_memory_utilization), 0.01), 0.99)),
             "--tensor-parallel-size",
             str(tensor_parallel_size),
             "--max-model-len",
@@ -225,6 +241,8 @@ def main() -> None:
         first = wait_event(target["conn"], "output", args.timeout_s)
         wait_event(target["conn"], "paused", args.timeout_s)
         recovery_s = round(time.monotonic() - phase_started, 3)
+        send(target["conn"], {"op": "resume", "request_id": request_id})
+        wait_event(target["conn"], "resumed", args.timeout_s)
         continued_started = time.monotonic()
         continued = wait_event(target["conn"], "output", args.timeout_s)
         continuation_s = round(time.monotonic() - continued_started, 3)
@@ -269,6 +287,63 @@ def main() -> None:
     outcome = "failed"
     recovery: dict = {}
 
+    def follow_trace_to_preemption() -> None:
+        """Apply add/remove churn until the trace removes the source.
+
+        The four policy branches need the reroute target to remain READY, but
+        they can tolerate the spare being removed and re-added before the
+        recovery point.  This keeps the trace's capacity changes real without
+        changing the semantics of the four policies themselves.
+        """
+        label_by_gpu = {
+            args.gpus[0]: "source",
+            args.gpus[1]: "reroute_replica",
+            args.gpus[2]: "spare",
+        }
+        previous_time_ms = 0.0
+        for event in trace_events:
+            delay_s = (
+                max(float(event["time_ms"]) - previous_time_ms, 0.0)
+                / 1000.0
+                / args.trace_speedup
+            )
+            if delay_s:
+                time.sleep(delay_s)
+            previous_time_ms = float(event["time_ms"])
+            action = event["event"]
+            if action == "DONE":
+                break
+            for node in event["nodes"]:
+                gpu = trace_slot(node)
+                if gpu not in label_by_gpu:
+                    raise AssertionError(
+                        f"trace GPU {gpu} is not present in --gpus: {event}"
+                    )
+                label = label_by_gpu[gpu]
+                if action == "add":
+                    if label in workers:
+                        continue
+                    if label != "spare":
+                        raise AssertionError(
+                            f"trace cannot add inactive policy worker {label}"
+                        )
+                    launch(spare_spec)
+                    register([spare_spec])
+                elif action == "remove":
+                    if label == "source":
+                        return
+                    if label == "reroute_replica":
+                        raise AssertionError(
+                            "trace cannot remove the pre-existing recovery target"
+                        )
+                    if label in workers:
+                        stop(label)
+                else:
+                    raise AssertionError(
+                        f"four-version trace only supports add/remove/DONE: {event}"
+                    )
+        raise AssertionError("trace must remove source node-0")
+
     try:
         run_podman(["network", "create", network])
         launch(source_spec)
@@ -291,6 +366,7 @@ def main() -> None:
                 or 0
             )
             source_computed = list(metadata.get("tokens", prompt))[:computed_tokens]
+        follow_trace_to_preemption()
         preempt_started = time.monotonic()
 
         if args.mode == "no_recovery":
