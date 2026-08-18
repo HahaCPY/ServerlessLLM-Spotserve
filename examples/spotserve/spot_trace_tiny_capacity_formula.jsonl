@@ -1,0 +1,26 @@
+# Deterministic four-GPU capacity trace for Qwen2-MoE-Tiny.
+# capacity(t)=clip(round(2 + 1.3*sin(2*pi*t/180s)
+#   + 0.7*sin(2*pi*t/70s) + burst(t)), 1, 4), seed-free and reproducible.
+# The burst windows are +1 at 210-270s and 480-540s, -1 at 330-390s.
+# This creates multi-node removes/adds, a one-worker floor interval, and a
+# four-worker interval rather than alternating one remove with one add. The
+# active set is rotated on pressure drops, so node-0 can be preempted while
+# at least one Tiny worker remains ready; no event adds beyond node-0..node-3.
+{"time_ms": 0, "event": "add", "nodes": ["node-0", "node-1"]}
+{"time_ms": 30000, "event": "add", "nodes": ["node-2"]}
+{"time_ms": 120000, "event": "add", "nodes": ["node-3"]}
+{"time_ms": 120000, "event": "remove", "nodes": ["node-0", "node-1", "node-2"]}
+{"time_ms": 180000, "event": "add", "nodes": ["node-0"]}
+{"time_ms": 210000, "event": "add", "nodes": ["node-1", "node-2"]}
+{"time_ms": 270000, "event": "remove", "nodes": ["node-3", "node-0", "node-1"]}
+{"time_ms": 300000, "event": "add", "nodes": ["node-3"]}
+{"time_ms": 330000, "event": "remove", "nodes": ["node-2"]}
+{"time_ms": 360000, "event": "add", "nodes": ["node-0"]}
+{"time_ms": 390000, "event": "add", "nodes": ["node-2"]}
+{"time_ms": 450000, "event": "remove", "nodes": ["node-1"]}
+{"time_ms": 480000, "event": "remove", "nodes": ["node-3"]}
+{"time_ms": 510000, "event": "add", "nodes": ["node-1", "node-2"]}
+{"time_ms": 540000, "event": "remove", "nodes": ["node-0", "node-1"]}
+{"time_ms": 570000, "event": "add", "nodes": ["node-0", "node-1", "node-3"]}
+{"time_ms": 600000, "event": "remove", "nodes": ["node-3"]}
+{"time_ms": 630000, "event": "DONE", "nodes": []}

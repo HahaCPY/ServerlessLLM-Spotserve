@@ -59,6 +59,24 @@ VLLM_MOE_SUPPORTED_SHAPES = (
     },
     {
         "tensor_parallel_size": 1,
+        "data_parallel_size": 1,
+        "pipeline_parallel_size": 1,
+        "expert_parallel_size": 1,
+    },
+    {
+        "tensor_parallel_size": 1,
+        "data_parallel_size": 2,
+        "pipeline_parallel_size": 1,
+        "expert_parallel_size": 1,
+    },
+    {
+        "tensor_parallel_size": 1,
+        "data_parallel_size": 3,
+        "pipeline_parallel_size": 1,
+        "expert_parallel_size": 1,
+    },
+    {
+        "tensor_parallel_size": 1,
         "data_parallel_size": 4,
         "pipeline_parallel_size": 1,
         "expert_parallel_size": 1,

@@ -219,6 +219,12 @@ def generate_parallel_candidates(
         ),
         available_gpus,
     )
+    min_tensor_parallel_size = min(
+        _positive_int(
+            planner_config, "min_tensor_parallel_size", 1
+        ),
+        max_tensor_parallel_size,
+    )
     max_pipeline_parallel_size = min(
         _positive_int(
             planner_config, "max_pipeline_parallel_size", available_gpus
@@ -233,7 +239,9 @@ def generate_parallel_candidates(
     )
 
     candidates: List[ParallelConfig] = []
-    for tensor_parallel_size in range(1, max_tensor_parallel_size + 1):
+    for tensor_parallel_size in range(
+        min_tensor_parallel_size, max_tensor_parallel_size + 1
+    ):
         for pipeline_parallel_size in range(1, max_pipeline_parallel_size + 1):
             replica_gpus = tensor_parallel_size * pipeline_parallel_size
             if replica_gpus > available_gpus:
@@ -343,6 +351,9 @@ def _supported_config_candidates(
     target_replica_gpus = _positive_int(
         planner_config, "target_replica_gpus", 1
     )
+    min_tensor_parallel_size = _positive_int(
+        planner_config, "min_tensor_parallel_size", 1
+    )
     candidates: List[ParallelConfig] = []
     for plan in supported_configs:
         if isinstance(plan, Mapping):
@@ -365,6 +376,9 @@ def _supported_config_candidates(
             expert_parallel_size = int(plan.expert_parallel_size)
             total_gpus = int(plan.num_gpus)
             reason = str(plan.reason)
+
+        if tensor_parallel_size < min_tensor_parallel_size:
+            continue
 
         if total_gpus > available_gpus:
             continue

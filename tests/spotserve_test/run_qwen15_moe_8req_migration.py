@@ -463,6 +463,10 @@ async def main(args: argparse.Namespace) -> None:
             "reparallelization_config": {
                 "model_gpu_requirement": 2,
                 "target_replica_gpus": 2,
+                # This checkpoint is about 27 GiB and does not fit on one
+                # 16-GiB GPU. Keep planner candidates at TP2 or above when
+                # capacity shrinks; TP1 is not a runnable fallback.
+                "min_tensor_parallel_size": 2,
                 "max_tensor_parallel_size": 2,
                 "max_pipeline_parallel_size": 1,
                 "drain_timeout_s": args.drain_timeout_s,

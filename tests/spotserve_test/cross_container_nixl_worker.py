@@ -92,6 +92,13 @@ async def main() -> None:
     conn = None
     generation_tasks: dict[str, asyncio.Task] = {}
     pause_events: dict[str, asyncio.Event] = {}
+    # Keep the EngineCore sequence id returned by the first metadata snapshot.
+    # The output processor normally retains the external->internal mapping,
+    # but an output/lease cleanup can race with the host control request.  A
+    # remembered internal id lets export address the live scheduler request
+    # directly during that short window.
+    request_internal_ids: dict[str, str] = {}
+    last_metadata: dict[str, dict] = {}
     send_lock = asyncio.Lock()
 
     async def send(payload: dict) -> None:
@@ -164,7 +171,14 @@ async def main() -> None:
                 "role": args.role,
                 "node_id": args.node_id or args.role,
                 "restore_supported": bool(
+                    # Baseline workers deliberately run without a KV
+                    # connector.  Probing EngineCore's connector utility in
+                    # that mode can block startup on this vLLM build, and
+                    # the baselines never use restore anyway.  Only the
+                    # Modified/NIXL path needs the live capability probe.
                     await engine.supports_state_restore()
+                    if args.kv_transfer_mode == "nixl"
+                    else False
                 ),
                 "side_channel_host": args.side_channel_host,
                 "side_channel_port": args.side_channel_port,
@@ -190,10 +204,48 @@ async def main() -> None:
                         if candidate.get("found", False):
                             result = candidate
                             break
+                if not result.get("found", False):
+                    # The frontend mapping can be removed as soon as a
+                    # streamed output is delivered, while EngineCore still
+                    # owns the paused scheduler request.  Query that source
+                    # of truth directly before declaring the request gone.
+                    for candidate in await engine.engine_core.call_utility_async(
+                        "get_all_request_kv_metadata"
+                    ):
+                        if candidate.get("found", False):
+                            result = candidate
+                            result["request_id"] = request_id
+                            break
+                if result.get("found", False) and result.get("sequence_id"):
+                    request_internal_ids[request_id] = str(result["sequence_id"])
+                last_metadata[request_id] = result
                 await send({"event": "metadata", "result": result})
             elif op == "export":
-                result = await engine.export_inference_state(request_id)
-                if not result.get("supports_restore", False):
+                # Try the external id first, then the remembered EngineCore
+                # sequence id.  Retry briefly because the first output is
+                # delivered through a separate output-processor task.
+                candidates = [request_id]
+                internal_id = request_internal_ids.get(request_id)
+                if internal_id and internal_id not in candidates:
+                    candidates.append(internal_id)
+                result = {"supports_restore": False, "reason": "request_not_active"}
+                for _ in range(8):
+                    for candidate_id in candidates:
+                        result = await engine.export_inference_state(candidate_id)
+                        if not result.get("supports_restore", False):
+                            # Same frontend-mapping race as metadata: use the
+                            # remembered internal EngineCore id directly.
+                            result = await engine.engine_core.call_utility_async(
+                                "export_inference_state", candidate_id
+                            )
+                        if result.get("supports_restore", False):
+                            # Preserve the host-visible request id while the
+                            # connector payload retains its internal source
+                            # sequence id for NIXL lookup.
+                            result["request_id"] = request_id
+                            break
+                    if result.get("supports_restore", False):
+                        break
                     live = await engine.get_all_request_kv_metadata()
                     for candidate in live:
                         if not candidate.get("found", False):
@@ -201,15 +253,25 @@ async def main() -> None:
                         sequence_id = candidate.get("sequence_id")
                         if not sequence_id:
                             continue
-                        result = await engine.export_inference_state(
-                            str(sequence_id)
+                        if str(sequence_id) not in candidates:
+                            candidates.append(str(sequence_id))
+                    await asyncio.sleep(0.05)
+                if not result.get("supports_restore", False):
+                    # Include a compact lifecycle snapshot in the control
+                    # response.  This makes a failed experimental cell
+                    # diagnosable instead of reducing every race to the same
+                    # request_not_active message.
+                    try:
+                        core_live = await engine.engine_core.call_utility_async(
+                            "get_all_request_kv_metadata"
                         )
-                        if result.get("supports_restore", False):
-                            # Preserve the host-visible request id while the
-                            # connector payload retains its internal source
-                            # sequence id for NIXL lookup.
-                            result["request_id"] = request_id
-                            break
+                    except Exception as exc:
+                        core_live = [{"debug_error": repr(exc)}]
+                    result["debug"] = {
+                        "metadata": last_metadata.get(request_id),
+                        "candidates": candidates,
+                        "core_live": core_live,
+                    }
                 await send({"event": "export", "result": result})
             elif op == "restore":
                 result = engine.restore_inference_state(

@@ -23,7 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
     parser.add_argument("--trace", required=True)
-    parser.add_argument("--gpus", type=int, nargs="+", default=[0, 1, 3])
+    parser.add_argument("--gpus", type=int, nargs="+", default=[0, 1, 2, 3])
     parser.add_argument("--modes", nargs="+", choices=MODES, default=list(MODES))
     parser.add_argument("--prompt-tokens", type=int, nargs="+", default=[64, 240, 480])
     parser.add_argument("--repeats", type=int, default=1)
@@ -33,6 +33,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cpu-offload-gb", type=float, default=0.0)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.08)
     parser.add_argument("--timeout-s", type=float, default=360.0)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Reuse already completed cell JSON files at the output prefix.",
+    )
     parser.add_argument("--output", required=True)
     return parser.parse_args()
 
@@ -94,6 +99,35 @@ def run_cell(args: argparse.Namespace, mode: str, prompt_tokens: int,
         "outcome": report.get("outcome"),
         "expected_outcome": report.get("expected_outcome"),
         "recovery": report.get("recovery", {}),
+        "metrics": report.get("metrics", {}),
+        "source_blocks": report.get("source_blocks", 0),
+        "source_computed_tokens": report.get("source_computed_tokens", 0),
+        "source_config": report.get("source_config", {}),
+        "report": str(cell_path),
+    }
+
+
+def load_existing_cell(mode: str, prompt_tokens: int, repeat: int,
+                       cell_path: Path) -> dict | None:
+    """Reconstruct a matrix cell from a completed smoke report."""
+    try:
+        report = json.loads(cell_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    if report.get("status") != "passed":
+        return None
+    return {
+        "status": "passed",
+        "mode": mode,
+        "prompt_tokens": prompt_tokens,
+        "repeat": repeat,
+        "elapsed_s": report.get("elapsed_s"),
+        "returncode": 0,
+        "log": str(cell_path.with_suffix(".log")),
+        "outcome": report.get("outcome"),
+        "expected_outcome": report.get("expected_outcome"),
+        "recovery": report.get("recovery", {}),
+        "metrics": report.get("metrics", {}),
         "source_blocks": report.get("source_blocks", 0),
         "source_computed_tokens": report.get("source_computed_tokens", 0),
         "source_config": report.get("source_config", {}),
@@ -106,7 +140,8 @@ def summarize(cells: list[dict]) -> list[dict]:
     keys = (
         "recovery_s", "target_recovery_s", "target_continuation_s",
         "recomputed_tokens", "restored_blocks", "source_blocks",
-        "source_computed_tokens",
+        "source_computed_tokens", "p99_latency_s",
+        "effective_throughput_tokens_s", "generated_tokens",
     )
     for mode in MODES:
         for prompt_tokens in sorted({int(c["prompt_tokens"]) for c in cells}):
@@ -137,14 +172,32 @@ def summarize(cells: list[dict]) -> list[dict]:
                 values = [c.get("recovery", {}).get(key) for c in passed
                           if isinstance(c.get("recovery", {}).get(key), bool)]
                 summary[f"{key}_count"] = sum(values)
+            metric_values = [
+                c.get("metrics", {}) for c in passed
+                if isinstance(c.get("metrics"), dict)
+            ]
+            for key in (
+                "recovery_time_s", "p99_latency_s",
+                "effective_throughput_tokens_s", "success_rate",
+            ):
+                values = [
+                    float(metric.get(key))
+                    for metric in metric_values
+                    if isinstance(metric.get(key), (int, float))
+                ]
+                summary[f"{key}_mean"] = numeric_mean(values)
+                summary[f"{key}_median"] = numeric_median(values)
+            summary["recovery_data"] = [
+                metric.get("recovery_data", {}) for metric in metric_values
+            ]
             summaries.append(summary)
     return summaries
 
 
 def main() -> None:
     args = parse_args()
-    if len(args.gpus) != 3 or len(set(args.gpus)) != 3:
-        raise SystemExit("--gpus must contain three distinct GPU indices")
+    if len(args.gpus) != 4 or len(set(args.gpus)) != 4:
+        raise SystemExit("--gpus must contain four distinct GPU indices")
     if args.repeats < 1:
         raise SystemExit("--repeats must be positive")
     if any(prompt < 1 or prompt > args.max_model_len for prompt in args.prompt_tokens):
@@ -158,6 +211,20 @@ def main() -> None:
                 cell_path = output.with_name(
                     f"{output.stem}.{mode}.p{prompt_tokens}.r{repeat}.json"
                 )
+                if args.resume:
+                    existing = load_existing_cell(
+                        mode, prompt_tokens, repeat, cell_path
+                    )
+                    if existing is not None:
+                        cells.append(existing)
+                        print(json.dumps({
+                            "event": "resume",
+                            "mode": mode,
+                            "prompt_tokens": prompt_tokens,
+                            "repeat": repeat,
+                            "report": str(cell_path),
+                        }, sort_keys=True), flush=True)
+                        continue
                 print(json.dumps({"event": "start", "mode": mode,
                                   "prompt_tokens": prompt_tokens,
                                   "repeat": repeat}, sort_keys=True), flush=True)
