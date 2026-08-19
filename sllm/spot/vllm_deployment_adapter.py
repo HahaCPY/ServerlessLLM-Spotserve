@@ -85,21 +85,24 @@ class VllmDeploymentAdapter:
         config = dict(self.backend_config)
         config["tensor_parallel_size"] = plan.tensor_parallel_size
         config["pipeline_parallel_size"] = plan.pipeline_parallel_size
-        # Data parallelism is represented by independent Ray actors here.  A
-        # vLLM actor must therefore be started with one local DP replica.
-        config["data_parallel_size"] = 1
-        planned_ep_size = max(1, int(plan.expert_parallel_size))
+        config["data_parallel_size"] = plan.data_parallel_size
+        config["replica_count"] = plan.replica_count
+        planned_ep_size = plan.effective_expert_parallel_size
+        config["planned_effective_expert_parallel_size"] = planned_ep_size
         config["planned_expert_parallel_size"] = planned_ep_size
-        config["expert_parallel_size"] = planned_ep_size
         config["expert_parallel_size_verified"] = False
-        config["enable_expert_parallel"] = planned_ep_size > 1
+        config["enable_expert_parallel"] = plan.enable_expert_parallel
         return config
 
     def _replica_gpu_count(self, plan: ParallelPlan) -> int:
-        replica_gpus = plan.tensor_parallel_size * plan.pipeline_parallel_size
+        replica_gpus = (
+            plan.tensor_parallel_size
+            * plan.pipeline_parallel_size
+            * plan.data_parallel_size
+        )
         if replica_gpus <= 0:
             raise ValueError("parallel plan has no GPUs per replica")
-        expected = replica_gpus * max(plan.num_replicas, 1)
+        expected = replica_gpus * max(plan.replica_count, 1)
         if plan.num_gpus < expected:
             raise ValueError(
                 "parallel plan num_gpus is smaller than its replica shape: "
@@ -133,7 +136,7 @@ class VllmDeploymentAdapter:
         target_nodes = list(plan.target_nodes)
 
         try:
-            for replica in range(max(plan.num_replicas, 1)):
+            for replica in range(max(plan.replica_count, 1)):
                 instance_id = (
                     f"{self.model_name}_reparallel_{uuid.uuid4().hex[:12]}"
                 )
@@ -181,11 +184,13 @@ class VllmDeploymentAdapter:
                 deployment.instances[instance_id] = handle
                 logger.info(
                     "Started vLLM re-parallelized instance %s on node %s "
-                    "with TP=%s PP=%s",
+                    "with TP=%s DP=%s PP=%s EP=%s",
                     instance_id,
                     startup_node,
                     plan.tensor_parallel_size,
+                    plan.data_parallel_size,
                     plan.pipeline_parallel_size,
+                    plan.enable_expert_parallel,
                 )
         except Exception:
             await self.stop_workers(deployment)
@@ -279,11 +284,16 @@ class VllmDeploymentAdapter:
             tensor_parallel_size=max(
                 1, int(self.backend_config.get("tensor_parallel_size", 1) or 1)
             ),
-            data_parallel_size=max(1, len(instances)),
+            data_parallel_size=max(
+                1, int(self.backend_config.get("data_parallel_size", 1) or 1)
+            ),
             pipeline_parallel_size=max(
                 1, int(self.backend_config.get("pipeline_parallel_size", 1) or 1)
             ),
-            num_replicas=max(1, len(instances)),
+            replica_count=max(1, len(instances)),
+            enable_expert_parallel=bool(
+                self.backend_config.get("enable_expert_parallel", False)
+            ),
             num_gpus=sum(int(handle.num_gpu or 0) for handle in instances.values()),
             target_nodes=[
                 str(handle.node_id)

@@ -27,18 +27,85 @@ class GpuAvailability:
         }
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class ParallelPlan:
     model_name: str
     backend: str
     tensor_parallel_size: int
     data_parallel_size: int
     pipeline_parallel_size: int = 1
-    expert_parallel_size: int = 1
-    num_replicas: int = 1
+    replica_count: int = 1
+    enable_expert_parallel: bool = False
     num_gpus: int = 1
     target_nodes: List[str] = field(default_factory=list)
     reason: str = "replan"
+
+    def __init__(
+        self,
+        model_name: str,
+        backend: str,
+        tensor_parallel_size: int,
+        data_parallel_size: int = 1,
+        pipeline_parallel_size: int = 1,
+        replica_count: Optional[int] = None,
+        enable_expert_parallel: Optional[bool] = None,
+        num_gpus: int = 1,
+        target_nodes: Optional[List[str]] = None,
+        reason: str = "replan",
+        num_replicas: Optional[int] = None,
+        expert_parallel_size: Optional[int] = None,
+    ) -> None:
+        runtime_dp = max(1, int(data_parallel_size or 1))
+        replicas = max(
+            1,
+            int(
+                replica_count
+                if replica_count is not None
+                else num_replicas
+                if num_replicas is not None
+                else 1
+            )
+            or 1,
+        )
+        if enable_expert_parallel is None:
+            enable_expert_parallel = bool(
+                expert_parallel_size is not None
+                and int(expert_parallel_size or 1) > 1
+            )
+        object.__setattr__(self, "model_name", str(model_name))
+        object.__setattr__(self, "backend", str(backend))
+        object.__setattr__(
+            self, "tensor_parallel_size", max(1, int(tensor_parallel_size))
+        )
+        object.__setattr__(self, "data_parallel_size", runtime_dp)
+        object.__setattr__(
+            self, "pipeline_parallel_size", max(1, int(pipeline_parallel_size))
+        )
+        object.__setattr__(self, "replica_count", replicas)
+        object.__setattr__(
+            self, "enable_expert_parallel", bool(enable_expert_parallel)
+        )
+        object.__setattr__(self, "num_gpus", max(1, int(num_gpus or 1)))
+        object.__setattr__(
+            self,
+            "target_nodes",
+            [str(node) for node in (target_nodes or [])],
+        )
+        object.__setattr__(self, "reason", str(reason))
+
+    @property
+    def effective_expert_parallel_size(self) -> int:
+        if not self.enable_expert_parallel:
+            return 1
+        return self.tensor_parallel_size * self.data_parallel_size
+
+    @property
+    def expert_parallel_size(self) -> int:
+        return self.effective_expert_parallel_size
+
+    @property
+    def num_replicas(self) -> int:
+        return self.replica_count
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "ParallelPlan":
@@ -70,18 +137,28 @@ class ParallelPlan:
             pipeline_parallel_size=max(
                 1, int(payload.get("pipeline_parallel_size", 1) or 1)
             ),
-            expert_parallel_size=max(
-                1, int(payload.get("expert_parallel_size", 1) or 1)
-            ),
-            num_replicas=max(
+            replica_count=max(
                 1,
                 int(
                     payload.get(
-                        "num_replicas",
-                        payload.get("data_parallel_size", 1),
+                        "replica_count",
+                        payload.get("num_replicas", 1),
                     )
                     or 1
                 ),
+            ),
+            enable_expert_parallel=bool(
+                payload.get(
+                    "enable_expert_parallel",
+                    int(
+                        payload.get(
+                            "effective_expert_parallel_size",
+                            payload.get("expert_parallel_size", 1),
+                        )
+                        or 1
+                    )
+                    > 1,
+                )
             ),
             num_gpus=max(1, int(payload.get("num_gpus", 1) or 1)),
             target_nodes=[str(node) for node in payload.get("target_nodes", [])],
@@ -95,7 +172,12 @@ class ParallelPlan:
             "tensor_parallel_size": self.tensor_parallel_size,
             "data_parallel_size": self.data_parallel_size,
             "pipeline_parallel_size": self.pipeline_parallel_size,
-            "expert_parallel_size": self.expert_parallel_size,
+            "replica_count": self.replica_count,
+            "enable_expert_parallel": self.enable_expert_parallel,
+            "effective_expert_parallel_size": (
+                self.effective_expert_parallel_size
+            ),
+            "expert_parallel_size": self.effective_expert_parallel_size,
             "num_replicas": self.num_replicas,
             "num_gpus": self.num_gpus,
             "target_nodes": list(self.target_nodes),
@@ -108,18 +190,34 @@ class ParallelConfig:
     tensor_parallel_size: int
     pipeline_parallel_size: int
     data_parallel_size: int
+    replica_count: int
     total_gpus: int
     unused_gpus: int
     score: float
     reason: str
-    expert_parallel_size: int = 1
+    enable_expert_parallel: bool = False
+
+    @property
+    def effective_expert_parallel_size(self) -> int:
+        if not self.enable_expert_parallel:
+            return 1
+        return self.tensor_parallel_size * self.data_parallel_size
+
+    @property
+    def expert_parallel_size(self) -> int:
+        return self.effective_expert_parallel_size
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "tensor_parallel_size": self.tensor_parallel_size,
             "pipeline_parallel_size": self.pipeline_parallel_size,
             "data_parallel_size": self.data_parallel_size,
-            "expert_parallel_size": self.expert_parallel_size,
+            "replica_count": self.replica_count,
+            "enable_expert_parallel": self.enable_expert_parallel,
+            "effective_expert_parallel_size": (
+                self.effective_expert_parallel_size
+            ),
+            "expert_parallel_size": self.effective_expert_parallel_size,
             "total_gpus": self.total_gpus,
             "unused_gpus": self.unused_gpus,
             "score": self.score,
@@ -231,8 +329,10 @@ def generate_parallel_candidates(
         ),
         available_gpus,
     )
-    min_data_parallel_size = _positive_int(
-        planner_config, "min_data_parallel_size", 1
+    min_replica_count = _positive_int(
+        planner_config,
+        "min_replica_count",
+        int(planner_config.get("min_data_parallel_size", 1) or 1),
     )
     target_replica_gpus = _positive_int(
         planner_config, "target_replica_gpus", 1
@@ -246,15 +346,16 @@ def generate_parallel_candidates(
             replica_gpus = tensor_parallel_size * pipeline_parallel_size
             if replica_gpus > available_gpus:
                 continue
-            data_parallel_size = available_gpus // replica_gpus
-            if data_parallel_size < min_data_parallel_size:
+            replica_count = available_gpus // replica_gpus
+            if replica_count < min_replica_count:
                 continue
-            total_gpus = replica_gpus * data_parallel_size
+            data_parallel_size = 1
+            total_gpus = replica_gpus * replica_count
             unused_gpus = available_gpus - total_gpus
             replica_distance = abs(replica_gpus - target_replica_gpus)
             score = (
                 total_gpus * 10000
-                + data_parallel_size * 100
+                + replica_count * 100
                 - replica_distance * 1000
                 - unused_gpus
             )
@@ -263,7 +364,8 @@ def generate_parallel_candidates(
                     tensor_parallel_size=tensor_parallel_size,
                     pipeline_parallel_size=pipeline_parallel_size,
                     data_parallel_size=data_parallel_size,
-                    expert_parallel_size=1,
+                    replica_count=replica_count,
+                    enable_expert_parallel=False,
                     total_gpus=total_gpus,
                     unused_gpus=unused_gpus,
                     score=float(score),
@@ -278,7 +380,7 @@ def generate_parallel_candidates(
         candidates,
         key=lambda candidate: (
             candidate.score,
-            candidate.data_parallel_size,
+            candidate.replica_count,
             candidate.tensor_parallel_size,
             -candidate.pipeline_parallel_size,
             -candidate.unused_gpus,
@@ -318,7 +420,7 @@ def select_target_nodes(
 
 def _candidate_score(
     total_gpus: int,
-    data_parallel_size: int,
+    replica_count: int,
     replica_gpus: int,
     target_replica_gpus: int,
     unused_gpus: int,
@@ -326,7 +428,7 @@ def _candidate_score(
     replica_distance = abs(replica_gpus - target_replica_gpus)
     return float(
         total_gpus * 10000
-        + data_parallel_size * 100
+        + replica_count * 100
         - replica_distance * 1000
         - unused_gpus
     )
@@ -364,8 +466,21 @@ def _supported_config_candidates(
                 plan.get("pipeline_parallel_size", 1) or 1
             )
             data_parallel_size = int(plan.get("data_parallel_size", 1) or 1)
-            expert_parallel_size = int(
-                plan.get("expert_parallel_size", 1) or 1
+            replica_count = int(
+                plan.get("replica_count", plan.get("num_replicas", 1)) or 1
+            )
+            enable_expert_parallel = bool(
+                plan.get(
+                    "enable_expert_parallel",
+                    int(
+                        plan.get(
+                            "effective_expert_parallel_size",
+                            plan.get("expert_parallel_size", 1),
+                        )
+                        or 1
+                    )
+                    > 1,
+                )
             )
             total_gpus = int(plan.get("num_gpus", 1) or 1)
             reason = str(plan.get("reason", "backend_capability"))
@@ -373,7 +488,8 @@ def _supported_config_candidates(
             tensor_parallel_size = int(plan.tensor_parallel_size)
             pipeline_parallel_size = int(plan.pipeline_parallel_size)
             data_parallel_size = int(plan.data_parallel_size)
-            expert_parallel_size = int(plan.expert_parallel_size)
+            replica_count = int(plan.replica_count)
+            enable_expert_parallel = bool(plan.enable_expert_parallel)
             total_gpus = int(plan.num_gpus)
             reason = str(plan.reason)
 
@@ -384,19 +500,22 @@ def _supported_config_candidates(
             continue
         if not select_target_nodes(worker_nodes, total_gpus):
             continue
-        replica_gpus = tensor_parallel_size * pipeline_parallel_size
+        replica_gpus = (
+            tensor_parallel_size * pipeline_parallel_size * data_parallel_size
+        )
         unused_gpus = available_gpus - total_gpus
         candidates.append(
             ParallelConfig(
                 tensor_parallel_size=tensor_parallel_size,
                 pipeline_parallel_size=pipeline_parallel_size,
                 data_parallel_size=data_parallel_size,
-                expert_parallel_size=expert_parallel_size,
+                replica_count=replica_count,
+                enable_expert_parallel=enable_expert_parallel,
                 total_gpus=total_gpus,
                 unused_gpus=unused_gpus,
                 score=_candidate_score( #!! score
                     total_gpus=total_gpus,
-                    data_parallel_size=data_parallel_size,
+                    replica_count=replica_count,
                     replica_gpus=replica_gpus,
                     target_replica_gpus=target_replica_gpus,
                     unused_gpus=unused_gpus,
@@ -409,9 +528,9 @@ def _supported_config_candidates(
         candidates,
         key=lambda candidate: (
             candidate.score,
-            candidate.data_parallel_size,
+            candidate.replica_count,
             candidate.tensor_parallel_size,
-            candidate.expert_parallel_size,
+            candidate.effective_expert_parallel_size,
             -candidate.pipeline_parallel_size,
             -candidate.unused_gpus,
         ),
@@ -457,8 +576,8 @@ def build_parallel_plan(
         tensor_parallel_size=parallel_config.tensor_parallel_size,
         data_parallel_size=parallel_config.data_parallel_size,
         pipeline_parallel_size=parallel_config.pipeline_parallel_size,
-        expert_parallel_size=parallel_config.expert_parallel_size,
-        num_replicas=parallel_config.data_parallel_size,
+        replica_count=parallel_config.replica_count,
+        enable_expert_parallel=parallel_config.enable_expert_parallel,
         num_gpus=parallel_config.total_gpus,
         target_nodes=select_target_nodes(
             worker_nodes, parallel_config.total_gpus
@@ -545,8 +664,15 @@ def plan_dynamic_reparallelization(
                     selected.pipeline_parallel_size
                 ),
                 "selected_data_parallel_size": selected.data_parallel_size,
+                "selected_replica_count": selected.replica_count,
+                "selected_effective_expert_parallel_size": (
+                    selected.effective_expert_parallel_size
+                ),
                 "selected_expert_parallel_size": (
-                    selected.expert_parallel_size
+                    selected.effective_expert_parallel_size
+                ),
+                "selected_enable_expert_parallel": (
+                    selected.enable_expert_parallel
                 ),
             }
         )
@@ -557,7 +683,10 @@ def plan_dynamic_reparallelization(
                 "selected_tensor_parallel_size": 0,
                 "selected_pipeline_parallel_size": 0,
                 "selected_data_parallel_size": 0,
+                "selected_replica_count": 0,
+                "selected_effective_expert_parallel_size": 0,
                 "selected_expert_parallel_size": 0,
+                "selected_enable_expert_parallel": False,
             }
         )
     return decision

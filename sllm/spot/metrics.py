@@ -72,6 +72,15 @@ def make_replanning_event(
         "selected_data_parallel_size": decision.get(
             "selected_data_parallel_size", 0
         ),
+        "selected_replica_count": decision.get(
+            "selected_replica_count", 0
+        ),
+        "selected_enable_expert_parallel": decision.get(
+            "selected_enable_expert_parallel", False
+        ),
+        "selected_effective_expert_parallel_size": decision.get(
+            "selected_effective_expert_parallel_size", 0
+        ),
         "selected_expert_parallel_size": decision.get(
             "selected_expert_parallel_size", 0
         ),

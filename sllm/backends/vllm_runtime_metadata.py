@@ -98,6 +98,7 @@ def get_vllm_model_resource_profile(
     num_gpus = tensor_parallel_size * pipeline_parallel_size * data_parallel_size
     planned_expert_parallel_size = _positive_int(
         _first_present(
+            backend_config.get("planned_effective_expert_parallel_size"),
             backend_config.get("planned_expert_parallel_size"),
             backend_config.get("expert_parallel_size"),
         ),
@@ -105,6 +106,7 @@ def get_vllm_model_resource_profile(
     )
     runtime_expert_parallel_size = _optional_positive_int(
         _first_present(
+            runtime_metadata.get("effective_expert_parallel_size"),
             runtime_metadata.get("expert_parallel_size"),
             runtime_metadata.get("runtime_expert_parallel_size"),
         )
@@ -123,16 +125,23 @@ def get_vllm_model_resource_profile(
     )
     if runtime_expert_parallel_size and runtime_expert_parallel_size > 1:
         expert_parallel_enabled = True
-    expert_parallel_size_source = str(
-        runtime_metadata.get("expert_parallel_size_source")
-        or (
-            "runtime_metadata"
-            if runtime_expert_parallel_size is not None
-            else "enable_expert_parallel_boolean"
-            if expert_parallel_enabled
-            else "default"
-        )
+    effective_expert_parallel_size = (
+        tensor_parallel_size * data_parallel_size
+        if expert_parallel_enabled
+        else 1
     )
+    runtime_expert_parallel_size = (
+        runtime_expert_parallel_size or effective_expert_parallel_size
+    )
+    expert_parallel_size_verified = True
+    if runtime_metadata.get("expert_parallel_size_source"):
+        expert_parallel_size_source = str(
+            runtime_metadata["expert_parallel_size_source"]
+        )
+    elif expert_parallel_enabled:
+        expert_parallel_size_source = "derived_from_tp_dp"
+    else:
+        expert_parallel_size_source = "disabled"
 
     profile = {
         "model_name": model_name,
@@ -142,9 +151,16 @@ def get_vllm_model_resource_profile(
         "pipeline_parallel_size": pipeline_parallel_size,
         "data_parallel_size": data_parallel_size,
         "expert_parallel_enabled": expert_parallel_enabled,
+        "planned_effective_expert_parallel_size": (
+            planned_expert_parallel_size
+        ),
         "planned_expert_parallel_size": planned_expert_parallel_size,
+        "effective_expert_parallel_size": effective_expert_parallel_size,
         "expert_parallel_size_verified": expert_parallel_size_verified,
         "expert_parallel_size_source": expert_parallel_size_source,
+        "parallel_plan_mismatch": (
+            planned_expert_parallel_size != effective_expert_parallel_size
+        ),
         "estimated_load_time_s": _non_negative_float(
             runtime_metadata.get("estimated_load_time_s"),
             _non_negative_float(runtime_metadata.get("load_time_s"), 0.0),
@@ -162,8 +178,7 @@ def get_vllm_model_resource_profile(
             backend_config.get("max_num_seqs"), 1
         ),
     }
-    if runtime_expert_parallel_size is not None and expert_parallel_size_verified:
-        profile["expert_parallel_size"] = runtime_expert_parallel_size
+    profile["expert_parallel_size"] = runtime_expert_parallel_size
     return profile
 
 

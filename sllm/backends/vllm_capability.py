@@ -24,80 +24,86 @@ VLLM_MOE_SUPPORTED_SHAPES = (
     {
         "tensor_parallel_size": 4,
         "data_parallel_size": 1,
+        "replica_count": 1,
         "pipeline_parallel_size": 1,
-        "expert_parallel_size": 1,
+        "enable_expert_parallel": False,
     },
     {
         "tensor_parallel_size": 4,
         "data_parallel_size": 1,
+        "replica_count": 1,
         "pipeline_parallel_size": 1,
-        "expert_parallel_size": 2,
+        "enable_expert_parallel": True,
     },
     {
         "tensor_parallel_size": 2,
         "data_parallel_size": 1,
+        "replica_count": 1,
         "pipeline_parallel_size": 1,
-        "expert_parallel_size": 1,
-    },
-    {
-        "tensor_parallel_size": 2,
-        "data_parallel_size": 2,
-        "pipeline_parallel_size": 1,
-        "expert_parallel_size": 1,
+        "enable_expert_parallel": False,
     },
     {
         "tensor_parallel_size": 2,
         "data_parallel_size": 1,
+        "replica_count": 2,
         "pipeline_parallel_size": 1,
-        "expert_parallel_size": 2,
-    },
-    {
-        "tensor_parallel_size": 2,
-        "data_parallel_size": 2,
-        "pipeline_parallel_size": 1,
-        "expert_parallel_size": 2,
-    },
-    {
-        "tensor_parallel_size": 1,
-        "data_parallel_size": 1,
-        "pipeline_parallel_size": 1,
-        "expert_parallel_size": 1,
-    },
-    {
-        "tensor_parallel_size": 1,
-        "data_parallel_size": 2,
-        "pipeline_parallel_size": 1,
-        "expert_parallel_size": 1,
-    },
-    {
-        "tensor_parallel_size": 1,
-        "data_parallel_size": 3,
-        "pipeline_parallel_size": 1,
-        "expert_parallel_size": 1,
-    },
-    {
-        "tensor_parallel_size": 1,
-        "data_parallel_size": 4,
-        "pipeline_parallel_size": 1,
-        "expert_parallel_size": 1,
-    },
-    {
-        "tensor_parallel_size": 1,
-        "data_parallel_size": 4,
-        "pipeline_parallel_size": 1,
-        "expert_parallel_size": 2,
+        "enable_expert_parallel": False,
     },
     {
         "tensor_parallel_size": 2,
         "data_parallel_size": 1,
+        "replica_count": 1,
+        "pipeline_parallel_size": 1,
+        "enable_expert_parallel": True,
+    },
+    {
+        "tensor_parallel_size": 2,
+        "data_parallel_size": 1,
+        "replica_count": 2,
+        "pipeline_parallel_size": 1,
+        "enable_expert_parallel": True,
+    },
+    {
+        "tensor_parallel_size": 1,
+        "data_parallel_size": 1,
+        "replica_count": 1,
+        "pipeline_parallel_size": 1,
+        "enable_expert_parallel": False,
+    },
+    {
+        "tensor_parallel_size": 1,
+        "data_parallel_size": 1,
+        "replica_count": 2,
+        "pipeline_parallel_size": 1,
+        "enable_expert_parallel": False,
+    },
+    {
+        "tensor_parallel_size": 1,
+        "data_parallel_size": 1,
+        "replica_count": 3,
+        "pipeline_parallel_size": 1,
+        "enable_expert_parallel": False,
+    },
+    {
+        "tensor_parallel_size": 1,
+        "data_parallel_size": 1,
+        "replica_count": 4,
+        "pipeline_parallel_size": 1,
+        "enable_expert_parallel": False,
+    },
+    {
+        "tensor_parallel_size": 2,
+        "data_parallel_size": 1,
+        "replica_count": 1,
         "pipeline_parallel_size": 2,
-        "expert_parallel_size": 1,
+        "enable_expert_parallel": False,
     },
     {
         "tensor_parallel_size": 2,
         "data_parallel_size": 1,
+        "replica_count": 1,
         "pipeline_parallel_size": 2,
-        "expert_parallel_size": 2,
+        "enable_expert_parallel": True,
     },
 )
 
@@ -123,8 +129,9 @@ def _make_plan(
     model_name: str,
     tensor_parallel_size: int,
     data_parallel_size: int,
+    replica_count: int,
     pipeline_parallel_size: int,
-    expert_parallel_size: int,
+    enable_expert_parallel: bool,
     reason: str,
     num_gpus: Optional[int] = None,
 ) -> ParallelPlan:
@@ -133,6 +140,7 @@ def _make_plan(
             tensor_parallel_size
             * data_parallel_size
             * pipeline_parallel_size
+            * replica_count
         )
     return ParallelPlan(
         model_name=model_name,
@@ -140,8 +148,8 @@ def _make_plan(
         tensor_parallel_size=tensor_parallel_size,
         data_parallel_size=data_parallel_size,
         pipeline_parallel_size=pipeline_parallel_size,
-        expert_parallel_size=expert_parallel_size,
-        num_replicas=data_parallel_size,
+        replica_count=replica_count,
+        enable_expert_parallel=enable_expert_parallel,
         num_gpus=num_gpus,
         reason=reason,
     )
@@ -163,8 +171,9 @@ def get_vllm_capability(
                 model_name=model_name,
                 tensor_parallel_size=shape["tensor_parallel_size"],
                 data_parallel_size=shape["data_parallel_size"],
+                replica_count=shape["replica_count"],
                 pipeline_parallel_size=shape["pipeline_parallel_size"],
-                expert_parallel_size=shape["expert_parallel_size"],
+                enable_expert_parallel=shape["enable_expert_parallel"],
                 reason="verified_vllm_moe_config",
             )
             for shape in VLLM_MOE_SUPPORTED_SHAPES
@@ -175,8 +184,9 @@ def get_vllm_capability(
                 model_name=model_name,
                 tensor_parallel_size=tensor_parallel_size,
                 data_parallel_size=1,
+                replica_count=1,
                 pipeline_parallel_size=1,
-                expert_parallel_size=1,
+                enable_expert_parallel=False,
                 reason="current_vllm_config",
                 num_gpus=max(configured_num_gpus, tensor_parallel_size),
             )
@@ -187,7 +197,9 @@ def get_vllm_capability(
         *(config.num_gpus for config in supported_configs),
     )
     supports_ep = any(
-        config.expert_parallel_size > 1 for config in supported_configs
+        config.enable_expert_parallel
+        and config.effective_expert_parallel_size > 1
+        for config in supported_configs
     )
     return BackendCapability(
         backend="vllm",

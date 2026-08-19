@@ -72,8 +72,10 @@ num_experts
 top_k
 tensor_parallel_size
 pipeline_parallel_size
-expert_parallel_size
+data_parallel_size
+replica_count
 expert_parallel_enabled
+effective_expert_parallel_size
 expert_ids_by_rank
 rank_id
 node_id
@@ -120,7 +122,10 @@ class ExpertPlacementState:
     model_name: str
     tensor_parallel_size: int
     pipeline_parallel_size: int
-    expert_parallel_size: int
+    data_parallel_size: int
+    replica_count: int
+    expert_parallel_enabled: bool
+    effective_expert_parallel_size: int
     shards: list[ExpertShard]
 
 
@@ -308,8 +313,9 @@ same-node/cross-node restore support
 MoE recovery 應在 `InferenceState.metadata` 中加入：
 
 ```text
-expert_parallel_size
 expert_parallel_enabled
+effective_expert_parallel_size
+replica_count
 expert_placement_fingerprint
 expert_route_histogram
 gate_model_revision
@@ -400,7 +406,8 @@ moe_planning_events
 moe_global_hot_experts
 moe_request_hot_experts
 moe_recent_window_hot_experts
-moe_selected_expert_parallel_size
+moe_selected_effective_expert_parallel_size
+moe_selected_replica_count
 moe_moved_expert_count
 moe_moved_weight_bytes
 moe_hot_expert_locality_ratio
@@ -432,7 +439,8 @@ expert placement result
 
 完成條件：
 
-- vLLM backend 回傳 `expert_parallel_enabled`、`expert_parallel_size`。
+- vLLM backend 回傳 `expert_parallel_enabled`、
+  `effective_expert_parallel_size`、`replica_count`。
 - 若 runtime 可取得，回傳 `expert_ids_by_rank`。
 - 分開回報 global hotness、per-request route histogram、
   recent-window hotness。

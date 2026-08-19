@@ -59,7 +59,8 @@ def test_parallel_candidate_generation_prefers_current_replica_shape():
     assert selected.total_gpus == 4
     assert selected.tensor_parallel_size == 2
     assert selected.pipeline_parallel_size == 1
-    assert selected.data_parallel_size == 2
+    assert selected.data_parallel_size == 1
+    assert selected.replica_count == 2
 
 
 def test_dynamic_reparallelization_plan_after_gpu_loss():
@@ -83,6 +84,9 @@ def test_dynamic_reparallelization_plan_after_gpu_loss():
     assert decision["availability"]["available_gpus"] == 2
     assert decision["selected_total_gpus"] == 2
     assert decision["selected_data_parallel_size"] == 1
+    assert decision["selected_replica_count"] == 1
+    assert decision["selected_enable_expert_parallel"] is False
+    assert decision["selected_effective_expert_parallel_size"] == 1
     assert decision["selected_expert_parallel_size"] == 1
     assert decision["parallel_plan"] == {
         "model_name": "dummy-reparallelization",
@@ -90,6 +94,9 @@ def test_dynamic_reparallelization_plan_after_gpu_loss():
         "tensor_parallel_size": 2,
         "data_parallel_size": 1,
         "pipeline_parallel_size": 1,
+        "replica_count": 1,
+        "enable_expert_parallel": False,
+        "effective_expert_parallel_size": 1,
         "expert_parallel_size": 1,
         "num_replicas": 1,
         "num_gpus": 2,
@@ -163,9 +170,9 @@ def test_parallel_plan_shared_interface_serializes_to_dict():
         model_name="moe-model",
         backend="vllm",
         tensor_parallel_size=2,
-        data_parallel_size=4,
-        expert_parallel_size=2,
-        num_replicas=4,
+        data_parallel_size=1,
+        replica_count=4,
+        enable_expert_parallel=True,
         num_gpus=8,
         target_nodes=["node-a", "node-b"],
         reason="spot_preempt",
@@ -175,8 +182,11 @@ def test_parallel_plan_shared_interface_serializes_to_dict():
         "model_name": "moe-model",
         "backend": "vllm",
         "tensor_parallel_size": 2,
-        "data_parallel_size": 4,
+        "data_parallel_size": 1,
         "pipeline_parallel_size": 1,
+        "replica_count": 4,
+        "enable_expert_parallel": True,
+        "effective_expert_parallel_size": 2,
         "expert_parallel_size": 2,
         "num_replicas": 4,
         "num_gpus": 8,

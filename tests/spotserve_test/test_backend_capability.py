@@ -30,6 +30,9 @@ def test_vllm_capability_advertises_current_tp_shape_only():
     assert plan.tensor_parallel_size == 2
     assert plan.data_parallel_size == 1
     assert plan.pipeline_parallel_size == 1
+    assert plan.replica_count == 1
+    assert plan.enable_expert_parallel is False
+    assert plan.effective_expert_parallel_size == 1
     assert plan.expert_parallel_size == 1
     assert plan.num_replicas == 1
     assert plan.num_gpus == 4
@@ -55,7 +58,9 @@ def test_vllm_moe_capability_advertises_verified_shapes():
             plan.tensor_parallel_size,
             plan.data_parallel_size,
             plan.pipeline_parallel_size,
-            plan.expert_parallel_size,
+            plan.replica_count,
+            plan.enable_expert_parallel,
+            plan.effective_expert_parallel_size,
             plan.num_gpus,
             plan.num_replicas,
             plan.reason,
@@ -66,16 +71,18 @@ def test_vllm_moe_capability_advertises_verified_shapes():
     assert capability.supports_ep is True
     assert capability.max_num_gpus == 4
     assert configs == {
-        (4, 1, 1, 1, 4, 1, "verified_vllm_moe_config"),
-        (4, 1, 1, 2, 4, 1, "verified_vllm_moe_config"),
-        (2, 1, 1, 1, 2, 1, "verified_vllm_moe_config"),
-        (2, 2, 1, 1, 4, 2, "verified_vllm_moe_config"),
-        (2, 1, 1, 2, 2, 1, "verified_vllm_moe_config"),
-        (2, 2, 1, 2, 4, 2, "verified_vllm_moe_config"),
-        (1, 4, 1, 1, 4, 4, "verified_vllm_moe_config"),
-        (1, 4, 1, 2, 4, 4, "verified_vllm_moe_config"),
-        (2, 1, 2, 1, 4, 1, "verified_vllm_moe_config"),
-        (2, 1, 2, 2, 4, 1, "verified_vllm_moe_config"),
+        (4, 1, 1, 1, False, 1, 4, 1, "verified_vllm_moe_config"),
+        (4, 1, 1, 1, True, 4, 4, 1, "verified_vllm_moe_config"),
+        (2, 1, 1, 1, False, 1, 2, 1, "verified_vllm_moe_config"),
+        (2, 1, 1, 2, False, 1, 4, 2, "verified_vllm_moe_config"),
+        (2, 1, 1, 1, True, 2, 2, 1, "verified_vllm_moe_config"),
+        (2, 1, 1, 2, True, 2, 4, 2, "verified_vllm_moe_config"),
+        (1, 1, 1, 1, False, 1, 1, 1, "verified_vllm_moe_config"),
+        (1, 1, 1, 2, False, 1, 2, 2, "verified_vllm_moe_config"),
+        (1, 1, 1, 3, False, 1, 3, 3, "verified_vllm_moe_config"),
+        (1, 1, 1, 4, False, 1, 4, 4, "verified_vllm_moe_config"),
+        (2, 1, 2, 1, False, 1, 4, 1, "verified_vllm_moe_config"),
+        (2, 1, 2, 1, True, 2, 4, 1, "verified_vllm_moe_config"),
     }
 
 
@@ -136,6 +143,9 @@ def test_backend_capability_serializes_supported_configs():
                 "tensor_parallel_size": 1,
                 "data_parallel_size": 1,
                 "pipeline_parallel_size": 1,
+                "replica_count": 1,
+                "enable_expert_parallel": False,
+                "effective_expert_parallel_size": 1,
                 "expert_parallel_size": 1,
                 "num_replicas": 1,
                 "num_gpus": 1,

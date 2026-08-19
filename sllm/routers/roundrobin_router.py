@@ -675,8 +675,8 @@ class RoundRobinRouter(SllmRouter):
             # Capability negotiation needs the concrete model/runtime
             # configuration.  Without this field the planner falls back to
             # the runtime-neutral candidate generator, which intentionally
-            # uses expert_parallel_size=1 and can never select a live EP
-            # shape for a MoE model.
+            # uses runtime DP=1 and EP disabled, so it cannot select an
+            # expert-parallel shape for a MoE model.
             "backend_config": dict(self.backend_config),
         }
         decision = plan_dynamic_reparallelization(
@@ -767,8 +767,10 @@ class RoundRobinRouter(SllmRouter):
             and left.tensor_parallel_size == right.tensor_parallel_size
             and left.pipeline_parallel_size == right.pipeline_parallel_size
             and left.data_parallel_size == right.data_parallel_size
-            and left.expert_parallel_size == right.expert_parallel_size
-            and left.num_replicas == right.num_replicas
+            and left.enable_expert_parallel == right.enable_expert_parallel
+            and left.effective_expert_parallel_size
+            == right.effective_expert_parallel_size
+            and left.replica_count == right.replica_count
             and left.num_gpus == right.num_gpus
             and sorted(left.target_nodes) == sorted(right.target_nodes)
         )

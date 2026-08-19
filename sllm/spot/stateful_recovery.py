@@ -186,7 +186,7 @@ def _parallel_and_cache_compatible(
         "model_revision",
         "tensor_parallel_size",
         "pipeline_parallel_size",
-        "expert_parallel_size",
+        "effective_expert_parallel_size",
         "expert_parallel_enabled",
         "cache_block_size",
         "cache_dtype",

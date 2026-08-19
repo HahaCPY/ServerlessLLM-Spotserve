@@ -33,8 +33,8 @@ preemption-aware flow 裡。
 vLLM MoE black-box integration，且 expert routing、expert migration、
 MoE-specific recovery optimization 都是 out of scope。
 
-程式上 `sllm/backends/vllm_capability.py` 有 MoE supported shapes，也包含
-`expert_parallel_size > 1` 的候選；但目前沒有做到：
+程式上 `sllm/backends/vllm_capability.py` 有 MoE supported shapes，也能表示
+`enable_expert_parallel=True` 後的 derived effective EP；但目前沒有做到：
 
 - expert-level placement decision
 - expert hotness / routed-token load balancing
@@ -50,7 +50,7 @@ MoE-specific recovery optimization 都是 out of scope。
 
 建議補強：
 
-- 在 runtime metadata 加入 `num_experts`, `expert_parallel_size`,
+- 在 runtime metadata 加入 `num_experts`, `effective_expert_parallel_size`,
   `expert_ids_by_rank`, `expert_load`, `routed_tokens_by_expert`。
 - 讓 re-parallelization planner 真的把 expert placement 放進候選與 cost model。
 - 加 MoE-specific benchmark：preempt 某個 expert-heavy rank，看新 plan 是否降低
@@ -58,44 +58,63 @@ MoE-specific recovery optimization 都是 out of scope。
 
 ### 2. `expert_parallel_size` 的規劃與實際 vLLM config 可能不一致 ✅
 
-`sllm/backends/vllm_capability.py` 會產生 `expert_parallel_size=2` 等候選。
-修正前，`sllm/spot/vllm_deployment_adapter.py` 只把它轉成：
+vLLM 的 MoE EP 不是獨立設定 `expert_parallel_size=N`。正確語意是：
+
+```text
+enable_expert_parallel = True / False
+effective_expert_parallel_size = tensor_parallel_size * data_parallel_size
+```
+
+修正前，`sllm/backends/vllm_capability.py` 會產生
+`expert_parallel_size=2` 等候選，而 `sllm/spot/vllm_deployment_adapter.py`
+只把它轉成：
 
 ```python
 config["enable_expert_parallel"] = plan.expert_parallel_size > 1
 ```
 
-也就是說，control plane 可以區分 EP=1 和 EP=2，但實際傳給 vLLM 的配置曾主要是
-boolean。若目前 vLLM 版本本來就只支援 boolean，這樣可以跑；但如果文件或實驗
-宣稱「planner 精準選了 EP=2」，證據會不足。
+更大的問題是：`data_parallel_size` 在 planner 中其實曾代表
+ServerlessLLM 要建立幾個 Ray Actor，但在 vLLM 中它代表同一個 distributed
+vLLM deployment 內部的 DP degree。也就是：
+
+```text
+planner data_parallel_size = replica count
+vLLM data_parallel_size = runtime DP
+```
+
+這兩個混在一起時，planner 以為 `DP=4`，但 executor 實際建立的是四個
+`data_parallel_size=1` 的獨立 vLLM actors。
 
 影響：
 
 ```text
-planner selected EP size != runtime necessarily applied EP size
+planner DP / EP plan != vLLM runtime DP / effective EP
 ```
 
 建議補強：
 
-- 若 vLLM API 支援明確 EP degree，將 `expert_parallel_size` 寫入
-  `backend_config` 並確認 engine args 有吃到。
-- 若 vLLM API 只支援 boolean，文件與 metric 應改成
-  `expert_parallel_enabled`，避免誤導。
-- `get_runtime_metadata()` 應回報 runtime 實際 EP shape，而不是只回報布林值。
+- `ParallelPlan.data_parallel_size` 只代表 vLLM runtime DP。
+- 新增 `replica_count` 代表 ServerlessLLM/Ray Actor 數量。
+- planner 不再自由設定 `expert_parallel_size`。
+- `effective_expert_parallel_size` 改成 derived value：
+  `TP * DP` when `enable_expert_parallel=True`，否則為 1。
+- `get_runtime_metadata()` 回報 actual TP/DP/EP-enabled/effective EP，並標示
+  `parallel_plan_mismatch`。
 
 已修正：
 
-- `VllmDeploymentAdapter` 會把 planner 選出的 EP degree 寫成
-  `planned_expert_parallel_size` / `expert_parallel_size`，並同步設定
-  `enable_expert_parallel`。
-- `VllmBackend.get_runtime_metadata()` 會從實際 `AsyncEngineArgs` 回報 TP/PP/DP
-  和 `expert_parallel_enabled`；只有 runtime / engine args 明確提供 EP degree 時，
-  才把它標成 verified `expert_parallel_size`。
-- 若目前 vLLM API 只有 `enable_expert_parallel` boolean，metadata 會保留
-  `planned_expert_parallel_size`，並用 `expert_parallel_size_verified=false` 避免把
-  planner 的 EP degree 誤宣稱成 runtime 已套用的 EP shape。
-- re-parallelization decision / metrics 增加
-  `selected_expert_parallel_size`，用來明確呈現 planner 選擇。
+- `ParallelPlan` 已拆成 `data_parallel_size` 與 `replica_count`。
+- `ParallelPlan.effective_expert_parallel_size` 由 `enable_expert_parallel`、
+  `tensor_parallel_size`、`data_parallel_size` 推導。
+- `VllmDeploymentAdapter` 會把 `data_parallel_size` 傳給 vLLM，並用
+  `replica_count` 建立 ServerlessLLM Ray actors。
+- 第一階段 planner/capability 保守限制 vLLM runtime DP 為 1；原本多 DP 的語意
+  轉成 `replica_count`。
+- re-parallelization decision / metrics 增加 `selected_replica_count`、
+  `selected_enable_expert_parallel`、
+  `selected_effective_expert_parallel_size`。
+- runtime metadata 增加 `planned_effective_expert_parallel_size`、
+  `effective_expert_parallel_size`、`parallel_plan_mismatch`。
 
 ### 3. V7 context migration 不等於 true KV migration
 
@@ -312,7 +331,8 @@ context_migration_reusable_context_blocks
 1. 文件措辭修正：把「SpotServe on MoE」改成
    「SpotServe-style control plane for vLLM MoE」。
 2. metric 修正：把 planning、prefix warmup、true KV restore 三種結果分開。
-3. EP 修正：確認 `expert_parallel_size` 是否真的傳入 vLLM；若沒有，避免宣稱 EP degree。
+3. EP 修正：把 ServerlessLLM `replica_count` 和 vLLM
+   `data_parallel_size` 分開；只宣稱 derived `effective_expert_parallel_size`。
 4. router 修正：避免 SpotServe flow 使用舊 `MigrationRouter`。
 5. simulator 修正：`preempt` 加 grace-period deadline 與自動 `dead`。
 6. 實驗補強：至少補一組 physical cross-node NIXL restore，或明確標示目前是 same-host。

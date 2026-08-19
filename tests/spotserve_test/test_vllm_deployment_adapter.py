@@ -62,8 +62,8 @@ async def test_vllm_adapter_creates_real_shape_and_honors_target_node(monkeypatc
         tensor_parallel_size=2,
         pipeline_parallel_size=1,
         data_parallel_size=1,
-        expert_parallel_size=2,
-        num_replicas=1,
+        replica_count=1,
+        enable_expert_parallel=True,
         num_gpus=2,
         target_nodes=["node-1"],
     )
@@ -71,8 +71,10 @@ async def test_vllm_adapter_creates_real_shape_and_honors_target_node(monkeypatc
     assert list(deployment.instances.values())[0].node_id == "node-1"
     assert deployment.resource_requirements["num_gpus"] == 2
     assert deployment.backend_config["tensor_parallel_size"] == 2
+    assert deployment.backend_config["data_parallel_size"] == 1
+    assert deployment.backend_config["replica_count"] == 1
+    assert deployment.backend_config["planned_effective_expert_parallel_size"] == 2
     assert deployment.backend_config["planned_expert_parallel_size"] == 2
-    assert deployment.backend_config["expert_parallel_size"] == 2
     assert deployment.backend_config["enable_expert_parallel"] is True
     assert deployment.backend_config["expert_parallel_size_verified"] is False
     assert await adapter.ready_workers(deployment, plan)

@@ -288,23 +288,40 @@ class VllmBackend(SllmBackend):
             if value is not None:
                 metadata[field_name] = value
         enable_ep = bool(metadata.get("enable_expert_parallel", False))
-        metadata["expert_parallel_enabled"] = enable_ep
-        metadata["planned_expert_parallel_size"] = self.backend_config.get(
-            "planned_expert_parallel_size",
-            self.backend_config.get("expert_parallel_size", 1),
+        tensor_parallel_size = max(
+            1, int(metadata.get("tensor_parallel_size", 1) or 1)
         )
-        if "expert_parallel_size" in self._async_engine_fields:
-            metadata["expert_parallel_size"] = max(
-                1,
-                int(getattr(self.engine_args, "expert_parallel_size", 1) or 1),
+        data_parallel_size = max(
+            1, int(metadata.get("data_parallel_size", 1) or 1)
+        )
+        effective_ep_size = (
+            tensor_parallel_size * data_parallel_size if enable_ep else 1
+        )
+        metadata["expert_parallel_enabled"] = enable_ep
+        planned_ep_size = self.backend_config.get(
+            "planned_effective_expert_parallel_size",
+            self.backend_config.get(
+                "planned_expert_parallel_size",
+                self.backend_config.get("expert_parallel_size", 1),
             )
-            metadata["expert_parallel_size_verified"] = True
-            metadata["expert_parallel_size_source"] = "engine_args"
-        else:
-            metadata["expert_parallel_size_verified"] = False
-            metadata["expert_parallel_size_source"] = (
-                "enable_expert_parallel_boolean" if enable_ep else "default"
-            )
+        )
+        try:
+            planned_ep_size = max(1, int(planned_ep_size or 1))
+        except (TypeError, ValueError):
+            planned_ep_size = 1
+        metadata["planned_effective_expert_parallel_size"] = planned_ep_size
+        metadata["planned_expert_parallel_size"] = metadata[
+            "planned_effective_expert_parallel_size"
+        ]
+        metadata["effective_expert_parallel_size"] = effective_ep_size
+        metadata["expert_parallel_size"] = effective_ep_size
+        metadata["expert_parallel_size_verified"] = True
+        metadata["expert_parallel_size_source"] = (
+            "derived_from_tp_dp" if enable_ep else "disabled"
+        )
+        metadata["parallel_plan_mismatch"] = (
+            metadata["planned_effective_expert_parallel_size"] != effective_ep_size
+        )
         return metadata
 
     def _runtime_hook(self, *names: str):
@@ -1067,20 +1084,28 @@ class VllmBackend(SllmBackend):
             "planned_expert_parallel_size": parallel_metadata.get(
                 "planned_expert_parallel_size"
             ),
+            "planned_effective_expert_parallel_size": parallel_metadata.get(
+                "planned_effective_expert_parallel_size"
+            ),
+            "effective_expert_parallel_size": parallel_metadata.get(
+                "effective_expert_parallel_size"
+            ),
             "expert_parallel_size_verified": parallel_metadata.get(
                 "expert_parallel_size_verified"
             ),
             "expert_parallel_size_source": parallel_metadata.get(
                 "expert_parallel_size_source"
             ),
+            "parallel_plan_mismatch": parallel_metadata.get(
+                "parallel_plan_mismatch"
+            ),
             "cache_block_size": self.backend_config.get("block_size"),
             "cache_dtype": self.backend_config.get("kv_cache_dtype"),
             "cache_layout": self.backend_config.get("kv_cache_layout"),
         }
-        if parallel_metadata.get("expert_parallel_size_verified"):
-            config_metadata["expert_parallel_size"] = parallel_metadata.get(
-                "expert_parallel_size"
-            )
+        config_metadata["expert_parallel_size"] = parallel_metadata.get(
+            "expert_parallel_size"
+        )
         for key, value in config_metadata.items():
             if value is not None:
                 state_metadata.setdefault(key, value)
