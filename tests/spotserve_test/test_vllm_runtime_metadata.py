@@ -13,6 +13,8 @@ def test_vllm_model_resource_profile_reports_parallel_shape():
             "pipeline_parallel_size": 2,
             "data_parallel_size": 1,
             "enable_expert_parallel": True,
+            "planned_expert_parallel_size": 2,
+            "expert_parallel_size": 2,
             "gpu_memory_utilization": 0.9,
             "max_model_len": 1024,
             "max_num_seqs": 1,
@@ -20,6 +22,9 @@ def test_vllm_model_resource_profile_reports_parallel_shape():
         runtime_metadata={
             "estimated_load_time_s": 12.5,
             "gpu_memory_required_gb": 28.0,
+            "expert_parallel_size": 2,
+            "expert_parallel_size_verified": True,
+            "expert_parallel_size_source": "engine_args",
         },
     )
 
@@ -30,8 +35,33 @@ def test_vllm_model_resource_profile_reports_parallel_shape():
     assert profile["pipeline_parallel_size"] == 2
     assert profile["data_parallel_size"] == 1
     assert profile["expert_parallel_enabled"] is True
+    assert profile["planned_expert_parallel_size"] == 2
+    assert profile["expert_parallel_size"] == 2
+    assert profile["expert_parallel_size_verified"] is True
+    assert profile["expert_parallel_size_source"] == "engine_args"
     assert profile["estimated_load_time_s"] == 12.5
     assert profile["gpu_memory_required_gb"] == 28.0
+
+
+def test_vllm_model_resource_profile_keeps_unverified_ep_degree_planned():
+    profile = get_vllm_model_resource_profile(
+        model_name="vllm-moe",
+        backend_config={
+            "tensor_parallel_size": 2,
+            "enable_expert_parallel": True,
+            "planned_expert_parallel_size": 2,
+            "expert_parallel_size": 2,
+            "expert_parallel_size_verified": False,
+        },
+    )
+
+    assert profile["expert_parallel_enabled"] is True
+    assert profile["planned_expert_parallel_size"] == 2
+    assert "expert_parallel_size" not in profile
+    assert profile["expert_parallel_size_verified"] is False
+    assert profile["expert_parallel_size_source"] == (
+        "enable_expert_parallel_boolean"
+    )
 
 
 def test_vllm_runtime_metadata_can_feed_risk_score():

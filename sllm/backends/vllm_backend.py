@@ -271,9 +271,41 @@ class VllmBackend(SllmBackend):
         )
 
         self.engine_args = AsyncEngineArgs(**filtered_engine_config)
+        self._async_engine_fields = async_engine_fields
 
         self.engine = None
         self.model_load_time_s = 0.0
+
+    def _engine_parallel_metadata(self) -> Dict[str, Any]:
+        metadata: Dict[str, Any] = {}
+        for field_name in (
+            "tensor_parallel_size",
+            "pipeline_parallel_size",
+            "data_parallel_size",
+            "enable_expert_parallel",
+        ):
+            value = getattr(self.engine_args, field_name, None)
+            if value is not None:
+                metadata[field_name] = value
+        enable_ep = bool(metadata.get("enable_expert_parallel", False))
+        metadata["expert_parallel_enabled"] = enable_ep
+        metadata["planned_expert_parallel_size"] = self.backend_config.get(
+            "planned_expert_parallel_size",
+            self.backend_config.get("expert_parallel_size", 1),
+        )
+        if "expert_parallel_size" in self._async_engine_fields:
+            metadata["expert_parallel_size"] = max(
+                1,
+                int(getattr(self.engine_args, "expert_parallel_size", 1) or 1),
+            )
+            metadata["expert_parallel_size_verified"] = True
+            metadata["expert_parallel_size_source"] = "engine_args"
+        else:
+            metadata["expert_parallel_size_verified"] = False
+            metadata["expert_parallel_size_source"] = (
+                "enable_expert_parallel_boolean" if enable_ep else "default"
+            )
+        return metadata
 
     def _runtime_hook(self, *names: str):
         """Find an optional state-transfer hook exposed by the vLLM runtime.
@@ -1021,17 +1053,34 @@ class VllmBackend(SllmBackend):
         state_metadata.setdefault("cache_engine", "vllm")
         state_metadata.setdefault("can_restore_same_node", False)
         state_metadata.setdefault("can_restore_cross_node", False)
+        parallel_metadata = self._engine_parallel_metadata()
         config_metadata = {
-            "tensor_parallel_size": self.backend_config.get(
+            "tensor_parallel_size": parallel_metadata.get(
                 "tensor_parallel_size"
             ),
-            "pipeline_parallel_size": self.backend_config.get(
+            "pipeline_parallel_size": parallel_metadata.get(
                 "pipeline_parallel_size"
+            ),
+            "expert_parallel_enabled": parallel_metadata.get(
+                "expert_parallel_enabled"
+            ),
+            "planned_expert_parallel_size": parallel_metadata.get(
+                "planned_expert_parallel_size"
+            ),
+            "expert_parallel_size_verified": parallel_metadata.get(
+                "expert_parallel_size_verified"
+            ),
+            "expert_parallel_size_source": parallel_metadata.get(
+                "expert_parallel_size_source"
             ),
             "cache_block_size": self.backend_config.get("block_size"),
             "cache_dtype": self.backend_config.get("kv_cache_dtype"),
             "cache_layout": self.backend_config.get("kv_cache_layout"),
         }
+        if parallel_metadata.get("expert_parallel_size_verified"):
+            config_metadata["expert_parallel_size"] = parallel_metadata.get(
+                "expert_parallel_size"
+            )
         for key, value in config_metadata.items():
             if value is not None:
                 state_metadata.setdefault(key, value)
@@ -1203,6 +1252,7 @@ class VllmBackend(SllmBackend):
             runtime_metadata={
                 "load_time_s": self.model_load_time_s,
                 **gpu_metadata,
+                **self._engine_parallel_metadata(),
             },
         )
 

@@ -25,12 +25,45 @@ def _positive_int(value: Any, default: int = 1) -> int:
     return max(parsed, 1)
 
 
+def _optional_positive_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return max(parsed, 1)
+
+
 def _non_negative_float(value: Any, default: float = 0.0) -> float:
     try:
         parsed = float(value if value is not None else default)
     except (TypeError, ValueError):
         parsed = default
     return max(parsed, 0.0)
+
+
+def _to_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off", ""}:
+            return False
+    return bool(value)
+
+
+def _first_present(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
 
 
 def get_vllm_model_resource_profile(
@@ -42,26 +75,76 @@ def get_vllm_model_resource_profile(
     runtime_metadata = runtime_metadata or {}
 
     tensor_parallel_size = _positive_int(
-        backend_config.get("tensor_parallel_size"), 1
+        _first_present(
+            runtime_metadata.get("tensor_parallel_size"),
+            backend_config.get("tensor_parallel_size"),
+        ),
+        1,
     )
     pipeline_parallel_size = _positive_int(
-        backend_config.get("pipeline_parallel_size"), 1
+        _first_present(
+            runtime_metadata.get("pipeline_parallel_size"),
+            backend_config.get("pipeline_parallel_size"),
+        ),
+        1,
     )
     data_parallel_size = _positive_int(
-        backend_config.get("data_parallel_size"), 1
+        _first_present(
+            runtime_metadata.get("data_parallel_size"),
+            backend_config.get("data_parallel_size"),
+        ),
+        1,
     )
     num_gpus = tensor_parallel_size * pipeline_parallel_size * data_parallel_size
+    planned_expert_parallel_size = _positive_int(
+        _first_present(
+            backend_config.get("planned_expert_parallel_size"),
+            backend_config.get("expert_parallel_size"),
+        ),
+        1,
+    )
+    runtime_expert_parallel_size = _optional_positive_int(
+        _first_present(
+            runtime_metadata.get("expert_parallel_size"),
+            runtime_metadata.get("runtime_expert_parallel_size"),
+        )
+    )
+    expert_parallel_enabled = _to_bool(
+        _first_present(
+            runtime_metadata.get("expert_parallel_enabled"),
+            backend_config.get("enable_expert_parallel"),
+        ),
+        default=planned_expert_parallel_size > 1
+        or bool(runtime_expert_parallel_size and runtime_expert_parallel_size > 1),
+    )
+    expert_parallel_size_verified = _to_bool(
+        runtime_metadata.get("expert_parallel_size_verified"),
+        default=runtime_expert_parallel_size is not None,
+    )
+    if runtime_expert_parallel_size and runtime_expert_parallel_size > 1:
+        expert_parallel_enabled = True
+    expert_parallel_size_source = str(
+        runtime_metadata.get("expert_parallel_size_source")
+        or (
+            "runtime_metadata"
+            if runtime_expert_parallel_size is not None
+            else "enable_expert_parallel_boolean"
+            if expert_parallel_enabled
+            else "default"
+        )
+    )
 
-    return {
+    profile = {
         "model_name": model_name,
         "backend": "vllm",
         "num_gpus": num_gpus,
         "tensor_parallel_size": tensor_parallel_size,
         "pipeline_parallel_size": pipeline_parallel_size,
         "data_parallel_size": data_parallel_size,
-        "expert_parallel_enabled": bool(
-            backend_config.get("enable_expert_parallel", False)
-        ),
+        "expert_parallel_enabled": expert_parallel_enabled,
+        "planned_expert_parallel_size": planned_expert_parallel_size,
+        "expert_parallel_size_verified": expert_parallel_size_verified,
+        "expert_parallel_size_source": expert_parallel_size_source,
         "estimated_load_time_s": _non_negative_float(
             runtime_metadata.get("estimated_load_time_s"),
             _non_negative_float(runtime_metadata.get("load_time_s"), 0.0),
@@ -79,6 +162,9 @@ def get_vllm_model_resource_profile(
             backend_config.get("max_num_seqs"), 1
         ),
     }
+    if runtime_expert_parallel_size is not None and expert_parallel_size_verified:
+        profile["expert_parallel_size"] = runtime_expert_parallel_size
+    return profile
 
 
 def get_vllm_runtime_metadata(

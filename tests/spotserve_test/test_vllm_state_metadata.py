@@ -46,6 +46,10 @@ def test_vllm_inference_state_can_use_runtime_tokens():
             "output_tokens": [12],
             "kv_block_count": 3,
             "expert_parallel_enabled": True,
+            "expert_parallel_size": 2,
+            "planned_expert_parallel_size": 2,
+            "expert_parallel_size_verified": True,
+            "expert_parallel_size_source": "engine_args",
         },
     )
 
@@ -56,6 +60,10 @@ def test_vllm_inference_state_can_use_runtime_tokens():
     assert state["metadata"]["generated_token_count"] == 1
     assert state["metadata"]["kv_block_count"] == 3
     assert state["metadata"]["expert_parallel_enabled"] is True
+    assert state["metadata"]["expert_parallel_size"] == 2
+    assert state["metadata"]["planned_expert_parallel_size"] == 2
+    assert state["metadata"]["expert_parallel_size_verified"] is True
+    assert state["metadata"]["expert_parallel_size_source"] == "engine_args"
 
 
 def test_vllm_inference_state_preserves_kv_transfer_metadata():

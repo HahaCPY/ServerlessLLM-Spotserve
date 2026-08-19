@@ -88,8 +88,11 @@ class VllmDeploymentAdapter:
         # Data parallelism is represented by independent Ray actors here.  A
         # vLLM actor must therefore be started with one local DP replica.
         config["data_parallel_size"] = 1
-        if "enable_expert_parallel" in config or plan.expert_parallel_size > 1:
-            config["enable_expert_parallel"] = plan.expert_parallel_size > 1
+        planned_ep_size = max(1, int(plan.expert_parallel_size))
+        config["planned_expert_parallel_size"] = planned_ep_size
+        config["expert_parallel_size"] = planned_ep_size
+        config["expert_parallel_size_verified"] = False
+        config["enable_expert_parallel"] = planned_ep_size > 1
         return config
 
     def _replica_gpu_count(self, plan: ParallelPlan) -> int:

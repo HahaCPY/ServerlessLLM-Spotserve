@@ -545,6 +545,9 @@ def plan_dynamic_reparallelization(
                     selected.pipeline_parallel_size
                 ),
                 "selected_data_parallel_size": selected.data_parallel_size,
+                "selected_expert_parallel_size": (
+                    selected.expert_parallel_size
+                ),
             }
         )
     else:
@@ -554,6 +557,7 @@ def plan_dynamic_reparallelization(
                 "selected_tensor_parallel_size": 0,
                 "selected_pipeline_parallel_size": 0,
                 "selected_data_parallel_size": 0,
+                "selected_expert_parallel_size": 0,
             }
         )
     return decision

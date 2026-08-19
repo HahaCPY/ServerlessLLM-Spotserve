@@ -83,6 +83,7 @@ def test_dynamic_reparallelization_plan_after_gpu_loss():
     assert decision["availability"]["available_gpus"] == 2
     assert decision["selected_total_gpus"] == 2
     assert decision["selected_data_parallel_size"] == 1
+    assert decision["selected_expert_parallel_size"] == 1
     assert decision["parallel_plan"] == {
         "model_name": "dummy-reparallelization",
         "backend": "unknown",
