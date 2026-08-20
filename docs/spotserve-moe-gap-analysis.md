@@ -134,6 +134,33 @@ context_migration_plan_count > 0 只能證明 planner 有產生 mapping。
 kv_cache_migration_successes > 0 不一定代表 true KV block transfer 成功。
 ```
 
+實驗解讀：
+
+```text
+V7 本身不一定需要 true KV cache transfer。
+V7 的核心目標是 low-cost target selection，而不是 runtime-level KV block
+serialization / attach。
+```
+
+因此，這個修正主要是語意、event 與 metric claim 的修正。若只比較
+「語意修正前的 V7」和「語意修正後的 V7」，理論上 latency / throughput
+不應該有明顯差異，因為 target selection 與 prefix warmup 的執行路徑沒有被改成
+true KV transfer。差異應該主要出現在 log / metrics 的解讀：
+
+```text
+以前：
+kv_cache_migration_successes > 0
+容易被誤解成 true KV migration。
+
+現在：
+prefix_warmup_successes > 0
+true_kv_block_transfer = false
+```
+
+如果 V7 語意修正前後的性能差異很大，應優先檢查 benchmark config、metric
+parser、runtime 狀態或 workload 是否一致，而不是把差異歸因於 true KV
+migration。
+
 建議補強：
 
 - metric 命名區分：
@@ -161,77 +188,6 @@ kv_cache_migration_successes > 0 不一定代表 true KV block transfer 成功�
   - `true_kv_block_transfer`
 - `VllmBackend.resume_kv_cache()` 回傳 structured prefix-warmup result，並明確標示
   `true_kv_block_transfer=false`。
-
-#### 2026-08-20 實驗結果：true KV restore 證據
-
-這次實驗結果進一步確認：V7 context migration 仍然只能視為
-planning / prefix warmup；真正用到 KV cache block restore 的證據來自 V8
-stateful recovery 在 patched vLLM/NIXL runtime 上的 restore path。
-
-Benchmark summary：
-
-```text
-vllm-stateful-recovery-token-replay:
-  successes = 3/3
-  success_rate = 100.00%
-  p95 = 48834.49 ms
-  failed_attempts = 1
-  retries = 1
-  recovered_tokens = 16
-  fallbacks = 0
-
-vllm-stateful-recovery-applied:
-  successes = 3/3
-  success_rate = 100.00%
-  p95 = 7621.91 ms
-  failed_attempts = 1
-  retries = 1
-  recovered_tokens = 16
-  fallbacks = 0
-  state_events = 1
-  state_restores = 1/1
-  state_tokens = 16
-```
-
-和 token replay baseline 相比，stateful recovery applied 的 failure-window p95
-從 `48834.49 ms` 降到 `7621.91 ms`，約降低 `84.4%`。這代表 recovery path
-不是單純重跑 prompt/token replay，而是成功套用了更短的 restore 路徑。
-
-Stateful recovery metrics：
-
-```text
-state_restore_attempts_total = 1
-state_restore_successes_total = 1
-state_restore_fallback_count = 0
-state_restored_tokens_total = 16
-state_recovery_restore_events = 1
-state_recovery_fallback_events = 0
-```
-
-raw response 中也出現 vLLM/NIXL restore metadata：
-
-```json
-"_spotserve_kv_restore": {
-  "cached_tokens": 82,
-  "reason": "nixl_kv_attach_completed",
-  "restored": true,
-  "restored_blocks": 6
-}
-```
-
-實驗輸出位置：
-
-```text
-results/spotserve_stateful_recovery_performance/2026-08-20_04-01-57_vllm-stateful-recovery-applied/raw_requests.jsonl
-```
-
-結論：
-
-```text
-V7 context migration success != true KV migration.
-V8 stateful recovery with patched vLLM/NIXL restored real KV blocks.
-restored_blocks = 6 > 0
-```
 
 ### 4. V8 stateful recovery 依賴 patched vLLM runtime
 
