@@ -189,7 +189,7 @@ migration。
 - `VllmBackend.resume_kv_cache()` 回傳 structured prefix-warmup result，並明確標示
   `true_kv_block_transfer=false`。
 
-### 4. V8 stateful recovery 依賴 patched vLLM runtime
+### 4. V8 stateful recovery 依賴 patched vLLM runtime ✅
 
 `sllm/backends/vllm_backend.py` 透過 runtime hooks 尋找：
 
@@ -224,7 +224,62 @@ restored_blocks 等欄位。
   - `restored_blocks`
 - CI 或 smoke test 在跑 NIXL 實驗前先執行 patch capability check。
 
-### 5. Re-parallelization 是 heuristic + actor recreate，不是論文完整 controller
+已修正：
+
+- `VllmBackend.supports_state_restore()` 只在 runtime hook 同時具備
+  export / restore 能力，且 `supports_state_restore()` probe 沒有回 false 時才回
+  true；未 patch 的 vLLM 會保守走 token snapshot / generated-token replay。
+- `VllmBackend.restore_inference_state()` 不把 `restored_blocks <= 0` 當成成功；
+  只有真的 attach 到 KV blocks 的結果才會回報 restored success。
+- request metrics 新增 restore evidence：
+  - `supports_state_restore`
+  - `state_kind`
+  - `state_restore_reason`
+  - `state_restored_blocks`
+  - `state_restore_staged`
+- benchmark analyzer 會從 router metrics 彙總：
+  - `state_restored_blocks_total`
+  - `supports_state_restore_requests`
+  - `state_restore_staged_count`
+  - `true_kv_restore_successes_total`
+  - `state_kinds`
+  - `state_restore_reasons`
+- benchmark analyzer 也會從 raw response 的 `_spotserve_kv_restore` 彙總：
+  - `response_kv_restore_events`
+  - `response_kv_restore_successes`
+  - `response_kv_restore_restored_blocks`
+  - `response_kv_restore_cached_tokens`
+  - `response_kv_restore_reasons`
+- benchmark analyzer 會把 router metrics 與 raw response evidence 合併成 unified
+  true KV restore 欄位：
+  - `true_kv_restore_successes_total`
+  - `true_kv_restored_blocks_total`
+  - `true_kv_restore_evidence_sources`
+- benchmark CLI summary 現在會直接印出 state fallback、state blocks、
+  response blocks、true KV blocks、supports-state-restore request count 和 state
+  kinds；不用再只靠 request success rate 判斷 V8 是否真的 restore。
+- `scripts/prepare_spotserve.sh` 在 stateful recovery / NIXL 相關 deploy set 前會檢查
+  patched vLLM hooks 是否存在，並確認 stateful-recovery model 在 worker container
+  內可見。
+
+修正後的解讀：
+
+```text
+stateful_recovery request 成功
+!= true KV restore 成功
+
+true KV restore evidence 至少要看到：
+state_restore_successes_total > 0
+true_kv_restore_successes_total > 0
+true_kv_restored_blocks_total > 0
+
+若 router request metrics 是舊版或沒有帶 state-restored blocks，
+vLLM/NIXL response evidence 仍可證明 attach 成功：
+response_kv_restore_successes > 0
+response_kv_restore_restored_blocks > 0
+```
+
+### 5. Re-parallelization 是 heuristic + actor recreate，不是論文完整 controller（部分修正）
 
 `sllm/spot/reparallelization.py` 的 candidate selection 主要依照：
 
@@ -253,6 +308,141 @@ ready 後切流、drain 舊 actors，不是 runtime 內部原地重分片。
   model load time、migration cost。
 - benchmark 至少要有多 worker node，才能顯示 preemption 後 replan 的服務能力改善。
 - 分開呈現 replan-window startup cost 與 post-replan steady-state latency。
+
+已開始修正：
+
+- `sllm/spot/reparallelization.py` 加入 optional workload/cost-aware score。
+  預設關閉；只有 `enable_workload_cost_model=true` 時，candidate 才會把
+  arrival rate、batch size、latency estimate、model load time、migration cost、
+  queue penalty 放進 score。這避免舊 V6 heuristic 在未設定時被偷偷改掉。
+- `sllm/routers/roundrobin_router.py` 會收集最近 request arrival / latency，
+  replan 時把 `runtime_workload` 傳給 planner，也會記錄 actor recreate/apply 的
+  `execution_duration_ms`。
+- `sllm/spot/metrics.py` 與 `scripts/analyze_spotserve_benchmark.py` 已輸出
+  `replanning_avg_execution_duration_ms`,
+  `replanning_avg_selected_replan_window_cost_ms`,
+  `replanning_avg_selected_load_time_estimate_ms`,
+  `replanning_avg_selected_migration_cost_estimate_ms`,
+  `replanning_cross_node_targets`,
+  `replanning_multi_worker_targets` 等欄位。
+- `benchmarks/spotserve/benchmark_matrix_reparallelization_performance.yaml`
+  的 comparison 會自動帶出 replan-window / post-replan phase latency，以及上述
+  replan cost/control-plane 指標。
+- 新增 `benchmarks/spotserve/benchmark_matrix_reparallelization_multi_worker_performance.yaml`，
+  搭配不含 `synthetic_worker_nodes` 的 V6 configs，讓 planner 從 scheduler/Ray
+  的 runtime worker snapshot 做 target selection。summary 會用
+  `replanning_max_runtime_worker_node_count` 確認 planner 是否真的看到多個 runtime
+  workers。
+- `scripts/prepare_spotserve.sh --deploy-set reparallelization-multi-worker-performance`
+  會啟動 `sllm_worker_0` / `sllm_worker_1`，並要求至少 2 個 Ray `worker_node`
+  resources 後才進入 benchmark。
+- V6 performance traces 改用 `instance_selector=ready`，避免 hardcode synthetic
+  node id 導致 spot event 沒有打到真正 live instance。
+- V6 vLLM configs 加上 `count_preempting_toward_capacity=true`，避免一般
+  autoscaler 在 preempting actor 尚未釋放 Ray/GPU resource 時，額外建立
+  pending replacement actor；actor recreate 應由 replan controller 控制。
+- router bulk shutdown 現在會對 inference instances 呼叫 scheduler
+  `deallocate_resource`，避免 benchmark baseline 的 preempting actor 在
+  `delete_after_run` 後仍佔用 Ray/GPU capacity，導致下一個 applied run 卡在
+  pending actor。
+
+仍未完成：
+
+- 這不是完整 SpotServe optimizer，也還沒有 monetary cost model。
+- 新增的 multi-worker matrix 可以驗證多個 runtime worker container，但如果兩個
+  worker 都在同一台 host 上，仍不能 claim physical cross-node validation；真正強
+  claim 需要不同 host / 不同 failure domain。
+- 目前是 actor recreate / ready 後切流，不是 runtime 內部 in-place repartition。
+
+這三件事的意思如下。
+
+第一，planner 不應只看「GPU 塞不塞得下」，也要看「跑起來值不值得」。
+目前的 V6 planner 比較像 capacity-aware heuristic：GPU 夠不夠、shape 差多少、
+replica 數怎麼變。但完整 SpotServe controller 需要把 workload 和 serving cost
+也納入：
+
+```text
+arrival rate
+→ 請求進來的速度。流量高時，重建 actor 的空窗成本會被放大。
+
+batch size
+→ 實際 batching 能力。某個 parallel plan 可能 GPU utilization 高，
+  但 batch shape 不適合目前 workload。
+
+latency estimate
+→ 預估不同 plan 下的 request latency / tail latency。
+  不能只選 GPU shape 最接近的 plan。
+
+load time
+→ 新 actor 載入模型、建立 vLLM engine、warmup 到 ready 的時間。
+  V6 最大成本通常就在這段。
+
+migration cost
+→ 切流、drain 舊 actor、request replay / state restore 的成本。
+  如果搬過去的成本比留在原 plan 還高，就不一定值得 replan。
+```
+
+換句話說，未來 planner 的 objective 應該從：
+
+```text
+Can this plan fit available GPUs?
+```
+
+提升成：
+
+```text
+Is this plan worth switching to under the current workload?
+```
+
+第二，benchmark 需要真正的多 worker node 才能展示 preemption 下的
+re-parallelization 效果。目前 single-host / same-host 實驗可以驗證控制流程，
+但研究 claim 比較弱。更有說服力的情境是：
+
+```text
+Node A 發生 preemption
+↓
+原本在 Node A 上的 capacity 消失
+↓
+controller 重新選 parallel plan
+↓
+new vLLM actors 被建立到 Node B / Node C
+↓
+ready 後切流並恢復服務能力
+```
+
+這樣才能展示 V6 的價值是「capacity event 後重新部署到剩餘 worker nodes」，
+而不只是同一台 host 裡重建 actor。
+
+第三，latency 要拆成兩段呈現：
+
+```text
+replan-window latency
+→ preemption 剛發生、舊 actor drain、planner 選新 plan、
+  新 actor 建立 / load model / ready 的期間。
+
+post-replan steady-state latency
+→ 新部署穩定後，正常 serving 的 latency。
+```
+
+這個拆分很重要，因為 V6 的主要成本通常不是新 plan 穩定後的 serving latency，
+而是 replan window 內的 startup / load / 切流成本。如果只看整體 p95，會把
+「重建期間的巨大延遲」和「穩定後的服務品質」混在一起，導致很難判斷
+re-parallelization 到底改善了哪一段、傷害了哪一段。
+
+目前較安全的 claim 是：
+
+```text
+V6 已具備 capacity event 後重新選 parallel plan、
+重建 vLLM actors、ready 後切流 / drain 舊 actors 的 control-plane prototype。
+
+V6 planner 已開始納入 workload/cost-aware score hook，
+可以量測 replan-window startup cost、post-replan steady-state latency、
+以及 synthetic/runtime worker placement signal。
+
+但它仍不是完整 SpotServe optimizer，monetary cost、physical cross-node
+validation 與 runtime 內部 in-place repartition 仍未完成，因此不能宣稱已完整重現
+SpotServe parallelization controller。
+```
 
 ### 6. Preemptible instance 目前是 trace replay，不是 cloud provider integration
 

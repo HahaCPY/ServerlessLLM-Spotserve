@@ -141,6 +141,21 @@ The workload labels each request as `warmup`, `pre_replan`,
 `replan_window`, or `post_replan`; the summary writes phase-specific fields
 such as `phase_post_replan_latency_p95_ms`. It also writes
 `latest_comparisons.json` in the performance output directory.
+The V6 performance traces use `instance_selector=ready` so the preemption event
+targets a live router instance instead of a hardcoded synthetic node id.
+The V6 configs set `count_preempting_toward_capacity=true` so the generic
+autoscaler does not create an extra replacement actor while the preempting
+actor still owns its Ray/GPU resources; V6 replan logic owns actor recreate.
+Router shutdown also deallocates inference scheduler resources during benchmark
+cleanup, so a preempting baseline actor cannot leak GPU capacity into the next
+run.
+The applied run enables the workload/cost-aware planner hook, so summaries also
+include `replanning_avg_execution_duration_ms`,
+`replanning_avg_selected_replan_window_cost_ms`,
+`replanning_avg_selected_load_time_estimate_ms`,
+`replanning_avg_selected_migration_cost_estimate_ms`,
+`replanning_cross_node_targets`, `replanning_multi_worker_targets`, and
+`replanning_max_runtime_worker_node_count`.
 
 On the default root compose setup there is only one real worker id
 (`sllm_worker_0`). The performance matrix is therefore useful for measuring
@@ -150,6 +165,29 @@ can lose the active node while the applied run moves to a different live node.
 The applied performance run uses the model alias
 `vllm-reparallelization-applied-perf` so its router metrics do not collide with
 the correctness smoke.
+
+For a V6 runtime-worker placement comparison, start the multi-worker deploy set:
+
+```bash
+scripts/prepare_spotserve.sh --deploy-set reparallelization-multi-worker-performance
+
+podman exec sllm_head bash -lc '
+cd /tmp/spotserve-work &&
+/opt/venvs/head/bin/python benchmarks/spotserve/run_benchmark.py \
+  --config benchmarks/spotserve/benchmark_matrix_reparallelization_multi_worker_performance.yaml \
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \
+  --request-timeout 240 \
+  --ray-address auto \
+  --ray-namespace sllm
+'
+```
+
+This matrix removes `synthetic_worker_nodes` from the router configs and
+requires at least two Ray `worker_node` resources. The summary field
+`replanning_max_runtime_worker_node_count >= 2` confirms that the planner saw
+multiple runtime workers. If both workers are containers on the same host, this
+is still a multi-worker-container experiment rather than physical cross-node
+validation.
 
 For a V7 context-migration performance comparison, run:
 
@@ -214,8 +252,10 @@ cd /tmp/spotserve-work &&
 This compares `generated_token_replay` against `stateful_recovery` on the same
 patched vLLM/NIXL backend shape. The applied run should show
 `state_restore_successes_total > 0`, `state_restore_fallback_count = 0`, and
-`state_restored_tokens_total > 0` before you claim V8 is using true state
-restore instead of token replay fallback.
+`true_kv_restore_successes_total > 0`. For KV-block evidence, prefer
+`true_kv_restored_blocks_total > 0`; if router request metrics were produced by
+an older router, `response_kv_restore_restored_blocks > 0` still proves the
+patched vLLM/NIXL attach path completed.
 
 Unlike V6/V7 performance configs, this matrix deploys and deletes each V8
 model alias inside `run_benchmark.py`. That keeps only one policy's two

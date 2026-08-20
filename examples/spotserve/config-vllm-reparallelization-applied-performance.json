@@ -25,11 +25,27 @@
     "trust_remote_code": true
   },
   "router_config": {
+    "count_preempting_toward_capacity": true,
     "enable_reparallelization": true,
     "reparallelization_config": {
       "target_replica_gpus": 1,
       "max_tensor_parallel_size": 1,
       "max_pipeline_parallel_size": 1,
+      "enable_workload_cost_model": true,
+      "workload_window_s": 60,
+      "workload_window_max_requests": 128,
+      "batch_size": 2,
+      "latency_estimate_ms": 1000,
+      "model_load_time_ms": 5000,
+      "load_time_per_gpu_ms": 500,
+      "migration_cost_ms": 200,
+      "migration_cost_per_replica_ms": 100,
+      "queue_penalty_ms_per_req_s": 1000,
+      "throughput_score_weight": 100,
+      "latency_penalty_weight": 0,
+      "load_time_penalty_weight": 0.1,
+      "migration_cost_penalty_weight": 0.1,
+      "queue_penalty_weight": 0.1,
       "drain_timeout_s": 30,
       "allow_stop_before_recreate": true,
       "synthetic_worker_nodes": {

@@ -25,6 +25,7 @@
     "trust_remote_code": true
   },
   "router_config": {
+    "count_preempting_toward_capacity": true,
     "enable_reparallelization": true,
     "reparallelization_config": {
       "target_replica_gpus": 1,

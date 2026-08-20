@@ -1,6 +1,29 @@
 {
   "endpoint": "http://127.0.0.1:8345/v1/chat/completions",
   "output_dir": "results/spotserve_reparallelization_performance",
+  "comparison_fields": [
+    "success_rate",
+    "latency_p95_ms",
+    "throughput_req_s",
+    "replanning_events",
+    "replanning_execution_applied",
+    "replanning_execution_failed",
+    "replanning_workload_cost_model_events",
+    "replanning_avg_execution_duration_ms",
+    "replanning_avg_selected_replan_window_cost_ms",
+    "replanning_avg_selected_load_time_estimate_ms",
+    "replanning_avg_selected_migration_cost_estimate_ms",
+    "replanning_cross_node_targets",
+    "replanning_multi_worker_targets",
+    "replanning_max_ready_worker_node_count",
+    "replanning_max_runtime_worker_node_count",
+    "replanning_max_physical_worker_node_count",
+    "phase_replan_window_success_rate",
+    "phase_replan_window_latency_p95_ms",
+    "phase_post_replan_success_rate",
+    "phase_post_replan_latency_p95_ms",
+    "phase_post_replan_throughput_req_s"
+  ],
   "runs": [
     {
       "name": "vllm-reparallelization-disabled",

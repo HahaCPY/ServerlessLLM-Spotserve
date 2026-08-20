@@ -64,6 +64,27 @@ def safe_metric_name(value: Any) -> str:
     return name or "unknown"
 
 
+def safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def compact_values(values: List[str]) -> str:
+    unique = sorted({value for value in values if value})
+    return ",".join(unique)
+
+
 def summarize_phase_requests(
     rows: List[Dict[str, Any]]
 ) -> Dict[str, Any]:
@@ -172,13 +193,13 @@ def metrics_in_request_window(
 
 def summarize_router_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     failed_attempts_total = sum(
-        int(row.get("failed_attempts", 0) or 0) for row in rows
+        safe_int(row.get("failed_attempts", 0)) for row in rows
     )
     retry_count_total = sum(
-        int(row.get("retry_count", 0) or 0) for row in rows
+        safe_int(row.get("retry_count", 0)) for row in rows
     )
     recovered_tokens_total = sum(
-        int(row.get("recovered_tokens", 0) or 0) for row in rows
+        safe_int(row.get("recovered_tokens", 0)) for row in rows
     )
     recovery_fallback_count = sum(
         1 for row in rows if bool(row.get("recovery_fallback", False))
@@ -186,33 +207,49 @@ def summarize_router_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     recovery_triggered_requests = sum(
         1
         for row in rows
-        if int(row.get("failed_attempts", 0) or 0) > 0
-        or int(row.get("retry_count", 0) or 0) > 0
+        if safe_int(row.get("failed_attempts", 0)) > 0
+        or safe_int(row.get("retry_count", 0)) > 0
     )
     replay_succeeded_requests = sum(
         1
         for row in rows
-        if int(row.get("recovered_tokens", 0) or 0) > 0
+        if safe_int(row.get("recovered_tokens", 0)) > 0
         and not bool(row.get("recovery_fallback", False))
     )
     replay_not_needed_requests = sum(
         1
         for row in rows
-        if int(row.get("failed_attempts", 0) or 0) == 0
-        and int(row.get("recovered_tokens", 0) or 0) == 0
+        if safe_int(row.get("failed_attempts", 0)) == 0
+        and safe_int(row.get("recovered_tokens", 0)) == 0
         and not bool(row.get("recovery_fallback", False))
     )
     state_restore_attempts_total = sum(
-        int(row.get("state_restore_attempts", 0) or 0) for row in rows
+        safe_int(row.get("state_restore_attempts", 0)) for row in rows
     )
     state_restore_successes_total = sum(
-        int(row.get("state_restore_successes", 0) or 0) for row in rows
+        safe_int(row.get("state_restore_successes", 0)) for row in rows
     )
     state_restore_fallback_count = sum(
         1 for row in rows if bool(row.get("state_restore_fallback", False))
     )
     state_restored_tokens_total = sum(
-        int(row.get("state_restored_tokens", 0) or 0) for row in rows
+        safe_int(row.get("state_restored_tokens", 0)) for row in rows
+    )
+    state_restored_blocks_total = sum(
+        safe_int(row.get("state_restored_blocks", 0)) for row in rows
+    )
+    supports_state_restore_requests = sum(
+        1 for row in rows if bool(row.get("supports_state_restore", False))
+    )
+    state_restore_staged_count = sum(
+        1 for row in rows if bool(row.get("state_restore_staged", False))
+    )
+    true_kv_restore_successes_total = sum(
+        1
+        for row in rows
+        if safe_int(row.get("state_restore_successes", 0)) > 0
+        and safe_int(row.get("state_restored_blocks", 0)) > 0
+        and str(row.get("state_kind", "")) == "vllm_kv_snapshot"
     )
     return {
         "router_metrics_rows": len(rows),
@@ -227,6 +264,105 @@ def summarize_router_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "state_restore_successes_total": state_restore_successes_total,
         "state_restore_fallback_count": state_restore_fallback_count,
         "state_restored_tokens_total": state_restored_tokens_total,
+        "state_restored_blocks_total": state_restored_blocks_total,
+        "supports_state_restore_requests": supports_state_restore_requests,
+        "state_restore_staged_count": state_restore_staged_count,
+        "true_kv_restore_successes_total": true_kv_restore_successes_total,
+        "state_kinds": compact_values(
+            [str(row.get("state_kind", "")) for row in rows]
+        ),
+        "state_restore_reasons": compact_values(
+            [str(row.get("state_restore_reason", "")) for row in rows]
+        ),
+    }
+
+
+def summarize_response_kv_restore(
+    rows: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    restore_rows = []
+    for row in rows:
+        response = row.get("response")
+        if not isinstance(response, dict):
+            continue
+        restore = response.get("_spotserve_kv_restore")
+        if isinstance(restore, dict):
+            restore_rows.append(restore)
+
+    response_restored_blocks = sum(
+        safe_int(row.get("restored_blocks", 0)) for row in restore_rows
+    )
+    response_cached_tokens = sum(
+        safe_int(row.get("cached_tokens", 0)) for row in restore_rows
+    )
+    response_restore_successes = sum(
+        1
+        for row in restore_rows
+        if bool(row.get("restored", False))
+        and safe_int(row.get("restored_blocks", 0)) > 0
+    )
+    return {
+        "response_kv_restore_events": len(restore_rows),
+        "response_kv_restore_successes": response_restore_successes,
+        "response_kv_restore_restored_blocks": response_restored_blocks,
+        "response_kv_restore_cached_tokens": response_cached_tokens,
+        "response_kv_restore_reasons": compact_values(
+            [str(row.get("reason", "")) for row in restore_rows]
+        ),
+    }
+
+
+def summarize_true_kv_restore_evidence(
+    request_rows: List[Dict[str, Any]],
+    router_request_rows: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    restored_blocks_by_request: Dict[str, int] = {}
+    sources = set()
+
+    for index, row in enumerate(router_request_rows):
+        restored_blocks = safe_int(row.get("state_restored_blocks", 0))
+        if (
+            safe_int(row.get("state_restore_successes", 0)) <= 0
+            or restored_blocks <= 0
+            or str(row.get("state_kind", "")) != "vllm_kv_snapshot"
+        ):
+            continue
+        request_id = str(row.get("request_id") or f"router-{index}")
+        restored_blocks_by_request[request_id] = max(
+            restored_blocks_by_request.get(request_id, 0),
+            restored_blocks,
+        )
+        sources.add("router_metrics")
+
+    for index, row in enumerate(request_rows):
+        response = row.get("response")
+        if not isinstance(response, dict):
+            continue
+        restore = response.get("_spotserve_kv_restore")
+        if not isinstance(restore, dict):
+            continue
+        restored_blocks = safe_int(restore.get("restored_blocks", 0))
+        if not bool(restore.get("restored", False)) or restored_blocks <= 0:
+            continue
+        request_id = str(
+            row.get("request_id")
+            or response.get("id")
+            or f"response-{index}"
+        )
+        restored_blocks_by_request[request_id] = max(
+            restored_blocks_by_request.get(request_id, 0),
+            restored_blocks,
+        )
+        sources.add("raw_response")
+
+    return {
+        "true_kv_restore_successes_total": len(restored_blocks_by_request),
+        "true_kv_restored_blocks_total": sum(
+            restored_blocks_by_request.values()
+        ),
+        "true_kv_restore_evidence_sources": compact_values(
+            [str(source) for source in sources]
+        ),
     }
 
 
@@ -253,6 +389,17 @@ def summarize_replanning_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     replanning_rows = [
         row for row in rows if row.get("type") == "reparallelization"
     ]
+
+    def numeric_values(key: str) -> List[float]:
+        return [
+            safe_float(row.get(key), 0.0)
+            for row in replanning_rows
+            if row.get(key) is not None and row.get(key) != ""
+        ]
+
+    def average(values: List[float]) -> float:
+        return mean(values) if values else 0.0
+
     no_capacity_count = sum(
         1 for row in replanning_rows if row.get("action") == "no_capacity"
     )
@@ -271,6 +418,24 @@ def summarize_replanning_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     latest_execution = (
         replanning_rows[-1].get("execution") if replanning_rows else None
     )
+    execution_durations = numeric_values("execution_duration_ms")
+    replan_window_costs = numeric_values("selected_replan_window_cost_ms")
+    load_time_costs = numeric_values("selected_load_time_estimate_ms")
+    migration_costs = numeric_values(
+        "selected_migration_cost_estimate_ms"
+    )
+    queue_penalties = numeric_values("selected_queue_penalty_ms")
+    throughput_estimates = numeric_values(
+        "selected_throughput_estimate_req_s"
+    )
+    target_worker_node_counts = [
+        safe_int(row.get("target_worker_node_count"), 0)
+        for row in replanning_rows
+    ]
+    ready_worker_node_counts = [
+        safe_int(row.get("ready_worker_node_count"), 0)
+        for row in replanning_rows
+    ]
     return {
         "replanning_events": len(replanning_rows),
         "replanning_no_capacity_events": no_capacity_count,
@@ -286,6 +451,76 @@ def summarize_replanning_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             json.dumps(latest_execution, sort_keys=True)
             if latest_execution
             else ""
+        ),
+        "replanning_workload_cost_model_events": sum(
+            1
+            for row in replanning_rows
+            if row.get("workload_cost_model_enabled")
+        ),
+        "replanning_avg_execution_duration_ms": average(
+            execution_durations
+        ),
+        "replanning_max_execution_duration_ms": (
+            max(execution_durations) if execution_durations else 0.0
+        ),
+        "replanning_avg_selected_replan_window_cost_ms": average(
+            replan_window_costs
+        ),
+        "replanning_max_selected_replan_window_cost_ms": (
+            max(replan_window_costs) if replan_window_costs else 0.0
+        ),
+        "replanning_avg_selected_load_time_estimate_ms": average(
+            load_time_costs
+        ),
+        "replanning_avg_selected_migration_cost_estimate_ms": average(
+            migration_costs
+        ),
+        "replanning_avg_selected_queue_penalty_ms": average(
+            queue_penalties
+        ),
+        "replanning_avg_selected_throughput_estimate_req_s": average(
+            throughput_estimates
+        ),
+        "replanning_cross_node_targets": sum(
+            1 for row in replanning_rows if row.get("cross_node_target")
+        ),
+        "replanning_multi_worker_targets": sum(
+            1 for row in replanning_rows if row.get("multi_worker_target")
+        ),
+        "replanning_max_target_worker_node_count": (
+            max(target_worker_node_counts)
+            if target_worker_node_counts
+            else 0
+        ),
+        "replanning_max_ready_worker_node_count": (
+            max(ready_worker_node_counts) if ready_worker_node_counts else 0
+        ),
+        "replanning_max_synthetic_worker_node_count": max(
+            (
+                safe_int(row.get("synthetic_worker_node_count"), 0)
+                for row in replanning_rows
+            ),
+            default=0,
+        ),
+        "replanning_max_runtime_worker_node_count": max(
+            (
+                safe_int(
+                    row.get(
+                        "runtime_worker_node_count",
+                        row.get("physical_worker_node_count", 0),
+                    ),
+                    0,
+                )
+                for row in replanning_rows
+            ),
+            default=0,
+        ),
+        "replanning_max_physical_worker_node_count": max(
+            (
+                safe_int(row.get("physical_worker_node_count"), 0)
+                for row in replanning_rows
+            ),
+            default=0,
         ),
     }
 
@@ -476,6 +711,15 @@ def analyze_run(run_dir: Path) -> Dict[str, Any]:
                 for row in router_request_rows:
                     metrics_file.write(json.dumps(row, sort_keys=True) + "\n")
 
+    request_summary = summarize_requests(request_rows)
+    phase_summary = summarize_phase_requests(request_rows)
+    response_kv_summary = summarize_response_kv_restore(request_rows)
+    router_summary = summarize_router_metrics(router_request_rows)
+    true_kv_summary = summarize_true_kv_restore_evidence(
+        request_rows,
+        router_request_rows,
+    )
+
     summary = {
         "run_dir": str(run_dir),
         "run_name": metadata.get("name", run_dir.name),
@@ -485,9 +729,11 @@ def analyze_run(run_dir: Path) -> Dict[str, Any]:
         "router_metrics_path": (
             str(router_metrics_path) if router_metrics_path is not None else ""
         ),
-        **summarize_requests(request_rows),
-        **summarize_phase_requests(request_rows),
-        **summarize_router_metrics(router_request_rows),
+        **request_summary,
+        **phase_summary,
+        **response_kv_summary,
+        **router_summary,
+        **true_kv_summary,
         **summarize_instance_state_metrics(router_metric_rows_in_window),
         **summarize_replanning_metrics(router_metric_rows_in_window),
         **summarize_context_migration_metrics(router_metric_rows_in_window),

@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Mapping, Optional
 
 
@@ -196,6 +196,17 @@ class ParallelConfig:
     score: float
     reason: str
     enable_expert_parallel: bool = False
+    base_score: float = 0.0
+    workload_score_delta: float = 0.0
+    arrival_rate_req_s: float = 0.0
+    batch_size: int = 0
+    latency_estimate_ms: float = 0.0
+    throughput_estimate_req_s: float = 0.0
+    load_time_estimate_ms: float = 0.0
+    migration_cost_estimate_ms: float = 0.0
+    queue_penalty_ms: float = 0.0
+    replan_window_cost_ms: float = 0.0
+    score_components: Dict[str, float] = field(default_factory=dict)
 
     @property
     def effective_expert_parallel_size(self) -> int:
@@ -208,6 +219,11 @@ class ParallelConfig:
         return self.effective_expert_parallel_size
 
     def to_dict(self) -> Dict[str, Any]:
+        base_score = (
+            self.base_score
+            if self.base_score
+            else self.score - self.workload_score_delta
+        )
         return {
             "tensor_parallel_size": self.tensor_parallel_size,
             "pipeline_parallel_size": self.pipeline_parallel_size,
@@ -221,6 +237,19 @@ class ParallelConfig:
             "total_gpus": self.total_gpus,
             "unused_gpus": self.unused_gpus,
             "score": self.score,
+            "base_score": base_score,
+            "workload_score_delta": self.workload_score_delta,
+            "arrival_rate_req_s": self.arrival_rate_req_s,
+            "batch_size": self.batch_size,
+            "latency_estimate_ms": self.latency_estimate_ms,
+            "throughput_estimate_req_s": self.throughput_estimate_req_s,
+            "load_time_estimate_ms": self.load_time_estimate_ms,
+            "migration_cost_estimate_ms": (
+                self.migration_cost_estimate_ms
+            ),
+            "queue_penalty_ms": self.queue_penalty_ms,
+            "replan_window_cost_ms": self.replan_window_cost_ms,
+            "score_components": dict(self.score_components),
             "reason": self.reason,
         }
 
@@ -302,6 +331,46 @@ def summarize_gpu_availability(
 def _positive_int(config: Mapping[str, Any], key: str, default: int) -> int:
     value = int(config.get(key, default) or default)
     return max(value, 1)
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return float(default)
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None or value == "":
+            return int(default)
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _planner_value(
+    planner_config: Mapping[str, Any],
+    key: str,
+    default: Any = None,
+    *,
+    positive_only: bool = False,
+) -> Any:
+    sources = [
+        planner_config.get("runtime_workload"),
+        planner_config.get("workload"),
+        planner_config,
+    ]
+    for source in sources:
+        if not isinstance(source, Mapping) or key not in source:
+            continue
+        value = source.get(key)
+        if positive_only and _safe_float(value, 0.0) <= 0.0:
+            continue
+        return value
+    return default
 
 
 def generate_parallel_candidates(
@@ -431,6 +500,257 @@ def _candidate_score(
         + replica_count * 100
         - replica_distance * 1000
         - unused_gpus
+    )
+
+
+def _workload_cost_model_enabled(
+    planner_config: Mapping[str, Any]
+) -> bool:
+    return bool(
+        planner_config.get(
+            "enable_workload_cost_model",
+            planner_config.get("workload_cost_model", False),
+        )
+    )
+
+
+def _workload_cost_model_snapshot(
+    planner_config: Mapping[str, Any],
+    model_config: Mapping[str, Any],
+) -> Dict[str, Any]:
+    backend_config = model_config.get("backend_config", {})
+    if not isinstance(backend_config, Mapping):
+        backend_config = {}
+    batch_size = max(
+        1,
+        _safe_int(
+            _planner_value(
+                planner_config,
+                "batch_size",
+                backend_config.get("max_num_seqs", 1),
+            ),
+            1,
+        ),
+    )
+    return {
+        "enabled": _workload_cost_model_enabled(planner_config),
+        "arrival_rate_req_s": max(
+            0.0,
+            _safe_float(
+                _planner_value(planner_config, "arrival_rate_req_s", 0.0),
+                0.0,
+            ),
+        ),
+        "batch_size": batch_size,
+        "latency_estimate_ms": max(
+            0.0,
+            _safe_float(
+                _planner_value(
+                    planner_config,
+                    "latency_estimate_ms",
+                    _planner_value(
+                        planner_config, "default_latency_estimate_ms", 0.0
+                    ),
+                    positive_only=True,
+                ),
+                0.0,
+            ),
+        ),
+        "model_load_time_ms": max(
+            0.0,
+            _safe_float(
+                _planner_value(planner_config, "model_load_time_ms", 0.0),
+                0.0,
+            ),
+        ),
+        "load_time_per_gpu_ms": max(
+            0.0,
+            _safe_float(
+                _planner_value(planner_config, "load_time_per_gpu_ms", 0.0),
+                0.0,
+            ),
+        ),
+        "migration_cost_ms": max(
+            0.0,
+            _safe_float(
+                _planner_value(planner_config, "migration_cost_ms", 0.0),
+                0.0,
+            ),
+        ),
+        "migration_cost_per_gpu_ms": max(
+            0.0,
+            _safe_float(
+                _planner_value(
+                    planner_config, "migration_cost_per_gpu_ms", 0.0
+                ),
+                0.0,
+            ),
+        ),
+        "migration_cost_per_replica_ms": max(
+            0.0,
+            _safe_float(
+                _planner_value(
+                    planner_config, "migration_cost_per_replica_ms", 0.0
+                ),
+                0.0,
+            ),
+        ),
+        "queue_penalty_ms_per_req_s": max(
+            0.0,
+            _safe_float(
+                _planner_value(
+                    planner_config, "queue_penalty_ms_per_req_s", 1000.0
+                ),
+                1000.0,
+            ),
+        ),
+        "base_score_weight": _safe_float(
+            _planner_value(planner_config, "base_score_weight", 1.0),
+            1.0,
+        ),
+        "throughput_score_weight": _safe_float(
+            _planner_value(planner_config, "throughput_score_weight", 100.0),
+            100.0,
+        ),
+        "latency_penalty_weight": _safe_float(
+            _planner_value(planner_config, "latency_penalty_weight", 0.0),
+            0.0,
+        ),
+        "load_time_penalty_weight": _safe_float(
+            _planner_value(planner_config, "load_time_penalty_weight", 1.0),
+            1.0,
+        ),
+        "migration_cost_penalty_weight": _safe_float(
+            _planner_value(
+                planner_config, "migration_cost_penalty_weight", 1.0
+            ),
+            1.0,
+        ),
+        "queue_penalty_weight": _safe_float(
+            _planner_value(planner_config, "queue_penalty_weight", 1.0),
+            1.0,
+        ),
+        "replan_window_penalty_weight": _safe_float(
+            _planner_value(
+                planner_config, "replan_window_penalty_weight", 0.0
+            ),
+            0.0,
+        ),
+    }
+
+
+def _score_parallel_candidates_for_workload(
+    candidates: List[ParallelConfig],
+    planner_config: Mapping[str, Any],
+    model_config: Mapping[str, Any],
+) -> tuple[List[ParallelConfig], Dict[str, Any]]:
+    snapshot = _workload_cost_model_snapshot(planner_config, model_config)
+    if not snapshot["enabled"] or not candidates:
+        return candidates, snapshot
+
+    scored_candidates: List[ParallelConfig] = []
+    arrival_rate_req_s = float(snapshot["arrival_rate_req_s"])
+    batch_size = int(snapshot["batch_size"])
+    latency_estimate_ms = float(snapshot["latency_estimate_ms"])
+    latency_s = latency_estimate_ms / 1000.0
+    for candidate in candidates:
+        base_score = candidate.base_score or candidate.score
+        throughput_estimate_req_s = 0.0
+        if latency_s > 0.0:
+            throughput_estimate_req_s = (
+                candidate.replica_count * batch_size
+            ) / latency_s
+        load_time_estimate_ms = (
+            float(snapshot["model_load_time_ms"])
+            + candidate.total_gpus * float(snapshot["load_time_per_gpu_ms"])
+        )
+        migration_cost_estimate_ms = (
+            float(snapshot["migration_cost_ms"])
+            + candidate.total_gpus
+            * float(snapshot["migration_cost_per_gpu_ms"])
+            + candidate.replica_count
+            * float(snapshot["migration_cost_per_replica_ms"])
+        )
+        queue_penalty_ms = (
+            max(0.0, arrival_rate_req_s - throughput_estimate_req_s)
+            * float(snapshot["queue_penalty_ms_per_req_s"])
+        )
+        replan_window_cost_ms = (
+            load_time_estimate_ms
+            + migration_cost_estimate_ms
+            + queue_penalty_ms
+        )
+        score_components = {
+            "base": base_score * float(snapshot["base_score_weight"]),
+            "throughput_bonus": (
+                throughput_estimate_req_s
+                * float(snapshot["throughput_score_weight"])
+            ),
+            "latency_penalty": (
+                latency_estimate_ms
+                * float(snapshot["latency_penalty_weight"])
+            ),
+            "load_time_penalty": (
+                load_time_estimate_ms
+                * float(snapshot["load_time_penalty_weight"])
+            ),
+            "migration_cost_penalty": (
+                migration_cost_estimate_ms
+                * float(snapshot["migration_cost_penalty_weight"])
+            ),
+            "queue_penalty": (
+                queue_penalty_ms * float(snapshot["queue_penalty_weight"])
+            ),
+            "replan_window_penalty": (
+                replan_window_cost_ms
+                * float(snapshot["replan_window_penalty_weight"])
+            ),
+        }
+        score = (
+            score_components["base"]
+            + score_components["throughput_bonus"]
+            - score_components["latency_penalty"]
+            - score_components["load_time_penalty"]
+            - score_components["migration_cost_penalty"]
+            - score_components["queue_penalty"]
+            - score_components["replan_window_penalty"]
+        )
+        scored_candidates.append(
+            replace(
+                candidate,
+                score=float(score),
+                base_score=float(base_score),
+                workload_score_delta=float(score - base_score),
+                arrival_rate_req_s=arrival_rate_req_s,
+                batch_size=batch_size,
+                latency_estimate_ms=latency_estimate_ms,
+                throughput_estimate_req_s=(
+                    float(throughput_estimate_req_s)
+                ),
+                load_time_estimate_ms=float(load_time_estimate_ms),
+                migration_cost_estimate_ms=(
+                    float(migration_cost_estimate_ms)
+                ),
+                queue_penalty_ms=float(queue_penalty_ms),
+                replan_window_cost_ms=float(replan_window_cost_ms),
+                score_components=score_components,
+            )
+        )
+
+    return (
+        sorted(
+            scored_candidates,
+            key=lambda candidate: (
+                candidate.score,
+                candidate.replica_count,
+                candidate.tensor_parallel_size,
+                candidate.effective_expert_parallel_size,
+                -candidate.pipeline_parallel_size,
+                -candidate.unused_gpus,
+            ),
+            reverse=True,
+        ),
+        snapshot,
     )
 
 
@@ -624,6 +944,11 @@ def plan_dynamic_reparallelization(
         candidates = generate_parallel_candidates(
             availability.available_gpus, planner_config
         )
+    candidates, workload_cost_model = _score_parallel_candidates_for_workload(
+        candidates,
+        planner_config,
+        model_config,
+    )
     selected = candidates[0] if candidates else None
     parallel_plan = (
         build_parallel_plan(
@@ -637,6 +962,17 @@ def plan_dynamic_reparallelization(
         else None
     )
     action = "reparallelize" if selected is not None else "no_capacity"
+    synthetic_worker_node_count = sum(
+        1
+        for node_info in worker_nodes.values()
+        if bool(node_info.get("_spotserve_synthetic", False))
+        or str(node_info.get("ray_node_id", "")).startswith("synthetic-")
+        or str(node_info.get("address", "")).startswith("synthetic-")
+    )
+    runtime_worker_node_count = max(
+        len(worker_nodes) - synthetic_worker_node_count,
+        0,
+    )
 
     decision = {
         "model": model_name,
@@ -647,6 +983,12 @@ def plan_dynamic_reparallelization(
         "action": action,
         "candidate_count": len(candidates),
         "availability": availability.to_dict(),
+        "worker_node_count": len(worker_nodes),
+        "ready_worker_node_count": len(availability.ready_nodes),
+        "synthetic_worker_node_count": synthetic_worker_node_count,
+        "runtime_worker_node_count": runtime_worker_node_count,
+        "physical_worker_node_count": runtime_worker_node_count,
+        "workload_cost_model": workload_cost_model,
         "parallel_plan": parallel_plan.to_dict() if parallel_plan else None,
         "selected_config": selected.to_dict() if selected else None,
         "top_candidates": [
@@ -674,6 +1016,35 @@ def plan_dynamic_reparallelization(
                 "selected_enable_expert_parallel": (
                     selected.enable_expert_parallel
                 ),
+                "selected_score": selected.score,
+                "selected_base_score": (
+                    selected.base_score
+                    if selected.base_score
+                    else selected.score - selected.workload_score_delta
+                ),
+                "selected_workload_score_delta": (
+                    selected.workload_score_delta
+                ),
+                "selected_arrival_rate_req_s": (
+                    selected.arrival_rate_req_s
+                ),
+                "selected_batch_size": selected.batch_size,
+                "selected_latency_estimate_ms": (
+                    selected.latency_estimate_ms
+                ),
+                "selected_throughput_estimate_req_s": (
+                    selected.throughput_estimate_req_s
+                ),
+                "selected_load_time_estimate_ms": (
+                    selected.load_time_estimate_ms
+                ),
+                "selected_migration_cost_estimate_ms": (
+                    selected.migration_cost_estimate_ms
+                ),
+                "selected_queue_penalty_ms": selected.queue_penalty_ms,
+                "selected_replan_window_cost_ms": (
+                    selected.replan_window_cost_ms
+                ),
             }
         )
     else:
@@ -687,6 +1058,17 @@ def plan_dynamic_reparallelization(
                 "selected_effective_expert_parallel_size": 0,
                 "selected_expert_parallel_size": 0,
                 "selected_enable_expert_parallel": False,
+                "selected_score": 0.0,
+                "selected_base_score": 0.0,
+                "selected_workload_score_delta": 0.0,
+                "selected_arrival_rate_req_s": 0.0,
+                "selected_batch_size": 0,
+                "selected_latency_estimate_ms": 0.0,
+                "selected_throughput_estimate_req_s": 0.0,
+                "selected_load_time_estimate_ms": 0.0,
+                "selected_migration_cost_estimate_ms": 0.0,
+                "selected_queue_penalty_ms": 0.0,
+                "selected_replan_window_cost_ms": 0.0,
             }
         )
     return decision

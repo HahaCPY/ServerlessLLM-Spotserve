@@ -165,6 +165,117 @@ def test_reparallelization_does_not_fallback_when_capability_has_no_capacity():
     assert decision["candidate_count"] == 0
 
 
+def test_workload_cost_model_is_opt_in_for_reparallelization_score():
+    decision = plan_dynamic_reparallelization(
+        model_name="cost-aware-vllm",
+        worker_nodes={
+            "0": {
+                "ray_node_id": "node-0",
+                "address": "10.0.0.1",
+                "free_gpu": 4,
+                "total_gpu": 4,
+                "state": "ready",
+            }
+        },
+        model_config={
+            "model": "cost-aware-vllm",
+            "backend": "vllm",
+            "num_gpus": 4,
+            "backend_capability": {
+                "supported_configs": [
+                    {
+                        "tensor_parallel_size": 4,
+                        "pipeline_parallel_size": 1,
+                        "data_parallel_size": 1,
+                        "replica_count": 1,
+                        "num_gpus": 4,
+                        "reason": "expensive_full_gpu_plan",
+                    },
+                    {
+                        "tensor_parallel_size": 2,
+                        "pipeline_parallel_size": 1,
+                        "data_parallel_size": 1,
+                        "replica_count": 1,
+                        "num_gpus": 2,
+                        "reason": "cheaper_partial_gpu_plan",
+                    },
+                ]
+            },
+        },
+        planner_config={
+            "load_time_per_gpu_ms": 1000,
+            "base_score_weight": 0,
+        },
+        event="manual",
+        backend="vllm",
+    )
+
+    assert decision["workload_cost_model"]["enabled"] is False
+    assert decision["selected_total_gpus"] == 4
+    assert decision["selected_config"]["reason"] == "expensive_full_gpu_plan"
+
+
+def test_workload_cost_model_can_prefer_lower_replan_cost():
+    decision = plan_dynamic_reparallelization(
+        model_name="cost-aware-vllm",
+        worker_nodes={
+            "0": {
+                "ray_node_id": "node-0",
+                "address": "10.0.0.1",
+                "free_gpu": 4,
+                "total_gpu": 4,
+                "state": "ready",
+            }
+        },
+        model_config={
+            "model": "cost-aware-vllm",
+            "backend": "vllm",
+            "num_gpus": 4,
+            "backend_config": {"max_num_seqs": 1},
+            "backend_capability": {
+                "supported_configs": [
+                    {
+                        "tensor_parallel_size": 4,
+                        "pipeline_parallel_size": 1,
+                        "data_parallel_size": 1,
+                        "replica_count": 1,
+                        "num_gpus": 4,
+                        "reason": "expensive_full_gpu_plan",
+                    },
+                    {
+                        "tensor_parallel_size": 2,
+                        "pipeline_parallel_size": 1,
+                        "data_parallel_size": 1,
+                        "replica_count": 1,
+                        "num_gpus": 2,
+                        "reason": "cheaper_partial_gpu_plan",
+                    },
+                ]
+            },
+        },
+        planner_config={
+            "enable_workload_cost_model": True,
+            "base_score_weight": 0,
+            "throughput_score_weight": 0,
+            "load_time_per_gpu_ms": 1000,
+            "load_time_penalty_weight": 1,
+            "migration_cost_penalty_weight": 0,
+            "queue_penalty_weight": 0,
+            "latency_estimate_ms": 1000,
+            "batch_size": 1,
+        },
+        event="manual",
+        backend="vllm",
+    )
+
+    assert decision["workload_cost_model"]["enabled"] is True
+    assert decision["selected_total_gpus"] == 2
+    assert decision["selected_config"]["reason"] == "cheaper_partial_gpu_plan"
+    assert decision["selected_load_time_estimate_ms"] == 2000
+    assert decision["selected_replan_window_cost_ms"] == 2000
+    assert decision["selected_score"] > decision["top_candidates"][1]["score"]
+
+
 def test_parallel_plan_shared_interface_serializes_to_dict():
     plan = ParallelPlan(
         model_name="moe-model",

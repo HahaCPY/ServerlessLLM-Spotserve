@@ -47,7 +47,18 @@ def make_replanning_event(
     instance_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     parallel_plan = decision.get("parallel_plan") or {}
+    selected_config = decision.get("selected_config") or {}
+    availability = decision.get("availability") or {}
+    workload_cost_model = decision.get("workload_cost_model") or {}
     execution = decision.get("execution") or {}
+    target_nodes = [str(node) for node in parallel_plan.get("target_nodes", [])]
+    ready_nodes = [str(node) for node in availability.get("ready_nodes", [])]
+    source_node = str(node_id) if node_id is not None else ""
+    cross_node_target = bool(
+        source_node
+        and target_nodes
+        and any(target_node != source_node for target_node in target_nodes)
+    )
     return {
         "type": "reparallelization",
         "model": model,
@@ -55,13 +66,23 @@ def make_replanning_event(
         "node_id": node_id,
         "instance_id": instance_id,
         "action": decision.get("action"),
-        "available_gpus": decision.get("availability", {}).get(
-            "available_gpus", 0
-        ),
-        "unavailable_gpus": decision.get("availability", {}).get(
-            "unavailable_gpus", 0
-        ),
+        "available_gpus": availability.get("available_gpus", 0),
+        "unavailable_gpus": availability.get("unavailable_gpus", 0),
         "candidate_count": decision.get("candidate_count", 0),
+        "worker_node_count": decision.get("worker_node_count", 0),
+        "ready_worker_node_count": decision.get(
+            "ready_worker_node_count", len(ready_nodes)
+        ),
+        "synthetic_worker_node_count": decision.get(
+            "synthetic_worker_node_count", 0
+        ),
+        "runtime_worker_node_count": decision.get(
+            "runtime_worker_node_count",
+            decision.get("physical_worker_node_count", 0),
+        ),
+        "physical_worker_node_count": decision.get(
+            "physical_worker_node_count", 0
+        ),
         "selected_total_gpus": decision.get("selected_total_gpus", 0),
         "selected_tensor_parallel_size": decision.get(
             "selected_tensor_parallel_size", 0
@@ -84,10 +105,65 @@ def make_replanning_event(
         "selected_expert_parallel_size": decision.get(
             "selected_expert_parallel_size", 0
         ),
-        "target_nodes": parallel_plan.get("target_nodes", []),
+        "selected_score": decision.get(
+            "selected_score", selected_config.get("score", 0.0)
+        ),
+        "selected_base_score": decision.get(
+            "selected_base_score", selected_config.get("base_score", 0.0)
+        ),
+        "selected_workload_score_delta": decision.get(
+            "selected_workload_score_delta",
+            selected_config.get("workload_score_delta", 0.0),
+        ),
+        "selected_arrival_rate_req_s": decision.get(
+            "selected_arrival_rate_req_s",
+            selected_config.get("arrival_rate_req_s", 0.0),
+        ),
+        "selected_batch_size": decision.get(
+            "selected_batch_size", selected_config.get("batch_size", 0)
+        ),
+        "selected_latency_estimate_ms": decision.get(
+            "selected_latency_estimate_ms",
+            selected_config.get("latency_estimate_ms", 0.0),
+        ),
+        "selected_throughput_estimate_req_s": decision.get(
+            "selected_throughput_estimate_req_s",
+            selected_config.get("throughput_estimate_req_s", 0.0),
+        ),
+        "selected_load_time_estimate_ms": decision.get(
+            "selected_load_time_estimate_ms",
+            selected_config.get("load_time_estimate_ms", 0.0),
+        ),
+        "selected_migration_cost_estimate_ms": decision.get(
+            "selected_migration_cost_estimate_ms",
+            selected_config.get("migration_cost_estimate_ms", 0.0),
+        ),
+        "selected_queue_penalty_ms": decision.get(
+            "selected_queue_penalty_ms",
+            selected_config.get("queue_penalty_ms", 0.0),
+        ),
+        "selected_replan_window_cost_ms": decision.get(
+            "selected_replan_window_cost_ms",
+            selected_config.get("replan_window_cost_ms", 0.0),
+        ),
+        "workload_cost_model_enabled": bool(
+            workload_cost_model.get("enabled", False)
+        ),
+        "workload_arrival_rate_req_s": workload_cost_model.get(
+            "arrival_rate_req_s", 0.0
+        ),
+        "workload_batch_size": workload_cost_model.get("batch_size", 0),
+        "workload_latency_estimate_ms": workload_cost_model.get(
+            "latency_estimate_ms", 0.0
+        ),
+        "target_nodes": target_nodes,
+        "target_worker_node_count": len(set(target_nodes)),
+        "cross_node_target": cross_node_target,
+        "multi_worker_target": len(set(target_nodes)) > 1,
         "parallel_plan": parallel_plan or None,
         "execution": execution or None,
         "execution_status": execution.get("status", ""),
+        "execution_duration_ms": execution.get("duration_ms", 0.0),
     }
 
 
@@ -228,6 +304,11 @@ def make_request_event(
     state_restore_successes: int = 0,
     state_restore_fallback: bool = False,
     state_restored_tokens: int = 0,
+    supports_state_restore: bool = False,
+    state_kind: str = "",
+    state_restore_reason: str = "",
+    state_restored_blocks: int = 0,
+    state_restore_staged: bool = False,
 ) -> Dict[str, Any]:
     return {
         "type": "request",
@@ -244,4 +325,9 @@ def make_request_event(
         "state_restore_successes": state_restore_successes,
         "state_restore_fallback": state_restore_fallback,
         "state_restored_tokens": state_restored_tokens,
+        "supports_state_restore": supports_state_restore,
+        "state_kind": state_kind,
+        "state_restore_reason": state_restore_reason,
+        "state_restored_blocks": state_restored_blocks,
+        "state_restore_staged": state_restore_staged,
     }

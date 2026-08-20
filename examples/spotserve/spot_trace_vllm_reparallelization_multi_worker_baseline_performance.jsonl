@@ -1,0 +1,1 @@
+{"time": 40.0, "event": "preempt", "instance_selector": "ready", "model_name": "vllm-reparallelization-multi-worker-baseline"}

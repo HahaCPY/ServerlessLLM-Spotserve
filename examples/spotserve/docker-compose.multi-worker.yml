@@ -1,0 +1,46 @@
+services:
+  # Optional Worker Node 1 for SpotServe multi-worker validation.
+  sllm_worker_1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: docker.io/serverlessllm/sllm:latest
+    container_name: sllm_worker_1
+    group_add:
+      - keep-groups
+    devices:
+      - "nvidia.com/gpu=${SLLM_WORKER_1_GPU_DEVICE:-1}"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: ["gpu"]
+              device_ids: ["${SLLM_WORKER_1_GPU_DEVICE:-1}"]
+    environment:
+      - WORKER_ID=1
+      - STORAGE_PATH=/models
+      - MODE=WORKER
+      - NVIDIA_VISIBLE_DEVICES=${SLLM_WORKER_1_VISIBLE_DEVICES:-1}
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - OMP_NUM_THREADS=1
+      - MKL_NUM_THREADS=1
+      - OPENBLAS_NUM_THREADS=1
+      - NUMEXPR_NUM_THREADS=1
+      - RAYON_NUM_THREADS=1
+      - TOKENIZERS_PARALLELISM=false
+      - RAY_TEMP_DIR=/raytmp/worker-1
+      - HF_HOME=/hf-cache
+      - HF_HUB_DISABLE_XET=1
+      - VLLM_NIXL_ABORT_REQUEST_TIMEOUT=120
+      - VLLM_NIXL_SIDE_CHANNEL_HOST=127.0.0.1
+    shm_size: "10gb"
+    pids_limit: 32768
+    networks:
+      - sllm_network
+    volumes:
+      - ${MODEL_FOLDER}:/models
+      - ./entrypoint.sh:/app/entrypoint.sh:ro
+      - /tmp/sllm-ray/worker-1:/raytmp/worker-1
+      - ${HF_CACHE_DIR:-/tmp/sllm-hf-cache-rootless}:/hf-cache
+    command: ["--mem-pool-size", "4GB", "--registration-required", "true"]

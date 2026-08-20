@@ -3,13 +3,14 @@ import asyncio
 import csv
 import importlib.util
 import json
+import ssl
 import subprocess
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, NamedTuple, Optional, TextIO
-from urllib import error, request
+from urllib import error, parse, request
 
 
 class TraceProcess(NamedTuple):
@@ -187,6 +188,16 @@ def build_comparisons(
         "replanning_events",
         "replanning_execution_applied",
         "replanning_execution_failed",
+        "replanning_workload_cost_model_events",
+        "replanning_avg_execution_duration_ms",
+        "replanning_avg_selected_replan_window_cost_ms",
+        "replanning_avg_selected_load_time_estimate_ms",
+        "replanning_avg_selected_migration_cost_estimate_ms",
+        "replanning_cross_node_targets",
+        "replanning_multi_worker_targets",
+        "replanning_max_ready_worker_node_count",
+        "replanning_max_runtime_worker_node_count",
+        "replanning_max_physical_worker_node_count",
         "phase_replan_window_success_rate",
         "phase_replan_window_latency_p95_ms",
         "phase_post_replan_success_rate",
@@ -255,6 +266,100 @@ def post_json(
             success = "error" not in result
     except error.HTTPError as exc:
         result = {"error": exc.read().decode("utf-8")}
+        success = False
+    except Exception as exc:
+        result = {"error": str(exc)}
+        success = False
+
+    return {
+        "type": "request",
+        "request_id": payload.get("request_id"),
+        "model": payload.get("model"),
+        "success": success,
+        "latency_ms": (time.time() - started_at) * 1000,
+        "response": result,
+    }
+
+
+async def _async_http_post_json_once(
+    endpoint: str, payload: Dict[str, Any]
+) -> Dict[str, Any]:
+    url = parse.urlparse(endpoint)
+    if url.scheme not in {"http", "https"}:
+        raise ValueError(f"Unsupported endpoint scheme: {url.scheme}")
+    if not url.hostname:
+        raise ValueError(f"Endpoint host is missing: {endpoint}")
+
+    body = json.dumps(payload).encode("utf-8")
+    path = url.path or "/"
+    if url.query:
+        path = f"{path}?{url.query}"
+    port = url.port or (443 if url.scheme == "https" else 80)
+    ssl_context = ssl.create_default_context() if url.scheme == "https" else None
+    writer = None
+    try:
+        reader, writer = await asyncio.open_connection(
+            url.hostname,
+            port,
+            ssl=ssl_context,
+        )
+        host_header = url.hostname
+        if url.port is not None:
+            host_header = f"{host_header}:{url.port}"
+        request_head = (
+            f"POST {path} HTTP/1.1\r\n"
+            f"Host: {host_header}\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ).encode("ascii")
+        writer.write(request_head + body)
+        await writer.drain()
+
+        raw_head = await reader.readuntil(b"\r\n\r\n")
+        head_text = raw_head.decode("iso-8859-1")
+        head_lines = head_text.split("\r\n")
+        status_parts = head_lines[0].split(" ", 2)
+        status_code = int(status_parts[1]) if len(status_parts) > 1 else 0
+        headers = {}
+        for line in head_lines[1:]:
+            if not line or ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            headers[key.strip().lower()] = value.strip()
+
+        if "content-length" in headers:
+            response_body = await reader.readexactly(
+                int(headers["content-length"])
+            )
+        else:
+            response_body = await reader.read()
+        response_text = response_body.decode("utf-8", errors="replace")
+        if status_code >= 400:
+            return {"error": response_text}
+        return json.loads(response_text)
+    finally:
+        if writer is not None:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+
+async def post_json_async(
+    endpoint: str, payload: Dict[str, Any], timeout_s: float
+) -> Dict[str, Any]:
+    started_at = time.time()
+    try:
+        result = await asyncio.wait_for(
+            _async_http_post_json_once(endpoint, payload),
+            timeout=max(0.1, timeout_s),
+        )
+        success = "error" not in result
+    except asyncio.TimeoutError:
+        result = {"error": f"request timed out after {timeout_s:.1f}s"}
         success = False
     except Exception as exc:
         result = {"error": str(exc)}
@@ -404,6 +509,10 @@ def is_preempting_instance_state(state: Dict[str, Any]) -> bool:
     return state.get("state") == "preempting"
 
 
+def is_failed_instance_state(state: Dict[str, Any]) -> bool:
+    return state.get("pool") == "failed" or state.get("state") == "dead"
+
+
 def instance_concurrency(state: Dict[str, Any]) -> int:
     try:
         return int(state.get("concurrency", 0) or 0)
@@ -460,6 +569,17 @@ async def wait_for_ready_instances(
         ]
         if len(ready_instances) >= min_ready_instances:
             return
+        failed_instances = {
+            instance_id: state
+            for instance_id, state in latest_states.items()
+            if is_failed_instance_state(state)
+        }
+        if failed_instances:
+            raise RuntimeError(
+                f"Instance startup failed while waiting for "
+                f"{min_ready_instances} ready instances for {model_name}; "
+                f"failed states={failed_instances}; latest states={latest_states}"
+            )
         await asyncio.sleep(2.0)
 
     raise RuntimeError(
@@ -547,9 +667,7 @@ async def send_workload(
         }
         payload["model"] = model
         sent_at = time.time()
-        result = await asyncio.to_thread(
-            post_json, endpoint, payload, request_timeout_s
-        )
+        result = await post_json_async(endpoint, payload, request_timeout_s)
         result["arrival_time"] = arrival_time
         if row.get("benchmark_phase") or row.get("phase"):
             result["benchmark_phase"] = str(
@@ -753,11 +871,16 @@ async def run_one(
     )
     run_dir = output_root / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
+    run_request_timeout_s = float(
+        run_config.get("request_timeout_s", request_timeout_s)
+        or request_timeout_s
+    )
 
     metadata = {
         "git_commit": git_commit(),
         "started_at": datetime.now().isoformat(),
         "endpoint": endpoint,
+        "effective_request_timeout_s": run_request_timeout_s,
         **run_config,
     }
     (run_dir / "run_metadata.json").write_text(
@@ -783,7 +906,7 @@ async def run_one(
 
     deleted_before_run = False
     for model_name in run_config.get("delete_models_before_run", []):
-        delete_model_over_http(endpoint, model_name, request_timeout_s)
+        delete_model_over_http(endpoint, model_name, run_request_timeout_s)
         deleted_before_run = True
     if deleted_before_run:
         await asyncio.sleep(float(run_config.get("delete_settle_s", 0.0) or 0.0))
@@ -793,7 +916,7 @@ async def run_one(
         deploy_config_over_http(
             endpoint,
             deploy_config,
-            request_timeout_s,
+            run_request_timeout_s,
             router_metrics_path=run_config.get("router_metrics_path"),
         )
 
@@ -825,19 +948,19 @@ async def run_one(
                     speedup,
                     endpoint,
                     run_dir / "trace_replayer.log",
-                    request_timeout_s,
+                    run_request_timeout_s,
                     ray_address,
                     ray_namespace,
                     model_name=run_config["model"],
                 )
         rows = await send_workload(
-            endpoint, run_config["model"], workload, request_timeout_s
+            endpoint, run_config["model"], workload, run_request_timeout_s
         )
     finally:
         await wait_trace_replayer(trace_replayer)
         if run_config.get("delete_after_run"):
             delete_model_over_http(
-                endpoint, run_config["model"], request_timeout_s
+                endpoint, run_config["model"], run_request_timeout_s
             )
 
     for row in rows:
@@ -940,7 +1063,15 @@ async def main_async(args):
                     f"applied="
                     f"{summary.get('replanning_execution_applied', 0)}, "
                     f"failed="
-                    f"{summary.get('replanning_execution_failed', 0)}"
+                    f"{summary.get('replanning_execution_failed', 0)}, "
+                    f"exec_ms="
+                    f"{summary.get('replanning_avg_execution_duration_ms', 0.0):.2f}, "
+                    f"cost_model="
+                    f"{summary.get('replanning_workload_cost_model_events', 0)}, "
+                    f"cross_node="
+                    f"{summary.get('replanning_cross_node_targets', 0)}, "
+                    f"runtime_workers="
+                    f"{summary.get('replanning_max_runtime_worker_node_count', 0)}"
                 )
             context_migration_suffix = ""
             if int(summary.get("context_migration_events", 0) or 0) > 0:
@@ -967,7 +1098,21 @@ async def main_async(args):
                     f"{summary.get('state_restore_successes_total', 0)}/"
                     f"{summary.get('state_restore_attempts_total', 0)}, "
                     f"state_tokens="
-                    f"{summary.get('state_restored_tokens_total', 0)}"
+                    f"{summary.get('state_restored_tokens_total', 0)}, "
+                    f"state_fallbacks="
+                    f"{summary.get('state_restore_fallback_count', 0)}, "
+                    f"state_blocks="
+                    f"{summary.get('state_restored_blocks_total', 0)}, "
+                    f"response_blocks="
+                    f"{summary.get('response_kv_restore_restored_blocks', 0)}, "
+                    f"true_kv_restores="
+                    f"{summary.get('true_kv_restore_successes_total', 0)}, "
+                    f"true_kv_blocks="
+                    f"{summary.get('true_kv_restored_blocks_total', 0)}, "
+                    f"supports_state_restore="
+                    f"{summary.get('supports_state_restore_requests', 0)}, "
+                    f"state_kinds="
+                    f"{summary.get('state_kinds', '') or 'none'}"
                 )
             print(
                 "  "

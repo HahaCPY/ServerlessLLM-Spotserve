@@ -27,6 +27,12 @@
     "state_restore_attempts_total",
     "state_restore_successes_total",
     "state_restore_fallback_count",
+    "state_restored_blocks_total",
+    "response_kv_restore_successes",
+    "response_kv_restore_restored_blocks",
+    "supports_state_restore_requests",
+    "true_kv_restore_successes_total",
+    "true_kv_restored_blocks_total",
     "risk_scheduling_events",
     "risk_scheduling_allocations",
     "risk_scheduling_avg_selected_risk"

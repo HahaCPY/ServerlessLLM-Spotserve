@@ -194,6 +194,67 @@ class FakeReparallelizationBackend(FakeRouterRestoreBackend):
         return {"aborted": True, "request_id": request_id, "reason": reason}
 
 
+class FakeShutdownBackend:
+    def __init__(self):
+        self.shutdown_calls = 0
+
+    async def shutdown(self):
+        self.shutdown_calls += 1
+
+
+class FakeRemoteMethod:
+    def __init__(self, callback):
+        self.callback = callback
+
+    async def remote(self, *args, **kwargs):
+        return self.callback(*args, **kwargs)
+
+
+class FakeModelLoadingScheduler:
+    def __init__(self, node_id="node-1"):
+        self.node_id = node_id
+        self.allocations = []
+        self.deallocations = []
+        self.allocate_resource = FakeRemoteMethod(self._allocate_resource)
+        self.deallocate_resource = FakeRemoteMethod(self._deallocate_resource)
+
+    def _allocate_resource(self, model_name, instance_id, resources):
+        self.allocations.append((model_name, instance_id, dict(resources)))
+        return self.node_id
+
+    def _deallocate_resource(self, model_name, instance_id, resources):
+        self.deallocations.append((model_name, instance_id, dict(resources)))
+
+
+class FakeFailingInitBackend:
+    def __init__(self):
+        self.shutdown_calls = 0
+
+    async def init_backend(self):
+        raise RuntimeError("cuda oom during init")
+
+    async def shutdown(self):
+        self.shutdown_calls += 1
+
+
+class FakeFailingShutdownRayBackend:
+    _ray_actor_id = "fake-ray-actor"
+
+    async def shutdown(self):
+        raise RuntimeError("shutdown failed")
+
+
+class FakeStartInstanceRemote:
+    def __init__(self, backend):
+        self.backend = backend
+
+    def options(self, **kwargs):
+        return self
+
+    async def remote(self, *args, **kwargs):
+        return self.backend
+
+
 @pytest.mark.asyncio
 async def test_preempting_instance_cannot_accept_new_requests():
     instance = InstanceHandle(
@@ -425,6 +486,106 @@ async def test_router_records_reparallelization_decision(tmp_path):
     ]
     assert rows[-1]["type"] == "reparallelization"
     assert rows[-1]["parallel_plan"] == replanning["parallel_plan"]
+
+
+@pytest.mark.asyncio
+async def test_router_shutdown_deallocates_preempting_inference_instance():
+    router = RoundRobinRouter(
+        model_name="test-model",
+        resource_requirements={"num_cpus": 1, "num_gpus": 1},
+        backend="vllm",
+        backend_config={},
+        router_config={},
+    )
+    scheduler = FakeModelLoadingScheduler()
+    router.model_loading_scheduler = scheduler
+    backend = FakeShutdownBackend()
+    instance = InstanceHandle(
+        instance_id="instance-preempting",
+        max_queue_length=1,
+        num_gpu=1,
+        backend_instance=backend,
+    )
+    await instance.mark_ready(node_id="node-1")
+    await instance.mark_preempting()
+    router.ready_inference_instances[instance.instance_id] = instance
+
+    deleted = await router.shutdown()
+
+    assert deleted == ["instance-preempting"]
+    assert instance.state == InstanceState.DEAD
+    assert backend.shutdown_calls == 1
+    assert scheduler.deallocations == [
+        (
+            "test-model",
+            "instance-preempting",
+            {"num_cpus": 1, "num_gpus": 1},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_start_instance_failure_moves_to_failed_and_deallocates(
+    monkeypatch,
+):
+    router = RoundRobinRouter(
+        model_name="test-model",
+        resource_requirements={"num_cpus": 1, "num_gpus": 1},
+        backend="vllm",
+        backend_config={},
+        router_config={},
+    )
+    scheduler = FakeModelLoadingScheduler(node_id="node-1")
+    router.model_loading_scheduler = scheduler
+    backend = FakeFailingInitBackend()
+    monkeypatch.setattr(
+        "sllm.routers.roundrobin_router.start_instance",
+        FakeStartInstanceRemote(backend),
+    )
+    instance = InstanceHandle(
+        instance_id="instance-starting",
+        max_queue_length=1,
+        num_gpu=1,
+    )
+    router.starting_inference_instances[instance.instance_id] = instance
+
+    await router._start_instance(instance.instance_id)
+
+    states = await router.get_instance_states()
+    assert instance.instance_id not in router.starting_inference_instances
+    assert states[instance.instance_id]["pool"] == "failed"
+    assert states[instance.instance_id]["state"] == "dead"
+    assert "cuda oom" in states[instance.instance_id]["failure_reason"]
+    assert backend.shutdown_calls == 1
+    assert scheduler.allocations == [
+        ("test-model", "instance-starting", {"num_cpus": 1, "num_gpus": 1})
+    ]
+    assert scheduler.deallocations == [
+        ("test-model", "instance-starting", {"num_cpus": 1, "num_gpus": 1})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stop_backend_kills_ray_actor_when_shutdown_fails(monkeypatch):
+    router = RoundRobinRouter(
+        model_name="test-model",
+        resource_requirements={"num_cpus": 1, "num_gpus": 1},
+        backend="vllm",
+        backend_config={},
+        router_config={},
+    )
+    backend = FakeFailingShutdownRayBackend()
+    killed = []
+
+    monkeypatch.setattr(
+        "sllm.routers.roundrobin_router.ray.kill",
+        lambda actor: killed.append(actor),
+    )
+
+    with pytest.raises(RuntimeError):
+        await router._stop_backend(backend, "shutdown")
+
+    assert killed == [backend]
 
 
 @pytest.mark.asyncio
@@ -801,6 +962,9 @@ async def test_router_stateful_restore_end_to_end_records_no_fallback(tmp_path):
     assert request_row["state_restore_attempts"] == 1
     assert request_row["state_restore_successes"] == 1
     assert request_row["state_restore_fallback"] is False
+    assert request_row["supports_state_restore"] is True
+    assert request_row["state_kind"] == "vllm_kv_snapshot"
+    assert request_row["state_restored_blocks"] == 1
 
 
 @pytest.mark.asyncio

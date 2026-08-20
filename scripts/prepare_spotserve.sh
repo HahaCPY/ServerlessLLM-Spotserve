@@ -17,6 +17,7 @@ Options:
   --cleanup-only     Prune stale build artifacts and exit
   --deploy-set SET   Models to deploy: standard, correctness,
                      reparallelization, reparallelization-performance,
+                     reparallelization-multi-worker-performance,
                      context-migration-performance,
                      stateful-recovery-performance,
                      spotserve-core-performance,
@@ -37,6 +38,14 @@ Environment overrides:
   SPOTSERVE_WORKDIR          Container workdir. Default: /tmp/spotserve-work
   SPOTSERVE_HEALTH_URL       Container API health URL. Default: http://127.0.0.1:8343/health
   SPOTSERVE_WORKER_CONTAINER Worker container used by vLLM deploy sets. Default: sllm_worker_0
+  SPOTSERVE_EXPECTED_WORKER_NODES
+                            Minimum Ray worker_node resources required before
+                            deploying. Default: 2 for
+                            reparallelization-multi-worker-performance,
+                            otherwise 1.
+  SPOTSERVE_REPARALLELIZATION_MULTI_WORKER
+                            When set to 1, include sllm_worker_1 in the
+                            compose services for V6 deploy sets.
   SPOTSERVE_HF_CACHE_DIR     Host HF cache dir mounted as /hf-cache.
                             Default: /tmp/sllm-hf-cache-rootless
   SPOTSERVE_CLEANUP_BUILD_ARTIFACTS
@@ -46,9 +55,8 @@ Environment overrides:
                             Remove stopped sllm_head/sllm_worker_* containers.
                             Default: 1
   SPOTSERVE_SYNC_SOURCE     Copy local sllm/ into running containers and restart
-                            before readiness checks. Default: 1 for
-                            spotserve-core-performance with --skip-build,
-                            otherwise 0.
+                            before readiness checks. Default: 1 with
+                            --skip-build, otherwise 0.
   SPOTSERVE_REPARALLELIZATION_MODEL_PATH
                             vLLM model path/id used by V6 reparallelization.
                             Default: /models/vllm/vllm-dense-baseline
@@ -134,8 +142,8 @@ while [[ $# -gt 0 ]]; do
       ;;
     --deploy-set)
       DEPLOY_SET="${2:-}"
-      if [[ "$DEPLOY_SET" != "standard" && "$DEPLOY_SET" != "correctness" && "$DEPLOY_SET" != "reparallelization" && "$DEPLOY_SET" != "reparallelization-performance" && "$DEPLOY_SET" != "context-migration-performance" && "$DEPLOY_SET" != "stateful-recovery-performance" && "$DEPLOY_SET" != "spotserve-core-performance" && "$DEPLOY_SET" != "vllm-dense" && "$DEPLOY_SET" != "vllm-moe" && "$DEPLOY_SET" != "vllm-blackbox" && "$DEPLOY_SET" != "all" ]]; then
-        echo "--deploy-set must be one of: standard, correctness, reparallelization, reparallelization-performance, context-migration-performance, stateful-recovery-performance, spotserve-core-performance, vllm-dense, vllm-moe, vllm-blackbox, all" >&2
+      if [[ "$DEPLOY_SET" != "standard" && "$DEPLOY_SET" != "correctness" && "$DEPLOY_SET" != "reparallelization" && "$DEPLOY_SET" != "reparallelization-performance" && "$DEPLOY_SET" != "reparallelization-multi-worker-performance" && "$DEPLOY_SET" != "context-migration-performance" && "$DEPLOY_SET" != "stateful-recovery-performance" && "$DEPLOY_SET" != "spotserve-core-performance" && "$DEPLOY_SET" != "vllm-dense" && "$DEPLOY_SET" != "vllm-moe" && "$DEPLOY_SET" != "vllm-blackbox" && "$DEPLOY_SET" != "all" ]]; then
+        echo "--deploy-set must be one of: standard, correctness, reparallelization, reparallelization-performance, reparallelization-multi-worker-performance, context-migration-performance, stateful-recovery-performance, spotserve-core-performance, vllm-dense, vllm-moe, vllm-blackbox, all" >&2
         exit 2
       fi
       shift 2
@@ -156,6 +164,12 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONTAINER="${SPOTSERVE_CONTAINER:-sllm_head}"
 COMPOSE_SERVICE="${SPOTSERVE_COMPOSE_SERVICE:-sllm_head}"
 WORKER_CONTAINER="${SPOTSERVE_WORKER_CONTAINER:-sllm_worker_0}"
+REPARALLELIZATION_MULTI_WORKER="${SPOTSERVE_REPARALLELIZATION_MULTI_WORKER:-0}"
+if [[ "$DEPLOY_SET" == "reparallelization-multi-worker-performance" ]]; then
+  EXPECTED_WORKER_NODES="${SPOTSERVE_EXPECTED_WORKER_NODES:-2}"
+else
+  EXPECTED_WORKER_NODES="${SPOTSERVE_EXPECTED_WORKER_NODES:-1}"
+fi
 HOST_TMPDIR="${SPOTSERVE_HOST_TMPDIR:-${ROOT_DIR}/.spotserve-tmp}"
 HF_CACHE_DIR="${SPOTSERVE_HF_CACHE_DIR:-/tmp/sllm-hf-cache-rootless}"
 WORKDIR_IN_CONTAINER="${SPOTSERVE_WORKDIR:-/tmp/spotserve-work}"
@@ -180,16 +194,43 @@ HEAD_RAY="/opt/venvs/head/bin/ray"
 WORKER_PYTHON="/opt/venvs/worker/bin/python"
 SYNC_SOURCE="${SPOTSERVE_SYNC_SOURCE:-}"
 
+MODEL_FOLDER_WAS_SET=0
+if [[ -n "${MODEL_FOLDER+x}" ]]; then
+  MODEL_FOLDER_WAS_SET=1
+fi
+
 DEFAULT_MODEL_FOLDER="${SPOTSERVE_DEFAULT_MODEL_FOLDER:-/work/spotserve-models}"
 if [[ ! -d "$DEFAULT_MODEL_FOLDER" ]]; then
   DEFAULT_MODEL_FOLDER="${ROOT_DIR}/model"
 fi
 MODEL_FOLDER="${MODEL_FOLDER:-$DEFAULT_MODEL_FOLDER}"
+maybe_use_repo_model_folder() {
+  local container_model_path="$1"
+  if [[ "$MODEL_FOLDER_WAS_SET" -eq 1 || "$container_model_path" != /models/* ]]; then
+    return
+  fi
+  local relative_model_path="${container_model_path#/models/}"
+  if [[ -f "${MODEL_FOLDER}/${relative_model_path}/config.json" ]]; then
+    return
+  fi
+  if [[ -f "${ROOT_DIR}/model/${relative_model_path}/config.json" ]]; then
+    MODEL_FOLDER="${ROOT_DIR}/model"
+  fi
+}
+if [[ "$DEPLOY_SET" == "reparallelization" || "$DEPLOY_SET" == "reparallelization-performance" || "$DEPLOY_SET" == "reparallelization-multi-worker-performance" ]]; then
+  maybe_use_repo_model_folder "$REPARALLELIZATION_MODEL_PATH"
+elif [[ "$DEPLOY_SET" == "context-migration-performance" ]]; then
+  maybe_use_repo_model_folder "$CONTEXT_MIGRATION_MODEL_PATH"
+elif [[ "$DEPLOY_SET" == "stateful-recovery-performance" ]]; then
+  maybe_use_repo_model_folder "$STATEFUL_RECOVERY_MODEL_PATH"
+elif [[ "$DEPLOY_SET" == "spotserve-core-performance" ]]; then
+  maybe_use_repo_model_folder "$CORE_MODEL_PATH"
+fi
 export MODEL_FOLDER
 export HF_CACHE_DIR
 
 if [[ -z "$SYNC_SOURCE" ]]; then
-  if [[ "$DEPLOY_SET" == "spotserve-core-performance" && "$SKIP_BUILD" -eq 1 ]]; then
+  if [[ "$SKIP_BUILD" -eq 1 ]]; then
     SYNC_SOURCE=1
   else
     SYNC_SOURCE=0
@@ -198,10 +239,27 @@ fi
 
 if [[ -n "${SPOTSERVE_COMPOSE_SERVICES:-}" ]]; then
   read -r -a COMPOSE_SERVICES <<<"$SPOTSERVE_COMPOSE_SERVICES"
+elif [[ "$DEPLOY_SET" == "reparallelization-multi-worker-performance" ]]; then
+  COMPOSE_SERVICES=("$COMPOSE_SERVICE" "sllm_worker_0" "sllm_worker_1")
 elif [[ "$DEPLOY_SET" == "reparallelization" || "$DEPLOY_SET" == "reparallelization-performance" || "$DEPLOY_SET" == "context-migration-performance" || "$DEPLOY_SET" == "stateful-recovery-performance" || "$DEPLOY_SET" == "spotserve-core-performance" || "$DEPLOY_SET" == "vllm-dense" || "$DEPLOY_SET" == "vllm-moe" || "$DEPLOY_SET" == "vllm-blackbox" || "$DEPLOY_SET" == "all" ]]; then
   COMPOSE_SERVICES=("$COMPOSE_SERVICE" "sllm_worker_0")
+  if [[ "$REPARALLELIZATION_MULTI_WORKER" == "1" && ( "$DEPLOY_SET" == "reparallelization" || "$DEPLOY_SET" == "reparallelization-performance" || "$DEPLOY_SET" == "all" ) ]]; then
+    COMPOSE_SERVICES+=("sllm_worker_1")
+  fi
 else
   COMPOSE_SERVICES=("$COMPOSE_SERVICE")
+fi
+if printf '%s\n' "${COMPOSE_SERVICES[@]}" | grep -qx "sllm_worker_1"; then
+  MULTI_WORKER_COMPOSE_FILE="examples/spotserve/docker-compose.multi-worker.yml"
+  export SLLM_WORKER_0_GPU_DEVICE="${SLLM_WORKER_0_GPU_DEVICE:-0}"
+  export SLLM_WORKER_0_VISIBLE_DEVICES="${SLLM_WORKER_0_VISIBLE_DEVICES:-0}"
+  export SLLM_WORKER_1_GPU_DEVICE="${SLLM_WORKER_1_GPU_DEVICE:-1}"
+  export SLLM_WORKER_1_VISIBLE_DEVICES="${SLLM_WORKER_1_VISIBLE_DEVICES:-1}"
+  if [[ -z "${COMPOSE_FILE:-}" ]]; then
+    export COMPOSE_FILE="docker-compose.yml:${MULTI_WORKER_COMPOSE_FILE}"
+  elif [[ ":${COMPOSE_FILE}:" != *":${MULTI_WORKER_COMPOSE_FILE}:"* ]]; then
+    export COMPOSE_FILE="${COMPOSE_FILE}:${MULTI_WORKER_COMPOSE_FILE}"
+  fi
 fi
 
 if [[ -n "${SPOTSERVE_COMPOSE_BUILD_SERVICES:-}" ]]; then
@@ -249,12 +307,18 @@ sync_source_into_containers() {
   fi
   log "Syncing local sllm package into running containers"
   podman cp sllm/. "${CONTAINER}:/opt/venvs/head/lib/python3.11/site-packages/sllm"
-  if podman ps -a --format "{{.Names}}" | grep -qx "$WORKER_CONTAINER"; then
-    podman cp sllm/. "${WORKER_CONTAINER}:/opt/venvs/worker/lib/python3.11/site-packages/sllm"
-    podman restart "$CONTAINER" "$WORKER_CONTAINER"
-  else
-    podman restart "$CONTAINER"
-  fi
+  restart_containers=("$CONTAINER")
+  for service in "${COMPOSE_SERVICES[@]}"; do
+    case "$service" in
+      sllm_worker_*)
+        if podman ps -a --format "{{.Names}}" | grep -qx "$service"; then
+          podman cp sllm/. "${service}:/opt/venvs/worker/lib/python3.11/site-packages/sllm"
+          restart_containers+=("$service")
+        fi
+        ;;
+    esac
+  done
+  podman restart "${restart_containers[@]}"
 }
 
 cleanup_on_exit() {
@@ -320,7 +384,7 @@ for attempt in $(seq 1 60); do
   sleep 2
 done
 
-if [[ "$DEPLOY_SET" == "reparallelization" || "$DEPLOY_SET" == "reparallelization-performance" || "$DEPLOY_SET" == "context-migration-performance" || "$DEPLOY_SET" == "stateful-recovery-performance" || "$DEPLOY_SET" == "spotserve-core-performance" || "$DEPLOY_SET" == "vllm-dense" || "$DEPLOY_SET" == "vllm-moe" || "$DEPLOY_SET" == "vllm-blackbox" || "$DEPLOY_SET" == "all" ]]; then
+if [[ "$DEPLOY_SET" == "reparallelization" || "$DEPLOY_SET" == "reparallelization-performance" || "$DEPLOY_SET" == "reparallelization-multi-worker-performance" || "$DEPLOY_SET" == "context-migration-performance" || "$DEPLOY_SET" == "stateful-recovery-performance" || "$DEPLOY_SET" == "spotserve-core-performance" || "$DEPLOY_SET" == "vllm-dense" || "$DEPLOY_SET" == "vllm-moe" || "$DEPLOY_SET" == "vllm-blackbox" || "$DEPLOY_SET" == "all" ]]; then
   log "Checking vLLM worker resources"
   podman exec "$WORKER_CONTAINER" bash -lc \
     "mkdir -p /hf-cache/hub /hf-cache/modules && chmod -R a+rwX /hf-cache && touch /hf-cache/modules/.spotserve-write-test"
@@ -338,7 +402,7 @@ if deploy_set == "context-migration-performance":
         "get_request_kv_metadata",
         "get_all_request_kv_metadata",
     )
-elif deploy_set not in ("reparallelization", "reparallelization-performance"):
+elif deploy_set not in ("reparallelization", "reparallelization-performance", "reparallelization-multi-worker-performance"):
     from nixl._api import nixl_agent
 
     required_hooks = (
@@ -386,7 +450,7 @@ EOF
       sleep 2
     done
   fi
-  if [[ "$DEPLOY_SET" == "reparallelization" || "$DEPLOY_SET" == "reparallelization-performance" || "$DEPLOY_SET" == "all" ]] &&
+  if [[ "$DEPLOY_SET" == "reparallelization" || "$DEPLOY_SET" == "reparallelization-performance" || "$DEPLOY_SET" == "reparallelization-multi-worker-performance" || "$DEPLOY_SET" == "all" ]] &&
       [[ "$REPARALLELIZATION_MODEL_PATH" == /* ]]; then
     for attempt in $(seq 1 90); do
       if podman exec "$WORKER_CONTAINER" test -f "${REPARALLELIZATION_MODEL_PATH}/config.json"; then
@@ -484,15 +548,21 @@ EOF
   fi
 
   for attempt in $(seq 1 90); do
-    if podman exec -i "$CONTAINER" "$HEAD_PYTHON" - >"$VLLM_RESOURCES_LOG" 2>&1 <<'PY'
+    if podman exec -i "$CONTAINER" "$HEAD_PYTHON" - "$EXPECTED_WORKER_NODES" >"$VLLM_RESOURCES_LOG" 2>&1 <<'PY'
 import ray
 import sys
 
+expected_worker_nodes = int(sys.argv[1])
 ray.init(address="auto", namespace="sllm", ignore_reinit_error=True)
 resources = ray.cluster_resources()
 print("Ray cluster resources:", resources)
-if resources.get("worker_node", 0) <= 0:
-    print("No Ray worker_node resource is registered.", file=sys.stderr)
+worker_nodes = resources.get("worker_node", 0)
+if worker_nodes < expected_worker_nodes:
+    print(
+        f"Expected at least {expected_worker_nodes} Ray worker_node "
+        f"resources, found {worker_nodes}.",
+        file=sys.stderr,
+    )
     sys.exit(1)
 if resources.get("GPU", 0) <= 0:
     print("No Ray GPU resource is registered.", file=sys.stderr)
@@ -505,9 +575,11 @@ PY
     if [[ "$attempt" -eq 90 ]]; then
       cat "$VLLM_RESOURCES_LOG" >&2 || true
       cat >&2 <<'EOF'
-Ray has no GPU worker available for vLLM deploy.
+Ray does not have the expected GPU worker capacity for vLLM deploy.
 Start sllm_worker_0 on a node where the NVIDIA driver is available, then rerun:
   scripts/prepare_spotserve.sh --deploy-set reparallelization
+For the multi-worker V6 benchmark, start at least two workers or rerun:
+  scripts/prepare_spotserve.sh --deploy-set reparallelization-multi-worker-performance
 or:
   scripts/prepare_spotserve.sh --deploy-set vllm-dense
 or:
@@ -556,7 +628,7 @@ podman cp benchmarks/spotserve/. "${CONTAINER}:${WORKDIR_IN_CONTAINER}/benchmark
 podman cp examples/spotserve/. "${CONTAINER}:${WORKDIR_IN_CONTAINER}/examples/spotserve"
 podman cp scripts/. "${CONTAINER}:${WORKDIR_IN_CONTAINER}/scripts"
 
-if [[ "$DEPLOY_SET" == "reparallelization" || "$DEPLOY_SET" == "reparallelization-performance" || "$DEPLOY_SET" == "all" ]]; then
+if [[ "$DEPLOY_SET" == "reparallelization" || "$DEPLOY_SET" == "reparallelization-performance" || "$DEPLOY_SET" == "reparallelization-multi-worker-performance" || "$DEPLOY_SET" == "all" ]]; then
   log "Applying vLLM reparallelization config override"
   podman exec -i "$CONTAINER" "$HEAD_PYTHON" - \
     "$WORKDIR_IN_CONTAINER" \
@@ -571,6 +643,8 @@ model_path = sys.argv[2]
 load_format = sys.argv[3]
 for relative_path in (
     "examples/spotserve/config-vllm-reparallelization-applied-performance.json",
+    "examples/spotserve/config-vllm-reparallelization-applied-multi-worker-performance.json",
+    "examples/spotserve/config-vllm-reparallelization-baseline-multi-worker-performance.json",
     "examples/spotserve/config-vllm-reparallelization-baseline-gpu-smoke.json",
     "examples/spotserve/config-vllm-reparallelization-gpu-smoke.json",
 ):
@@ -751,6 +825,9 @@ if [[ "$SKIP_DEPLOY" -eq 0 ]]; then
   if [[ "$DEPLOY_SET" == "reparallelization-performance" || "$DEPLOY_SET" == "all" ]]; then
     DEPLOY_CONFIGS+=("${REPARALLELIZATION_PERFORMANCE_CONFIGS[@]}")
   fi
+  if [[ "$DEPLOY_SET" == "reparallelization-multi-worker-performance" || "$DEPLOY_SET" == "all" ]]; then
+    log "Reparallelization multi-worker performance configs will be deployed one run at a time by the benchmark runner"
+  fi
   if [[ "$DEPLOY_SET" == "context-migration-performance" || "$DEPLOY_SET" == "all" ]]; then
     DEPLOY_CONFIGS+=("${CONTEXT_MIGRATION_PERFORMANCE_CONFIGS[@]}")
   fi
@@ -855,6 +932,23 @@ ${HEAD_PYTHON} benchmarks/spotserve/run_benchmark.py \\
   --config benchmarks/spotserve/benchmark_matrix_reparallelization_performance.yaml \\
   --endpoint http://127.0.0.1:8343/v1/chat/completions \\
   --request-timeout 180 \\
+  --ray-address auto \\
+  --ray-namespace sllm
+'
+EOF
+fi
+
+if [[ "$DEPLOY_SET" == "reparallelization-multi-worker-performance" || "$DEPLOY_SET" == "all" ]]; then
+  cat <<EOF
+
+Run the dynamic-reparallelization multi-worker performance comparison with:
+
+podman exec ${CONTAINER} bash -lc '
+cd ${WORKDIR_IN_CONTAINER} &&
+${HEAD_PYTHON} benchmarks/spotserve/run_benchmark.py \\
+  --config benchmarks/spotserve/benchmark_matrix_reparallelization_multi_worker_performance.yaml \\
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \\
+  --request-timeout 240 \\
   --ray-address auto \\
   --ray-namespace sllm
 '

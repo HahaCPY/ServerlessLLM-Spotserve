@@ -22,6 +22,7 @@ import logging
 import os
 import time
 import uuid
+from collections import deque
 from dataclasses import replace
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
@@ -145,14 +146,33 @@ class RoundRobinRouter(SllmRouter):
         synthetic_worker_nodes = self.reparallelization_config.get(
             "synthetic_worker_nodes", {}
         )
-        self.reparallelization_worker_nodes = {
-            str(node_id): dict(node_info)
-            for node_id, node_info in synthetic_worker_nodes.items()
-        }
+        self.reparallelization_worker_nodes = {}
+        for node_id, node_info in synthetic_worker_nodes.items():
+            synthetic_node_info = dict(node_info)
+            synthetic_node_info.setdefault("_spotserve_synthetic", True)
+            self.reparallelization_worker_nodes[str(node_id)] = (
+                synthetic_node_info
+            )
         self.vllm_deployment_adapter: Optional[VllmDeploymentAdapter] = None
         self.reparallelization_executor: Optional[
             ReparallelizationExecutor
         ] = None
+        workload_window_max_requests = int(
+            self.reparallelization_config.get(
+                "workload_window_max_requests", 128
+            )
+            or 128
+        )
+        self.reparallelization_workload_window_s = float(
+            self.reparallelization_config.get("workload_window_s", 60.0)
+            or 60.0
+        )
+        self.reparallelization_request_arrivals = deque(
+            maxlen=max(workload_window_max_requests, 1)
+        )
+        self.reparallelization_request_latencies_ms = deque(
+            maxlen=max(workload_window_max_requests, 1)
+        )
         metrics_path = router_config.get("metrics_path") or os.getenv(
             "SLLM_SPOT_METRICS_PATH"
         )
@@ -167,6 +187,7 @@ class RoundRobinRouter(SllmRouter):
         self.starting_inference_instances: Dict[str, InstanceHandle] = {}  # type:ignore
         self.deleting_inference_instances: Dict[str, InstanceHandle] = {}  # type:ignore
         self.ready_inference_instances: Dict[str, InstanceHandle] = {}  # type:ignore
+        self.failed_inference_instances: Dict[str, InstanceHandle] = {}  # type:ignore
         # Fine-tuning instance pools
         self.starting_ft_instances: Dict[str, InstanceHandle] = {}  # type:ignore
         self.deleting_ft_instances: Dict[str, InstanceHandle] = {}  # type:ignore
@@ -216,9 +237,11 @@ class RoundRobinRouter(SllmRouter):
         return result
 
     async def _stop_backend(self, backend_instance: Any, method_name: str):
-        await self._call_backend_method(backend_instance, method_name)
-        if hasattr(backend_instance, "_ray_actor_id"):
-            ray.kill(backend_instance)
+        try:
+            await self._call_backend_method(backend_instance, method_name)
+        finally:
+            if hasattr(backend_instance, "_ray_actor_id"):
+                ray.kill(backend_instance)
 
     async def _track_inflight_request(
         self,
@@ -492,6 +515,7 @@ class RoundRobinRouter(SllmRouter):
                 "starting": self.starting_inference_instances,
                 "ready": self.ready_inference_instances,
                 "deleting": self.deleting_inference_instances,
+                "failed": self.failed_inference_instances,
             }
             states = {}
             for pool_name, pool in pools.items():
@@ -503,6 +527,9 @@ class RoundRobinRouter(SllmRouter):
                         "state": status.state,
                         "concurrency": status.concurrency,
                     }
+                    failure_reason = getattr(instance, "failure_reason", None)
+                    if failure_reason:
+                        states[instance_id]["failure_reason"] = failure_reason
             return states
 
     def _matches_spot_target(
@@ -566,6 +593,63 @@ class RoundRobinRouter(SllmRouter):
             seen.add(target_node_id)
             target_node_ids.append(target_node_id)
         return target_node_ids
+
+    def _record_reparallelization_request_start(
+        self, timestamp: float
+    ) -> None:
+        if not self.enable_reparallelization:
+            return
+        self.reparallelization_request_arrivals.append(float(timestamp))
+
+    def _record_reparallelization_request_latency(
+        self, latency_ms: float
+    ) -> None:
+        if not self.enable_reparallelization:
+            return
+        self.reparallelization_request_latencies_ms.append(
+            max(0.0, float(latency_ms))
+        )
+
+    def _reparallelization_workload_snapshot(self) -> Dict[str, Any]:
+        window_s = max(float(self.reparallelization_workload_window_s), 1.0)
+        now = time.time()
+        while (
+            self.reparallelization_request_arrivals
+            and now - self.reparallelization_request_arrivals[0] > window_s
+        ):
+            self.reparallelization_request_arrivals.popleft()
+
+        arrivals = list(self.reparallelization_request_arrivals)
+        if len(arrivals) >= 2:
+            elapsed_s = max(arrivals[-1] - arrivals[0], 1e-6)
+            arrival_rate_req_s = (len(arrivals) - 1) / elapsed_s
+        elif arrivals:
+            arrival_rate_req_s = 1.0 / window_s
+        else:
+            arrival_rate_req_s = 0.0
+
+        latencies = list(self.reparallelization_request_latencies_ms)
+        snapshot: Dict[str, Any] = {
+            "window_s": window_s,
+            "sample_count": len(arrivals),
+            "latency_sample_count": len(latencies),
+            "arrival_rate_req_s": arrival_rate_req_s,
+            "batch_size": int(
+                self.reparallelization_config.get("batch_size")
+                or self.backend_config.get("max_num_seqs", 1)
+                or 1
+            ),
+        }
+        if latencies:
+            snapshot["latency_estimate_ms"] = sum(latencies) / len(latencies)
+        return snapshot
+
+    def _reparallelization_planner_config(self) -> Dict[str, Any]:
+        planner_config = dict(self.reparallelization_config)
+        planner_config["runtime_workload"] = (
+            self._reparallelization_workload_snapshot()
+        )
+        return planner_config
 
     async def _snapshot_reparallelization_worker_nodes(self):
         if self.reparallelization_worker_nodes:
@@ -683,7 +767,7 @@ class RoundRobinRouter(SllmRouter):
             model_name=self.model_name,
             worker_nodes=worker_nodes,
             model_config=model_config,
-            planner_config=self.reparallelization_config,
+            planner_config=self._reparallelization_planner_config(),
             event=event,
             node_id=node_id,
             instance_id=instance_id,
@@ -711,6 +795,7 @@ class RoundRobinRouter(SllmRouter):
             }
         if decision.get("action") == "reparallelize":
             if self._ensure_vllm_reparallelization_adapter():
+                apply_started_at = time.time()
                 try:
                     plan = ParallelPlan.from_dict(decision["parallel_plan"])
                     self.reparallelization_executor.current = (
@@ -728,6 +813,10 @@ class RoundRobinRouter(SllmRouter):
                             "last_request_migration",
                             None,
                         ),
+                        "duration_ms": (
+                            time.time() - apply_started_at
+                        )
+                        * 1000,
                     }
                 except Exception as exc:
                     logger.exception(
@@ -736,6 +825,10 @@ class RoundRobinRouter(SllmRouter):
                     decision["execution"] = {
                         "status": "failed",
                         "reason": str(exc),
+                        "duration_ms": (
+                            time.time() - apply_started_at
+                        )
+                        * 1000,
                     }
             else:
                 decision["execution"] = {
@@ -1769,16 +1862,23 @@ class RoundRobinRouter(SllmRouter):
     ) -> Tuple[
         Optional[InferenceState],
         Optional[List[List[int]]],
-        Dict[str, int],
+        Dict[str, Any],
         bool,
     ]:
         counters = {
             "state_restore_attempts": 0,
             "state_restore_successes": 0,
             "state_restored_tokens": 0,
+            "supports_state_restore": False,
+            "state_kind": "",
+            "state_restore_reason": "",
+            "state_restored_blocks": 0,
+            "state_restore_staged": False,
         }
         if state is None:
             return None, None, counters, False
+        counters["state_kind"] = state.state_kind
+        counters["supports_state_restore"] = bool(state.supports_restore)
 
         planner_allows_restore = (
             target_selection is None
@@ -1787,6 +1887,7 @@ class RoundRobinRouter(SllmRouter):
         restore_supported = planner_allows_restore and await (
             self._backend_supports_state_restore(target_instance)
         )
+        counters["supports_state_restore"] = bool(restore_supported)
         decision = plan_stateful_recovery(
             request_id=request_id,
             source_instance_id=source_instance_id,
@@ -1814,12 +1915,50 @@ class RoundRobinRouter(SllmRouter):
             restore_result = await self._restore_inference_state(
                 target_instance, state, request_data
             )
+            try:
+                restored_blocks = int(
+                    restore_result.get("restored_blocks", 0) or 0
+                )
+            except (TypeError, ValueError):
+                restored_blocks = 0
+            counters["state_restore_reason"] = str(
+                restore_result.get("reason")
+                or (
+                    "state_restore_staged"
+                    if restore_result.get("staged")
+                    else decision.reason
+                )
+            )
+            counters["state_restored_blocks"] = (
+                restored_blocks if restore_result.get("restored") else 0
+            )
+            counters["state_restore_staged"] = bool(
+                restore_result.get("staged", False)
+            )
+            if restore_result.get("staged"):
+                try:
+                    expected_blocks = int(
+                        restore_result.get("expected_blocks", 0) or 0
+                    )
+                except (TypeError, ValueError):
+                    expected_blocks = 0
+                counters["state_restore_expected_blocks"] = expected_blocks
             if restore_result.get("restored"):
+                if state.state_kind == "vllm_kv_snapshot" and restored_blocks <= 0:
+                    counters["state_restore_reason"] = (
+                        "vllm_kv_restore_empty"
+                    )
+                    return None, [list(state.tokens)], counters, True
                 counters["state_restore_successes"] = 1
                 counters["state_restored_tokens"] = decision.recovered_tokens
                 return state, None, counters, False
             if restore_result.get("staged"):
                 return state, None, counters, False
+
+            counters["state_restore_reason"] = str(
+                restore_result.get("reason")
+                or decision.reason
+            )
 
         if state.tokens:
             return None, [list(state.tokens)], counters, True
@@ -1939,6 +2078,13 @@ class RoundRobinRouter(SllmRouter):
         # is the key used by export/abort/restore during a live replan.
         request_data.setdefault("request_id", request_id)
         request_start = time.time()
+        self._record_reparallelization_request_start(request_start)
+
+        def finish_request_latency_ms() -> float:
+            latency_ms = (time.time() - request_start) * 1000
+            self._record_reparallelization_request_latency(latency_ms)
+            return latency_ms
+
         attempts = 0
         failed_attempts = 0
         assigned_instances = []
@@ -1951,6 +2097,11 @@ class RoundRobinRouter(SllmRouter):
         state_restore_successes = 0
         state_restore_fallback = False
         state_restored_tokens = 0
+        supports_state_restore = False
+        state_kind = ""
+        state_restore_reason = ""
+        state_restored_blocks = 0
+        state_restore_staged = False
         force_state_recovery = False
         force_retry_budget = 0
 
@@ -2039,6 +2190,34 @@ class RoundRobinRouter(SllmRouter):
                         ]
                         state_restored_tokens += restored_tokens
                         recovered_tokens += restored_tokens
+                        supports_state_restore = bool(
+                            state_counters.get(
+                                "supports_state_restore",
+                                supports_state_restore,
+                            )
+                        )
+                        state_kind = str(
+                            state_counters.get("state_kind", state_kind) or ""
+                        )
+                        state_restore_reason = str(
+                            state_counters.get(
+                                "state_restore_reason",
+                                state_restore_reason,
+                            )
+                            or ""
+                        )
+                        state_restored_blocks += int(
+                            state_counters.get("state_restored_blocks", 0)
+                            or 0
+                        )
+                        state_restore_staged = (
+                            state_restore_staged
+                            or bool(
+                                state_counters.get(
+                                    "state_restore_staged", False
+                                )
+                            )
+                        )
                         if used_fallback:
                             state_restore_fallback = True
                             recovery_fallback = True
@@ -2061,7 +2240,22 @@ class RoundRobinRouter(SllmRouter):
                         else {}
                     )
                     if state_snapshot is not None and kv_restore:
-                        if kv_restore.get("restored"):
+                        try:
+                            kv_restored_blocks = int(
+                                kv_restore.get("restored_blocks", 0) or 0
+                            )
+                        except (TypeError, ValueError):
+                            kv_restored_blocks = 0
+                        if not kv_restore.get("restored"):
+                            kv_restored_blocks = 0
+                        state_restored_blocks += kv_restored_blocks
+                        state_restore_reason = str(
+                            kv_restore.get("reason")
+                            or state_restore_reason
+                            or ""
+                        )
+                        state_kind = state_snapshot.state_kind or state_kind
+                        if kv_restore.get("restored") and kv_restored_blocks > 0:
                             restored_count = (
                                 state_snapshot.completed_tokens
                                 or len(state_snapshot.tokens)
@@ -2087,8 +2281,7 @@ class RoundRobinRouter(SllmRouter):
                                 model=self.model_name,
                                 policy=self.recovery_policy.value,
                                 success=True,
-                                latency_ms=(time.time() - request_start)
-                                * 1000,
+                                latency_ms=finish_request_latency_ms(),
                                 retry_count=attempts - 1,
                                 failed_attempts=failed_attempts,
                                 recovered_tokens=recovered_tokens,
@@ -2103,6 +2296,13 @@ class RoundRobinRouter(SllmRouter):
                                     state_restore_fallback
                                 ),
                                 state_restored_tokens=state_restored_tokens,
+                                supports_state_restore=(
+                                    supports_state_restore
+                                ),
+                                state_kind=state_kind,
+                                state_restore_reason=state_restore_reason,
+                                state_restored_blocks=state_restored_blocks,
+                                state_restore_staged=state_restore_staged,
                             )
                         )
                         return result
@@ -2203,8 +2403,7 @@ class RoundRobinRouter(SllmRouter):
                                 model=self.model_name,
                                 policy=self.recovery_policy.value,
                                 success=False,
-                                latency_ms=(time.time() - request_start)
-                                * 1000,
+                                latency_ms=finish_request_latency_ms(),
                                 retry_count=attempts - 1,
                                 failed_attempts=failed_attempts,
                                 recovered_tokens=recovered_tokens,
@@ -2219,6 +2418,13 @@ class RoundRobinRouter(SllmRouter):
                                     state_restore_fallback
                                 ),
                                 state_restored_tokens=state_restored_tokens,
+                                supports_state_restore=(
+                                    supports_state_restore
+                                ),
+                                state_kind=state_kind,
+                                state_restore_reason=state_restore_reason,
+                                state_restored_blocks=state_restored_blocks,
+                                state_restore_staged=state_restore_staged,
                             )
                         )
                         return result
@@ -2239,13 +2445,18 @@ class RoundRobinRouter(SllmRouter):
                             model=self.model_name,
                             policy=self.recovery_policy.value,
                             success=False,
-                            latency_ms=(time.time() - request_start) * 1000,
+                            latency_ms=finish_request_latency_ms(),
                             retry_count=attempts - 1,
                             failed_attempts=failed_attempts,
                             state_restore_attempts=state_restore_attempts,
                             state_restore_successes=state_restore_successes,
                             state_restore_fallback=state_restore_fallback,
                             state_restored_tokens=state_restored_tokens,
+                            supports_state_restore=supports_state_restore,
+                            state_kind=state_kind,
+                            state_restore_reason=state_restore_reason,
+                            state_restored_blocks=state_restored_blocks,
+                            state_restore_staged=state_restore_staged,
                         )
                     )
                     return {"error": str(e)}
@@ -2300,8 +2511,7 @@ class RoundRobinRouter(SllmRouter):
                                 model=self.model_name,
                                 policy=self.recovery_policy.value,
                                 success=False,
-                                latency_ms=(time.time() - request_start)
-                                * 1000,
+                                latency_ms=finish_request_latency_ms(),
                                 retry_count=attempts - 1,
                                 failed_attempts=failed_attempts,
                                 recovered_tokens=recovered_tokens,
@@ -2316,6 +2526,13 @@ class RoundRobinRouter(SllmRouter):
                                     state_restore_fallback
                                 ),
                                 state_restored_tokens=state_restored_tokens,
+                                supports_state_restore=(
+                                    supports_state_restore
+                                ),
+                                state_kind=state_kind,
+                                state_restore_reason=state_restore_reason,
+                                state_restored_blocks=state_restored_blocks,
+                                state_restore_staged=state_restore_staged,
                             )
                         )
                         return {"error": str(e)}
@@ -2424,11 +2641,32 @@ class RoundRobinRouter(SllmRouter):
             done_event.set_result({"error": "Instance cancelled"})
 
         async with self.instance_management_lock:
-            deleted_instance_id = list(self.ready_inference_instances.keys())
+            inference_instances = {}
+            for pool in (
+                self.starting_inference_instances,
+                self.ready_inference_instances,
+                self.deleting_inference_instances,
+                self.failed_inference_instances,
+            ):
+                inference_instances.update(pool)
+                pool.clear()
+            ft_instances = {}
+            for pool in (self.starting_ft_instances, self.ready_ft_instances):
+                ft_instances.update(pool)
+                pool.clear()
+            deleted_instance_id = list(inference_instances.keys()) + list(
+                ft_instances.keys()
+            )
         delete_tasks = [
-            self._shutdown_instance(instance_id)
-            for instance_id in deleted_instance_id
+            self._shutdown_instance_handle(instance_id, instance)
+            for instance_id, instance in inference_instances.items()
         ]
+        delete_tasks.extend(
+            self._shutdown_instance_handle(
+                instance_id, instance, deallocate_resources=False
+            )
+            for instance_id, instance in ft_instances.items()
+        )
         await asyncio.gather(*delete_tasks)
 
         return deleted_instance_id
@@ -2565,69 +2803,136 @@ class RoundRobinRouter(SllmRouter):
         return instance_id
 
     async def _start_instance(self, instance_id):
-        async with self.instance_management_lock:
-            if instance_id not in self.starting_inference_instances:
-                logger.error(f"Instance {instance_id} not found")
-                return
-            instance = self.starting_inference_instances[instance_id]
-        if self.backend == "dummy":
-            startup_node = "control"
-            startup_resources = {}
-        else:
-            # Now ask model loading scheduler to load the model
-            logger.info(
-                f"Allocating resources for model {self.model_name} on instance {instance_id}"
-            )
-            startup_node = (
-                await self.model_loading_scheduler.allocate_resource.remote(
-                    self.model_name, instance_id, self.resource_requirements
+        instance = None
+        resources_allocated = False
+        try:
+            async with self.instance_management_lock:
+                if instance_id not in self.starting_inference_instances:
+                    logger.error(f"Instance {instance_id} not found")
+                    return
+                instance = self.starting_inference_instances[instance_id]
+            if self.backend == "dummy":
+                startup_node = "control"
+                startup_resources = {}
+            else:
+                # Now ask model loading scheduler to load the model
+                logger.info(
+                    f"Allocating resources for model {self.model_name} on instance {instance_id}"
                 )
-            )
-            startup_resources = {
-                "worker_node": 0.1,
-                f"worker_id_{startup_node}": 0.1,
+                startup_node = (
+                    await self.model_loading_scheduler.allocate_resource.remote(
+                        self.model_name, instance_id, self.resource_requirements
+                    )
+                )
+                resources_allocated = True
+                startup_resources = {
+                    "worker_node": 0.1,
+                    f"worker_id_{startup_node}": 0.1,
+                }
+            async with instance.lock:
+                instance.node_id = startup_node
+            startup_config = {
+                "num_cpus": self.resource_requirements["num_cpus"],
+                "num_gpus": self.resource_requirements["num_gpus"],
+                "resources": startup_resources,
             }
-        async with instance.lock:
-            instance.node_id = startup_node
-        startup_config = {
-            "num_cpus": self.resource_requirements["num_cpus"],
-            "num_gpus": self.resource_requirements["num_gpus"],
-            "resources": startup_resources,
-        }
-        logger.info(f"Startup config: {startup_config}, {self.backend_config}")
-
-        starter_options = {}
-        if startup_resources:
-            starter_options["resources"] = startup_resources
-
-        if self.backend == "dummy":
-            from sllm.backends.dummy_backend import DummyBackend
-
-            instance.backend_instance = DummyBackend(
-                self.model_name, self.backend_config
+            logger.info(
+                f"Startup config: {startup_config}, {self.backend_config}"
             )
-        else:
-            instance.backend_instance = await start_instance.options(
-                **starter_options
-            ).remote(
+
+            starter_options = {}
+            if startup_resources:
+                starter_options["resources"] = startup_resources
+
+            if self.backend == "dummy":
+                from sllm.backends.dummy_backend import DummyBackend
+
+                instance.backend_instance = DummyBackend(
+                    self.model_name, self.backend_config
+                )
+            else:
+                instance.backend_instance = await start_instance.options(
+                    **starter_options
+                ).remote(
+                    instance_id,
+                    self.backend,
+                    self.model_name,
+                    self.backend_config,
+                    startup_config,
+                )
+            logger.info(
+                f"Started instance {instance_id} for model {self.model_name}"
+            )
+            await self._call_backend_method(
+                instance.backend_instance, "init_backend"
+            )
+            await instance.mark_ready(node_id=startup_node)
+
+            async with self.instance_management_lock:
+                if instance_id not in self.starting_inference_instances:
+                    cleanup_started_instance = True
+                else:
+                    cleanup_started_instance = False
+                    self.ready_inference_instances[instance_id] = instance
+                    self.starting_inference_instances.pop(instance_id)
+            if cleanup_started_instance:
+                logger.info(
+                    "Instance %s finished startup after it was untracked; "
+                    "shutting it down",
+                    instance_id,
+                )
+                await self._shutdown_instance_handle(
+                    instance_id,
+                    instance,
+                    deallocate_resources=resources_allocated,
+                )
+                return
+            return instance_id
+        except Exception as exc:
+            logger.exception(
+                "Failed to start instance %s for model %s",
                 instance_id,
-                self.backend,
                 self.model_name,
-                self.backend_config,
-                startup_config,
             )
-        logger.info(
-            f"Started instance {instance_id} for model {self.model_name}"
-        )
-        await self._call_backend_method(
-            instance.backend_instance, "init_backend"
-        )
-        await instance.mark_ready(node_id=startup_node)
-
-        async with self.instance_management_lock:
-            self.ready_inference_instances[instance_id] = instance
-            self.starting_inference_instances.pop(instance_id)
-        return instance_id
+            if instance is None:
+                return
+            failure_reason = str(exc)
+            if len(failure_reason) > 2000:
+                failure_reason = failure_reason[:2000] + "...<truncated>"
+            setattr(instance, "failure_reason", failure_reason)
+            await self._set_instance_state(
+                instance, InstanceState.DEAD, reason="startup_failed"
+            )
+            async with self.instance_management_lock:
+                self.starting_inference_instances.pop(instance_id, None)
+                self.failed_inference_instances[instance_id] = instance
+            if instance.backend_instance is not None:
+                try:
+                    await self._stop_backend(
+                        instance.backend_instance, "shutdown"
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to shutdown failed backend actor %s for "
+                        "model %s",
+                        instance_id,
+                        self.model_name,
+                    )
+            if resources_allocated and self.backend != "dummy":
+                try:
+                    await self.model_loading_scheduler.deallocate_resource.remote(
+                        self.model_name,
+                        instance_id,
+                        self.resource_requirements,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to deallocate resources for failed instance "
+                        "%s of model %s",
+                        instance_id,
+                        self.model_name,
+                    )
+            return
 
     async def _start_ft_instance(self, instance_id: str):
         async with self.instance_management_lock:
@@ -2727,23 +3032,48 @@ class RoundRobinRouter(SllmRouter):
                 self.model_name, instance_id, self.resource_requirements
             )
 
+    async def _shutdown_instance_handle(
+        self,
+        instance_id: str,
+        instance: InstanceHandle,
+        deallocate_resources: bool = True,
+    ):
+        await instance.mark_dead()
+        if instance.backend_instance is not None:
+            try:
+                await self._stop_backend(instance.backend_instance, "shutdown")
+            except Exception:
+                logger.exception(
+                    "Failed to shutdown backend actor %s for model %s",
+                    instance_id,
+                    self.model_name,
+                )
+        if deallocate_resources and self.backend != "dummy":
+            await self.model_loading_scheduler.deallocate_resource.remote(
+                self.model_name, instance_id, self.resource_requirements
+            )
+
     async def _shutdown_instance(self, instance_id: str, is_ft: bool = False):
         logger.info(
             f"Force deleting an instance (even if it is busy) for model {self.model_name}"
         )
         async with self.instance_management_lock:
             if is_ft:
-                pool = self.ready_ft_instances
+                pools = (self.ready_ft_instances, self.starting_ft_instances)
             else:
-                pool = self.ready_inference_instances
-            if instance_id not in pool:
+                pools = (
+                    self.ready_inference_instances,
+                    self.starting_inference_instances,
+                    self.deleting_inference_instances,
+                    self.failed_inference_instances,
+                )
+            instance = None
+            for pool in pools:
+                if instance_id in pool:
+                    instance = pool.pop(instance_id)
+                    break
+            if instance is None:
                 logger.error(f"Instance {instance_id} not found")
                 return
-            instance = pool.pop(instance_id)
-        await instance.mark_dead()
-        await self._stop_backend(instance.backend_instance, "shutdown")
-        if self.backend != "dummy":
-            await self.model_loading_scheduler.deallocate_resource.remote(
-                self.model_name, instance_id, self.resource_requirements
-            )
+        await self._shutdown_instance_handle(instance_id, instance)
         return

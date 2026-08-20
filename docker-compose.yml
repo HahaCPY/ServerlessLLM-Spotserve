@@ -44,19 +44,19 @@ services:
     group_add:
       - keep-groups
     devices:
-      - "nvidia.com/gpu=all"
+      - "nvidia.com/gpu=${SLLM_WORKER_0_GPU_DEVICE:-all}"
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
               capabilities: ["gpu"]
-              device_ids: ["0"] # Assigns GPU 0 to the worker
+              device_ids: ["${SLLM_WORKER_0_GPU_DEVICE:-0}"]
     environment:
       - WORKER_ID=0
       - STORAGE_PATH=/models
       - MODE=WORKER
-      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_VISIBLE_DEVICES=${SLLM_WORKER_0_VISIBLE_DEVICES:-all}
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - OMP_NUM_THREADS=1
       - MKL_NUM_THREADS=1
