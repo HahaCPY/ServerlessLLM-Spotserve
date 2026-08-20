@@ -1195,7 +1195,7 @@ class RoundRobinRouter(SllmRouter):
             )
         return targets
 
-    async def _execute_kv_cache_migration(
+    async def _execute_prefix_warmup(
         self,
         decision: Dict[str, Any],
         source_instances: List[InstanceHandle],
@@ -1205,6 +1205,8 @@ class RoundRobinRouter(SllmRouter):
         if decision.get("action") != "migrate":
             return {
                 "action": "skipped",
+                "operation_kind": "prefix_warmup",
+                "true_kv_block_transfer": False,
                 "reason": decision.get("action", "no_migration_plan"),
             }
 
@@ -1287,13 +1289,18 @@ class RoundRobinRouter(SllmRouter):
             succeeded += 1
 
         return {
-            "action": "resume_kv_cache",
+            "action": "prefix_warmup",
+            "legacy_action": "resume_kv_cache",
+            "operation_kind": "prefix_warmup",
+            "state_kind": "token_replay_prefix_warmup",
+            "true_kv_block_transfer": False,
             "attempted": attempted,
             "succeeded": succeeded,
             "skipped": skipped,
             "failures": failures,
+            "warmed_tokens": total_tokens,
             "total_tokens": total_tokens,
-            "reason": "target_cache_warmup",
+            "reason": "resume_kv_cache_token_replay",
         }
 
     async def _plan_context_migration_after_spot_event(
@@ -1314,12 +1321,16 @@ class RoundRobinRouter(SllmRouter):
             targets=targets,
             planner_config=planner_config,
         ).to_dict()
-        kv_cache_migration = await self._execute_kv_cache_migration(
+        prefix_warmup = await self._execute_prefix_warmup(
             decision,
             matches,
         )
-        if kv_cache_migration is not None:
-            decision["kv_cache_migration"] = kv_cache_migration
+        if prefix_warmup is not None:
+            decision["prefix_warmup"] = prefix_warmup
+            decision["kv_cache_migration"] = {
+                **prefix_warmup,
+                "deprecated_alias": True,
+            }
 
         self._emit_metric(
             make_context_migration_event(

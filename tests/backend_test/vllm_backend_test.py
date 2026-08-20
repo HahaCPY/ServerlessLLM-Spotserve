@@ -250,8 +250,12 @@ async def test_resume_kv_cache(vllm_backend):
         await vllm_backend.init_backend()
     vllm_backend.generate = AsyncMock()
     request_datas = [[1, 2, 3], [4, 5, 6]]
-    await vllm_backend.resume_kv_cache(request_datas)
+    result = await vllm_backend.resume_kv_cache(request_datas)
     assert vllm_backend.generate.call_count == len(request_datas)
+    assert result["action"] == "prefix_warmup"
+    assert result["true_kv_block_transfer"] is False
+    assert result["warmed_sequences"] == 2
+    assert result["warmed_tokens"] == 6
 
 
 @pytest.mark.asyncio

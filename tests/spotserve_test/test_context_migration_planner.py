@@ -189,5 +189,9 @@ def test_context_migration_metric_contains_summary_fields():
     )
 
     assert event["type"] == "context_migration"
+    assert event["context_migration_plan_count"] == 1
     assert event["migration_plan_count"] == 1
     assert event["reuse_ratio"] == 1.0
+    assert event["prefix_warmup_attempts"] == 0
+    assert event["kv_restore_attempts"] == 0
+    assert event["true_kv_block_transfer"] is False

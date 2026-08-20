@@ -97,11 +97,28 @@ def make_context_migration_event(
     reason: Optional[str] = None,
 ) -> Dict[str, Any]:
     plans = decision.get("plans", [])
+    prefix_warmup = (
+        decision.get("prefix_warmup")
+        or decision.get("kv_cache_migration")
+        or {}
+    )
+    kv_restore = decision.get("kv_restore") or {}
+    prefix_warmup_attempts = int(prefix_warmup.get("attempted", 0) or 0)
+    prefix_warmup_successes = int(prefix_warmup.get("succeeded", 0) or 0)
+    kv_restore_attempts = int(kv_restore.get("attempted", 0) or 0)
+    kv_restore_successes = int(kv_restore.get("succeeded", 0) or 0)
+    kv_restore_restored_blocks = int(
+        kv_restore.get("restored_blocks", 0) or 0
+    )
+    true_kv_block_transfer = bool(
+        kv_restore_successes > 0 and kv_restore_restored_blocks > 0
+    )
     return {
         "type": "context_migration",
         "model": model,
         "action": decision.get("action"),
         "reason": reason,
+        "context_migration_plan_count": len(plans),
         "migration_plan_count": len(plans),
         "unassigned_context_count": len(
             decision.get("unassigned_contexts", [])
@@ -115,6 +132,20 @@ def make_context_migration_event(
         "total_context_blocks": decision.get("total_context_blocks", 0),
         "reuse_ratio": decision.get("reuse_ratio", 0.0),
         "plans": plans,
+        "prefix_warmup": prefix_warmup or None,
+        "prefix_warmup_attempts": prefix_warmup_attempts,
+        "prefix_warmup_successes": prefix_warmup_successes,
+        "prefix_warmup_tokens": int(
+            prefix_warmup.get(
+                "warmed_tokens", prefix_warmup.get("total_tokens", 0)
+            )
+            or 0
+        ),
+        "kv_restore": kv_restore or None,
+        "kv_restore_attempts": kv_restore_attempts,
+        "kv_restore_successes": kv_restore_successes,
+        "kv_restore_restored_blocks": kv_restore_restored_blocks,
+        "true_kv_block_transfer": true_kv_block_transfer,
         "kv_cache_migration": decision.get("kv_cache_migration"),
     }
 

@@ -527,7 +527,7 @@ async def test_router_plans_live_context_migration_on_preemption(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_router_executes_kv_cache_migration_on_preemption(tmp_path):
+async def test_router_executes_prefix_warmup_on_preemption(tmp_path):
     metrics_path = tmp_path / "router-metrics.jsonl"
     router = RoundRobinRouter(
         model_name="test-model",
@@ -567,12 +567,19 @@ async def test_router_executes_kv_cache_migration_on_preemption(tmp_path):
 
     result = await router.handle_preemption(node_id="node-source")
 
-    execution = result["context_migration"]["kv_cache_migration"]
-    assert execution["action"] == "resume_kv_cache"
+    execution = result["context_migration"]["prefix_warmup"]
+    assert execution["action"] == "prefix_warmup"
+    assert execution["legacy_action"] == "resume_kv_cache"
+    assert execution["operation_kind"] == "prefix_warmup"
+    assert execution["true_kv_block_transfer"] is False
     assert execution["attempted"] == 1
     assert execution["succeeded"] == 1
+    assert execution["warmed_tokens"] == 4
     assert execution["total_tokens"] == 4
     assert target_backend.resumed_batches == [[[1, 2, 3, 4]]]
+    legacy = result["context_migration"]["kv_cache_migration"]
+    assert legacy["deprecated_alias"] is True
+    assert legacy["operation_kind"] == "prefix_warmup"
 
     rows = [
         json.loads(line)
@@ -581,7 +588,12 @@ async def test_router_executes_kv_cache_migration_on_preemption(tmp_path):
     context_rows = [
         row for row in rows if row["type"] == "context_migration"
     ]
-    assert context_rows[-1]["kv_cache_migration"]["succeeded"] == 1
+    assert context_rows[-1]["prefix_warmup"]["succeeded"] == 1
+    assert context_rows[-1]["prefix_warmup_attempts"] == 1
+    assert context_rows[-1]["prefix_warmup_successes"] == 1
+    assert context_rows[-1]["prefix_warmup_tokens"] == 4
+    assert context_rows[-1]["true_kv_block_transfer"] is False
+    assert context_rows[-1]["kv_cache_migration"]["deprecated_alias"] is True
 
 
 @pytest.mark.asyncio

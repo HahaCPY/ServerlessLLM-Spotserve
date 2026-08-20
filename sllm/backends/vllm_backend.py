@@ -925,10 +925,15 @@ class VllmBackend(SllmBackend):
             )
         return {"request_id": str(request_id), "found": False}
 
-    async def resume_kv_cache(self, request_datas: List[List[int]]) -> None:
+    async def resume_kv_cache(self, request_datas: List[List[int]]) -> Dict[str, Any]:
         async with self.status_lock:
             if self.status != BackendStatus.RUNNING:
-                return
+                return {
+                    "action": "prefix_warmup",
+                    "warmed": False,
+                    "reason": "engine_not_running",
+                    "true_kv_block_transfer": False,
+                }
         constructed_inputs = [
             {
                 "input_tokens": request_data,
@@ -938,6 +943,15 @@ class VllmBackend(SllmBackend):
         ]
         tasks = [self.generate(inputs) for inputs in constructed_inputs]
         await asyncio.gather(*tasks)
+        return {
+            "action": "prefix_warmup",
+            "operation_kind": "prefix_warmup",
+            "warmed": True,
+            "warmed_sequences": len(request_datas),
+            "warmed_tokens": sum(len(tokens) for tokens in request_datas),
+            "true_kv_block_transfer": False,
+            "reason": "resume_kv_cache_token_replay",
+        }
 
     async def supports_state_restore(self) -> bool:
         if self.engine is None:

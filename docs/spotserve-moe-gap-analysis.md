@@ -116,7 +116,7 @@ planner DP / EP plan != vLLM runtime DP / effective EP
 - runtime metadata 增加 `planned_effective_expert_parallel_size`、
   `effective_expert_parallel_size`、`parallel_plan_mismatch`。
 
-### 3. V7 context migration 不等於 true KV migration
+### 3. V7 context migration 不等於 true KV migration ✅
 
 `sllm/spot/context_migration.py` 做的是低成本 assignment planning。router 的
 live path 會收集 source/target context metadata，推估 reuse，然後可選擇呼叫
@@ -142,6 +142,96 @@ kv_cache_migration_successes > 0 不一定代表 true KV block transfer 成功�
   - `kv_restore_*`
 - 只有當 `state_kind=vllm_kv_snapshot`、`supports_restore=true`、
   `restored_blocks>0` 時，才宣稱 true KV migration / restore。
+
+已修正：
+
+- `RoundRobinRouter` 的執行路徑改成回報 `prefix_warmup`，而不是把
+  `resume_kv_cache()` 直接稱為 true KV migration。
+- 舊欄位 `kv_cache_migration` 保留為相容 alias，但會標示
+  `deprecated_alias=true`、`operation_kind=prefix_warmup`、
+  `true_kv_block_transfer=false`。
+- `make_context_migration_event()` 新增：
+  - `context_migration_plan_count`
+  - `prefix_warmup_attempts`
+  - `prefix_warmup_successes`
+  - `prefix_warmup_tokens`
+  - `kv_restore_attempts`
+  - `kv_restore_successes`
+  - `kv_restore_restored_blocks`
+  - `true_kv_block_transfer`
+- `VllmBackend.resume_kv_cache()` 回傳 structured prefix-warmup result，並明確標示
+  `true_kv_block_transfer=false`。
+
+#### 2026-08-20 實驗結果：true KV restore 證據
+
+這次實驗結果進一步確認：V7 context migration 仍然只能視為
+planning / prefix warmup；真正用到 KV cache block restore 的證據來自 V8
+stateful recovery 在 patched vLLM/NIXL runtime 上的 restore path。
+
+Benchmark summary：
+
+```text
+vllm-stateful-recovery-token-replay:
+  successes = 3/3
+  success_rate = 100.00%
+  p95 = 48834.49 ms
+  failed_attempts = 1
+  retries = 1
+  recovered_tokens = 16
+  fallbacks = 0
+
+vllm-stateful-recovery-applied:
+  successes = 3/3
+  success_rate = 100.00%
+  p95 = 7621.91 ms
+  failed_attempts = 1
+  retries = 1
+  recovered_tokens = 16
+  fallbacks = 0
+  state_events = 1
+  state_restores = 1/1
+  state_tokens = 16
+```
+
+和 token replay baseline 相比，stateful recovery applied 的 failure-window p95
+從 `48834.49 ms` 降到 `7621.91 ms`，約降低 `84.4%`。這代表 recovery path
+不是單純重跑 prompt/token replay，而是成功套用了更短的 restore 路徑。
+
+Stateful recovery metrics：
+
+```text
+state_restore_attempts_total = 1
+state_restore_successes_total = 1
+state_restore_fallback_count = 0
+state_restored_tokens_total = 16
+state_recovery_restore_events = 1
+state_recovery_fallback_events = 0
+```
+
+raw response 中也出現 vLLM/NIXL restore metadata：
+
+```json
+"_spotserve_kv_restore": {
+  "cached_tokens": 82,
+  "reason": "nixl_kv_attach_completed",
+  "restored": true,
+  "restored_blocks": 6
+}
+```
+
+實驗輸出位置：
+
+```text
+results/spotserve_stateful_recovery_performance/2026-08-20_04-01-57_vllm-stateful-recovery-applied/raw_requests.jsonl
+```
+
+結論：
+
+```text
+V7 context migration success != true KV migration.
+V8 stateful recovery with patched vLLM/NIXL restored real KV blocks.
+restored_blocks = 6 > 0
+```
 
 ### 4. V8 stateful recovery 依賴 patched vLLM runtime
 
