@@ -46,6 +46,72 @@ def test_router_summary_exposes_state_restore_evidence():
     assert summary["state_restore_reasons"] == "nixl_kv_attach_completed"
 
 
+def test_router_summary_separates_success_from_fallback():
+    analyzer = load_analyzer()
+
+    summary = analyzer.summarize_router_metrics(
+        [
+            {
+                "type": "request",
+                "request_id": "req-clean",
+                "success": True,
+                "failed_attempts": 0,
+                "retry_count": 0,
+                "recovery_fallback": False,
+                "state_restore_fallback": False,
+            },
+            {
+                "type": "request",
+                "request_id": "req-fallback",
+                "success": True,
+                "failed_attempts": 1,
+                "retry_count": 1,
+                "recovered_tokens": 16,
+                "recovery_fallback": True,
+                "state_restore_attempts": 1,
+                "state_restore_successes": 0,
+                "state_restore_fallback": True,
+            },
+        ]
+    )
+
+    assert summary["router_successes"] == 2
+    assert summary["clean_success_count"] == 1
+    assert summary["clean_success_rate"] == 0.5
+    assert summary["fallback_request_count"] == 1
+    assert summary["fallback_rate"] == 0.5
+    assert summary["recovery_triggered_requests"] == 1
+    assert summary["recovery_triggered_rate"] == 0.5
+    assert summary["state_restore_success_rate"] == 0.0
+    assert summary["state_restore_fallback_rate"] == 1.0
+
+
+def test_router_summary_uses_request_denominator_for_clean_success_rate():
+    analyzer = load_analyzer()
+
+    router_rows = [
+        {
+            "type": "request",
+            "request_id": f"req-{index}",
+            "success": True,
+            "recovery_fallback": False,
+            "state_restore_fallback": False,
+        }
+        for index in range(3)
+    ]
+    request_rows = [{"request_id": f"req-{index}"} for index in range(8)]
+
+    summary = analyzer.summarize_router_metrics(router_rows, request_rows)
+
+    assert summary["clean_success_count"] == 3
+    assert summary["clean_success_denominator"] == 8
+    assert summary["clean_success_rate"] == 0.375
+    assert summary["router_clean_success_rate"] == 1.0
+    assert summary["fallback_denominator"] == 8
+    assert summary["fallback_rate"] == 0.0
+    assert summary["router_fallback_rate"] == 0.0
+
+
 def test_raw_response_summary_exposes_kv_restore_evidence():
     analyzer = load_analyzer()
 

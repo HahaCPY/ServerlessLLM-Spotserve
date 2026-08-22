@@ -32,6 +32,8 @@
       "candidate": "vllm-context-migration-applied",
       "fields": [
         "success_rate",
+        "clean_success_rate",
+        "fallback_rate",
         "latency_p95_ms",
         "throughput_req_s",
         "context_migration_events",

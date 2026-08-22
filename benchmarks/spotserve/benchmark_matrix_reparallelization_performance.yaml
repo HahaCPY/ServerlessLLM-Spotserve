@@ -3,6 +3,8 @@
   "output_dir": "results/spotserve_reparallelization_performance",
   "comparison_fields": [
     "success_rate",
+    "clean_success_rate",
+    "fallback_rate",
     "latency_p95_ms",
     "throughput_req_s",
     "replanning_events",

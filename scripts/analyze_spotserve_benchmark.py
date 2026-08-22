@@ -191,7 +191,14 @@ def metrics_in_request_window(
     ]
 
 
-def summarize_router_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+def summarize_router_metrics(
+    rows: List[Dict[str, Any]],
+    request_rows: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    request_denominator = (
+        len(request_rows) if request_rows is not None else len(rows)
+    )
+    router_successes = sum(1 for row in rows if bool(row.get("success", False)))
     failed_attempts_total = sum(
         safe_int(row.get("failed_attempts", 0)) for row in rows
     )
@@ -232,6 +239,19 @@ def summarize_router_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     state_restore_fallback_count = sum(
         1 for row in rows if bool(row.get("state_restore_fallback", False))
     )
+    fallback_request_count = sum(
+        1
+        for row in rows
+        if bool(row.get("recovery_fallback", False))
+        or bool(row.get("state_restore_fallback", False))
+    )
+    clean_success_count = sum(
+        1
+        for row in rows
+        if bool(row.get("success", False))
+        and not bool(row.get("recovery_fallback", False))
+        and not bool(row.get("state_restore_fallback", False))
+    )
     state_restored_tokens_total = sum(
         safe_int(row.get("state_restored_tokens", 0)) for row in rows
     )
@@ -261,18 +281,58 @@ def summarize_router_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         and safe_int(row.get("state_restored_blocks", 0)) > 0
         and str(row.get("state_kind", "")) == "vllm_kv_snapshot"
     )
+    restore_attempt_request_count = sum(
+        1 for row in rows if safe_int(row.get("state_restore_attempts", 0)) > 0
+    )
     return {
         "router_metrics_rows": len(rows),
+        "router_successes": router_successes,
+        "clean_success_count": clean_success_count,
+        "clean_success_denominator": request_denominator,
+        "clean_success_rate": (
+            clean_success_count / request_denominator
+            if request_denominator
+            else 0.0
+        ),
+        "router_clean_success_rate": (
+            clean_success_count / len(rows) if rows else 0.0
+        ),
+        "fallback_request_count": fallback_request_count,
+        "fallback_denominator": request_denominator,
+        "fallback_rate": (
+            fallback_request_count / request_denominator
+            if request_denominator
+            else 0.0
+        ),
+        "router_fallback_rate": (
+            fallback_request_count / len(rows) if rows else 0.0
+        ),
         "failed_attempts_total": failed_attempts_total,
         "retry_count_total": retry_count_total,
         "recovered_tokens_total": recovered_tokens_total,
         "recovery_fallback_count": recovery_fallback_count,
+        "recovery_fallback_rate": (
+            recovery_fallback_count / len(rows) if rows else 0.0
+        ),
         "recovery_triggered_requests": recovery_triggered_requests,
+        "recovery_triggered_rate": (
+            recovery_triggered_requests / len(rows) if rows else 0.0
+        ),
         "replay_succeeded_requests": replay_succeeded_requests,
         "replay_not_needed_requests": replay_not_needed_requests,
         "state_restore_attempts_total": state_restore_attempts_total,
         "state_restore_successes_total": state_restore_successes_total,
+        "state_restore_success_rate": (
+            state_restore_successes_total / state_restore_attempts_total
+            if state_restore_attempts_total
+            else 0.0
+        ),
         "state_restore_fallback_count": state_restore_fallback_count,
+        "state_restore_fallback_rate": (
+            state_restore_fallback_count / restore_attempt_request_count
+            if restore_attempt_request_count
+            else 0.0
+        ),
         "state_restored_tokens_total": state_restored_tokens_total,
         "state_restored_blocks_total": state_restored_blocks_total,
         "supports_state_restore_requests": supports_state_restore_requests,
@@ -289,6 +349,11 @@ def summarize_router_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             else 0.0
         ),
         "true_kv_restore_successes_total": true_kv_restore_successes_total,
+        "true_kv_restore_rate": (
+            true_kv_restore_successes_total / state_restore_attempts_total
+            if state_restore_attempts_total
+            else 0.0
+        ),
         "state_kinds": compact_values(
             [str(row.get("state_kind", "")) for row in rows]
         ),
@@ -824,7 +889,10 @@ def analyze_run(run_dir: Path) -> Dict[str, Any]:
     request_summary = summarize_requests(request_rows)
     phase_summary = summarize_phase_requests(request_rows)
     response_kv_summary = summarize_response_kv_restore(request_rows)
-    router_summary = summarize_router_metrics(router_request_rows)
+    router_summary = summarize_router_metrics(
+        router_request_rows,
+        request_rows,
+    )
     true_kv_summary = summarize_true_kv_restore_evidence(
         request_rows,
         router_request_rows,

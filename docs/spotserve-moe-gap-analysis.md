@@ -362,10 +362,13 @@ ready 後切流、drain 舊 actors，不是 runtime 內部原地重分片。
 仍未完成：
 
 - 這不是完整 SpotServe optimizer，也還沒有 monetary cost model。
-- 新增的 multi-worker matrix 可以驗證多個 runtime worker container，但如果兩個
-  worker 都在同一台 host 上，仍不能 claim physical cross-node validation；真正強
-  claim 需要不同 host / 不同 failure domain。
 - 目前是 actor recreate / ready 後切流，不是 runtime 內部 in-place repartition。
+
+實驗邊界：
+
+- 新增的 multi-worker matrix 可以驗證多個 runtime worker container。若兩個
+  worker 都在同一台 host 上，結果應標示為 same-host / same-machine validation；
+  本階段不 claim physical cross-node validation。
 
 這三件事的意思如下。
 
@@ -536,29 +539,36 @@ recovery_policy=stateful_recovery
 - 新增 `tests/spotserve_test/test_controller_spotserve_router.py` 驗證 legacy
   migration flag 不會再啟用舊 scheduler/router path。
 
-### 8. 現有實驗多為 single-host / same-host simulation
+### 8. 現有實驗多為 single-host / same-host simulation（de-scoped limitation）
 
 文件中已有記錄：Tiny/Qwen MoE 的 NIXL restore smoke、cross-container 模擬、
 four-container fleet churn 都有價值，但多數仍在同一台主機上跑。這可以證明控制流程、
 container packaging、NIXL same-host 或 network namespace path，但還不是真正
 physical cross-node GPU cluster validation。
 
-影響：
+目前決定：
+
+```text
+single-host / same-host simulation 不列為本階段必修 gap。
+它是實驗邊界，不是阻塞目前 SpotServe-style control-plane prototype 的問題。
+```
+
+報告中只需明確標示：
 
 ```text
 不能宣稱已完成 physical cross-node KV restore。
 can_restore_cross_node 應維持 false，除非真的有跨機器正向結果。
 ```
 
-建議補強：
+建議呈現方式：
 
-- 用兩台以上 GPU nodes 跑 source/target NIXL restore。
-- 報告中分開寫：
-  - same-process / same-node
-  - same-host multi-container
-  - physical cross-node
+```text
+same-process / same-node
+same-host multi-container
+physical cross-node（out of scope for current validation）
+```
 
-### 9. 成功率指標可能掩蓋 fallback
+### 9. 成功率指標可能掩蓋 fallback（已修正）
 
 目前 recovery path 設計有 fallback，這是好的；但如果只看 request success rate，
 很容易把「重試成功」誤讀成「KV restore 成功」。
@@ -569,22 +579,53 @@ can_restore_cross_node 應維持 false，除非真的有跨機器正向結果。
 success_rate=100% 可能只是 naive retry 或 token replay 成功。
 ```
 
-建議補強：
+已修正：
 
-每份 SpotServe/MoE 報告至少列：
+- `scripts/analyze_spotserve_benchmark.py` 現在會把 raw request
+  `success_rate` 和 router-level clean outcome 分開。新增欄位包含：
 
 ```text
+router_successes
+clean_success_count
+clean_success_denominator
+clean_success_rate
+router_clean_success_rate
+fallback_request_count
+fallback_denominator
+fallback_rate
+router_fallback_rate
 failed_attempts_total
 retry_count_total
 recovered_tokens_total
 recovery_fallback_count
+recovery_fallback_rate
+recovery_triggered_requests
+recovery_triggered_rate
 state_restore_attempts_total
 state_restore_successes_total
+state_restore_success_rate
 state_restore_fallback_count
+state_restore_fallback_rate
 state_restored_tokens_total
-restored_blocks
+state_restored_blocks_total
+true_kv_restore_successes_total
+true_kv_restore_rate
+true_kv_restored_blocks_total
 context_migration_reusable_context_blocks
 ```
+
+- `benchmarks/spotserve/run_benchmark.py` 的 console summary 會直接印
+  `fallback_rate`、`clean_success_rate` 和 `true_kv_rate`，避免只看到
+  `success_rate=100%`。
+- `clean_success_rate` 和 `fallback_rate` 使用整個 benchmark 的 request count
+  當分母；`router_clean_success_rate` 和 `router_fallback_rate` 則只描述有
+  router metrics 的 request，避免 baseline `3/8` 成功時被誤讀成
+  `clean_success_rate=100%`。
+- V6/V7/V8/core benchmark matrix 的 comparison fields 已加入
+  clean/fallback/restore rate 欄位，`latest_comparisons.json` 也會比較這些
+  指標。
+- 新增 analyzer test，驗證 `success=True` 但 fallback 發生時，
+  `clean_success_rate` 會低於 `success_rate`。
 
 ### 10. Risk-aware scheduling 是額外功能，不屬於原本三核心
 
@@ -613,7 +654,8 @@ context_migration_reusable_context_blocks
    `data_parallel_size` 分開；只宣稱 derived `effective_expert_parallel_size`。
 4. router 修正：避免 SpotServe flow 使用舊 `MigrationRouter`。
 5. simulator 修正：`preempt` 加 grace-period deadline 與自動 `dead`。
-6. 實驗補強：至少補一組 physical cross-node NIXL restore，或明確標示目前是 same-host。
+6. 實驗措辭修正：明確標示目前 validation 是 same-host / same-machine；
+   physical cross-node validation 不列入本階段 scope。
 
 ## 最安全的對外說法
 
@@ -621,6 +663,6 @@ context_migration_reusable_context_blocks
 本專案將 SpotServe 的 re-parallelization、context migration planning、
 stateful recovery 三個核心流程實作在 ServerlessLLM/vLLM 控制平面上，並驗證
 vLLM MoE backend 可以接入這些流程。現階段 MoE 仍主要以 vLLM black-box 方式
-服務；expert-aware placement/migration/recovery 與 physical cross-node KV
-restore 尚未完整完成。
+服務；expert-aware placement/migration/recovery 仍是後續研究方向。實驗結果
+限定在 same-host / same-machine validation，不宣稱 physical cross-node KV restore。
 ```

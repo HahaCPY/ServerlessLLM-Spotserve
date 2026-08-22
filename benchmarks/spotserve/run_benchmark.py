@@ -183,6 +183,10 @@ def build_comparisons(
     rows = []
     default_fields = [
         "success_rate",
+        "clean_success_rate",
+        "fallback_rate",
+        "router_clean_success_rate",
+        "router_fallback_rate",
         "latency_p95_ms",
         "throughput_req_s",
         "replanning_events",
@@ -1044,7 +1048,11 @@ async def main_async(args):
                     f"recovered_tokens="
                     f"{summary.get('recovered_tokens_total', 0)}, "
                     f"fallbacks="
-                    f"{summary.get('recovery_fallback_count', 0)}"
+                    f"{summary.get('recovery_fallback_count', 0)}, "
+                    f"fallback_rate="
+                    f"{summary.get('fallback_rate', 0.0):.2%}, "
+                    f"clean_success_rate="
+                    f"{summary.get('clean_success_rate', 0.0):.2%}"
                 )
             instance_suffix = ""
             if int(summary.get("instance_state_rows", 0) or 0) > 0:
@@ -1107,6 +1115,8 @@ async def main_async(args):
                     f"{summary.get('response_kv_restore_restored_blocks', 0)}, "
                     f"true_kv_restores="
                     f"{summary.get('true_kv_restore_successes_total', 0)}, "
+                    f"true_kv_rate="
+                    f"{summary.get('true_kv_restore_rate', 0.0):.2%}, "
                     f"true_kv_blocks="
                     f"{summary.get('true_kv_restored_blocks_total', 0)}, "
                     f"supports_state_restore="
