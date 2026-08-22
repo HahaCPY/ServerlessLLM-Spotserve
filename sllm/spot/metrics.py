@@ -27,8 +27,9 @@ def make_instance_state_event(
     to_state: str,
     node_id: Optional[str] = None,
     reason: Optional[str] = None,
+    **metadata: Any,
 ) -> Dict[str, Any]:
-    return {
+    event = {
         "type": "instance_state",
         "model": model,
         "instance_id": instance_id,
@@ -37,6 +38,14 @@ def make_instance_state_event(
         "to": to_state,
         "reason": reason,
     }
+    event.update(
+        {
+            key: value
+            for key, value in metadata.items()
+            if value is not None
+        }
+    )
+    return event
 
 
 def make_replanning_event(
@@ -309,6 +318,9 @@ def make_request_event(
     state_restore_reason: str = "",
     state_restored_blocks: int = 0,
     state_restore_staged: bool = False,
+    state_restore_started_at_s: float = 0.0,
+    state_restore_finished_at_s: float = 0.0,
+    state_restore_duration_ms: float = 0.0,
 ) -> Dict[str, Any]:
     return {
         "type": "request",
@@ -330,4 +342,7 @@ def make_request_event(
         "state_restore_reason": state_restore_reason,
         "state_restored_blocks": state_restored_blocks,
         "state_restore_staged": state_restore_staged,
+        "state_restore_started_at_s": state_restore_started_at_s,
+        "state_restore_finished_at_s": state_restore_finished_at_s,
+        "state_restore_duration_ms": state_restore_duration_ms,
     }

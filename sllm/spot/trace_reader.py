@@ -19,10 +19,17 @@ class SpotEvent:
     instance_index: Optional[int] = None
     instance_selector: Optional[str] = None
     node_info: Optional[dict] = None
+    grace_period_s: Optional[float] = None
+    auto_generated: bool = False
 
     def __post_init__(self):
         if self.time < 0:
             raise ValueError("Spot event time must be non-negative")
+        if self.grace_period_s is not None:
+            if self.grace_period_s < 0:
+                raise ValueError("Spot event grace_period_s must be non-negative")
+            if self.event != "preempt":
+                raise ValueError("grace_period_s is only supported on preempt")
         if self.event not in SUPPORTED_EVENTS:
             raise ValueError(
                 f"Unsupported spot event '{self.event}'. "
@@ -62,6 +69,11 @@ def _event_from_dict(
         raise ValueError(f"{source}: invalid event time") from exc
 
     model_name = raw_event.get("model_name") or default_model_name
+    grace_period_s = (
+        float(raw_event["grace_period_s"])
+        if raw_event.get("grace_period_s") is not None
+        else None
+    )
     return SpotEvent(
         time=event_time,
         event=event_type,
@@ -75,6 +87,7 @@ def _event_from_dict(
         ),
         instance_selector=raw_event.get("instance_selector"),
         node_info=raw_event.get("node_info"),
+        grace_period_s=grace_period_s,
     )
 
 

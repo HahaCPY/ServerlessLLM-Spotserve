@@ -125,6 +125,13 @@ def create_app() -> FastAPI:
         node_id = body.get("node_id")
         instance_id = body.get("instance_id")
         model_name = body.get("model_name")
+        timing_metadata = {
+            "notice_time_s": body.get("notice_time_s"),
+            "deadline_time_s": body.get("deadline_time_s"),
+            "trace_event_time_s": body.get("trace_event_time_s"),
+            "trace_deadline_time_s": body.get("trace_deadline_time_s"),
+            "grace_period_s": body.get("grace_period_s"),
+        }
         if event in {"add", "remove"} and node_id is None:
             raise HTTPException(
                 status_code=400,
@@ -163,6 +170,7 @@ def create_app() -> FastAPI:
                     node_id=node_id,
                     instance_id=instance_id,
                     model_name=model_name,
+                    **timing_metadata,
                 )
             elif event == "recover":
                 result = await controller.handle_recover.remote(
@@ -175,6 +183,8 @@ def create_app() -> FastAPI:
                     node_id=node_id,
                     instance_id=instance_id,
                     model_name=model_name,
+                    auto_deadline=bool(body.get("auto_deadline", False)),
+                    **timing_metadata,
                 )
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))

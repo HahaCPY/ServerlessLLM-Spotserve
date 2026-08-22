@@ -244,6 +244,16 @@ def summarize_router_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     state_restore_staged_count = sum(
         1 for row in rows if bool(row.get("state_restore_staged", False))
     )
+    state_restore_durations = [
+        safe_float(row.get("state_restore_duration_ms"), 0.0)
+        for row in rows
+        if safe_float(row.get("state_restore_duration_ms"), 0.0) > 0.0
+    ]
+    state_restore_finished_times = [
+        safe_float(row.get("state_restore_finished_at_s"), 0.0)
+        for row in rows
+        if safe_float(row.get("state_restore_finished_at_s"), 0.0) > 0.0
+    ]
     true_kv_restore_successes_total = sum(
         1
         for row in rows
@@ -267,6 +277,17 @@ def summarize_router_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "state_restored_blocks_total": state_restored_blocks_total,
         "supports_state_restore_requests": supports_state_restore_requests,
         "state_restore_staged_count": state_restore_staged_count,
+        "state_restore_avg_duration_ms": (
+            mean(state_restore_durations) if state_restore_durations else 0.0
+        ),
+        "state_restore_max_duration_ms": (
+            max(state_restore_durations) if state_restore_durations else 0.0
+        ),
+        "state_restore_last_finished_at_s": (
+            max(state_restore_finished_times)
+            if state_restore_finished_times
+            else 0.0
+        ),
         "true_kv_restore_successes_total": true_kv_restore_successes_total,
         "state_kinds": compact_values(
             [str(row.get("state_kind", "")) for row in rows]
@@ -376,12 +397,68 @@ def summarize_instance_state_metrics(
     def count_to(state: str) -> int:
         return sum(1 for row in instance_rows if row.get("to") == state)
 
+    preemption_notice_rows = [
+        row
+        for row in instance_rows
+        if row.get("to") == "preempting"
+        and safe_float(row.get("notice_time_s"), 0.0) > 0.0
+    ]
+    deadline_rows = [
+        row
+        for row in instance_rows
+        if safe_float(row.get("deadline_time_s"), 0.0) > 0.0
+    ]
+    auto_dead_rows = [
+        row
+        for row in instance_rows
+        if row.get("to") == "dead" and bool(row.get("auto_deadline", False))
+    ]
+    grace_periods = [
+        safe_float(row.get("grace_period_s"), 0.0)
+        for row in deadline_rows
+        if safe_float(row.get("grace_period_s"), 0.0) > 0.0
+    ]
+    notice_to_deadline_ms = [
+        (
+            safe_float(row.get("deadline_time_s"), 0.0)
+            - safe_float(row.get("notice_time_s"), 0.0)
+        )
+        * 1000
+        for row in deadline_rows
+        if safe_float(row.get("deadline_time_s"), 0.0) > 0.0
+        and safe_float(row.get("notice_time_s"), 0.0) > 0.0
+    ]
+    auto_dead_lag_ms = [
+        (
+            safe_float(row.get("timestamp"), 0.0)
+            - safe_float(row.get("deadline_time_s"), 0.0)
+        )
+        * 1000
+        for row in auto_dead_rows
+        if safe_float(row.get("deadline_time_s"), 0.0) > 0.0
+        and safe_float(row.get("timestamp"), 0.0) > 0.0
+    ]
+
     return {
         "instance_state_rows": len(instance_rows),
         "instances_marked_preempting": count_to("preempting"),
         "instances_marked_ready": count_to("ready"),
         "instances_marked_dead": count_to("dead"),
         "instances_marked_draining": count_to("draining"),
+        "preemption_notice_events": len(preemption_notice_rows),
+        "preemption_deadline_events": len(deadline_rows),
+        "preemption_auto_deadline_events": len(auto_dead_rows),
+        "preemption_avg_grace_period_s": (
+            mean(grace_periods) if grace_periods else 0.0
+        ),
+        "preemption_avg_notice_to_deadline_ms": (
+            mean(notice_to_deadline_ms)
+            if notice_to_deadline_ms
+            else 0.0
+        ),
+        "preemption_max_auto_deadline_lag_ms": (
+            max(auto_dead_lag_ms) if auto_dead_lag_ms else 0.0
+        ),
     }
 
 
@@ -418,6 +495,14 @@ def summarize_replanning_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     latest_execution = (
         replanning_rows[-1].get("execution") if replanning_rows else None
     )
+    request_migrations = [
+        row.get("execution", {}).get("request_migration", {})
+        for row in replanning_rows
+        if isinstance(row.get("execution"), dict)
+        and isinstance(
+            row.get("execution", {}).get("request_migration"), dict
+        )
+    ]
     execution_durations = numeric_values("execution_duration_ms")
     replan_window_costs = numeric_values("selected_replan_window_cost_ms")
     load_time_costs = numeric_values("selected_load_time_estimate_ms")
@@ -428,6 +513,16 @@ def summarize_replanning_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     throughput_estimates = numeric_values(
         "selected_throughput_estimate_req_s"
     )
+    state_export_durations = [
+        safe_float(row.get("state_export_duration_ms"), 0.0)
+        for row in request_migrations
+        if safe_float(row.get("state_export_duration_ms"), 0.0) > 0.0
+    ]
+    state_export_finished_times = [
+        safe_float(row.get("state_export_finished_at_s"), 0.0)
+        for row in request_migrations
+        if safe_float(row.get("state_export_finished_at_s"), 0.0) > 0.0
+    ]
     target_worker_node_counts = [
         safe_int(row.get("target_worker_node_count"), 0)
         for row in replanning_rows
@@ -480,6 +575,21 @@ def summarize_replanning_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         ),
         "replanning_avg_selected_throughput_estimate_req_s": average(
             throughput_estimates
+        ),
+        "replanning_state_export_events": sum(
+            safe_int(row.get("state_exported"), 0)
+            for row in request_migrations
+        ),
+        "replanning_avg_state_export_duration_ms": average(
+            state_export_durations
+        ),
+        "replanning_max_state_export_duration_ms": (
+            max(state_export_durations) if state_export_durations else 0.0
+        ),
+        "replanning_last_state_export_finished_at_s": (
+            max(state_export_finished_times)
+            if state_export_finished_times
+            else 0.0
         ),
         "replanning_cross_node_targets": sum(
             1 for row in replanning_rows if row.get("cross_node_target")

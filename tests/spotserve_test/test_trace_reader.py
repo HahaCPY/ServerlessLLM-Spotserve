@@ -60,3 +60,35 @@ def test_load_spot_trace_accepts_capacity_events(tmp_path):
 
     assert [event.event for event in events] == ["add", "remove"]
     assert events[0].node_info == {"total_gpu": 2, "free_gpu": 2}
+
+
+def test_load_spot_trace_accepts_preemption_grace_period(tmp_path):
+    trace_path = tmp_path / "grace-trace.jsonl"
+    trace_path.write_text(
+        '{"time": 1.0, "event": "preempt", "node_id": "node-0", '
+        '"grace_period_s": 30}\n',
+        encoding="utf-8",
+    )
+
+    events = load_spot_trace(trace_path)
+
+    assert events == [
+        SpotEvent(
+            time=1.0,
+            event="preempt",
+            node_id="node-0",
+            grace_period_s=30.0,
+        )
+    ]
+
+
+def test_load_spot_trace_rejects_grace_period_on_non_preempt(tmp_path):
+    trace_path = tmp_path / "bad-grace-trace.jsonl"
+    trace_path.write_text(
+        '{"time": 1.0, "event": "recover", "node_id": "node-0", '
+        '"grace_period_s": 30}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="grace_period_s"):
+        load_spot_trace(trace_path)

@@ -262,6 +262,11 @@ class SllmController:
         node_id: Optional[str] = None,
         instance_id: Optional[str] = None,
         model_name: Optional[str] = None,
+        notice_time_s: Optional[float] = None,
+        deadline_time_s: Optional[float] = None,
+        trace_event_time_s: Optional[float] = None,
+        trace_deadline_time_s: Optional[float] = None,
+        grace_period_s: Optional[float] = None,
     ):
         if node_id is None and instance_id is None:
             raise ValueError("Preemption event requires node_id or instance_id")
@@ -285,7 +290,13 @@ class SllmController:
             try:
                 results[target_model] = await (
                     request_router.handle_preemption.remote(
-                        node_id=node_id, instance_id=instance_id
+                        node_id=node_id,
+                        instance_id=instance_id,
+                        notice_time_s=notice_time_s,
+                        deadline_time_s=deadline_time_s,
+                        trace_event_time_s=trace_event_time_s,
+                        trace_deadline_time_s=trace_deadline_time_s,
+                        grace_period_s=grace_period_s,
                     )
                 )
             except Exception as e:
@@ -406,6 +417,12 @@ class SllmController:
         node_id: Optional[str] = None,
         instance_id: Optional[str] = None,
         model_name: Optional[str] = None,
+        notice_time_s: Optional[float] = None,
+        deadline_time_s: Optional[float] = None,
+        trace_event_time_s: Optional[float] = None,
+        trace_deadline_time_s: Optional[float] = None,
+        grace_period_s: Optional[float] = None,
+        auto_deadline: bool = False,
     ):
         if node_id is None and instance_id is None:
             raise ValueError("Dead event requires node_id or instance_id")
@@ -429,7 +446,14 @@ class SllmController:
             try:
                 results[target_model] = await (
                     request_router.handle_dead.remote(
-                        node_id=node_id, instance_id=instance_id
+                        node_id=node_id,
+                        instance_id=instance_id,
+                        notice_time_s=notice_time_s,
+                        deadline_time_s=deadline_time_s,
+                        trace_event_time_s=trace_event_time_s,
+                        trace_deadline_time_s=trace_deadline_time_s,
+                        grace_period_s=grace_period_s,
+                        auto_deadline=auto_deadline,
                     )
                 )
             except Exception as e:

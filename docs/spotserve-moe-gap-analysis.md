@@ -457,28 +457,45 @@ validation 與 runtime 內部 in-place repartition 仍未完成，因此不能�
 SpotServe parallelization controller。
 ```
 
-### 6. Preemptible instance 目前是 trace replay，不是 cloud provider integration
+### 6. Preemptible instance trace replay 缺少 grace-period deadline（已修正）
 
 `sllm/spot/trace_reader.py` 支援 `add/remove/preempt/recover/dead`，而
 `sllm/spot/preemption_simulator.py` 依照 JSONL 時間播放事件。這適合研究與
-benchmark，但不是 AWS/GCP/Azure 的真實 spot/preemptible notice integration。
+benchmark；本專案目前 scope 是 preemptible behavior simulation，不包含
+AWS/GCP/Azure provider integration。
 
-另外，`preempt` 只會把 instance/node 標成 preempting，停止接新 request；
-真正移除或死亡仍需 trace 裡有 `dead` / `remove` 事件，或 backend request 自己回
-`preempted`。
+另外，沒有 `grace_period_s` 的 `preempt` 仍只會把 instance/node 標成
+preempting，停止接新 request；真正移除或死亡仍需 trace 裡有 `dead` /
+`remove` 事件，或 backend request 自己回 `preempted`。
 
 影響：
 
 ```text
-目前沒有強制模擬 cloud grace period deadline。
-如果 trace 沒有 dead/remove，preempting instance 可能只是停止接新流量。
+不含 grace_period_s 的舊 trace 仍維持原本語意：
+preempting instance 可能只是停止接新流量，不會自動死亡。
 ```
 
-建議補強：
+已修正：
 
-- trace event 加上 `grace_period_s`。
-- simulator 在 `preempt` 後自動排程 `dead`，除非中間收到 `recover`。
-- metrics 記錄 notice time、deadline、state export time、restore finish time。
+- `sllm/spot/trace_reader.py` 的 `preempt` event 已支援
+  `grace_period_s`。
+- `sllm/spot/preemption_simulator.py` 在 replay 到帶有
+  `grace_period_s` 的 `preempt` 後，會自動排程 synthetic `dead`
+  deadline；如果 deadline 前 replay 到 matching `recover`，會取消該
+  auto-dead task。
+- `sllm/controller.py`、`sllm/routers/roundrobin_router.py` 與 `/spot/event`
+  已可傳遞 notice/deadline metadata。`instance_state` metrics 會記錄
+  `notice_time_s`、`deadline_time_s`、`trace_event_time_s`、
+  `trace_deadline_time_s`、`grace_period_s` 與 `auto_deadline`。
+- V6 re-parallelization request migration summary 會記錄
+  `state_export_started_at_s`、`state_export_finished_at_s`、
+  `state_export_duration_ms`。
+- V8 request metrics 會記錄 `state_restore_started_at_s`、
+  `state_restore_finished_at_s`、`state_restore_duration_ms`。
+- `scripts/analyze_spotserve_benchmark.py` 會彙總
+  `preemption_notice_events`、`preemption_deadline_events`、
+  `preemption_auto_deadline_events`、state export duration、state restore
+  duration 等欄位。
 
 ### 7. `MigrationRouter` 是舊路徑，可能已經不適合 SpotServe flow
 

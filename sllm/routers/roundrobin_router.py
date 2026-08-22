@@ -294,6 +294,9 @@ class RoundRobinRouter(SllmRouter):
         summary = {
             "attempted": len(entries),
             "state_exported": 0,
+            "state_export_started_at_s": 0.0,
+            "state_export_finished_at_s": 0.0,
+            "state_export_duration_ms": 0.0,
             "abort_requested": 0,
             "migratable": 0,
             "unsupported": 0,
@@ -301,6 +304,7 @@ class RoundRobinRouter(SllmRouter):
                 str(entry.get("request_id")) for entry in entries
             ),
         }
+        state_export_durations_ms: List[float] = []
         for entry in entries:
             instance = entry.get("instance")
             if instance is None or instance.backend_instance is None:
@@ -313,6 +317,9 @@ class RoundRobinRouter(SllmRouter):
                 "Exporting live inference state for %s before re-parallelization",
                 entry["request_id"],
             )
+            export_started_at = time.time()
+            if summary["state_export_started_at_s"] == 0.0:
+                summary["state_export_started_at_s"] = export_started_at
             try:
                 # A connector utility must not stall the whole deployment
                 # switch.  If a runtime cannot answer while its output loop
@@ -339,6 +346,11 @@ class RoundRobinRouter(SllmRouter):
                     request_data=entry.get("request_data", {}),
                     current_output=await self._capture_current_tokens(instance),
                 )
+            export_finished_at = time.time()
+            summary["state_export_finished_at_s"] = export_finished_at
+            state_export_durations_ms.append(
+                (export_finished_at - export_started_at) * 1000
+            )
             entry["migration_state"] = state
             if state is not None:
                 summary["state_exported"] += 1
@@ -373,6 +385,17 @@ class RoundRobinRouter(SllmRouter):
             entry["migration_requested"] = True
             summary["abort_requested"] += 1
             summary["migratable"] += 1
+        if state_export_durations_ms:
+            summary["state_export_duration_ms"] = sum(
+                state_export_durations_ms
+            )
+            summary["state_export_avg_duration_ms"] = (
+                summary["state_export_duration_ms"]
+                / len(state_export_durations_ms)
+            )
+            summary["state_export_max_duration_ms"] = max(
+                state_export_durations_ms
+            )
         return summary
 
     async def start(
@@ -869,7 +892,11 @@ class RoundRobinRouter(SllmRouter):
         )
 
     async def _set_instance_state(
-        self, instance: InstanceHandle, state: InstanceState, reason: str
+        self,
+        instance: InstanceHandle,
+        state: InstanceState,
+        reason: str,
+        metadata: Optional[Mapping[str, Any]] = None,
     ):
         from_state = instance.state.value
         if state == InstanceState.PREEMPTING:
@@ -892,6 +919,7 @@ class RoundRobinRouter(SllmRouter):
                 from_state=from_state,
                 to_state=instance.state.value,
                 reason=reason,
+                **dict(metadata or {}),
             )
         )
 
@@ -1443,14 +1471,29 @@ class RoundRobinRouter(SllmRouter):
         self,
         node_id: Optional[str] = None,
         instance_id: Optional[str] = None,
+        notice_time_s: Optional[float] = None,
+        deadline_time_s: Optional[float] = None,
+        trace_event_time_s: Optional[float] = None,
+        trace_deadline_time_s: Optional[float] = None,
+        grace_period_s: Optional[float] = None,
     ):
         matches = await self._matching_inference_instances(
             node_id=node_id, instance_id=instance_id
         )
         marked_instances = []
+        timing_metadata = {
+            "notice_time_s": notice_time_s,
+            "deadline_time_s": deadline_time_s,
+            "trace_event_time_s": trace_event_time_s,
+            "trace_deadline_time_s": trace_deadline_time_s,
+            "grace_period_s": grace_period_s,
+        }
         for instance in matches:
             await self._set_instance_state(
-                instance, InstanceState.PREEMPTING, reason="trace_event"
+                instance,
+                InstanceState.PREEMPTING,
+                reason="trace_event",
+                metadata=timing_metadata,
             )
             await self._capture_current_tokens(instance)
             marked_instances.append(instance.instance_id)
@@ -1472,6 +1515,11 @@ class RoundRobinRouter(SllmRouter):
             "model": self.model_name,
             "event": "preempt",
             "instances": marked_instances,
+            "notice_time_s": notice_time_s,
+            "deadline_time_s": deadline_time_s,
+            "trace_event_time_s": trace_event_time_s,
+            "trace_deadline_time_s": trace_deadline_time_s,
+            "grace_period_s": grace_period_s,
             "reparallelization": replanning,
             "context_migration": context_migration,
         }
@@ -1590,15 +1638,32 @@ class RoundRobinRouter(SllmRouter):
         self,
         node_id: Optional[str] = None,
         instance_id: Optional[str] = None,
+        notice_time_s: Optional[float] = None,
+        deadline_time_s: Optional[float] = None,
+        trace_event_time_s: Optional[float] = None,
+        trace_deadline_time_s: Optional[float] = None,
+        grace_period_s: Optional[float] = None,
+        auto_deadline: bool = False,
     ):
         matches = await self._matching_inference_instances(
             node_id=node_id, instance_id=instance_id
         )
         marked_instances = []
+        timing_metadata = {
+            "notice_time_s": notice_time_s,
+            "deadline_time_s": deadline_time_s,
+            "trace_event_time_s": trace_event_time_s,
+            "trace_deadline_time_s": trace_deadline_time_s,
+            "grace_period_s": grace_period_s,
+            "auto_deadline": auto_deadline,
+        }
         for instance in matches:
             await self._capture_current_tokens(instance)
             await self._set_instance_state(
-                instance, InstanceState.DEAD, reason="trace_dead"
+                instance,
+                InstanceState.DEAD,
+                reason="trace_dead",
+                metadata=timing_metadata,
             )
             marked_instances.append(instance.instance_id)
             logger.info(
@@ -1619,6 +1684,12 @@ class RoundRobinRouter(SllmRouter):
             "model": self.model_name,
             "event": "dead",
             "instances": marked_instances,
+            "notice_time_s": notice_time_s,
+            "deadline_time_s": deadline_time_s,
+            "trace_event_time_s": trace_event_time_s,
+            "trace_deadline_time_s": trace_deadline_time_s,
+            "grace_period_s": grace_period_s,
+            "auto_deadline": auto_deadline,
             "reparallelization": replanning,
             "context_migration": context_migration,
         }
@@ -1874,6 +1945,9 @@ class RoundRobinRouter(SllmRouter):
             "state_restore_reason": "",
             "state_restored_blocks": 0,
             "state_restore_staged": False,
+            "state_restore_started_at_s": 0.0,
+            "state_restore_finished_at_s": 0.0,
+            "state_restore_duration_ms": 0.0,
         }
         if state is None:
             return None, None, counters, False
@@ -1912,9 +1986,16 @@ class RoundRobinRouter(SllmRouter):
 
         if decision.action == "restore_state":
             counters["state_restore_attempts"] = 1
+            restore_started_at = time.time()
+            counters["state_restore_started_at_s"] = restore_started_at
             restore_result = await self._restore_inference_state(
                 target_instance, state, request_data
             )
+            restore_finished_at = time.time()
+            counters["state_restore_finished_at_s"] = restore_finished_at
+            counters["state_restore_duration_ms"] = (
+                restore_finished_at - restore_started_at
+            ) * 1000
             try:
                 restored_blocks = int(
                     restore_result.get("restored_blocks", 0) or 0
@@ -2102,6 +2183,9 @@ class RoundRobinRouter(SllmRouter):
         state_restore_reason = ""
         state_restored_blocks = 0
         state_restore_staged = False
+        state_restore_started_at_s = 0.0
+        state_restore_finished_at_s = 0.0
+        state_restore_duration_ms = 0.0
         force_state_recovery = False
         force_retry_budget = 0
 
@@ -2218,6 +2302,25 @@ class RoundRobinRouter(SllmRouter):
                                 )
                             )
                         )
+                        if state_counters.get("state_restore_started_at_s"):
+                            if state_restore_started_at_s == 0.0:
+                                state_restore_started_at_s = float(
+                                    state_counters[
+                                        "state_restore_started_at_s"
+                                    ]
+                                )
+                        if state_counters.get("state_restore_finished_at_s"):
+                            state_restore_finished_at_s = float(
+                                state_counters[
+                                    "state_restore_finished_at_s"
+                                ]
+                            )
+                        state_restore_duration_ms += float(
+                            state_counters.get(
+                                "state_restore_duration_ms", 0.0
+                            )
+                            or 0.0
+                        )
                         if used_fallback:
                             state_restore_fallback = True
                             recovery_fallback = True
@@ -2303,6 +2406,15 @@ class RoundRobinRouter(SllmRouter):
                                 state_restore_reason=state_restore_reason,
                                 state_restored_blocks=state_restored_blocks,
                                 state_restore_staged=state_restore_staged,
+                                state_restore_started_at_s=(
+                                    state_restore_started_at_s
+                                ),
+                                state_restore_finished_at_s=(
+                                    state_restore_finished_at_s
+                                ),
+                                state_restore_duration_ms=(
+                                    state_restore_duration_ms
+                                ),
                             )
                         )
                         return result
@@ -2425,6 +2537,15 @@ class RoundRobinRouter(SllmRouter):
                                 state_restore_reason=state_restore_reason,
                                 state_restored_blocks=state_restored_blocks,
                                 state_restore_staged=state_restore_staged,
+                                state_restore_started_at_s=(
+                                    state_restore_started_at_s
+                                ),
+                                state_restore_finished_at_s=(
+                                    state_restore_finished_at_s
+                                ),
+                                state_restore_duration_ms=(
+                                    state_restore_duration_ms
+                                ),
                             )
                         )
                         return result
@@ -2457,6 +2578,15 @@ class RoundRobinRouter(SllmRouter):
                             state_restore_reason=state_restore_reason,
                             state_restored_blocks=state_restored_blocks,
                             state_restore_staged=state_restore_staged,
+                            state_restore_started_at_s=(
+                                state_restore_started_at_s
+                            ),
+                            state_restore_finished_at_s=(
+                                state_restore_finished_at_s
+                            ),
+                            state_restore_duration_ms=(
+                                state_restore_duration_ms
+                            ),
                         )
                     )
                     return {"error": str(e)}
@@ -2533,6 +2663,15 @@ class RoundRobinRouter(SllmRouter):
                                 state_restore_reason=state_restore_reason,
                                 state_restored_blocks=state_restored_blocks,
                                 state_restore_staged=state_restore_staged,
+                                state_restore_started_at_s=(
+                                    state_restore_started_at_s
+                                ),
+                                state_restore_finished_at_s=(
+                                    state_restore_finished_at_s
+                                ),
+                                state_restore_duration_ms=(
+                                    state_restore_duration_ms
+                                ),
                             )
                         )
                         return {"error": str(e)}
