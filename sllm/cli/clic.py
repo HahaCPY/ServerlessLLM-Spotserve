@@ -146,7 +146,10 @@ def delete(models, lora_adapters):
 @click.option(
     "--enable-migration",
     is_flag=True,
-    help="Enable live migration of model instances.",
+    help=(
+        "Deprecated legacy MigrationRouter flag; accepted for compatibility "
+        "but ignored by the SpotServe controller."
+    ),
 )
 def start(host, port, enable_storage_aware, enable_migration):
     """Start the head node of the SLLM cluster."""

@@ -497,12 +497,13 @@ preempting instance 可能只是停止接新流量，不會自動死亡。
   `preemption_auto_deadline_events`、state export duration、state restore
   duration 等欄位。
 
-### 7. `MigrationRouter` 是舊路徑，可能已經不適合 SpotServe flow
+### 7. `MigrationRouter` 是舊路徑，可能已經不適合 SpotServe flow（已修正）
 
-`sllm/controller.py` 如果 `enable_migration=true`，會使用
-`sllm/routers/migration_router.py`。但這個 class 看起來仍沿用舊欄位，例如
-`ready_instances`，而目前 `RoundRobinRouter` 使用的是
-`ready_inference_instances`。
+舊版本中，`sllm/controller.py` 如果 `enable_migration=true`，會使用
+`sllm/routers/migration_router.py`。但這個 class 仍沿用舊欄位，例如
+`ready_instances`，而目前 SpotServe 主要路徑在 `RoundRobinRouter`，使用的是
+`ready_inference_instances`、stateful recovery、context migration、reparallelization
+等新欄位與流程。
 
 SpotServe 新實作主要集中在 `RoundRobinRouter`：
 
@@ -515,14 +516,25 @@ recovery_policy=stateful_recovery
 影響：
 
 ```text
-若啟動時打開 enable_migration，可能繞過 SpotServe 新路徑，甚至踩到舊欄位錯誤。
+修正前若啟動時打開 enable_migration，可能繞過 SpotServe 新路徑，
+甚至踩到舊欄位錯誤。
 ```
 
-建議補強：
+已修正：
 
-- 明確標記 `MigrationRouter` deprecated，或移除 controller 對它的自動切換。
-- 若仍要保留，需把它更新到 `ready_inference_instances` 與新 recovery/stateful path。
-- SpotServe 範例文件應提醒不要用 `enable_migration=true` 啟用舊 router。
+- `sllm/controller.py` 不再因為 `enable_migration=true` 自動切到
+  `MigrationRouter`；controller 固定使用 `RoundRobinRouter` 作為 SpotServe
+  router path。
+- legacy `enable_migration` flag 會被視為 deprecated compatibility flag，
+  scheduler config 內的 `enable_migration` 也會被強制設為 `false`，避免
+  storage-aware scheduler 走舊 migration planning。
+- `sllm/routers/migration_router.py` 已明確標記 deprecated，並保留 constructor
+  相容性，避免外部 import 直接破掉。
+- CLI `--enable-migration` help 已標註 deprecated；SpotServe 應使用
+  `router_config.enable_reparallelization`、`router_config.enable_context_migration`
+  與 `recovery_policy=stateful_recovery`。
+- 新增 `tests/spotserve_test/test_controller_spotserve_router.py` 驗證 legacy
+  migration flag 不會再啟用舊 scheduler/router path。
 
 ### 8. 現有實驗多為 single-host / same-host simulation
 

@@ -4,6 +4,13 @@ sidebar_position: 1
 
 # Live Migration of Inference Instances
 
+> Note: this page documents the legacy `MigrationRouter` live-migration path.
+> The SpotServe preemption flow in this repository uses `RoundRobinRouter`
+> with `enable_reparallelization`, `enable_context_migration`, and
+> `recovery_policy=stateful_recovery` instead. The `--enable-migration`
+> controller flag is kept only for compatibility and is ignored by the
+> SpotServe controller.
+
 This example illustrates the live migration of inference instances in a ServerlessLLM cluster by constructing a scenario where two models are deployed to the cluster. Model `Qwen2.5-3B` is stored on both nodes, while model `Qwen2.5-1.5B` is only stored on node 0 (e.g., due to being less popular). This example will show a locality-contention scenario where `Qwen2.5-3B` is being served on node 0 but `Qwen2.5-1.5B` is requested to be served on the same node for optimal locality. We will find that:
 
 - **Without migration**, `Qwen2.5-1.5B` would have to wait for the completion of the ongoing inference instance of `Qwen2.5-3B` on node 0.
@@ -207,5 +214,4 @@ As shown in the log message, the ongoing inference instance of the model `Qwen/Q
 ```bash
 docker compose down
 ```
-
 

@@ -25,8 +25,12 @@ import ray
 
 from sllm.fine_tuning_job_store import FineTuningJobStore
 from sllm.logger import init_logger
-from sllm.routers import MigrationRouter, RoundRobinRouter
+from sllm.routers import RoundRobinRouter
 from sllm.schedulers import FcfsScheduler, StorageAwareScheduler
+from sllm.spot.controller_config import (
+    LEGACY_MIGRATION_WARNING,
+    spotserve_scheduler_config,
+)
 from sllm.store_manager import StoreManager
 
 
@@ -41,7 +45,7 @@ logger = init_logger(__name__)
 
 class SllmController:
     def __init__(self, config: Optional[Mapping] = None):
-        self.config = config
+        self.config = dict(config or {})
 
         self.running_lock = asyncio.Lock()
         self.running = False
@@ -80,14 +84,12 @@ class SllmController:
         else:
             ray_scheduler_cls = ray.remote(FcfsScheduler)
 
-        enable_migration = self.config.get("enable_migration", False)
-        if enable_migration:
-            self.router_cls = ray.remote(MigrationRouter)
-        else:
-            self.router_cls = ray.remote(RoundRobinRouter)
-
-        scheduler_config = dict(self.config.get("scheduler_config", {}) or {})
-        scheduler_config["enable_migration"] = enable_migration
+        scheduler_config, legacy_migration_requested = (
+            spotserve_scheduler_config(self.config)
+        )
+        if legacy_migration_requested:
+            logger.warning(LEGACY_MIGRATION_WARNING)
+        self.router_cls = ray.remote(RoundRobinRouter)
         self.scheduler = ray_scheduler_cls.options(
             name="model_loading_scheduler", resources={"control_node": 0.1}
         ).remote(scheduler_config=scheduler_config)

@@ -15,7 +15,7 @@
 #  see the license for the specific language governing permissions and         #
 #  limitations under the license.                                              #
 # ---------------------------------------------------------------------------- #
-from typing import Dict
+from typing import Dict, Optional
 
 import ray
 
@@ -28,6 +28,15 @@ logger = init_logger(__name__)
 
 
 class MigrationRouter(RoundRobinRouter):
+    """Deprecated legacy live-migration router.
+
+    SpotServe recovery now lives in ``RoundRobinRouter`` through
+    ``enable_reparallelization``, ``enable_context_migration`` and
+    ``recovery_policy=stateful_recovery``.  The controller no longer selects
+    this class automatically because this path still depends on the older
+    ``ready_instances`` migration flow.
+    """
+
     def __init__(
         self,
         model_name: str,
@@ -35,13 +44,22 @@ class MigrationRouter(RoundRobinRouter):
         backend: str,
         backend_config: Dict,
         router_config: Dict,
+        enable_lora: bool = False,
+        lora_adapters: Optional[Dict[str, str]] = None,
     ) -> None:
+        logger.warning(
+            "MigrationRouter is deprecated and is not used by SpotServe "
+            "preemption recovery. Use RoundRobinRouter SpotServe configs "
+            "instead."
+        )
         super().__init__(
             model_name,
             resource_requirements,
             backend,
             backend_config,
             router_config,
+            enable_lora=enable_lora,
+            lora_adapters=lora_adapters,
         )
         self.migration_record = {}
         self.migration_delta = self.router_config.get("migration_delta", 20)
