@@ -276,6 +276,76 @@ def test_workload_cost_model_can_prefer_lower_replan_cost():
     assert decision["selected_score"] > decision["top_candidates"][1]["score"]
 
 
+def test_workload_cost_model_can_prefer_higher_throughput_under_queue_pressure():
+    decision = plan_dynamic_reparallelization(
+        model_name="cost-aware-vllm",
+        worker_nodes={
+            "0": {
+                "ray_node_id": "node-0",
+                "address": "10.0.0.1",
+                "free_gpu": 4,
+                "total_gpu": 4,
+                "state": "ready",
+            }
+        },
+        model_config={
+            "model": "cost-aware-vllm",
+            "backend": "vllm",
+            "num_gpus": 4,
+            "backend_config": {"max_num_seqs": 1},
+            "backend_capability": {
+                "supported_configs": [
+                    {
+                        "tensor_parallel_size": 1,
+                        "pipeline_parallel_size": 1,
+                        "data_parallel_size": 1,
+                        "replica_count": 1,
+                        "num_gpus": 1,
+                        "latency_estimate_ms": 2000,
+                        "load_time_estimate_ms": 500,
+                        "migration_cost_estimate_ms": 100,
+                        "reason": "low_cost_single_replica",
+                    },
+                    {
+                        "tensor_parallel_size": 1,
+                        "pipeline_parallel_size": 1,
+                        "data_parallel_size": 1,
+                        "replica_count": 2,
+                        "num_gpus": 2,
+                        "latency_estimate_ms": 1000,
+                        "load_time_estimate_ms": 1500,
+                        "migration_cost_estimate_ms": 300,
+                        "reason": "higher_throughput_replicas",
+                    },
+                ]
+            },
+        },
+        planner_config={
+            "enable_workload_cost_model": True,
+            "arrival_rate_req_s": 2.5,
+            "batch_size": 1,
+            "base_score_weight": 0,
+            "throughput_score_weight": 1000,
+            "latency_penalty_weight": 0,
+            "load_time_penalty_weight": 0.1,
+            "migration_cost_penalty_weight": 0.1,
+            "queue_penalty_weight": 1,
+        },
+        event="manual",
+        backend="vllm",
+    )
+
+    assert decision["selected_config"]["reason"] == "higher_throughput_replicas"
+    assert decision["selected_replica_count"] == 2
+    assert decision["selected_latency_estimate_ms"] == 1000
+    assert decision["selected_throughput_estimate_req_s"] == 2.0
+    assert decision["selected_queue_penalty_ms"] == 500
+    assert decision["selected_load_time_estimate_ms"] == 1500
+    assert decision["selected_migration_cost_estimate_ms"] == 300
+    assert decision["selected_replan_window_cost_ms"] == 2300
+    assert decision["selected_score"] > decision["top_candidates"][1]["score"]
+
+
 def test_parallel_plan_shared_interface_serializes_to_dict():
     plan = ParallelPlan(
         model_name="moe-model",

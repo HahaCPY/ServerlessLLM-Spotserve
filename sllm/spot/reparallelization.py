@@ -342,6 +342,10 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(default)
 
 
+def _nonnegative_float(value: Any, default: float = 0.0) -> float:
+    return max(0.0, _safe_float(value, default))
+
+
 def _safe_int(value: Any, default: int = 0) -> int:
     try:
         if value is None or value == "":
@@ -652,25 +656,34 @@ def _score_parallel_candidates_for_workload(
     arrival_rate_req_s = float(snapshot["arrival_rate_req_s"])
     batch_size = int(snapshot["batch_size"])
     latency_estimate_ms = float(snapshot["latency_estimate_ms"])
-    latency_s = latency_estimate_ms / 1000.0
     for candidate in candidates:
         base_score = candidate.base_score or candidate.score
-        throughput_estimate_req_s = 0.0
-        if latency_s > 0.0:
+        candidate_latency_estimate_ms = (
+            candidate.latency_estimate_ms
+            if candidate.latency_estimate_ms > 0.0
+            else latency_estimate_ms
+        )
+        candidate_latency_s = candidate_latency_estimate_ms / 1000.0
+        throughput_estimate_req_s = candidate.throughput_estimate_req_s
+        if throughput_estimate_req_s <= 0.0 and candidate_latency_s > 0.0:
             throughput_estimate_req_s = (
                 candidate.replica_count * batch_size
-            ) / latency_s
-        load_time_estimate_ms = (
-            float(snapshot["model_load_time_ms"])
-            + candidate.total_gpus * float(snapshot["load_time_per_gpu_ms"])
-        )
-        migration_cost_estimate_ms = (
-            float(snapshot["migration_cost_ms"])
-            + candidate.total_gpus
-            * float(snapshot["migration_cost_per_gpu_ms"])
-            + candidate.replica_count
-            * float(snapshot["migration_cost_per_replica_ms"])
-        )
+            ) / candidate_latency_s
+        load_time_estimate_ms = candidate.load_time_estimate_ms
+        if load_time_estimate_ms <= 0.0:
+            load_time_estimate_ms = (
+                float(snapshot["model_load_time_ms"])
+                + candidate.total_gpus * float(snapshot["load_time_per_gpu_ms"])
+            )
+        migration_cost_estimate_ms = candidate.migration_cost_estimate_ms
+        if migration_cost_estimate_ms <= 0.0:
+            migration_cost_estimate_ms = (
+                float(snapshot["migration_cost_ms"])
+                + candidate.total_gpus
+                * float(snapshot["migration_cost_per_gpu_ms"])
+                + candidate.replica_count
+                * float(snapshot["migration_cost_per_replica_ms"])
+            )
         queue_penalty_ms = (
             max(0.0, arrival_rate_req_s - throughput_estimate_req_s)
             * float(snapshot["queue_penalty_ms_per_req_s"])
@@ -687,7 +700,7 @@ def _score_parallel_candidates_for_workload(
                 * float(snapshot["throughput_score_weight"])
             ),
             "latency_penalty": (
-                latency_estimate_ms
+                candidate_latency_estimate_ms
                 * float(snapshot["latency_penalty_weight"])
             ),
             "load_time_penalty": (
@@ -723,7 +736,7 @@ def _score_parallel_candidates_for_workload(
                 workload_score_delta=float(score - base_score),
                 arrival_rate_req_s=arrival_rate_req_s,
                 batch_size=batch_size,
-                latency_estimate_ms=latency_estimate_ms,
+                latency_estimate_ms=candidate_latency_estimate_ms,
                 throughput_estimate_req_s=(
                     float(throughput_estimate_req_s)
                 ),
@@ -804,6 +817,21 @@ def _supported_config_candidates(
             )
             total_gpus = int(plan.get("num_gpus", 1) or 1)
             reason = str(plan.get("reason", "backend_capability"))
+            latency_estimate_ms = _nonnegative_float(
+                plan.get("latency_estimate_ms", 0.0)
+            )
+            throughput_estimate_req_s = _nonnegative_float(
+                plan.get(
+                    "throughput_estimate_req_s",
+                    plan.get("throughput_req_s", 0.0),
+                )
+            )
+            load_time_estimate_ms = _nonnegative_float(
+                plan.get("load_time_estimate_ms", 0.0)
+            )
+            migration_cost_estimate_ms = _nonnegative_float(
+                plan.get("migration_cost_estimate_ms", 0.0)
+            )
         else:
             tensor_parallel_size = int(plan.tensor_parallel_size)
             pipeline_parallel_size = int(plan.pipeline_parallel_size)
@@ -812,6 +840,22 @@ def _supported_config_candidates(
             enable_expert_parallel = bool(plan.enable_expert_parallel)
             total_gpus = int(plan.num_gpus)
             reason = str(plan.reason)
+            latency_estimate_ms = _nonnegative_float(
+                getattr(plan, "latency_estimate_ms", 0.0)
+            )
+            throughput_estimate_req_s = _nonnegative_float(
+                getattr(
+                    plan,
+                    "throughput_estimate_req_s",
+                    getattr(plan, "throughput_req_s", 0.0),
+                )
+            )
+            load_time_estimate_ms = _nonnegative_float(
+                getattr(plan, "load_time_estimate_ms", 0.0)
+            )
+            migration_cost_estimate_ms = _nonnegative_float(
+                getattr(plan, "migration_cost_estimate_ms", 0.0)
+            )
 
         if tensor_parallel_size < min_tensor_parallel_size:
             continue
@@ -840,6 +884,10 @@ def _supported_config_candidates(
                     target_replica_gpus=target_replica_gpus,
                     unused_gpus=unused_gpus,
                 ),
+                latency_estimate_ms=latency_estimate_ms,
+                throughput_estimate_req_s=throughput_estimate_req_s,
+                load_time_estimate_ms=load_time_estimate_ms,
+                migration_cost_estimate_ms=migration_cost_estimate_ms,
                 reason=reason,
             )
         )

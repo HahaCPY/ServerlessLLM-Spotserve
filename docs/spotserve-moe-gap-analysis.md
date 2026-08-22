@@ -302,19 +302,32 @@ ready 後切流、drain 舊 actors，不是 runtime 內部原地重分片。
 不能說：已完整重現 SpotServe parallelization controller。
 ```
 
-建議補強：
+建議補強與目前狀態：
 
-- 在 planner 中加入 workload arrival rate、batch size、latency estimate、
-  model load time、migration cost。
-- benchmark 至少要有多 worker node，才能顯示 preemption 後 replan 的服務能力改善。
-- 分開呈現 replan-window startup cost 與 post-replan steady-state latency。
+- [x] 在 planner 中加入 workload arrival rate、batch size、latency estimate、
+  throughput estimate、model load time、migration cost、queue penalty。
+- [ ] benchmark 至少要有真正跨 failure domain 的多 worker node，才能強 claim
+  preemption 後 replan 的服務能力改善；目前 multi-worker deploy set 可以驗證多個
+  runtime worker container，但若都在同一台 host 上，仍只能算 control-plane
+  validation。
+- [x] 分開呈現 replan-window startup cost 與 post-replan steady-state latency。
 
-已開始修正：
+已修正：
 
 - `sllm/spot/reparallelization.py` 加入 optional workload/cost-aware score。
   預設關閉；只有 `enable_workload_cost_model=true` 時，candidate 才會把
-  arrival rate、batch size、latency estimate、model load time、migration cost、
-  queue penalty 放進 score。這避免舊 V6 heuristic 在未設定時被偷偷改掉。
+  arrival rate、batch size、latency estimate、throughput estimate、model load
+  time、migration cost、queue penalty 放進 score。這避免舊 V6 heuristic 在未設定
+  時被偷偷改掉。
+- `backend_capability.supported_configs` 現在可以提供 per-plan
+  `latency_estimate_ms`、`throughput_estimate_req_s`、
+  `load_time_estimate_ms`、`migration_cost_estimate_ms`。如果 supported config
+  沒有提供，planner 會退回 router runtime workload snapshot 與全域 planner
+  defaults。這讓 planner 不只回答「GPU 是否塞得下」，也能比較「在目前 workload
+  下切到這個 plan 是否值得」。
+- `tests/spotserve_test/test_reparallelization_planner.py` 已補測試：高 arrival rate /
+  queue pressure 下，即使較高 throughput 的 plan 需要更多 load/migration cost，
+  planner 仍可選擇它，而不是固定選最低 GPU 或最低 load-cost plan。
 - `sllm/routers/roundrobin_router.py` 會收集最近 request arrival / latency，
   replan 時把 `runtime_workload` 傳給 planner，也會記錄 actor recreate/apply 的
   `execution_duration_ms`。
