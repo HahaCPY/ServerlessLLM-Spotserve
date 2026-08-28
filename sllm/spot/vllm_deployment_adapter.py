@@ -86,10 +86,17 @@ class VllmDeploymentAdapter:
         config["tensor_parallel_size"] = plan.tensor_parallel_size
         config["pipeline_parallel_size"] = plan.pipeline_parallel_size
         config["data_parallel_size"] = plan.data_parallel_size
+        config["vllm_data_parallel_size"] = plan.data_parallel_size
         config["replica_count"] = plan.replica_count
+        config["sllm_replica_count"] = plan.replica_count
         planned_ep_size = plan.effective_expert_parallel_size
         config["planned_effective_expert_parallel_size"] = planned_ep_size
         config["planned_expert_parallel_size"] = planned_ep_size
+        config["expert_parallel_size_source"] = (
+            "derived_from_tp_dp"
+            if plan.enable_expert_parallel
+            else "disabled"
+        )
         config["expert_parallel_size_verified"] = False
         config["enable_expert_parallel"] = plan.enable_expert_parallel
         return config

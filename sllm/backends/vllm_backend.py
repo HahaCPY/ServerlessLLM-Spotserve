@@ -314,11 +314,32 @@ class VllmBackend(SllmBackend):
             "planned_effective_expert_parallel_size"
         ]
         metadata["effective_expert_parallel_size"] = effective_ep_size
+        metadata["runtime_effective_expert_parallel_size"] = effective_ep_size
+        metadata["derived_effective_expert_parallel_size"] = effective_ep_size
         metadata["expert_parallel_size"] = effective_ep_size
         metadata["expert_parallel_size_verified"] = True
         metadata["expert_parallel_size_source"] = (
             "derived_from_tp_dp" if enable_ep else "disabled"
         )
+        metadata["vllm_data_parallel_size"] = data_parallel_size
+        metadata["sllm_replica_count"] = max(
+            1, int(self.backend_config.get("replica_count", 1) or 1)
+        )
+        metadata["expert_physical_replication_factor"] = max(
+            1,
+            int(
+                self.backend_config.get(
+                    "expert_physical_replication_factor", 1
+                )
+                or 1
+            ),
+        )
+        metadata["expert_placement_available"] = False
+        metadata["placement_epoch"] = 0
+        metadata["placement_version"] = 0
+        metadata["placement_source"] = "unavailable"
+        metadata["moe_route_histogram_available"] = False
+        metadata["moe_route_histogram_source"] = "unavailable"
         metadata["parallel_plan_mismatch"] = (
             metadata["planned_effective_expert_parallel_size"] != effective_ep_size
         )
@@ -1092,6 +1113,14 @@ class VllmBackend(SllmBackend):
             "pipeline_parallel_size": parallel_metadata.get(
                 "pipeline_parallel_size"
             ),
+            "data_parallel_size": parallel_metadata.get(
+                "data_parallel_size"
+            ),
+            "vllm_data_parallel_size": parallel_metadata.get(
+                "vllm_data_parallel_size"
+            ),
+            "replica_count": parallel_metadata.get("sllm_replica_count"),
+            "sllm_replica_count": parallel_metadata.get("sllm_replica_count"),
             "expert_parallel_enabled": parallel_metadata.get(
                 "expert_parallel_enabled"
             ),
@@ -1104,6 +1133,12 @@ class VllmBackend(SllmBackend):
             "effective_expert_parallel_size": parallel_metadata.get(
                 "effective_expert_parallel_size"
             ),
+            "runtime_effective_expert_parallel_size": (
+                parallel_metadata.get("runtime_effective_expert_parallel_size")
+            ),
+            "derived_effective_expert_parallel_size": (
+                parallel_metadata.get("derived_effective_expert_parallel_size")
+            ),
             "expert_parallel_size_verified": parallel_metadata.get(
                 "expert_parallel_size_verified"
             ),
@@ -1112,6 +1147,21 @@ class VllmBackend(SllmBackend):
             ),
             "parallel_plan_mismatch": parallel_metadata.get(
                 "parallel_plan_mismatch"
+            ),
+            "expert_physical_replication_factor": parallel_metadata.get(
+                "expert_physical_replication_factor"
+            ),
+            "expert_placement_available": parallel_metadata.get(
+                "expert_placement_available"
+            ),
+            "placement_epoch": parallel_metadata.get("placement_epoch"),
+            "placement_version": parallel_metadata.get("placement_version"),
+            "placement_source": parallel_metadata.get("placement_source"),
+            "moe_route_histogram_available": parallel_metadata.get(
+                "moe_route_histogram_available"
+            ),
+            "moe_route_histogram_source": parallel_metadata.get(
+                "moe_route_histogram_source"
             ),
             "cache_block_size": self.backend_config.get("block_size"),
             "cache_dtype": self.backend_config.get("kv_cache_dtype"),

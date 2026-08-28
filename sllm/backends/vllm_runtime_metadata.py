@@ -35,6 +35,16 @@ def _optional_positive_int(value: Any) -> Optional[int]:
     return max(parsed, 1)
 
 
+def _optional_non_negative_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return max(parsed, 0)
+
+
 def _non_negative_float(value: Any, default: float = 0.0) -> float:
     try:
         parsed = float(value if value is not None else default)
@@ -66,6 +76,16 @@ def _first_present(*values: Any) -> Any:
     return None
 
 
+def _has_payload(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, (str, bytes)):
+        return bool(value)
+    if isinstance(value, (list, tuple, dict, set)):
+        return bool(value)
+    return True
+
+
 def get_vllm_model_resource_profile(
     model_name: str,
     backend_config: Optional[Mapping[str, Any]] = None,
@@ -91,7 +111,18 @@ def get_vllm_model_resource_profile(
     data_parallel_size = _positive_int(
         _first_present(
             runtime_metadata.get("data_parallel_size"),
+            runtime_metadata.get("vllm_data_parallel_size"),
             backend_config.get("data_parallel_size"),
+            backend_config.get("vllm_data_parallel_size"),
+        ),
+        1,
+    )
+    sllm_replica_count = _positive_int(
+        _first_present(
+            runtime_metadata.get("sllm_replica_count"),
+            runtime_metadata.get("replica_count"),
+            backend_config.get("sllm_replica_count"),
+            backend_config.get("replica_count"),
         ),
         1,
     )
@@ -111,6 +142,9 @@ def get_vllm_model_resource_profile(
             runtime_metadata.get("runtime_expert_parallel_size"),
         )
     )
+    runtime_expert_parallel_size_provided = (
+        runtime_expert_parallel_size is not None
+    )
     expert_parallel_enabled = _to_bool(
         _first_present(
             runtime_metadata.get("expert_parallel_enabled"),
@@ -125,23 +159,71 @@ def get_vllm_model_resource_profile(
     )
     if runtime_expert_parallel_size and runtime_expert_parallel_size > 1:
         expert_parallel_enabled = True
-    effective_expert_parallel_size = (
+    derived_expert_parallel_size = (
         tensor_parallel_size * data_parallel_size
         if expert_parallel_enabled
         else 1
     )
-    runtime_expert_parallel_size = (
-        runtime_expert_parallel_size or effective_expert_parallel_size
+    effective_expert_parallel_size = (
+        runtime_expert_parallel_size or derived_expert_parallel_size
     )
+    runtime_expert_parallel_size = effective_expert_parallel_size
     expert_parallel_size_verified = True
     if runtime_metadata.get("expert_parallel_size_source"):
         expert_parallel_size_source = str(
             runtime_metadata["expert_parallel_size_source"]
         )
+    elif runtime_expert_parallel_size_provided:
+        expert_parallel_size_source = "runtime_metadata"
     elif expert_parallel_enabled:
         expert_parallel_size_source = "derived_from_tp_dp"
     else:
         expert_parallel_size_source = "disabled"
+    expert_physical_replication_factor = _positive_int(
+        _first_present(
+            runtime_metadata.get("expert_physical_replication_factor"),
+            backend_config.get("expert_physical_replication_factor"),
+        ),
+        1,
+    )
+    expert_placement_snapshot = _first_present(
+        runtime_metadata.get("expert_placement_snapshot"),
+        runtime_metadata.get("expert_placement"),
+        backend_config.get("expert_placement_snapshot"),
+    )
+    placement_available = _has_payload(expert_placement_snapshot)
+    placement_epoch = _optional_non_negative_int(
+        _first_present(
+            runtime_metadata.get("placement_epoch"),
+            runtime_metadata.get("placement_version"),
+            backend_config.get("placement_epoch"),
+        )
+    )
+    placement_source = str(
+        _first_present(
+            runtime_metadata.get("placement_source"),
+            backend_config.get("placement_source"),
+            "runtime" if placement_available else "unavailable",
+        )
+    )
+    route_histogram = _first_present(
+        runtime_metadata.get("per_request_expert_route_histogram"),
+        runtime_metadata.get("per_request_routed_tokens_by_expert"),
+        runtime_metadata.get("expert_route_histogram"),
+    )
+    route_histogram_available = _to_bool(
+        runtime_metadata.get("moe_route_histogram_available"),
+        default=_has_payload(route_histogram),
+    )
+    route_histogram_source = str(
+        _first_present(
+            runtime_metadata.get("moe_route_histogram_source"),
+            runtime_metadata.get("route_histogram_source"),
+            "runtime_or_instrumentation"
+            if route_histogram_available
+            else "unavailable",
+        )
+    )
 
     profile = {
         "model_name": model_name,
@@ -150,14 +232,30 @@ def get_vllm_model_resource_profile(
         "tensor_parallel_size": tensor_parallel_size,
         "pipeline_parallel_size": pipeline_parallel_size,
         "data_parallel_size": data_parallel_size,
+        "vllm_data_parallel_size": data_parallel_size,
+        "replica_count": sllm_replica_count,
+        "sllm_replica_count": sllm_replica_count,
         "expert_parallel_enabled": expert_parallel_enabled,
         "planned_effective_expert_parallel_size": (
             planned_expert_parallel_size
         ),
         "planned_expert_parallel_size": planned_expert_parallel_size,
         "effective_expert_parallel_size": effective_expert_parallel_size,
+        "runtime_effective_expert_parallel_size": (
+            effective_expert_parallel_size
+        ),
+        "derived_effective_expert_parallel_size": derived_expert_parallel_size,
         "expert_parallel_size_verified": expert_parallel_size_verified,
         "expert_parallel_size_source": expert_parallel_size_source,
+        "expert_physical_replication_factor": (
+            expert_physical_replication_factor
+        ),
+        "expert_placement_available": placement_available,
+        "placement_epoch": placement_epoch,
+        "placement_version": placement_epoch,
+        "placement_source": placement_source,
+        "moe_route_histogram_available": route_histogram_available,
+        "moe_route_histogram_source": route_histogram_source,
         "parallel_plan_mismatch": (
             planned_expert_parallel_size != effective_expert_parallel_size
         ),
@@ -179,6 +277,24 @@ def get_vllm_model_resource_profile(
         ),
     }
     profile["expert_parallel_size"] = runtime_expert_parallel_size
+    if placement_available:
+        profile["expert_placement_snapshot"] = expert_placement_snapshot
+    for source_key, target_key in (
+        ("global_expert_hotness", "global_expert_hotness"),
+        ("recent_window_expert_hotness", "recent_window_expert_hotness"),
+        ("routed_tokens_by_expert", "routed_tokens_by_expert"),
+        ("routed_tokens_by_layer", "routed_tokens_by_layer"),
+        (
+            "per_request_routed_tokens_by_expert",
+            "per_request_routed_tokens_by_expert",
+        ),
+        (
+            "per_request_expert_route_histogram",
+            "per_request_expert_route_histogram",
+        ),
+    ):
+        if _has_payload(runtime_metadata.get(source_key)):
+            profile[target_key] = runtime_metadata[source_key]
     return profile
 
 
@@ -202,6 +318,31 @@ def get_vllm_runtime_metadata(
         "model_name": model_name,
         "model_resource_profile": profile,
         "loading_cost": profile["estimated_load_time_s"],
+        "tensor_parallel_size": profile["tensor_parallel_size"],
+        "pipeline_parallel_size": profile["pipeline_parallel_size"],
+        "data_parallel_size": profile["data_parallel_size"],
+        "vllm_data_parallel_size": profile["vllm_data_parallel_size"],
+        "replica_count": profile["replica_count"],
+        "sllm_replica_count": profile["sllm_replica_count"],
+        "expert_parallel_enabled": profile["expert_parallel_enabled"],
+        "effective_expert_parallel_size": (
+            profile["effective_expert_parallel_size"]
+        ),
+        "expert_parallel_size": profile["expert_parallel_size"],
+        "expert_parallel_size_source": (
+            profile["expert_parallel_size_source"]
+        ),
+        "expert_placement_available": (
+            profile["expert_placement_available"]
+        ),
+        "placement_epoch": profile["placement_epoch"],
+        "placement_source": profile["placement_source"],
+        "moe_route_histogram_available": (
+            profile["moe_route_histogram_available"]
+        ),
+        "moe_route_histogram_source": (
+            profile["moe_route_histogram_source"]
+        ),
         "free_gpu": int(runtime_metadata.get("free_gpu", 0) or 0),
         "total_gpu": int(runtime_metadata.get("total_gpu", 0) or 0),
         "free_gpu_memory_gb": _non_negative_float(

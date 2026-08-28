@@ -6,6 +6,11 @@ from .context_migration import (
     plan_low_cost_migration,
     plan_low_cost_migration_from_dict,
 )
+from .moe_placement import (
+    ExpertPlacementPlan,
+    ExpertPlacementState,
+    ExpertShard,
+)
 from .recovery_policy import RecoveryPolicy, normalize_policy
 from .reparallelization import ParallelPlan, plan_dynamic_reparallelization
 from .reparallelization_executor import ReparallelizationExecutor
@@ -33,6 +38,9 @@ from .trace_reader import SpotEvent, load_spot_trace
 
 __all__ = [
     "ContextMetadata",
+    "ExpertPlacementPlan",
+    "ExpertPlacementState",
+    "ExpertShard",
     "InferenceState",
     "MigrationDecision",
     "MigrationPlan",

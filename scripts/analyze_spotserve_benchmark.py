@@ -596,6 +596,36 @@ def summarize_replanning_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         safe_int(row.get("ready_worker_node_count"), 0)
         for row in replanning_rows
     ]
+    selected_sllm_replica_counts = [
+        safe_int(
+            row.get(
+                "selected_sllm_replica_count",
+                row.get("selected_replica_count", 0),
+            ),
+            0,
+        )
+        for row in replanning_rows
+    ]
+    selected_vllm_dp_sizes = [
+        safe_int(
+            row.get(
+                "selected_vllm_data_parallel_size",
+                row.get("selected_data_parallel_size", 0),
+            ),
+            0,
+        )
+        for row in replanning_rows
+    ]
+    selected_effective_ep_sizes = [
+        safe_int(
+            row.get(
+                "selected_runtime_effective_expert_parallel_size",
+                row.get("selected_effective_expert_parallel_size", 0),
+            ),
+            0,
+        )
+        for row in replanning_rows
+    ]
     return {
         "replanning_events": len(replanning_rows),
         "replanning_no_capacity_events": no_capacity_count,
@@ -669,6 +699,36 @@ def summarize_replanning_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         ),
         "replanning_max_ready_worker_node_count": (
             max(ready_worker_node_counts) if ready_worker_node_counts else 0
+        ),
+        "replanning_max_selected_sllm_replica_count": (
+            max(selected_sllm_replica_counts)
+            if selected_sllm_replica_counts
+            else 0
+        ),
+        "replanning_max_selected_vllm_data_parallel_size": (
+            max(selected_vllm_dp_sizes) if selected_vllm_dp_sizes else 0
+        ),
+        "replanning_max_selected_effective_expert_parallel_size": (
+            max(selected_effective_ep_sizes)
+            if selected_effective_ep_sizes
+            else 0
+        ),
+        "replanning_moe_route_histogram_available_events": sum(
+            1
+            for row in replanning_rows
+            if row.get("moe_route_histogram_available")
+        ),
+        "replanning_moe_route_histogram_sources": compact_values(
+            [
+                str(row.get("moe_route_histogram_source", ""))
+                for row in replanning_rows
+            ]
+        ),
+        "replanning_moe_expert_parallel_size_sources": compact_values(
+            [
+                str(row.get("moe_expert_parallel_size_source", ""))
+                for row in replanning_rows
+            ]
         ),
         "replanning_max_synthetic_worker_node_count": max(
             (
@@ -748,6 +808,21 @@ def summarize_context_migration_metrics(
     kv_succeeded = sum(int(row.get("succeeded", 0) or 0) for row in kv_rows)
     kv_tokens = sum(int(row.get("total_tokens", 0) or 0) for row in kv_rows)
     latest_kv = kv_rows[-1] if kv_rows else None
+    moe_dispatch_costs = [
+        safe_float(row.get("moe_estimated_dispatch_cost"), 0.0)
+        for row in migration_rows
+        if row.get("moe_estimated_dispatch_cost") is not None
+    ]
+    moe_locality_ratios = [
+        safe_float(row.get("moe_hot_expert_locality_ratio"), 0.0)
+        for row in migration_rows
+        if row.get("moe_hot_expert_locality_ratio") is not None
+    ]
+    moe_remote_routing_ratios = [
+        safe_float(row.get("moe_estimated_remote_routing_ratio"), 0.0)
+        for row in migration_rows
+        if row.get("moe_estimated_remote_routing_ratio") is not None
+    ]
     return {
         "context_migration_events": len(migration_rows),
         "context_migration_plan_count": total_plan_count,
@@ -760,6 +835,35 @@ def summarize_context_migration_metrics(
         "context_migration_reusable_context_blocks": total_reusable_blocks,
         "context_migration_reuse_ratio": (
             reuse_numerator / reuse_denominator if reuse_denominator else 0.0
+        ),
+        "context_migration_moe_route_histogram_available_count": sum(
+            safe_int(row.get("moe_route_histogram_available_count"), 0)
+            for row in migration_rows
+        ),
+        "context_migration_moe_target_placement_available_count": sum(
+            safe_int(row.get("moe_target_placement_available_count"), 0)
+            for row in migration_rows
+        ),
+        "context_migration_moe_route_histogram_sources": compact_values(
+            [
+                str(row.get("moe_route_histogram_source", ""))
+                for row in migration_rows
+            ]
+        ),
+        "context_migration_moe_avg_hot_expert_locality_ratio": (
+            mean(moe_locality_ratios) if moe_locality_ratios else 0.0
+        ),
+        "context_migration_moe_avg_estimated_remote_routing_ratio": (
+            mean(moe_remote_routing_ratios)
+            if moe_remote_routing_ratios
+            else 0.0
+        ),
+        "context_migration_moe_estimated_remote_routed_tokens": sum(
+            safe_int(row.get("moe_estimated_remote_routed_tokens"), 0)
+            for row in migration_rows
+        ),
+        "context_migration_moe_estimated_dispatch_cost": sum(
+            moe_dispatch_costs
         ),
         "context_migration_latest_plans": (
             json.dumps(latest_plans, sort_keys=True) if latest_plans else ""

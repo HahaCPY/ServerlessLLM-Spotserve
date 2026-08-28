@@ -52,6 +52,19 @@ def test_vllm_inference_state_can_use_runtime_tokens():
             "planned_effective_expert_parallel_size": 2,
             "expert_parallel_size_verified": True,
             "expert_parallel_size_source": "derived_from_tp_dp",
+            "vllm_data_parallel_size": 1,
+            "sllm_replica_count": 2,
+            "expert_placement_available": True,
+            "expert_placement_snapshot": {
+                "layer:0/expert:1": {"rank_id": "rank-0"}
+            },
+            "placement_epoch": 3,
+            "placement_source": "runtime_snapshot",
+            "moe_route_histogram_available": True,
+            "moe_route_histogram_source": "instrumentation",
+            "per_request_expert_route_histogram": {
+                "req-2": {"layer:0/expert:1": 2}
+            },
         },
     )
 
@@ -68,6 +81,16 @@ def test_vllm_inference_state_can_use_runtime_tokens():
     assert state["metadata"]["planned_effective_expert_parallel_size"] == 2
     assert state["metadata"]["expert_parallel_size_verified"] is True
     assert state["metadata"]["expert_parallel_size_source"] == "derived_from_tp_dp"
+    assert state["metadata"]["vllm_data_parallel_size"] == 1
+    assert state["metadata"]["sllm_replica_count"] == 2
+    assert state["metadata"]["expert_placement_available"] is True
+    assert state["metadata"]["placement_epoch"] == 3
+    assert state["metadata"]["placement_source"] == "runtime_snapshot"
+    assert state["metadata"]["moe_route_histogram_available"] is True
+    assert state["metadata"]["moe_route_histogram_source"] == "instrumentation"
+    assert state["metadata"]["per_request_expert_route_histogram"] == {
+        "req-2": {"layer:0/expert:1": 2}
+    }
 
 
 def test_vllm_inference_state_preserves_kv_transfer_metadata():

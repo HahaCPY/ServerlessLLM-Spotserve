@@ -160,6 +160,16 @@ def _state_value(state: InferenceState, key: str) -> Any:
     return (state.metadata or {}).get(key)
 
 
+def _boolish(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
 def _parallel_and_cache_compatible(
     state: InferenceState,
     candidate: Mapping[str, Any],
@@ -186,8 +196,6 @@ def _parallel_and_cache_compatible(
         "model_revision",
         "tensor_parallel_size",
         "pipeline_parallel_size",
-        "effective_expert_parallel_size",
-        "expert_parallel_enabled",
         "cache_block_size",
         "cache_dtype",
         "cache_layout",
@@ -202,6 +210,21 @@ def _parallel_and_cache_compatible(
             continue
         if str(source_value) != str(target_value):
             return False, f"{key}_mismatch"
+    ep_required = _boolish(
+        _state_value(state, "state_restore_requires_ep_layout")
+    ) or _boolish(_candidate_value(candidate, "state_restore_requires_ep_layout"))
+    if ep_required:
+        for key in (
+            "effective_expert_parallel_size",
+            "expert_parallel_enabled",
+            "expert_placement_fingerprint",
+        ):
+            source_value = _state_value(state, key)
+            target_value = _candidate_value(candidate, key)
+            if source_value is None or target_value is None:
+                continue
+            if str(source_value) != str(target_value):
+                return False, f"{key}_mismatch"
     return True, "compatible_parallel_and_cache_shape"
 
 

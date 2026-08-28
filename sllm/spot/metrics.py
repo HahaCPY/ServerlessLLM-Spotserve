@@ -102,8 +102,16 @@ def make_replanning_event(
         "selected_data_parallel_size": decision.get(
             "selected_data_parallel_size", 0
         ),
+        "selected_vllm_data_parallel_size": decision.get(
+            "selected_vllm_data_parallel_size",
+            decision.get("selected_data_parallel_size", 0),
+        ),
         "selected_replica_count": decision.get(
             "selected_replica_count", 0
+        ),
+        "selected_sllm_replica_count": decision.get(
+            "selected_sllm_replica_count",
+            decision.get("selected_replica_count", 0),
         ),
         "selected_enable_expert_parallel": decision.get(
             "selected_enable_expert_parallel", False
@@ -111,8 +119,39 @@ def make_replanning_event(
         "selected_effective_expert_parallel_size": decision.get(
             "selected_effective_expert_parallel_size", 0
         ),
+        "selected_runtime_effective_expert_parallel_size": decision.get(
+            "selected_runtime_effective_expert_parallel_size",
+            decision.get("selected_effective_expert_parallel_size", 0),
+        ),
+        "selected_derived_effective_expert_parallel_size": decision.get(
+            "selected_derived_effective_expert_parallel_size",
+            decision.get("selected_effective_expert_parallel_size", 0),
+        ),
         "selected_expert_parallel_size": decision.get(
             "selected_expert_parallel_size", 0
+        ),
+        "selected_expert_parallel_size_source": decision.get(
+            "selected_expert_parallel_size_source", "unavailable"
+        ),
+        "moe_selected_sllm_replica_count": decision.get(
+            "selected_sllm_replica_count",
+            decision.get("selected_replica_count", 0),
+        ),
+        "moe_selected_vllm_data_parallel_size": decision.get(
+            "selected_vllm_data_parallel_size",
+            decision.get("selected_data_parallel_size", 0),
+        ),
+        "moe_selected_effective_expert_parallel_size": decision.get(
+            "selected_effective_expert_parallel_size", 0
+        ),
+        "moe_expert_parallel_size_source": decision.get(
+            "selected_expert_parallel_size_source", "unavailable"
+        ),
+        "moe_route_histogram_available": decision.get(
+            "moe_route_histogram_available", False
+        ),
+        "moe_route_histogram_source": decision.get(
+            "moe_route_histogram_source", "unavailable"
         ),
         "selected_score": decision.get(
             "selected_score", selected_config.get("score", 0.0)
@@ -198,6 +237,13 @@ def make_context_migration_event(
     true_kv_block_transfer = bool(
         kv_restore_successes > 0 and kv_restore_restored_blocks > 0
     )
+    total_expert_dispatch_cost = float(
+        decision.get("total_expert_dispatch_cost", 0.0) or 0.0
+    )
+    total_remote_routed_tokens = int(
+        decision.get("total_estimated_remote_routed_tokens", 0)
+        or 0
+    )
     return {
         "type": "context_migration",
         "model": model,
@@ -216,6 +262,23 @@ def make_context_migration_event(
         ),
         "total_context_blocks": decision.get("total_context_blocks", 0),
         "reuse_ratio": decision.get("reuse_ratio", 0.0),
+        "moe_route_histogram_available_count": decision.get(
+            "moe_route_histogram_available_count", 0
+        ),
+        "moe_target_placement_available_count": decision.get(
+            "moe_target_placement_available_count", 0
+        ),
+        "moe_route_histogram_source": decision.get(
+            "moe_route_histogram_source", "unavailable"
+        ),
+        "moe_hot_expert_locality_ratio": decision.get(
+            "avg_hot_expert_locality_ratio", 0.0
+        ),
+        "moe_estimated_remote_routing_ratio": decision.get(
+            "avg_estimated_remote_routing_ratio", 0.0
+        ),
+        "moe_estimated_remote_routed_tokens": total_remote_routed_tokens,
+        "moe_estimated_dispatch_cost": total_expert_dispatch_cost,
         "plans": plans,
         "prefix_warmup": prefix_warmup or None,
         "prefix_warmup_attempts": prefix_warmup_attempts,

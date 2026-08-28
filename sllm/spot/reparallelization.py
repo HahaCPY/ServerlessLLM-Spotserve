@@ -171,13 +171,26 @@ class ParallelPlan:
             "backend": self.backend,
             "tensor_parallel_size": self.tensor_parallel_size,
             "data_parallel_size": self.data_parallel_size,
+            "vllm_data_parallel_size": self.data_parallel_size,
             "pipeline_parallel_size": self.pipeline_parallel_size,
             "replica_count": self.replica_count,
+            "sllm_replica_count": self.replica_count,
             "enable_expert_parallel": self.enable_expert_parallel,
             "effective_expert_parallel_size": (
                 self.effective_expert_parallel_size
             ),
+            "runtime_effective_expert_parallel_size": (
+                self.effective_expert_parallel_size
+            ),
+            "derived_effective_expert_parallel_size": (
+                self.effective_expert_parallel_size
+            ),
             "expert_parallel_size": self.effective_expert_parallel_size,
+            "expert_parallel_size_source": (
+                "derived_from_tp_dp"
+                if self.enable_expert_parallel
+                else "disabled"
+            ),
             "num_replicas": self.num_replicas,
             "num_gpus": self.num_gpus,
             "target_nodes": list(self.target_nodes),
@@ -228,12 +241,25 @@ class ParallelConfig:
             "tensor_parallel_size": self.tensor_parallel_size,
             "pipeline_parallel_size": self.pipeline_parallel_size,
             "data_parallel_size": self.data_parallel_size,
+            "vllm_data_parallel_size": self.data_parallel_size,
             "replica_count": self.replica_count,
+            "sllm_replica_count": self.replica_count,
             "enable_expert_parallel": self.enable_expert_parallel,
             "effective_expert_parallel_size": (
                 self.effective_expert_parallel_size
             ),
+            "runtime_effective_expert_parallel_size": (
+                self.effective_expert_parallel_size
+            ),
+            "derived_effective_expert_parallel_size": (
+                self.effective_expert_parallel_size
+            ),
             "expert_parallel_size": self.effective_expert_parallel_size,
+            "expert_parallel_size_source": (
+                "derived_from_tp_dp"
+                if self.enable_expert_parallel
+                else "disabled"
+            ),
             "total_gpus": self.total_gpus,
             "unused_gpus": self.unused_gpus,
             "score": self.score,
@@ -1054,12 +1080,25 @@ def plan_dynamic_reparallelization(
                     selected.pipeline_parallel_size
                 ),
                 "selected_data_parallel_size": selected.data_parallel_size,
+                "selected_vllm_data_parallel_size": selected.data_parallel_size,
                 "selected_replica_count": selected.replica_count,
+                "selected_sllm_replica_count": selected.replica_count,
                 "selected_effective_expert_parallel_size": (
+                    selected.effective_expert_parallel_size
+                ),
+                "selected_runtime_effective_expert_parallel_size": (
+                    selected.effective_expert_parallel_size
+                ),
+                "selected_derived_effective_expert_parallel_size": (
                     selected.effective_expert_parallel_size
                 ),
                 "selected_expert_parallel_size": (
                     selected.effective_expert_parallel_size
+                ),
+                "selected_expert_parallel_size_source": (
+                    "derived_from_tp_dp"
+                    if selected.enable_expert_parallel
+                    else "disabled"
                 ),
                 "selected_enable_expert_parallel": (
                     selected.enable_expert_parallel
@@ -1102,9 +1141,14 @@ def plan_dynamic_reparallelization(
                 "selected_tensor_parallel_size": 0,
                 "selected_pipeline_parallel_size": 0,
                 "selected_data_parallel_size": 0,
+                "selected_vllm_data_parallel_size": 0,
                 "selected_replica_count": 0,
+                "selected_sllm_replica_count": 0,
                 "selected_effective_expert_parallel_size": 0,
+                "selected_runtime_effective_expert_parallel_size": 0,
+                "selected_derived_effective_expert_parallel_size": 0,
                 "selected_expert_parallel_size": 0,
+                "selected_expert_parallel_size_source": "unavailable",
                 "selected_enable_expert_parallel": False,
                 "selected_score": 0.0,
                 "selected_base_score": 0.0,

@@ -111,6 +111,92 @@ def test_planner_selects_only_compatible_ready_target():
     assert decision["target_instance_id"] == "tp1-target"
 
 
+def test_planner_does_not_reject_ep_mismatch_without_hard_dependency():
+    state = InferenceState.from_tokens(
+        tokens=[1, 2, 3],
+        request_id="req-ep-locality",
+        instance_id="source",
+        node_id="node-0",
+        backend="vllm",
+        model_name="model",
+        state_kind="vllm_kv_snapshot",
+        supports_restore=True,
+        metadata={
+            "tensor_parallel_size": 1,
+            "pipeline_parallel_size": 1,
+            "effective_expert_parallel_size": 1,
+            "expert_parallel_enabled": False,
+            "cache_block_size": 16,
+            "can_restore_same_node": True,
+        },
+    )
+
+    decision = plan_compatible_state_target(
+        state,
+        [{
+            "instance_id": "ep-target",
+            "node_id": "node-0",
+            "ready": True,
+            "supports_state_restore": True,
+            "backend": "vllm",
+            "model_name": "model",
+            "tensor_parallel_size": 1,
+            "pipeline_parallel_size": 1,
+            "effective_expert_parallel_size": 2,
+            "expert_parallel_enabled": True,
+            "cache_block_size": 16,
+        }],
+        source_instance_id="source",
+    )
+
+    assert decision["action"] == "restore_state"
+    assert decision["target_instance_id"] == "ep-target"
+
+
+def test_planner_rejects_ep_mismatch_when_state_requires_ep_layout():
+    state = InferenceState.from_tokens(
+        tokens=[1, 2, 3],
+        request_id="req-ep-hard",
+        instance_id="source",
+        node_id="node-0",
+        backend="vllm",
+        model_name="model",
+        state_kind="vllm_kv_snapshot",
+        supports_restore=True,
+        metadata={
+            "tensor_parallel_size": 1,
+            "pipeline_parallel_size": 1,
+            "effective_expert_parallel_size": 1,
+            "expert_parallel_enabled": False,
+            "state_restore_requires_ep_layout": True,
+            "can_restore_same_node": True,
+        },
+    )
+
+    decision = plan_compatible_state_target(
+        state,
+        [{
+            "instance_id": "ep-target",
+            "node_id": "node-0",
+            "ready": True,
+            "supports_state_restore": True,
+            "backend": "vllm",
+            "model_name": "model",
+            "tensor_parallel_size": 1,
+            "pipeline_parallel_size": 1,
+            "effective_expert_parallel_size": 2,
+            "expert_parallel_enabled": True,
+        }],
+        source_instance_id="source",
+    )
+
+    assert decision["action"] == "fallback_token_replay"
+    assert decision["candidates"] == [{
+        "instance_id": "ep-target",
+        "reason": "effective_expert_parallel_size_mismatch",
+    }]
+
+
 def test_planner_rejects_cross_node_without_capability():
     state = InferenceState.from_tokens(
         tokens=[1],

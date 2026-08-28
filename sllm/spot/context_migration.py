@@ -77,6 +77,7 @@ class MigrationTarget:
     node_id: str
     capacity: int = 1
     warmup_cost: float = 0.0
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "MigrationTarget":
@@ -85,6 +86,7 @@ class MigrationTarget:
             node_id=str(payload["node_id"]),
             capacity=max(0, int(payload.get("capacity", 1) or 0)),
             warmup_cost=float(payload.get("warmup_cost", 0.0) or 0.0),
+            metadata=dict(payload.get("metadata", {}) or {}),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -93,6 +95,7 @@ class MigrationTarget:
             "node_id": self.node_id,
             "capacity": self.capacity,
             "warmup_cost": self.warmup_cost,
+            "metadata": dict(self.metadata),
         }
 
 @dataclass(frozen=True)
@@ -106,6 +109,11 @@ class MigrationPlan:
     reusable_tokens: int = 0
     reusable_context_blocks: int = 0
     reason: str = "low_cost_mapping"
+    expert_locality_available: bool = False
+    hot_expert_locality_ratio: float = 0.0
+    estimated_remote_routing_ratio: float = 0.0
+    estimated_remote_routed_tokens: int = 0
+    expert_dispatch_cost: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -118,6 +126,15 @@ class MigrationPlan:
             "reusable_tokens": self.reusable_tokens,
             "reusable_context_blocks": self.reusable_context_blocks,
             "reason": self.reason,
+            "expert_locality_available": self.expert_locality_available,
+            "hot_expert_locality_ratio": self.hot_expert_locality_ratio,
+            "estimated_remote_routing_ratio": (
+                self.estimated_remote_routing_ratio
+            ),
+            "estimated_remote_routed_tokens": (
+                self.estimated_remote_routed_tokens
+            ),
+            "expert_dispatch_cost": self.expert_dispatch_cost,
         }
 
 @dataclass(frozen=True)
@@ -132,6 +149,13 @@ class MigrationDecision:
     total_context_blocks: int
     reuse_ratio: float
     cost_matrix: List[List[float]]
+    moe_route_histogram_available_count: int = 0
+    moe_target_placement_available_count: int = 0
+    total_estimated_remote_routed_tokens: int = 0
+    total_expert_dispatch_cost: float = 0.0
+    avg_hot_expert_locality_ratio: float = 0.0
+    avg_estimated_remote_routing_ratio: float = 0.0
+    moe_route_histogram_source: str = "unavailable"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -147,6 +171,23 @@ class MigrationDecision:
             "total_context_blocks": self.total_context_blocks,
             "reuse_ratio": self.reuse_ratio,
             "cost_matrix": [list(row) for row in self.cost_matrix],
+            "moe_route_histogram_available_count": (
+                self.moe_route_histogram_available_count
+            ),
+            "moe_target_placement_available_count": (
+                self.moe_target_placement_available_count
+            ),
+            "total_estimated_remote_routed_tokens": (
+                self.total_estimated_remote_routed_tokens
+            ),
+            "total_expert_dispatch_cost": self.total_expert_dispatch_cost,
+            "avg_hot_expert_locality_ratio": (
+                self.avg_hot_expert_locality_ratio
+            ),
+            "avg_estimated_remote_routing_ratio": (
+                self.avg_estimated_remote_routing_ratio
+            ),
+            "moe_route_histogram_source": self.moe_route_histogram_source,
         }
 
 
@@ -159,6 +200,211 @@ def _positive_float(
     if value is None:
         value = default
     return max(0.0, float(value))
+
+
+def _to_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _as_non_negative_int(value: Any) -> Optional[int]:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return max(parsed, 0)
+
+
+def _expert_key_from_parts(parts: Sequence[Any]) -> str:
+    cleaned = [str(part) for part in parts if str(part) not in {"", "None"}]
+    if not cleaned:
+        return ""
+    if len(cleaned) >= 2 and all(part.isdigit() for part in cleaned[-2:]):
+        return f"layer:{cleaned[-2]}/expert:{cleaned[-1]}"
+    if len(cleaned) == 1:
+        return cleaned[0]
+    return "/".join(cleaned)
+
+
+def _flatten_expert_histogram(
+    value: Any,
+    request_id: Optional[str] = None,
+) -> Dict[str, int]:
+    if not isinstance(value, Mapping):
+        return {}
+    if request_id and isinstance(value.get(request_id), Mapping):
+        value = value[request_id]
+
+    histogram: Dict[str, int] = {}
+
+    def visit(node: Any, parts: Tuple[Any, ...]) -> None:
+        parsed = _as_non_negative_int(node)
+        if parsed is not None:
+            key = _expert_key_from_parts(parts)
+            if key and parsed > 0:
+                histogram[key] = histogram.get(key, 0) + parsed
+            return
+        if isinstance(node, Mapping):
+            if "layer_id" in node and "expert_id" in node:
+                routed_tokens = _as_non_negative_int(
+                    node.get("routed_tokens", node.get("tokens", 0))
+                )
+                if routed_tokens:
+                    key = _expert_key_from_parts(
+                        (node["layer_id"], node["expert_id"])
+                    )
+                    histogram[key] = histogram.get(key, 0) + routed_tokens
+                return
+            for key, child in node.items():
+                visit(child, parts + (key,))
+            return
+        if isinstance(node, (list, tuple)):
+            for index, child in enumerate(node):
+                visit(child, parts + (index,))
+
+    visit(value, ())
+    return histogram
+
+
+def _normalize_expert_key(value: Any) -> str:
+    text = str(value)
+    if "layer:" in text and "expert:" in text:
+        return text
+    parts = [part for part in text.replace("/", ":").split(":") if part]
+    if len(parts) >= 2 and all(part.isdigit() for part in parts[-2:]):
+        return _expert_key_from_parts(parts[-2:])
+    return text
+
+
+def _placement_expert_keys(value: Any) -> set[str]:
+    keys: set[str] = set()
+
+    def visit(node: Any, parent_key: Optional[str] = None) -> None:
+        if isinstance(node, Mapping):
+            if "layer_id" in node and "expert_id" in node:
+                keys.add(_expert_key_from_parts((node["layer_id"], node["expert_id"])))
+            elif parent_key is not None:
+                keys.add(_normalize_expert_key(parent_key))
+            for key, child in node.items():
+                if "expert" in str(key) or "layer" in str(key):
+                    keys.add(_normalize_expert_key(key))
+                if isinstance(child, (Mapping, list, tuple)):
+                    visit(child, str(key))
+        elif isinstance(node, (list, tuple)):
+            for child in node:
+                visit(child)
+
+    visit(value)
+    return {key for key in keys if key}
+
+
+def _metadata_value(
+    item: ContextMetadata | MigrationTarget,
+    *keys: str,
+) -> Any:
+    metadata = dict(item.metadata or {})
+    for key in keys:
+        if key in metadata:
+            return metadata[key]
+    return None
+
+
+def source_expert_route_histogram(
+    source: ContextMetadata,
+) -> Dict[str, int]:
+    raw = _metadata_value(
+        source,
+        "per_request_expert_route_histogram",
+        "per_request_routed_tokens_by_expert",
+        "expert_route_histogram",
+        "routed_tokens_by_expert",
+    )
+    return _flatten_expert_histogram(raw, request_id=source.request_id)
+
+
+def target_expert_placement_keys(target: MigrationTarget) -> set[str]:
+    raw = _metadata_value(
+        target,
+        "expert_placement_snapshot",
+        "expert_placement",
+    )
+    return _placement_expert_keys(raw)
+
+
+def estimate_expert_dispatch_cost(
+    source: ContextMetadata,
+    target: MigrationTarget,
+    planner_config: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    planner_config = planner_config or {}
+    enabled = _to_bool(
+        planner_config.get("enable_moe_expert_locality"),
+        default=("expert_dispatch_weight" in planner_config),
+    )
+    histogram = source_expert_route_histogram(source)
+    placement_keys = target_expert_placement_keys(target)
+    histogram_available = bool(histogram)
+    placement_available = bool(placement_keys)
+    source_declares_histogram = _to_bool(
+        _metadata_value(source, "moe_route_histogram_available"),
+        default=histogram_available,
+    )
+    target_declares_placement = _to_bool(
+        _metadata_value(target, "expert_placement_available"),
+        default=placement_available,
+    )
+    if (
+        not enabled
+        or not histogram_available
+        or not placement_available
+        or not source_declares_histogram
+        or not target_declares_placement
+    ):
+        return {
+            "available": False,
+            "histogram_available": histogram_available,
+            "placement_available": placement_available,
+            "locality_ratio": 0.0,
+            "estimated_remote_routing_ratio": 0.0,
+            "estimated_remote_routed_tokens": 0,
+            "cost": 0.0,
+            "route_histogram_source": str(
+                _metadata_value(source, "moe_route_histogram_source")
+                or "unavailable"
+            ),
+        }
+
+    total_tokens = sum(histogram.values())
+    local_tokens = sum(
+        tokens
+        for expert_key, tokens in histogram.items()
+        if _normalize_expert_key(expert_key) in placement_keys
+    )
+    locality_ratio = local_tokens / total_tokens if total_tokens else 0.0
+    remote_tokens = max(total_tokens - local_tokens, 0)
+    remote_ratio = 1.0 - locality_ratio if total_tokens else 0.0
+    weight = _positive_float(planner_config, "expert_dispatch_weight", 1.0)
+    cost = remote_ratio * weight
+    return {
+        "available": True,
+        "histogram_available": True,
+        "placement_available": True,
+        "locality_ratio": float(locality_ratio),
+        "estimated_remote_routing_ratio": float(remote_ratio),
+        "estimated_remote_routed_tokens": int(remote_tokens),
+        "cost": float(cost),
+        "route_histogram_source": str(
+            _metadata_value(source, "moe_route_histogram_source")
+            or "runtime_or_instrumentation"
+        ),
+    }
 
 
 def _reuse_value(
@@ -250,6 +496,10 @@ def estimate_migration_cost(
         + token_cost * token_transfer_cost
         + block_cost * context_block_transfer_cost
     )
+    expert_dispatch = estimate_expert_dispatch_cost(
+        source, target, planner_config
+    )
+    estimated_cost += float(expert_dispatch.get("cost", 0.0) or 0.0)
     if include_warmup:
         estimated_cost += target.warmup_cost
     if source.node_id != target.node_id:
@@ -379,6 +629,9 @@ def plan_low_cost_migration(
             )
         )
         opened_targets.add(assigned_slot)
+        expert_dispatch = estimate_expert_dispatch_cost(
+            source, target, planner_config
+        )
         plans.append(
             MigrationPlan(
                 request_id=source.request_id,
@@ -389,6 +642,32 @@ def plan_low_cost_migration(
                 estimated_cost=estimated_cost,
                 reusable_tokens=reusable_tokens,
                 reusable_context_blocks=reusable_blocks,
+                reason=(
+                    "kv_and_expert_locality"
+                    if expert_dispatch.get("available")
+                    else "low_cost_mapping"
+                ),
+                expert_locality_available=bool(
+                    expert_dispatch.get("available", False)
+                ),
+                hot_expert_locality_ratio=float(
+                    expert_dispatch.get("locality_ratio", 0.0) or 0.0
+                ),
+                estimated_remote_routing_ratio=float(
+                    expert_dispatch.get(
+                        "estimated_remote_routing_ratio", 0.0
+                    )
+                    or 0.0
+                ),
+                estimated_remote_routed_tokens=int(
+                    expert_dispatch.get(
+                        "estimated_remote_routed_tokens", 0
+                    )
+                    or 0
+                ),
+                expert_dispatch_cost=float(
+                    expert_dispatch.get("cost", 0.0) or 0.0
+                ),
             )
         )
 
@@ -399,6 +678,35 @@ def plan_low_cost_migration(
         plan.reusable_context_blocks for plan in plans
     )
     total_estimated_cost = sum(plan.estimated_cost for plan in plans)
+    total_expert_dispatch_cost = sum(
+        plan.expert_dispatch_cost for plan in plans
+    )
+    total_estimated_remote_routed_tokens = sum(
+        plan.estimated_remote_routed_tokens for plan in plans
+    )
+    locality_ratios = [
+        plan.hot_expert_locality_ratio
+        for plan in plans
+        if plan.expert_locality_available
+    ]
+    remote_ratios = [
+        plan.estimated_remote_routing_ratio
+        for plan in plans
+        if plan.expert_locality_available
+    ]
+    route_histogram_available_count = sum(
+        1 for source in sources if source_expert_route_histogram(source)
+    )
+    target_placement_available_count = sum(
+        1 for target in targets if target_expert_placement_keys(target)
+    )
+    route_sources = sorted(
+        {
+            str(_metadata_value(source, "moe_route_histogram_source") or "")
+            for source in sources
+            if source_expert_route_histogram(source)
+        }
+    )
     reuse_denominator = total_context_blocks or total_context_tokens
     reuse_numerator = (
         total_reusable_blocks if total_context_blocks else total_reusable_tokens
@@ -425,6 +733,26 @@ def plan_low_cost_migration(
         total_context_blocks=total_context_blocks,
         reuse_ratio=float(reuse_ratio),
         cost_matrix=cost_matrix,
+        moe_route_histogram_available_count=route_histogram_available_count,
+        moe_target_placement_available_count=target_placement_available_count,
+        total_estimated_remote_routed_tokens=(
+            total_estimated_remote_routed_tokens
+        ),
+        total_expert_dispatch_cost=float(total_expert_dispatch_cost),
+        avg_hot_expert_locality_ratio=(
+            sum(locality_ratios) / len(locality_ratios)
+            if locality_ratios
+            else 0.0
+        ),
+        avg_estimated_remote_routing_ratio=(
+            sum(remote_ratios) / len(remote_ratios)
+            if remote_ratios
+            else 0.0
+        ),
+        moe_route_histogram_source=(
+            ",".join(source for source in route_sources if source)
+            or "unavailable"
+        ),
     )
 
 

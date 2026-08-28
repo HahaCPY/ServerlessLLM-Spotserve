@@ -34,6 +34,8 @@ def test_vllm_model_resource_profile_reports_parallel_shape():
     assert profile["tensor_parallel_size"] == 2
     assert profile["pipeline_parallel_size"] == 2
     assert profile["data_parallel_size"] == 1
+    assert profile["vllm_data_parallel_size"] == 1
+    assert profile["sllm_replica_count"] == 1
     assert profile["expert_parallel_enabled"] is True
     assert profile["planned_effective_expert_parallel_size"] == 2
     assert profile["planned_expert_parallel_size"] == 2
@@ -41,6 +43,10 @@ def test_vllm_model_resource_profile_reports_parallel_shape():
     assert profile["expert_parallel_size"] == 2
     assert profile["expert_parallel_size_verified"] is True
     assert profile["expert_parallel_size_source"] == "engine_args"
+    assert profile["expert_placement_available"] is False
+    assert profile["placement_source"] == "unavailable"
+    assert profile["moe_route_histogram_available"] is False
+    assert profile["moe_route_histogram_source"] == "unavailable"
     assert profile["parallel_plan_mismatch"] is False
     assert profile["estimated_load_time_s"] == 12.5
     assert profile["gpu_memory_required_gb"] == 28.0
@@ -83,6 +89,45 @@ def test_vllm_model_resource_profile_reports_parallel_plan_mismatch():
     assert profile["parallel_plan_mismatch"] is True
 
 
+def test_vllm_model_resource_profile_prefers_runtime_effective_ep():
+    profile = get_vllm_model_resource_profile(
+        model_name="vllm-moe",
+        backend_config={
+            "tensor_parallel_size": 2,
+            "data_parallel_size": 1,
+            "enable_expert_parallel": True,
+            "planned_effective_expert_parallel_size": 4,
+            "replica_count": 3,
+        },
+        runtime_metadata={
+            "effective_expert_parallel_size": 4,
+            "expert_placement_snapshot": {
+                "layer:0/expert:1": {"rank_id": "rank-0"}
+            },
+            "placement_epoch": 7,
+            "placement_source": "runtime_snapshot",
+            "per_request_expert_route_histogram": {
+                "req-1": {"layer:0/expert:1": 4}
+            },
+            "moe_route_histogram_source": "instrumentation",
+        },
+    )
+
+    assert profile["effective_expert_parallel_size"] == 4
+    assert profile["runtime_effective_expert_parallel_size"] == 4
+    assert profile["derived_effective_expert_parallel_size"] == 2
+    assert profile["expert_parallel_size"] == 4
+    assert profile["expert_parallel_size_source"] == "runtime_metadata"
+    assert profile["parallel_plan_mismatch"] is False
+    assert profile["sllm_replica_count"] == 3
+    assert profile["vllm_data_parallel_size"] == 1
+    assert profile["expert_placement_available"] is True
+    assert profile["placement_epoch"] == 7
+    assert profile["placement_source"] == "runtime_snapshot"
+    assert profile["moe_route_histogram_available"] is True
+    assert profile["moe_route_histogram_source"] == "instrumentation"
+
+
 def test_vllm_runtime_metadata_can_feed_risk_score():
     metadata = get_vllm_runtime_metadata(
         model_name="vllm-moe",
@@ -100,6 +145,10 @@ def test_vllm_runtime_metadata_can_feed_risk_score():
 
     assert metadata["loading_cost"] == 8.0
     assert metadata["model_resource_profile"]["num_gpus"] == 4
+    assert metadata["vllm_data_parallel_size"] == 1
+    assert metadata["sllm_replica_count"] == 1
+    assert metadata["expert_placement_available"] is False
+    assert metadata["moe_route_histogram_available"] is False
 
     score = node_risk_score(
         node_id=metadata["node_id"],

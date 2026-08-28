@@ -1274,6 +1274,54 @@ class RoundRobinRouter(SllmRouter):
             ),
         )
 
+    async def _context_migration_target_metadata(
+        self,
+        instance: InstanceHandle,
+    ) -> Dict[str, Any]:
+        if instance.backend_instance is None:
+            return {}
+        try:
+            runtime_metadata = await self._call_backend_method(
+                instance.backend_instance,
+                "get_runtime_metadata",
+                instance_id=instance.instance_id,
+                node_id=str(instance.node_id or ""),
+            )
+        except Exception:
+            logger.info(
+                "Could not query target MoE metadata from %s",
+                instance.instance_id,
+                exc_info=True,
+            )
+            return {}
+        if not isinstance(runtime_metadata, dict):
+            return {}
+        profile = runtime_metadata.get("model_resource_profile")
+        metadata: Dict[str, Any] = {}
+        if isinstance(profile, dict):
+            metadata.update(profile)
+        metadata.update(runtime_metadata)
+        return {
+            key: value
+            for key, value in metadata.items()
+            if key
+            in {
+                "expert_placement_available",
+                "expert_placement_snapshot",
+                "placement_epoch",
+                "placement_version",
+                "placement_source",
+                "moe_route_histogram_available",
+                "moe_route_histogram_source",
+                "effective_expert_parallel_size",
+                "runtime_effective_expert_parallel_size",
+                "expert_parallel_size_source",
+                "expert_physical_replication_factor",
+                "vllm_data_parallel_size",
+                "sllm_replica_count",
+            }
+        }
+
     def _context_migration_planner_config(self) -> Dict[str, Any]:
         configured = self.context_migration_config.get(
             "planner_config", self.context_migration_config
@@ -1310,6 +1358,9 @@ class RoundRobinRouter(SllmRouter):
                     node_id=str(instance.node_id or ""),
                     capacity=capacity,
                     warmup_cost=self._context_migration_target_warmup_cost(
+                        instance
+                    ),
+                    metadata=await self._context_migration_target_metadata(
                         instance
                     ),
                 )

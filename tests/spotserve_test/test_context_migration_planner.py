@@ -1,6 +1,7 @@
 from sllm.spot.context_migration import (
     ContextMetadata,
     MigrationTarget,
+    estimate_expert_dispatch_cost,
     estimate_migration_cost,
     plan_low_cost_migration,
     plan_low_cost_migration_from_dict,
@@ -137,6 +138,120 @@ def test_warmup_cost_is_charged_once_per_target():
     assert sum(plan.estimated_cost for plan in decision.plans) == 100.0
 
 
+def test_expert_locality_cost_prefers_target_with_hot_experts():
+    source = ContextMetadata(
+        request_id="req-hot",
+        instance_id="old-a",
+        node_id="node-0",
+        num_tokens=10,
+        metadata={
+            "moe_route_histogram_available": True,
+            "moe_route_histogram_source": "instrumentation",
+            "per_request_expert_route_histogram": {
+                "req-hot": {"layer:0/expert:1": 10}
+            },
+        },
+    )
+    remote_expert_target = MigrationTarget(
+        instance_id="remote-expert",
+        node_id="node-1",
+        metadata={
+            "expert_placement_available": True,
+            "expert_placement_snapshot": {
+                "layer:0/expert:2": {"rank_id": "rank-0"}
+            },
+        },
+    )
+    local_expert_target = MigrationTarget(
+        instance_id="local-expert",
+        node_id="node-2",
+        metadata={
+            "expert_placement_available": True,
+            "expert_placement_snapshot": {
+                "layer:0/expert:1": {"rank_id": "rank-1"}
+            },
+        },
+    )
+
+    decision = plan_low_cost_migration(
+        sources=[source],
+        targets=[remote_expert_target, local_expert_target],
+        planner_config={
+            "enable_moe_expert_locality": True,
+            "expert_dispatch_weight": 1.0,
+            "token_transfer_cost": 0.0,
+            "context_block_transfer_cost": 0.0,
+            "cross_node_penalty": 0.0,
+        },
+    )
+
+    assert decision.plans[0].new_instance_id == "local-expert"
+    assert decision.plans[0].expert_locality_available is True
+    assert decision.plans[0].hot_expert_locality_ratio == 1.0
+    assert decision.plans[0].estimated_remote_routing_ratio == 0.0
+    assert decision.plans[0].estimated_remote_routed_tokens == 0
+    assert decision.total_expert_dispatch_cost == 0.0
+    assert decision.avg_hot_expert_locality_ratio == 1.0
+    assert decision.avg_estimated_remote_routing_ratio == 0.0
+    assert decision.total_estimated_remote_routed_tokens == 0
+    assert decision.moe_route_histogram_available_count == 1
+    assert decision.moe_target_placement_available_count == 2
+
+
+def test_expert_dispatch_cost_reports_unavailable_without_metadata():
+    result = estimate_expert_dispatch_cost(
+        ContextMetadata(
+            request_id="req-no-moe",
+            instance_id="old-a",
+            node_id="node-0",
+        ),
+        MigrationTarget(instance_id="new-a", node_id="node-1"),
+        planner_config={"enable_moe_expert_locality": True},
+    )
+
+    assert result["available"] is False
+    assert result["cost"] == 0.0
+
+
+def test_expert_dispatch_cost_uses_routing_weighted_locality():
+    result = estimate_expert_dispatch_cost(
+        ContextMetadata(
+            request_id="req-weighted",
+            instance_id="old-a",
+            node_id="node-0",
+            metadata={
+                "moe_route_histogram_available": True,
+                "per_request_expert_route_histogram": {
+                    "req-weighted": {
+                        "layer:0/expert:1": 6,
+                        "layer:0/expert:2": 4,
+                    }
+                },
+            },
+        ),
+        MigrationTarget(
+            instance_id="new-a",
+            node_id="node-1",
+            metadata={
+                "expert_placement_available": True,
+                "expert_placement_snapshot": {
+                    "layer:0/expert:1": {"rank_id": "rank-0"}
+                },
+            },
+        ),
+        planner_config={
+            "enable_moe_expert_locality": True,
+            "expert_dispatch_weight": 2.0,
+        },
+    )
+
+    assert result["available"] is True
+    assert result["locality_ratio"] == 0.6
+    assert result["estimated_remote_routing_ratio"] == 0.4
+    assert result["estimated_remote_routed_tokens"] == 4
+    assert result["cost"] == 0.8
+
+
 def test_unassigned_contexts_when_target_capacity_is_insufficient():
     payload = {
         "sources": [
@@ -192,6 +307,10 @@ def test_context_migration_metric_contains_summary_fields():
     assert event["context_migration_plan_count"] == 1
     assert event["migration_plan_count"] == 1
     assert event["reuse_ratio"] == 1.0
+    assert event["moe_hot_expert_locality_ratio"] == 0.0
+    assert event["moe_estimated_remote_routing_ratio"] == 0.0
+    assert event["moe_estimated_remote_routed_tokens"] == 0
+    assert event["moe_estimated_dispatch_cost"] == 0.0
     assert event["prefix_warmup_attempts"] == 0
     assert event["kv_restore_attempts"] == 0
     assert event["true_kv_block_transfer"] is False

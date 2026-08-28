@@ -27,36 +27,11 @@ preemption-aware flow 裡。
 
 ## 主要問題
 
-### 1. MoE 目前多數仍是 black-box integration
+MoE-aware expert placement、hotness、routing skew 與 expert migration 的研究規劃
+已收斂到 `docs/spotserve-moe-aware-planner.md`。本文件只保留目前實作/實驗中
+需要修正或明確標示的 gap。
 
-目前 `docs/spotserve-version5-vllm-moe.md` 已經明確寫出 MoE path 是
-vLLM MoE black-box integration，且 expert routing、expert migration、
-MoE-specific recovery optimization 都是 out of scope。
-
-程式上 `sllm/backends/vllm_capability.py` 有 MoE supported shapes，也能表示
-`enable_expert_parallel=True` 後的 derived effective EP；但目前沒有做到：
-
-- expert-level placement decision
-- expert hotness / routed-token load balancing
-- expert KV / expert weight migration cost model
-- preemption 後針對 expert shard 的 recovery policy
-
-影響：
-
-```text
-可以宣稱：SpotServe-style control plane 可以服務 vLLM MoE model。
-不能宣稱：已經把 SpotServe 完整應用到 MoE expert-level serving。
-```
-
-建議補強：
-
-- 在 runtime metadata 加入 `num_experts`, `effective_expert_parallel_size`,
-  `expert_ids_by_rank`, `expert_load`, `routed_tokens_by_expert`。
-- 讓 re-parallelization planner 真的把 expert placement 放進候選與 cost model。
-- 加 MoE-specific benchmark：preempt 某個 expert-heavy rank，看新 plan 是否降低
-  expert movement / recomputation。
-
-### 2. `expert_parallel_size` 的規劃與實際 vLLM config 可能不一致 ✅
+### 1. `expert_parallel_size` 的規劃與實際 vLLM config 可能不一致 ✅
 
 vLLM 的 MoE EP 不是獨立設定 `expert_parallel_size=N`。正確語意是：
 
@@ -116,7 +91,7 @@ planner DP / EP plan != vLLM runtime DP / effective EP
 - runtime metadata 增加 `planned_effective_expert_parallel_size`、
   `effective_expert_parallel_size`、`parallel_plan_mismatch`。
 
-### 3. V7 context migration 不等於 true KV migration ✅
+### 2. V7 context migration 不等於 true KV migration ✅
 
 `sllm/spot/context_migration.py` 做的是低成本 assignment planning。router 的
 live path 會收集 source/target context metadata，推估 reuse，然後可選擇呼叫
@@ -189,7 +164,7 @@ migration。
 - `VllmBackend.resume_kv_cache()` 回傳 structured prefix-warmup result，並明確標示
   `true_kv_block_transfer=false`。
 
-### 4. V8 stateful recovery 依賴 patched vLLM runtime ✅
+### 3. V8 stateful recovery 依賴 patched vLLM runtime ✅
 
 `sllm/backends/vllm_backend.py` 透過 runtime hooks 尋找：
 
@@ -279,7 +254,7 @@ response_kv_restore_successes > 0
 response_kv_restore_restored_blocks > 0
 ```
 
-### 5. Re-parallelization 是 heuristic + actor recreate，不是論文完整 controller（部分修正）
+### 4. Re-parallelization 是 heuristic + actor recreate，不是論文完整 controller（部分修正）
 
 `sllm/spot/reparallelization.py` 的 candidate selection 主要依照：
 
@@ -460,7 +435,7 @@ validation 與 runtime 內部 in-place repartition 仍未完成，因此不能�
 SpotServe parallelization controller。
 ```
 
-### 6. Preemptible instance trace replay 缺少 grace-period deadline（已修正）
+### 5. Preemptible instance trace replay 缺少 grace-period deadline（已修正）
 
 `sllm/spot/trace_reader.py` 支援 `add/remove/preempt/recover/dead`，而
 `sllm/spot/preemption_simulator.py` 依照 JSONL 時間播放事件。這適合研究與
@@ -500,7 +475,7 @@ preempting instance 可能只是停止接新流量，不會自動死亡。
   `preemption_auto_deadline_events`、state export duration、state restore
   duration 等欄位。
 
-### 7. `MigrationRouter` 是舊路徑，可能已經不適合 SpotServe flow（已修正）
+### 6. `MigrationRouter` 是舊路徑，可能已經不適合 SpotServe flow（已修正）
 
 舊版本中，`sllm/controller.py` 如果 `enable_migration=true`，會使用
 `sllm/routers/migration_router.py`。但這個 class 仍沿用舊欄位，例如
@@ -539,7 +514,7 @@ recovery_policy=stateful_recovery
 - 新增 `tests/spotserve_test/test_controller_spotserve_router.py` 驗證 legacy
   migration flag 不會再啟用舊 scheduler/router path。
 
-### 8. 現有實驗多為 single-host / same-host simulation（de-scoped limitation）
+### 7. 現有實驗多為 single-host / same-host simulation（de-scoped limitation）
 
 文件中已有記錄：Tiny/Qwen MoE 的 NIXL restore smoke、cross-container 模擬、
 four-container fleet churn 都有價值，但多數仍在同一台主機上跑。這可以證明控制流程、
@@ -568,7 +543,7 @@ same-host multi-container
 physical cross-node（out of scope for current validation）
 ```
 
-### 9. 成功率指標可能掩蓋 fallback（已修正）
+### 8. 成功率指標可能掩蓋 fallback（已修正）
 
 目前 recovery path 設計有 fallback，這是好的；但如果只看 request success rate，
 很容易把「重試成功」誤讀成「KV restore 成功」。
@@ -627,7 +602,7 @@ context_migration_reusable_context_blocks
 - 新增 analyzer test，驗證 `success=True` 但 fallback 發生時，
   `clean_success_rate` 會低於 `success_rate`。
 
-### 10. Risk-aware scheduling 是額外功能，不屬於原本三核心
+### 9. Risk-aware scheduling 是額外功能，不屬於原本三核心
 
 `sllm/spot/risk_aware_scheduling.py` 和 `sllm/schedulers/fcfs_scheduler.py`
 提供 spot risk / remaining lifetime / loading cost ranking。這是合理延伸，但不是

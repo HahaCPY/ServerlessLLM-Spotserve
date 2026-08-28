@@ -190,6 +190,12 @@ def test_replanning_summary_exposes_workload_cost_metrics():
                 "selected_migration_cost_estimate_ms": 200,
                 "selected_queue_penalty_ms": 0,
                 "selected_throughput_estimate_req_s": 2,
+                "selected_sllm_replica_count": 2,
+                "selected_vllm_data_parallel_size": 1,
+                "selected_runtime_effective_expert_parallel_size": 2,
+                "moe_route_histogram_available": False,
+                "moe_route_histogram_source": "unavailable",
+                "moe_expert_parallel_size_source": "derived_from_tp_dp",
                 "cross_node_target": True,
                 "multi_worker_target": False,
                 "target_worker_node_count": 1,
@@ -210,5 +216,43 @@ def test_replanning_summary_exposes_workload_cost_metrics():
     assert summary["replanning_avg_selected_migration_cost_estimate_ms"] == 200
     assert summary["replanning_cross_node_targets"] == 1
     assert summary["replanning_max_ready_worker_node_count"] == 2
+    assert summary["replanning_max_selected_sllm_replica_count"] == 2
+    assert summary["replanning_max_selected_vllm_data_parallel_size"] == 1
+    assert summary["replanning_max_selected_effective_expert_parallel_size"] == 2
+    assert summary["replanning_moe_route_histogram_available_events"] == 0
+    assert summary["replanning_moe_route_histogram_sources"] == "unavailable"
+    assert summary["replanning_moe_expert_parallel_size_sources"] == "derived_from_tp_dp"
     assert summary["replanning_max_runtime_worker_node_count"] == 2
     assert summary["replanning_max_physical_worker_node_count"] == 2
+
+
+def test_context_migration_summary_exposes_moe_locality_metrics():
+    analyzer = load_analyzer()
+
+    summary = analyzer.summarize_context_migration_metrics(
+        [
+            {
+                "type": "context_migration",
+                "migration_plan_count": 1,
+                "total_estimated_cost": 3.5,
+                "total_reusable_tokens": 8,
+                "total_context_tokens": 10,
+                "moe_route_histogram_available_count": 1,
+                "moe_target_placement_available_count": 2,
+                "moe_route_histogram_source": "instrumentation",
+                "moe_hot_expert_locality_ratio": 0.75,
+                "moe_estimated_remote_routing_ratio": 0.25,
+                "moe_estimated_remote_routed_tokens": 4,
+                "moe_estimated_dispatch_cost": 1.5,
+            }
+        ]
+    )
+
+    assert summary["context_migration_events"] == 1
+    assert summary["context_migration_moe_route_histogram_available_count"] == 1
+    assert summary["context_migration_moe_target_placement_available_count"] == 2
+    assert summary["context_migration_moe_route_histogram_sources"] == "instrumentation"
+    assert summary["context_migration_moe_avg_hot_expert_locality_ratio"] == 0.75
+    assert summary["context_migration_moe_avg_estimated_remote_routing_ratio"] == 0.25
+    assert summary["context_migration_moe_estimated_remote_routed_tokens"] == 4
+    assert summary["context_migration_moe_estimated_dispatch_cost"] == 1.5
