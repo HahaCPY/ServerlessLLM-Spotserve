@@ -41,7 +41,8 @@ analysis 當成單純錯誤，而應該視為 MoE-aware planner 要往前推進�
 MoE-aware planner 要補上的不是單一 bug，而是研究 extension：
 
 - 在 runtime metadata 加入 `num_experts`, `effective_expert_parallel_size`,
-  `expert_placement_snapshot`, `expert_load`, `routed_tokens_by_expert`。
+  `expert_placement_snapshot`, `expert_load`,
+  `per_request_expert_route_histogram`。
 - 讓 re-parallelization planner 真的把 expert placement 放進候選與 cost model。
 - 加 MoE-specific benchmark：preempt 某個 expert-heavy rank，看新 plan 是否降低
   expert movement / recomputation。
@@ -136,10 +137,9 @@ rank_id
 node_id
 gpu_id
 expert_weight_size_bytes
-routed_tokens_by_expert
-routed_tokens_by_layer
-per_request_routed_tokens_by_expert
-recent_window_routed_tokens_by_expert
+global_expert_hotness
+per_request_expert_route_histogram
+recent_window_expert_hotness
 expert_load
 expert_weight_resident
 recent_expert_execution_count
@@ -335,15 +335,21 @@ request metadata
 request_id
 tokens
 kv_blocks
-expert_route_histogram
+per_request_expert_route_histogram
 last_n_tokens_expert_histogram
 top_experts
 ```
 
-`expert_route_histogram` 形式：
+Phase 2 planner 的 canonical input key 固定為
+`per_request_expert_route_histogram`。planner 不再把
+`per_request_routed_tokens_by_expert`、`expert_route_histogram` 或
+`routed_tokens_by_expert` 當成 request-locality input，避免 runtime contract
+模糊。
+
+`per_request_expert_route_histogram` 形式：
 
 ```text
-layer_id -> expert_id -> routed_token_count
+request_id -> "layer:{layer_id}/expert:{expert_id}" -> routed_token_count
 ```
 
 這個 profile 是 optional runtime capability。若 runtime 不能直接提供，MVP 可以先
@@ -390,7 +396,7 @@ correctness 條件，也不能保證 request 後續 token 一定繼續走同一�
 ```text
 preempt/dead event
 -> collect source request KV metadata
--> collect source request expert_route_histogram
+-> collect source request per_request_expert_route_histogram
 -> collect target expert placement
 -> compute KV compatibility
 -> compute expert locality score
@@ -424,7 +430,7 @@ sllm_replica_count
 vllm_data_parallel_size
 expert_placement_fingerprint
 expert_placement_epoch
-expert_route_histogram
+per_request_expert_route_histogram
 gate_model_revision
 moe_backend
 top_k
@@ -460,7 +466,8 @@ MoE-aware V8 的核心原則。
 ```text
 KV compatible != expert-locality optimal
 expert placement changed != KV restore impossible
-expert_route_histogram = historical locality hint, not a restore requirement
+per_request_expert_route_histogram = historical locality hint,
+  not a restore requirement
 expert_placement_fingerprint = locality/topology change detector,
   not a restore rejection rule by itself
 ```
@@ -619,12 +626,14 @@ weights。（已開始實作）
 
 完成條件：
 
-- active request 有 `expert_route_histogram`。
+- active request 有 `per_request_expert_route_histogram`。
 - target 有 expert placement metadata。
 - planner 選 target 時考慮 hot expert locality。
 - metric 顯示 `moe_hot_expert_locality_ratio`、
   `moe_estimated_remote_routing_ratio`、
   `moe_estimated_remote_routed_tokens`、`moe_estimated_dispatch_cost`。
+- metric 顯示 `context_migration_queue_penalty_cost`、
+  `context_migration_avg_queue_pressure`、`context_migration_max_queue_depth`。
 - 若沒有 route histogram，planner 可退化成 KV-only target selection，並在
   metrics 中標示 route histogram unavailable。
 
@@ -634,19 +643,74 @@ weights。（已開始實作）
   並在 `MigrationPlan` / `MigrationDecision` 中輸出
   `expert_locality_available`、`hot_expert_locality_ratio`、
   `estimated_remote_routing_ratio`、`estimated_remote_routed_tokens`、
-  `expert_dispatch_cost`。
+  `expert_dispatch_cost`、`queue_depth`、`queue_pressure`、
+  `queue_penalty_cost`。
 - 新增 `estimate_expert_dispatch_cost()`，MVP 只保留一套
   routing-weighted expert locality cost。
+- 新增 `estimate_queue_penalty_cost()`，讓 target selection 不只看 target
+  是否還有 capacity，也把 target 現有 `concurrency` / `queue_depth` 以及同一輪
+  migration 已排在前面的 planned requests 納入 soft penalty。queue cost 預設不改變
+  舊 planner 行為；需要設定 `queue_penalty_weight`、`queue_pressure_weight`，或 target
+  明確帶入 `queue_penalty` 才會影響 target assignment。
 - `plan_low_cost_migration()` 會在 planner config 啟用
   `enable_moe_expert_locality` 或設定 expert dispatch cost 參數時，把
   expert dispatch cost 加入 target assignment；若 histogram 或 placement snapshot
   不可用，會退化為原本 KV / queue / warmup cost。
 - `RoundRobinRouter` 的 context migration target collection 會嘗試讀取 target
   runtime metadata，並把 `expert_placement_snapshot`、`placement_epoch`、
-  `moe_route_histogram_available` 等欄位放入 target metadata。
+  `moe_route_histogram_available` 等欄位放入 target metadata；同時會把 target
+  的 `concurrency`、`max_queue_length`、`queue_depth` 傳給 planner。
 - `make_context_migration_event()` 與 benchmark analyzer 已新增
   `moe_hot_expert_locality_ratio`、`moe_estimated_remote_routing_ratio`、
-  `moe_estimated_remote_routed_tokens`、`moe_estimated_dispatch_cost` 等欄位。
+  `moe_estimated_remote_routed_tokens`、`moe_estimated_dispatch_cost`、
+  `context_migration_queue_penalty_cost`、
+  `context_migration_avg_queue_pressure`、`context_migration_max_queue_depth`
+  等欄位。
+- context migration / core applied benchmark config 已設定
+  `queue_penalty_weight=1.0`，因此 standard benchmark 會啟用這個 queue cost
+  component；若 target 當下沒有 queue pressure，對應 metric 仍會自然為 0。
+
+### Phase 2 可驗證實驗
+
+Phase 2 的 MVP 應先用 synthetic ablation 驗證 planner，而不是直接依賴
+end-to-end vLLM latency。原因是 vLLM runtime 目前還不一定能穩定輸出真實
+per-request expert routing instrumentation；synthetic workload 可以先確認 cost
+model 本身是否正確影響 target selection。
+
+執行：
+
+```bash
+python scripts/run_context_migration_phase2_ablation.py \
+  --input benchmarks/spotserve/context_migration_phase2_ablation.json \
+  --output-dir results/spotserve_context_migration_phase2_ablation
+```
+
+這個實驗不需要啟動 container、Ray 或 vLLM。它會產生：
+
+- `report.json`
+- `latest_summary.json`
+- `latest_comparisons.json`
+- 每個 run 的 `migration_plan.json`
+- 每個 run 的 `migration_metrics.jsonl`
+
+四組 ablation 的預期 target selection：
+
+| Run | Active cost | Expected target | 驗證重點 |
+|---|---|---|---|
+| `phase2-kv-only` | KV cost | `target-kv-busy-remote-expert` | 同 node KV/context reuse 會贏 |
+| `phase2-kv-plus-expert-locality` | KV + expert dispatch cost | `target-expert-busy` | routing-weighted expert locality 能抵銷 KV locality |
+| `phase2-kv-plus-queue` | KV + queue cost | `target-idle-remote-expert` | busy target 的 queue penalty 會讓 planner 選 idle target |
+| `phase2-kv-plus-expert-plus-queue` | KV + expert dispatch + queue cost | `target-expert-idle` | combined cost 會選 expert-local 且 idle 的 target |
+
+此實驗的 pass/fail 條件是：
+
+- `report.json` 的 `passed=true`。
+- 四個 run 的 `selected_targets` 符合上表。
+- `candidate_component_costs` 中可以看到每個 candidate 的
+  `kv_migration_cost`、`expert_dispatch_cost`、`queue_penalty_cost` 和
+  `total_cost`，因此能解釋 target 為什麼改變。
+- `phase2-kv-plus-queue` 中 busy same-node target 的 queue cost 必須高於 idle
+  target，證明 queue cost 不是只出現在 metrics，而是真的進入 target ranking。
 
 ### Milestone C: MoE-aware Stateful Recovery
 

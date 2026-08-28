@@ -206,15 +206,12 @@ def get_vllm_model_resource_profile(
             "runtime" if placement_available else "unavailable",
         )
     )
-    route_histogram = _first_present(
-        runtime_metadata.get("per_request_expert_route_histogram"),
-        runtime_metadata.get("per_request_routed_tokens_by_expert"),
-        runtime_metadata.get("expert_route_histogram"),
-    )
+    route_histogram = runtime_metadata.get("per_request_expert_route_histogram")
+    route_histogram_payload_available = _has_payload(route_histogram)
     route_histogram_available = _to_bool(
         runtime_metadata.get("moe_route_histogram_available"),
-        default=_has_payload(route_histogram),
-    )
+        default=route_histogram_payload_available,
+    ) and route_histogram_payload_available
     route_histogram_source = str(
         _first_present(
             runtime_metadata.get("moe_route_histogram_source"),
@@ -282,12 +279,6 @@ def get_vllm_model_resource_profile(
     for source_key, target_key in (
         ("global_expert_hotness", "global_expert_hotness"),
         ("recent_window_expert_hotness", "recent_window_expert_hotness"),
-        ("routed_tokens_by_expert", "routed_tokens_by_expert"),
-        ("routed_tokens_by_layer", "routed_tokens_by_layer"),
-        (
-            "per_request_routed_tokens_by_expert",
-            "per_request_routed_tokens_by_expert",
-        ),
         (
             "per_request_expert_route_histogram",
             "per_request_expert_route_histogram",

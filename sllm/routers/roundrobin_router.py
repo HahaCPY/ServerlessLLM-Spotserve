@@ -1360,6 +1360,9 @@ class RoundRobinRouter(SllmRouter):
                     warmup_cost=self._context_migration_target_warmup_cost(
                         instance
                     ),
+                    concurrency=max(0, int(instance.concurrency)),
+                    max_queue_length=max(0, int(instance.max_queue_length)),
+                    queue_depth=max(0, int(instance.concurrency)),
                     metadata=await self._context_migration_target_metadata(
                         instance
                     ),

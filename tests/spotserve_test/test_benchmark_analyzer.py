@@ -237,6 +237,10 @@ def test_context_migration_summary_exposes_moe_locality_metrics():
                 "total_estimated_cost": 3.5,
                 "total_reusable_tokens": 8,
                 "total_context_tokens": 10,
+                "kv_migration_cost": 1.0,
+                "queue_penalty_cost": 2.0,
+                "avg_queue_pressure": 0.5,
+                "max_queue_depth": 2,
                 "moe_route_histogram_available_count": 1,
                 "moe_target_placement_available_count": 2,
                 "moe_route_histogram_source": "instrumentation",
@@ -252,6 +256,10 @@ def test_context_migration_summary_exposes_moe_locality_metrics():
     assert summary["context_migration_moe_route_histogram_available_count"] == 1
     assert summary["context_migration_moe_target_placement_available_count"] == 2
     assert summary["context_migration_moe_route_histogram_sources"] == "instrumentation"
+    assert summary["context_migration_kv_migration_cost"] == 1.0
+    assert summary["context_migration_queue_penalty_cost"] == 2.0
+    assert summary["context_migration_avg_queue_pressure"] == 0.5
+    assert summary["context_migration_max_queue_depth"] == 2
     assert summary["context_migration_moe_avg_hot_expert_locality_ratio"] == 0.75
     assert summary["context_migration_moe_avg_estimated_remote_routing_ratio"] == 0.25
     assert summary["context_migration_moe_estimated_remote_routed_tokens"] == 4

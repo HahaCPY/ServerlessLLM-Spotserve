@@ -3,6 +3,7 @@ from sllm.spot.context_migration import (
     MigrationTarget,
     estimate_expert_dispatch_cost,
     estimate_migration_cost,
+    estimate_queue_penalty_cost,
     plan_low_cost_migration,
     plan_low_cost_migration_from_dict,
 )
@@ -187,6 +188,7 @@ def test_expert_locality_cost_prefers_target_with_hot_experts():
 
     assert decision.plans[0].new_instance_id == "local-expert"
     assert decision.plans[0].expert_locality_available is True
+    assert decision.plans[0].kv_migration_cost == 0.0
     assert decision.plans[0].hot_expert_locality_ratio == 1.0
     assert decision.plans[0].estimated_remote_routing_ratio == 0.0
     assert decision.plans[0].estimated_remote_routed_tokens == 0
@@ -210,6 +212,43 @@ def test_expert_dispatch_cost_reports_unavailable_without_metadata():
     )
 
     assert result["available"] is False
+    assert result["cost"] == 0.0
+
+
+def test_expert_dispatch_cost_ignores_legacy_histogram_aliases():
+    result = estimate_expert_dispatch_cost(
+        ContextMetadata(
+            request_id="req-legacy",
+            instance_id="old-a",
+            node_id="node-0",
+            metadata={
+                "moe_route_histogram_available": True,
+                "per_request_routed_tokens_by_expert": {
+                    "req-legacy": {"layer:0/expert:1": 10}
+                },
+                "expert_route_histogram": {
+                    "layer:0/expert:1": 10
+                },
+                "routed_tokens_by_expert": {
+                    "layer:0/expert:1": 10
+                },
+            },
+        ),
+        MigrationTarget(
+            instance_id="new-a",
+            node_id="node-1",
+            metadata={
+                "expert_placement_available": True,
+                "expert_placement_snapshot": {
+                    "layer:0/expert:1": {"rank_id": "rank-0"}
+                },
+            },
+        ),
+        planner_config={"enable_moe_expert_locality": True},
+    )
+
+    assert result["available"] is False
+    assert result["histogram_available"] is False
     assert result["cost"] == 0.0
 
 
@@ -250,6 +289,74 @@ def test_expert_dispatch_cost_uses_routing_weighted_locality():
     assert result["estimated_remote_routing_ratio"] == 0.4
     assert result["estimated_remote_routed_tokens"] == 4
     assert result["cost"] == 0.8
+
+
+def test_queue_penalty_prefers_less_loaded_target():
+    source = ContextMetadata(
+        request_id="req-queue",
+        instance_id="old-a",
+        node_id="node-source",
+    )
+    busy_target = MigrationTarget(
+        instance_id="busy-target",
+        node_id="node-0",
+        capacity=1,
+        concurrency=3,
+        max_queue_length=4,
+    )
+    idle_target = MigrationTarget(
+        instance_id="idle-target",
+        node_id="node-1",
+        capacity=1,
+        concurrency=0,
+        max_queue_length=4,
+    )
+
+    decision = plan_low_cost_migration(
+        sources=[source],
+        targets=[busy_target, idle_target],
+        planner_config={
+            "base_migration_cost": 0.0,
+            "token_transfer_cost": 0.0,
+            "context_block_transfer_cost": 0.0,
+            "cross_node_penalty": 0.0,
+            "queue_penalty_weight": 10.0,
+        },
+    )
+
+    assert decision.plans[0].new_instance_id == "idle-target"
+    assert decision.plans[0].queue_depth == 0
+    assert decision.plans[0].queue_penalty_cost == 0.0
+    assert decision.total_queue_penalty_cost == 0.0
+    assert decision.max_queue_depth == 0
+
+
+def test_queue_penalty_accounts_for_planned_requests_ahead():
+    target = MigrationTarget(
+        instance_id="target",
+        node_id="node-0",
+        capacity=2,
+        concurrency=1,
+        max_queue_length=4,
+    )
+
+    first = estimate_queue_penalty_cost(
+        target,
+        planner_config={"queue_penalty_weight": 10.0},
+        planned_requests_ahead=0,
+    )
+    second = estimate_queue_penalty_cost(
+        target,
+        planner_config={"queue_penalty_weight": 10.0},
+        planned_requests_ahead=1,
+    )
+
+    assert first["queue_depth"] == 1
+    assert first["queue_pressure"] == 0.25
+    assert first["cost"] == 10.0
+    assert second["queue_depth"] == 2
+    assert second["queue_pressure"] == 0.5
+    assert second["cost"] == 20.0
 
 
 def test_unassigned_contexts_when_target_capacity_is_insufficient():
@@ -307,6 +414,10 @@ def test_context_migration_metric_contains_summary_fields():
     assert event["context_migration_plan_count"] == 1
     assert event["migration_plan_count"] == 1
     assert event["reuse_ratio"] == 1.0
+    assert event["kv_migration_cost"] == 0.0
+    assert event["queue_penalty_cost"] == 0.0
+    assert event["avg_queue_pressure"] == 0.0
+    assert event["max_queue_depth"] == 0
     assert event["moe_hot_expert_locality_ratio"] == 0.0
     assert event["moe_estimated_remote_routing_ratio"] == 0.0
     assert event["moe_estimated_remote_routed_tokens"] == 0

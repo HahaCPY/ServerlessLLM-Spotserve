@@ -262,6 +262,12 @@ def make_context_migration_event(
         ),
         "total_context_blocks": decision.get("total_context_blocks", 0),
         "reuse_ratio": decision.get("reuse_ratio", 0.0),
+        "kv_migration_cost": decision.get("total_kv_migration_cost", 0.0),
+        "queue_penalty_cost": decision.get(
+            "total_queue_penalty_cost", 0.0
+        ),
+        "avg_queue_pressure": decision.get("avg_queue_pressure", 0.0),
+        "max_queue_depth": decision.get("max_queue_depth", 0),
         "moe_route_histogram_available_count": decision.get(
             "moe_route_histogram_available_count", 0
         ),

@@ -233,6 +233,30 @@ does not assume cross-node cache reuse without explicit runtime proof. For a
 same-node reuse benchmark, run on a worker with at least two GPUs or target a
 specific same-node replica via the trace.
 
+For a Phase 2 planner-only ablation of MoE-aware context migration target
+selection, run:
+
+```bash
+python scripts/run_context_migration_phase2_ablation.py \
+  --input benchmarks/spotserve/context_migration_phase2_ablation.json \
+  --output-dir results/spotserve_context_migration_phase2_ablation
+```
+
+This synthetic test does not need Ray, containers, or a deployed vLLM model. It
+checks four target-selection modes:
+
+```text
+phase2-kv-only                    -> target-kv-busy-remote-expert
+phase2-kv-plus-expert-locality    -> target-expert-busy
+phase2-kv-plus-queue              -> target-idle-remote-expert
+phase2-kv-plus-expert-plus-queue  -> target-expert-idle
+```
+
+The report includes candidate-level `kv_migration_cost`,
+`expert_dispatch_cost`, `queue_penalty_cost`, and `total_cost`, so the target
+change can be attributed to a specific Phase 2 cost component instead of only
+observing the final selected target.
+
 For vLLM stateful-recovery performance, deploy the V8 live restore pair and run
 the dedicated matrix:
 

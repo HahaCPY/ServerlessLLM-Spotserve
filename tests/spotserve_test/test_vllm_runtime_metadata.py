@@ -128,6 +128,29 @@ def test_vllm_model_resource_profile_prefers_runtime_effective_ep():
     assert profile["moe_route_histogram_source"] == "instrumentation"
 
 
+def test_vllm_model_resource_profile_requires_canonical_route_histogram():
+    profile = get_vllm_model_resource_profile(
+        model_name="vllm-moe",
+        backend_config={
+            "tensor_parallel_size": 2,
+            "data_parallel_size": 1,
+            "enable_expert_parallel": True,
+        },
+        runtime_metadata={
+            "moe_route_histogram_available": True,
+            "per_request_routed_tokens_by_expert": {
+                "req-1": {"layer:0/expert:1": 4}
+            },
+            "expert_route_histogram": {
+                "layer:0/expert:1": 4
+            },
+        },
+    )
+
+    assert profile["moe_route_histogram_available"] is False
+    assert "per_request_expert_route_histogram" not in profile
+
+
 def test_vllm_runtime_metadata_can_feed_risk_score():
     metadata = get_vllm_runtime_metadata(
         model_name="vllm-moe",

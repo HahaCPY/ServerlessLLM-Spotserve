@@ -1,0 +1,167 @@
+{
+  "model": "context-migration-phase2-ablation",
+  "description": "Synthetic Phase 2 ablation for KV/context cost, routing-weighted expert locality, and queue penalty.",
+  "planner_config": {
+    "base_migration_cost": 0.0,
+    "token_transfer_cost": 0.0,
+    "context_block_transfer_cost": 2.0,
+    "same_node_token_reuse_ratio": 1.0,
+    "same_node_block_reuse_ratio": 1.0,
+    "cross_node_token_reuse_ratio": 0.0,
+    "cross_node_block_reuse_ratio": 0.0,
+    "cross_node_penalty": 4.0,
+    "unmatched_penalty": 1000000.0
+  },
+  "sources": [
+    {
+      "request_id": "phase2-req-hot-expert-1",
+      "instance_id": "source-kv",
+      "node_id": "node-kv",
+      "num_tokens": 100,
+      "context_blocks": 5,
+      "metadata": {
+        "moe_route_histogram_available": true,
+        "moe_route_histogram_source": "synthetic",
+        "per_request_expert_route_histogram": {
+          "phase2-req-hot-expert-1": {
+            "layer:0/expert:1": 9,
+            "layer:0/expert:2": 1
+          }
+        }
+      }
+    }
+  ],
+  "targets": [
+    {
+      "instance_id": "target-kv-busy-remote-expert",
+      "node_id": "node-kv",
+      "capacity": 1,
+      "concurrency": 4,
+      "max_queue_length": 5,
+      "metadata": {
+        "expert_placement_available": true,
+        "expert_placement_snapshot": {
+          "layer:0/expert:2": {
+            "rank_id": "rank-kv"
+          }
+        }
+      }
+    },
+    {
+      "instance_id": "target-expert-busy",
+      "node_id": "node-expert-busy",
+      "capacity": 1,
+      "concurrency": 4,
+      "max_queue_length": 5,
+      "metadata": {
+        "expert_placement_available": true,
+        "expert_placement_snapshot": {
+          "layer:0/expert:1": {
+            "rank_id": "rank-expert-busy"
+          }
+        }
+      }
+    },
+    {
+      "instance_id": "target-idle-remote-expert",
+      "node_id": "node-idle-remote",
+      "capacity": 1,
+      "concurrency": 0,
+      "max_queue_length": 5,
+      "metadata": {
+        "expert_placement_available": true,
+        "expert_placement_snapshot": {
+          "layer:0/expert:2": {
+            "rank_id": "rank-idle-remote"
+          }
+        }
+      }
+    },
+    {
+      "instance_id": "target-expert-idle",
+      "node_id": "node-expert-idle",
+      "capacity": 1,
+      "concurrency": 0,
+      "max_queue_length": 5,
+      "metadata": {
+        "expert_placement_available": true,
+        "expert_placement_snapshot": {
+          "layer:0/expert:1": {
+            "rank_id": "rank-expert-idle"
+          }
+        }
+      }
+    }
+  ],
+  "runs": [
+    {
+      "name": "phase2-kv-only",
+      "description": "Only KV/context reuse cost is active; the same-node target should win even though it is busy and has poor expert locality.",
+      "planner_config": {
+        "enable_moe_expert_locality": false,
+        "expert_dispatch_weight": 0.0,
+        "queue_penalty_weight": 0.0,
+        "queue_pressure_weight": 0.0
+      },
+      "expected_targets": [
+        "target-kv-busy-remote-expert"
+      ]
+    },
+    {
+      "name": "phase2-kv-plus-expert-locality",
+      "description": "Expert locality is active while queue penalty is disabled; the planner should move away from the same-node KV target.",
+      "planner_config": {
+        "enable_moe_expert_locality": true,
+        "expert_dispatch_weight": 25.0,
+        "queue_penalty_weight": 0.0,
+        "queue_pressure_weight": 0.0
+      },
+      "expected_targets": [
+        "target-expert-busy"
+      ]
+    },
+    {
+      "name": "phase2-kv-plus-queue",
+      "description": "Queue penalty is active while expert locality is disabled; the planner should prefer an idle target over the busy same-node KV target.",
+      "planner_config": {
+        "enable_moe_expert_locality": false,
+        "expert_dispatch_weight": 0.0,
+        "queue_penalty_weight": 5.0,
+        "queue_pressure_weight": 0.0
+      },
+      "expected_targets": [
+        "target-idle-remote-expert"
+      ]
+    },
+    {
+      "name": "phase2-kv-plus-expert-plus-queue",
+      "description": "Expert locality and queue penalty are both active; the planner should select the target that is both expert-local and idle.",
+      "planner_config": {
+        "enable_moe_expert_locality": true,
+        "expert_dispatch_weight": 25.0,
+        "queue_penalty_weight": 5.0,
+        "queue_pressure_weight": 0.0
+      },
+      "expected_targets": [
+        "target-expert-idle"
+      ]
+    }
+  ],
+  "comparisons": [
+    {
+      "name": "expert-locality-vs-kv-only",
+      "baseline": "phase2-kv-only",
+      "candidate": "phase2-kv-plus-expert-locality"
+    },
+    {
+      "name": "queue-vs-kv-only",
+      "baseline": "phase2-kv-only",
+      "candidate": "phase2-kv-plus-queue"
+    },
+    {
+      "name": "combined-vs-kv-only",
+      "baseline": "phase2-kv-only",
+      "candidate": "phase2-kv-plus-expert-plus-queue"
+    }
+  ]
+}

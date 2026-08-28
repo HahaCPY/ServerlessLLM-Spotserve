@@ -823,6 +823,11 @@ def summarize_context_migration_metrics(
         for row in migration_rows
         if row.get("moe_estimated_remote_routing_ratio") is not None
     ]
+    queue_pressures = [
+        safe_float(row.get("avg_queue_pressure"), 0.0)
+        for row in migration_rows
+        if row.get("avg_queue_pressure") is not None
+    ]
     return {
         "context_migration_events": len(migration_rows),
         "context_migration_plan_count": total_plan_count,
@@ -835,6 +840,24 @@ def summarize_context_migration_metrics(
         "context_migration_reusable_context_blocks": total_reusable_blocks,
         "context_migration_reuse_ratio": (
             reuse_numerator / reuse_denominator if reuse_denominator else 0.0
+        ),
+        "context_migration_kv_migration_cost": sum(
+            safe_float(row.get("kv_migration_cost"), 0.0)
+            for row in migration_rows
+        ),
+        "context_migration_queue_penalty_cost": sum(
+            safe_float(row.get("queue_penalty_cost"), 0.0)
+            for row in migration_rows
+        ),
+        "context_migration_avg_queue_pressure": (
+            mean(queue_pressures) if queue_pressures else 0.0
+        ),
+        "context_migration_max_queue_depth": max(
+            (
+                safe_int(row.get("max_queue_depth"), 0)
+                for row in migration_rows
+            ),
+            default=0,
         ),
         "context_migration_moe_route_histogram_available_count": sum(
             safe_int(row.get("moe_route_histogram_available_count"), 0)
