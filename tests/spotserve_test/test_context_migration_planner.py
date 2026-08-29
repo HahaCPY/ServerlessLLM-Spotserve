@@ -2,6 +2,7 @@ from sllm.spot.context_migration import (
     ContextMetadata,
     MigrationTarget,
     estimate_expert_dispatch_cost,
+    estimate_kv_migration_cost,
     estimate_migration_cost,
     estimate_queue_penalty_cost,
     plan_low_cost_migration,
@@ -137,6 +138,44 @@ def test_warmup_cost_is_charged_once_per_target():
     assert len(decision.plans) == 2
     assert decision.total_estimated_cost == 100.0
     assert sum(plan.estimated_cost for plan in decision.plans) == 100.0
+
+
+def test_kv_migration_cost_reports_component_breakdown():
+    source = ContextMetadata(
+        request_id="req-kv",
+        instance_id="old-a",
+        node_id="node-0",
+        num_tokens=10,
+        context_blocks=3,
+        reusable_tokens_by_target={"new-a": 4},
+        reusable_blocks_by_target={"new-a": 1},
+    )
+    target = MigrationTarget(
+        instance_id="new-a",
+        node_id="node-1",
+        warmup_cost=5.0,
+    )
+
+    cost = estimate_kv_migration_cost(
+        source,
+        target,
+        planner_config={
+            "base_migration_cost": 1.0,
+            "token_transfer_cost": 2.0,
+            "context_block_transfer_cost": 3.0,
+            "cross_node_penalty": 7.0,
+        },
+    )
+
+    assert cost["reusable_tokens"] == 4
+    assert cost["reusable_context_blocks"] == 1
+    assert cost["non_reusable_tokens"] == 6
+    assert cost["non_reusable_context_blocks"] == 2
+    assert cost["token_migration_cost"] == 12.0
+    assert cost["context_block_migration_cost"] == 6.0
+    assert cost["warmup_cost"] == 5.0
+    assert cost["cross_node_penalty_cost"] == 7.0
+    assert cost["cost"] == 31.0
 
 
 def test_expert_locality_cost_prefers_target_with_hot_experts():
@@ -413,15 +452,31 @@ def test_context_migration_metric_contains_summary_fields():
     assert event["type"] == "context_migration"
     assert event["context_migration_plan_count"] == 1
     assert event["migration_plan_count"] == 1
+    assert event["selected_plan_count"] == 1
+    assert event["selected_target_ids"] == ["new-a"]
+    assert event["selected_source_instance_ids"] == ["old-a"]
+    assert event["selected_request_ids"] == ["req-a"]
+    assert event["selected_plan_total_estimated_cost"] == 0.0
+    assert event["selected_plan_kv_migration_cost"] == 0.0
+    assert event["selected_plan_expert_dispatch_cost"] == 0.0
+    assert event["selected_plan_queue_penalty_cost"] == 0.0
+    assert event["selected_plan_avg_queue_pressure"] == 0.0
+    assert event["selected_plan_max_queue_depth"] == 0
     assert event["reuse_ratio"] == 1.0
     assert event["kv_migration_cost"] == 0.0
     assert event["queue_penalty_cost"] == 0.0
     assert event["avg_queue_pressure"] == 0.0
     assert event["max_queue_depth"] == 0
+    assert event["moe_route_histogram_available"] is False
+    assert event["moe_target_placement_available"] is False
     assert event["moe_hot_expert_locality_ratio"] == 0.0
     assert event["moe_estimated_remote_routing_ratio"] == 0.0
     assert event["moe_estimated_remote_routed_tokens"] == 0
     assert event["moe_estimated_dispatch_cost"] == 0.0
+    assert event["context_source_count"] == 1
+    assert event["context_target_count"] == 0
+    assert event["candidate_component_costs_enabled"] is False
+    assert event["candidate_component_costs"] is None
     assert event["prefix_warmup_attempts"] == 0
     assert event["kv_restore_attempts"] == 0
     assert event["true_kv_block_transfer"] is False

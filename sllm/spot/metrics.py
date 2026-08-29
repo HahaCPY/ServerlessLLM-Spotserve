@@ -221,6 +221,51 @@ def make_context_migration_event(
     reason: Optional[str] = None,
 ) -> Dict[str, Any]:
     plans = decision.get("plans", [])
+    selected_target_ids = [
+        str(plan.get("new_instance_id", ""))
+        for plan in plans
+        if plan.get("new_instance_id")
+    ]
+    selected_source_instance_ids = [
+        str(plan.get("old_instance_id", ""))
+        for plan in plans
+        if plan.get("old_instance_id")
+    ]
+    selected_request_ids = [
+        str(plan.get("request_id", ""))
+        for plan in plans
+        if plan.get("request_id")
+    ]
+    selected_total_cost = sum(
+        float(plan.get("estimated_cost", 0.0) or 0.0)
+        for plan in plans
+    )
+    selected_kv_cost = sum(
+        float(plan.get("kv_migration_cost", 0.0) or 0.0)
+        for plan in plans
+    )
+    selected_expert_cost = sum(
+        float(plan.get("expert_dispatch_cost", 0.0) or 0.0)
+        for plan in plans
+    )
+    selected_queue_cost = sum(
+        float(plan.get("queue_penalty_cost", 0.0) or 0.0)
+        for plan in plans
+    )
+    selected_queue_pressures = [
+        float(plan.get("queue_pressure", 0.0) or 0.0)
+        for plan in plans
+    ]
+    selected_hot_expert_ratios = [
+        float(plan.get("hot_expert_locality_ratio", 0.0) or 0.0)
+        for plan in plans
+        if plan.get("expert_locality_available")
+    ]
+    selected_remote_routing_ratios = [
+        float(plan.get("estimated_remote_routing_ratio", 0.0) or 0.0)
+        for plan in plans
+        if plan.get("expert_locality_available")
+    ]
     prefix_warmup = (
         decision.get("prefix_warmup")
         or decision.get("kv_cache_migration")
@@ -244,6 +289,27 @@ def make_context_migration_event(
         decision.get("total_estimated_remote_routed_tokens", 0)
         or 0
     )
+    route_histogram_available_count = int(
+        decision.get("moe_route_histogram_available_count", 0) or 0
+    )
+    target_placement_available_count = int(
+        decision.get("moe_target_placement_available_count", 0) or 0
+    )
+    candidate_component_costs = (
+        decision.get("candidate_component_costs") or {}
+    )
+    candidate_target_count = int(
+        decision.get("context_target_count", 0) or 0
+    )
+    if not candidate_target_count and isinstance(candidate_component_costs, dict):
+        candidate_target_count = max(
+            (
+                len(targets)
+                for targets in candidate_component_costs.values()
+                if isinstance(targets, dict)
+            ),
+            default=0,
+        )
     return {
         "type": "context_migration",
         "model": model,
@@ -251,6 +317,41 @@ def make_context_migration_event(
         "reason": reason,
         "context_migration_plan_count": len(plans),
         "migration_plan_count": len(plans),
+        "selected_plan_count": len(plans),
+        "selected_target_ids": selected_target_ids,
+        "selected_source_instance_ids": selected_source_instance_ids,
+        "selected_request_ids": selected_request_ids,
+        "selected_plan_total_estimated_cost": selected_total_cost,
+        "selected_plan_kv_migration_cost": selected_kv_cost,
+        "selected_plan_expert_dispatch_cost": selected_expert_cost,
+        "selected_plan_queue_penalty_cost": selected_queue_cost,
+        "selected_plan_avg_queue_pressure": (
+            sum(selected_queue_pressures) / len(selected_queue_pressures)
+            if selected_queue_pressures
+            else 0.0
+        ),
+        "selected_plan_max_queue_depth": max(
+            (
+                int(plan.get("queue_depth", 0) or 0)
+                for plan in plans
+            ),
+            default=0,
+        ),
+        "selected_plan_avg_hot_expert_locality_ratio": (
+            sum(selected_hot_expert_ratios) / len(selected_hot_expert_ratios)
+            if selected_hot_expert_ratios
+            else 0.0
+        ),
+        "selected_plan_avg_estimated_remote_routing_ratio": (
+            sum(selected_remote_routing_ratios)
+            / len(selected_remote_routing_ratios)
+            if selected_remote_routing_ratios
+            else 0.0
+        ),
+        "selected_plan_estimated_remote_routed_tokens": sum(
+            int(plan.get("estimated_remote_routed_tokens", 0) or 0)
+            for plan in plans
+        ),
         "unassigned_context_count": len(
             decision.get("unassigned_contexts", [])
         ),
@@ -268,11 +369,17 @@ def make_context_migration_event(
         ),
         "avg_queue_pressure": decision.get("avg_queue_pressure", 0.0),
         "max_queue_depth": decision.get("max_queue_depth", 0),
-        "moe_route_histogram_available_count": decision.get(
-            "moe_route_histogram_available_count", 0
+        "moe_route_histogram_available": (
+            route_histogram_available_count > 0
         ),
-        "moe_target_placement_available_count": decision.get(
-            "moe_target_placement_available_count", 0
+        "moe_route_histogram_available_count": (
+            route_histogram_available_count
+        ),
+        "moe_target_placement_available": (
+            target_placement_available_count > 0
+        ),
+        "moe_target_placement_available_count": (
+            target_placement_available_count
         ),
         "moe_route_histogram_source": decision.get(
             "moe_route_histogram_source", "unavailable"
@@ -285,6 +392,18 @@ def make_context_migration_event(
         ),
         "moe_estimated_remote_routed_tokens": total_remote_routed_tokens,
         "moe_estimated_dispatch_cost": total_expert_dispatch_cost,
+        "context_source_count": int(
+            decision.get("context_source_count", len(plans)) or 0
+        ),
+        "context_target_count": candidate_target_count,
+        "candidate_component_costs_enabled": bool(
+            decision.get("candidate_component_costs_enabled", False)
+        ),
+        "candidate_component_costs": (
+            candidate_component_costs
+            if candidate_component_costs
+            else None
+        ),
         "plans": plans,
         "prefix_warmup": prefix_warmup or None,
         "prefix_warmup_attempts": prefix_warmup_attempts,

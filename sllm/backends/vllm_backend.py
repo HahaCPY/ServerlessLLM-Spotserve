@@ -18,13 +18,15 @@
 import asyncio
 import gc
 import inspect
+import json
 import logging
 import os
 import time
 import uuid
 import zlib
 from dataclasses import fields
-from typing import Any, Dict, List, Optional, Sequence, Union, cast
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Union, cast
 
 import torch
 from vllm import (
@@ -155,6 +157,86 @@ def runtime_metadata_from_request_output(
     return runtime_metadata
 
 
+def _as_non_negative_int(value: Any) -> Optional[int]:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return max(parsed, 0)
+
+
+def _expert_key_from_parts(parts: Sequence[Any]) -> str:
+    cleaned = [str(part) for part in parts if str(part) not in {"", "None"}]
+    if not cleaned:
+        return ""
+    if len(cleaned) >= 2 and all(part.isdigit() for part in cleaned[-2:]):
+        return f"layer:{cleaned[-2]}/expert:{cleaned[-1]}"
+    if len(cleaned) == 1:
+        return cleaned[0]
+    return "/".join(cleaned)
+
+
+def _normalize_expert_route_histogram(
+    value: Any,
+    request_id: Optional[str] = None,
+) -> Dict[str, int]:
+    if not isinstance(value, Mapping):
+        return {}
+    if request_id and isinstance(value.get(request_id), Mapping):
+        value = value[request_id]
+
+    histogram: Dict[str, int] = {}
+
+    def visit(node: Any, parts: Sequence[Any]) -> None:
+        parsed = _as_non_negative_int(node)
+        if parsed is not None:
+            key = _expert_key_from_parts(parts)
+            if key and parsed > 0:
+                histogram[key] = histogram.get(key, 0) + parsed
+            return
+        if isinstance(node, Mapping):
+            if "layer_id" in node and "expert_id" in node:
+                routed_tokens = _as_non_negative_int(
+                    node.get("routed_tokens", node.get("tokens", 0))
+                )
+                if routed_tokens:
+                    key = _expert_key_from_parts(
+                        (node["layer_id"], node["expert_id"])
+                    )
+                    histogram[key] = histogram.get(key, 0) + routed_tokens
+                return
+            for key, child in node.items():
+                visit(child, (*parts, key))
+            return
+        if isinstance(node, (list, tuple)):
+            for index, child in enumerate(node):
+                visit(child, (*parts, index))
+
+    visit(value, ())
+    return histogram
+
+
+def _normalize_per_request_expert_route_histogram(
+    value: Any,
+) -> Dict[str, Dict[str, int]]:
+    if not isinstance(value, Mapping):
+        return {}
+    result: Dict[str, Dict[str, int]] = {}
+    for request_id, histogram_payload in value.items():
+        histogram = _normalize_expert_route_histogram(histogram_payload)
+        if histogram:
+            result[str(request_id)] = histogram
+    return result
+
+
+def _merge_int_histogram(
+    target: Dict[str, int],
+    source: Mapping[str, int],
+) -> None:
+    for key, value in source.items():
+        target[str(key)] = target.get(str(key), 0) + max(0, int(value or 0))
+
+
 async def _maybe_await(value: Any) -> Any:
     return await value if inspect.isawaitable(value) else value
 
@@ -207,6 +289,36 @@ class VllmBackend(SllmBackend):
         self.backend_config = backend_config
         self.request_trace = LLMEngineStatusDict()
         self.pending_kv_restores: Dict[str, int] = {}
+        self.request_expert_route_histograms: Dict[str, Dict[str, int]] = (
+            _normalize_per_request_expert_route_histogram(
+                backend_config.get("per_request_expert_route_histogram")
+            )
+        )
+        self.request_expert_route_histogram_sources: Dict[str, str] = {}
+        configured_histogram_source = str(
+            backend_config.get(
+                "moe_route_histogram_source",
+                "instrumentation"
+                if self.request_expert_route_histograms
+                else "unavailable",
+            )
+            or "unavailable"
+        )
+        for request_id in self.request_expert_route_histograms:
+            self.request_expert_route_histogram_sources[request_id] = (
+                configured_histogram_source
+            )
+        self.global_expert_hotness: Dict[str, int] = (
+            _normalize_expert_route_histogram(
+                backend_config.get("global_expert_hotness")
+            )
+        )
+        self.recent_window_expert_hotness: Dict[str, int] = (
+            _normalize_expert_route_histogram(
+                backend_config.get("recent_window_expert_hotness")
+            )
+        )
+        self._model_config_cache: Optional[Dict[str, Any]] = None
         self._forced_failures_seen = set()
         self.abort_reasons: Dict[str, str] = {}
         # Test-only pacing lets a live-migration smoke keep a real GPU request
@@ -276,15 +388,245 @@ class VllmBackend(SllmBackend):
         self.engine = None
         self.model_load_time_s = 0.0
 
-    def _engine_parallel_metadata(self) -> Dict[str, Any]:
+    def _config_value_for_runtime(
+        self,
+        key: str,
+        instance_id: str = "",
+        node_id: str = "",
+    ) -> Any:
+        by_instance = self.backend_config.get(f"{key}_by_instance")
+        if isinstance(by_instance, Mapping) and instance_id in by_instance:
+            return by_instance[instance_id]
+        by_node = self.backend_config.get(f"{key}_by_node")
+        if isinstance(by_node, Mapping) and node_id in by_node:
+            return by_node[node_id]
+        return self.backend_config.get(key)
+
+    def _load_model_config(self) -> Dict[str, Any]:
+        if getattr(self, "_model_config_cache", None) is not None:
+            return self._model_config_cache
+        self._model_config_cache = {}
+        model_path = self.backend_config.get("pretrained_model_name_or_path")
+        if not isinstance(model_path, str) or not model_path.startswith("/"):
+            return self._model_config_cache
+        config_path = Path(model_path) / "config.json"
+        try:
+            if config_path.is_file():
+                self._model_config_cache = json.loads(
+                    config_path.read_text(encoding="utf-8")
+                )
+        except Exception:
+            logger.debug(
+                "Unable to read model config for MoE instrumentation",
+                exc_info=True,
+            )
+        return self._model_config_cache
+
+    @staticmethod
+    def _first_positive_config_int(
+        config: Mapping[str, Any],
+        *keys: str,
+    ) -> int:
+        for key in keys:
+            value = _as_non_negative_int(config.get(key))
+            if value and value > 0:
+                return value
+        return 0
+
+    def _instrumented_expert_placement_snapshot(
+        self,
+        instance_id: str = "",
+        node_id: str = "",
+        effective_ep_size: int = 1,
+    ) -> Optional[Dict[str, Any]]:
+        configured = self._config_value_for_runtime(
+            "expert_placement_snapshot",
+            instance_id=instance_id,
+            node_id=node_id,
+        )
+        if isinstance(configured, Mapping) and configured:
+            return dict(configured)
+
+        infer_enabled = bool(
+            self.backend_config.get(
+                "infer_moe_expert_placement_from_model_config",
+                True,
+            )
+        )
+        if not infer_enabled:
+            return None
+
+        model_config = self._load_model_config()
+        num_layers = self._first_positive_config_int(
+            model_config,
+            "num_hidden_layers",
+            "n_layer",
+            "num_layers",
+        )
+        num_experts = self._first_positive_config_int(
+            model_config,
+            "num_experts",
+            "num_local_experts",
+            "n_routed_experts",
+            "moe_num_experts",
+        )
+        if num_layers <= 0 or num_experts <= 0:
+            return None
+
+        ep_size = max(1, int(effective_ep_size or 1))
+        placement: Dict[str, Any] = {}
+        for layer_id in range(num_layers):
+            for expert_id in range(num_experts):
+                rank_id = f"ep-rank-{expert_id % ep_size}"
+                placement[f"layer:{layer_id}/expert:{expert_id}"] = {
+                    "layer_id": layer_id,
+                    "expert_id": expert_id,
+                    "rank_id": rank_id,
+                    "node_id": node_id,
+                    "gpu_id": str(expert_id % ep_size),
+                    "placement_source": "derived_from_model_config",
+                }
+        return placement
+
+    def _record_request_expert_route_histogram(
+        self,
+        request_id: str,
+        histogram: Mapping[str, int],
+        source: str,
+    ) -> None:
+        normalized: Dict[str, int] = {}
+        for key, value in histogram.items():
+            parsed = _as_non_negative_int(value)
+            if parsed and parsed > 0:
+                normalized[str(key)] = parsed
+        if not normalized:
+            return
+        request_key = str(request_id)
+        if not hasattr(self, "request_expert_route_histograms"):
+            self.request_expert_route_histograms = {}
+        if not hasattr(self, "request_expert_route_histogram_sources"):
+            self.request_expert_route_histogram_sources = {}
+        if not hasattr(self, "global_expert_hotness"):
+            self.global_expert_hotness = {}
+        self.request_expert_route_histograms[request_key] = normalized
+        self.request_expert_route_histogram_sources[request_key] = (
+            str(source or "instrumentation")
+        )
+        _merge_int_histogram(self.global_expert_hotness, normalized)
+
+    def _clear_request_expert_route_histogram(self, request_id: str) -> None:
+        request_key = str(request_id)
+        getattr(self, "request_expert_route_histograms", {}).pop(
+            request_key, None
+        )
+        getattr(self, "request_expert_route_histogram_sources", {}).pop(
+            request_key, None
+        )
+
+    def _pop_request_expert_route_histogram(
+        self,
+        request_data: Dict[str, Any],
+        request_id: str,
+    ) -> None:
+        raw_histogram = request_data.pop(
+            "_spotserve_per_request_expert_route_histogram", None
+        )
+        if raw_histogram is None:
+            raw_histogram = request_data.pop(
+                "per_request_expert_route_histogram", None
+            )
+        source = request_data.pop(
+            "_spotserve_moe_route_histogram_source",
+            "request_instrumentation",
+        )
+        histogram = _normalize_expert_route_histogram(
+            raw_histogram,
+            request_id=request_id,
+        )
+        if histogram:
+            self._record_request_expert_route_histogram(
+                request_id=request_id,
+                histogram=histogram,
+                source=str(source or "request_instrumentation"),
+            )
+
+    def _request_expert_route_metadata(
+        self,
+        request_id: str,
+        runtime_metadata: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        request_key = str(request_id)
+        runtime_metadata = runtime_metadata or {}
+        runtime_histogram = _normalize_expert_route_histogram(
+            runtime_metadata.get("per_request_expert_route_histogram"),
+            request_id=request_key,
+        )
+        if runtime_histogram:
+            return {
+                "per_request_expert_route_histogram": {
+                    request_key: runtime_histogram
+                },
+                "moe_route_histogram_available": True,
+                "moe_route_histogram_source": str(
+                    runtime_metadata.get("moe_route_histogram_source")
+                    or "runtime"
+                ),
+            }
+
+        histogram = getattr(
+            self, "request_expert_route_histograms", {}
+        ).get(request_key)
+        if not histogram:
+            return {}
+        return {
+            "per_request_expert_route_histogram": {
+                request_key: dict(histogram)
+            },
+            "moe_route_histogram_available": True,
+            "moe_route_histogram_source": (
+                getattr(
+                    self,
+                    "request_expert_route_histogram_sources",
+                    {},
+                ).get(
+                    request_key,
+                    "instrumentation",
+                )
+            ),
+        }
+
+    def _merge_request_expert_route_metadata(
+        self,
+        runtime_metadata: Mapping[str, Any],
+        request_id: str,
+    ) -> Dict[str, Any]:
+        merged = dict(runtime_metadata)
+        merged.update(
+            self._request_expert_route_metadata(
+                request_id=request_id,
+                runtime_metadata=merged,
+            )
+        )
+        return merged
+
+    def _engine_parallel_metadata(
+        self,
+        instance_id: str = "",
+        node_id: str = "",
+    ) -> Dict[str, Any]:
         metadata: Dict[str, Any] = {}
+        engine_args = getattr(self, "engine_args", None)
         for field_name in (
             "tensor_parallel_size",
             "pipeline_parallel_size",
             "data_parallel_size",
             "enable_expert_parallel",
         ):
-            value = getattr(self.engine_args, field_name, None)
+            value = getattr(
+                engine_args,
+                field_name,
+                self.backend_config.get(field_name),
+            )
             if value is not None:
                 metadata[field_name] = value
         enable_ep = bool(metadata.get("enable_expert_parallel", False))
@@ -334,12 +676,77 @@ class VllmBackend(SllmBackend):
                 or 1
             ),
         )
-        metadata["expert_placement_available"] = False
-        metadata["placement_epoch"] = 0
-        metadata["placement_version"] = 0
-        metadata["placement_source"] = "unavailable"
-        metadata["moe_route_histogram_available"] = False
-        metadata["moe_route_histogram_source"] = "unavailable"
+        placement_snapshot = self._instrumented_expert_placement_snapshot(
+            instance_id=instance_id,
+            node_id=node_id,
+            effective_ep_size=effective_ep_size,
+        )
+        configured_placement = self._config_value_for_runtime(
+            "expert_placement_snapshot",
+            instance_id=instance_id,
+            node_id=node_id,
+        )
+        default_placement_source = "unavailable"
+        if isinstance(configured_placement, Mapping) and configured_placement:
+            default_placement_source = "instrumentation"
+        elif placement_snapshot:
+            default_placement_source = "derived_from_model_config"
+        metadata["expert_placement_available"] = bool(placement_snapshot)
+        metadata["placement_epoch"] = (
+            _as_non_negative_int(
+                self.backend_config.get("placement_epoch", 0)
+            )
+            or 0
+        )
+        metadata["placement_version"] = metadata["placement_epoch"]
+        metadata["placement_source"] = (
+            str(
+                self.backend_config.get(
+                    "placement_source",
+                    default_placement_source,
+                )
+            )
+            or "unavailable"
+        )
+        if placement_snapshot:
+            metadata["expert_placement_snapshot"] = placement_snapshot
+        request_histograms = getattr(
+            self, "request_expert_route_histograms", {}
+        )
+        route_histogram_available = bool(request_histograms)
+        metadata["moe_route_histogram_available"] = route_histogram_available
+        metadata["moe_route_histogram_source"] = (
+            ",".join(
+                sorted(
+                    {
+                        source
+                        for source in (
+                            getattr(
+                                self,
+                                "request_expert_route_histogram_sources",
+                                {},
+                            )
+                        ).values()
+                        if source
+                    }
+                )
+            )
+            if route_histogram_available
+            else "unavailable"
+        )
+        if route_histogram_available:
+            metadata["per_request_expert_route_histogram"] = {
+                request_id: dict(histogram)
+                for request_id, histogram in request_histograms.items()
+            }
+        if getattr(self, "global_expert_hotness", {}):
+            metadata["global_expert_hotness"] = dict(
+                self.global_expert_hotness
+            )
+        if getattr(self, "recent_window_expert_hotness", {}):
+            metadata["recent_window_expert_hotness"] = dict(
+                self.recent_window_expert_hotness
+            )
         metadata["parallel_plan_mismatch"] = (
             metadata["planned_effective_expert_parallel_size"] != effective_ep_size
         )
@@ -389,6 +796,36 @@ class VllmBackend(SllmBackend):
             )
         return await _maybe_await(hook(**call_kwargs))
 
+    async def _request_runtime_moe_metadata(
+        self,
+        request_id: str,
+    ) -> Dict[str, Any]:
+        extra = await self._call_runtime_hook(
+            (
+                "get_request_moe_metadata",
+                "get_request_expert_route_metadata",
+                "get_request_expert_routing_metadata",
+            ),
+            request_id=str(request_id),
+        )
+        return dict(extra) if isinstance(extra, dict) else {}
+
+    async def _runtime_moe_metadata(
+        self,
+        instance_id: str = "",
+        node_id: str = "",
+    ) -> Dict[str, Any]:
+        extra = await self._call_runtime_hook(
+            (
+                "get_moe_runtime_metadata",
+                "get_expert_placement_metadata",
+                "get_moe_placement_metadata",
+            ),
+            instance_id=instance_id,
+            node_id=node_id,
+        )
+        return dict(extra) if isinstance(extra, dict) else {}
+
     async def _request_runtime_metadata(
         self, result: RequestOutput
     ) -> Dict[str, Any]:
@@ -399,6 +836,13 @@ class VllmBackend(SllmBackend):
         )
         if isinstance(extra, dict):
             metadata.update(extra)
+        metadata.update(
+            await self._request_runtime_moe_metadata(result.request_id)
+        )
+        metadata = self._merge_request_expert_route_metadata(
+            metadata,
+            str(result.request_id),
+        )
         restore_supported = await self.supports_state_restore()
         metadata["supports_state_export"] = restore_supported
         metadata["supports_state_restore"] = restore_supported
@@ -552,6 +996,7 @@ class VllmBackend(SllmBackend):
 
         failure_mode = str(forced_failure["failure_mode"])
         if failure_mode in {"preempt", "preempted", "preemption"}:
+            self._clear_request_expert_route_histogram(output.request_id)
             return {
                 "error": (
                     "Forced vLLM backend preemption after "
@@ -601,6 +1046,7 @@ class VllmBackend(SllmBackend):
         request_id: str = request_data.pop(
             "request_id", f"chatcmpl-{uuid.uuid4()}"
         )
+        self._pop_request_expert_route_histogram(request_data, request_id)
         # Test-only observability for deterministic migration experiments.
         # The private request flag is removed before SamplingParams is built,
         # so it cannot change production sampling semantics or leak into the
@@ -649,6 +1095,7 @@ class VllmBackend(SllmBackend):
         try:
             sampling_params = SamplingParams(**request_data)
         except Exception as e:
+            self._clear_request_expert_route_histogram(request_id)
             return {"error": f"Invalid sampling parameters: {e}"}
 
         results_generator = self.engine.generate(
@@ -688,6 +1135,7 @@ class VllmBackend(SllmBackend):
                 return await self._reparallelization_abort_result(
                     request_id, reason
                 )
+            self._clear_request_expert_route_histogram(request_id)
             raise
 
         reason = self.abort_reasons.pop(request_id, None)
@@ -700,6 +1148,7 @@ class VllmBackend(SllmBackend):
 
         if not self.trace_debug:
             await self.request_trace.delete_request(request_id)
+            self._clear_request_expert_route_histogram(request_id)
 
         response = process_output(final_output, model_name)
         expected_blocks = self.pending_kv_restores.pop(request_id, 0)
@@ -751,6 +1200,7 @@ class VllmBackend(SllmBackend):
                 current_output = [tokens]
 
         await self.request_trace.delete_request(request_id)
+        self._clear_request_expert_route_histogram(request_id)
         return {
             "preempted": True,
             "_spotserve_reparallelization": reason == "reparallelization",
@@ -856,21 +1306,33 @@ class VllmBackend(SllmBackend):
             else:
                 if isinstance(runtime_snapshots, list):
                     restore_supported = await self.supports_state_restore()
-                    return [
-                        get_vllm_context_metadata(
-                            model_name=self.model_name,
-                            instance_id=instance_id or self.model_name,
-                            node_id=node_id,
-                            runtime_metadata={
-                                **snapshot,
-                                "supports_state_export": restore_supported,
-                                "supports_state_restore": restore_supported,
-                            },
+                    contexts = []
+                    for snapshot in runtime_snapshots:
+                        if not isinstance(snapshot, dict):
+                            continue
+                        if not snapshot.get("found", True):
+                            continue
+                        request_id = str(snapshot.get("request_id", ""))
+                        snapshot.update(
+                            await self._request_runtime_moe_metadata(
+                                request_id
+                            )
                         )
-                        for snapshot in runtime_snapshots
-                        if isinstance(snapshot, dict)
-                        and snapshot.get("found", True)
-                    ]
+                        snapshot = self._merge_request_expert_route_metadata(
+                            snapshot,
+                            request_id,
+                        )
+                        snapshot["supports_state_export"] = restore_supported
+                        snapshot["supports_state_restore"] = restore_supported
+                        contexts.append(
+                            get_vllm_context_metadata(
+                                model_name=self.model_name,
+                                instance_id=instance_id or self.model_name,
+                                node_id=node_id,
+                                runtime_metadata=snapshot,
+                            )
+                        )
+                    return contexts
 
         results = await self.request_trace.return_all_results()
         ongoing_results: List[RequestOutput] = [
@@ -918,6 +1380,13 @@ class VllmBackend(SllmBackend):
             payload.setdefault("request_id", str(request_id))
             if not payload.get("found", True):
                 return payload
+            payload.update(
+                await self._request_runtime_moe_metadata(str(request_id))
+            )
+            payload = self._merge_request_expert_route_metadata(
+                payload,
+                str(request_id),
+            )
             return get_vllm_context_metadata(
                 model_name=self.model_name,
                 instance_id=instance_id or self.model_name,
@@ -1047,7 +1516,13 @@ class VllmBackend(SllmBackend):
             if isinstance(live_metadata, dict) and live_metadata.get(
                 "found", True
             ):
-                runtime_metadata = dict(live_metadata)
+                live_metadata.update(
+                    await self._request_runtime_moe_metadata(str(request_id))
+                )
+                runtime_metadata = self._merge_request_expert_route_metadata(
+                    dict(live_metadata),
+                    str(request_id),
+                )
         if current_output is None:
             if runtime_metadata.get("tokens"):
                 current_output = [list(runtime_metadata["tokens"])]
@@ -1333,6 +1808,10 @@ class VllmBackend(SllmBackend):
                 }
             except Exception:
                 logger.debug("Unable to query CUDA runtime metadata", exc_info=True)
+        runtime_moe_metadata = await self._runtime_moe_metadata(
+            instance_id=instance_id,
+            node_id=node_id,
+        )
         return get_vllm_runtime_metadata(
             model_name=self.model_name,
             backend_config=self.backend_config,
@@ -1341,7 +1820,11 @@ class VllmBackend(SllmBackend):
             runtime_metadata={
                 "load_time_s": self.model_load_time_s,
                 **gpu_metadata,
-                **self._engine_parallel_metadata(),
+                **self._engine_parallel_metadata(
+                    instance_id=instance_id,
+                    node_id=node_id,
+                ),
+                **runtime_moe_metadata,
             },
         )
 

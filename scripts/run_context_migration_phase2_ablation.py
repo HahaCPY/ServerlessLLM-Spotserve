@@ -13,9 +13,7 @@ if str(REPO_ROOT) not in sys.path:
 from sllm.spot.context_migration import (
     ContextMetadata,
     MigrationTarget,
-    estimate_expert_dispatch_cost,
-    estimate_kv_migration_cost,
-    estimate_queue_penalty_cost,
+    build_candidate_component_costs,
     plan_low_cost_migration_from_dict,
 )
 from sllm.spot.metrics import JsonlMetricsWriter, make_context_migration_event
@@ -103,51 +101,6 @@ def first_plan(decision: Mapping[str, Any]) -> Dict[str, Any]:
     if not plans:
         return {}
     return dict(plans[0] or {})
-
-
-def candidate_component_costs(
-    sources: List[Mapping[str, Any]],
-    targets: List[Mapping[str, Any]],
-    planner_config: Mapping[str, Any],
-) -> Dict[str, Dict[str, Dict[str, float]]]:
-    rows: Dict[str, Dict[str, Dict[str, float]]] = {}
-    target_objects = [MigrationTarget.from_dict(row) for row in targets]
-    for source_row in sources:
-        source = ContextMetadata.from_dict(source_row)
-        request_id = str(source.request_id or source.instance_id)
-        rows[request_id] = {}
-        for target in target_objects:
-            kv = estimate_kv_migration_cost(source, target, planner_config)
-            expert = estimate_expert_dispatch_cost(
-                source, target, planner_config
-            )
-            queue = estimate_queue_penalty_cost(
-                target,
-                planner_config,
-                planned_requests_ahead=0,
-            )
-            rows[request_id][target.instance_id] = {
-                "total_cost": (
-                    float(kv.get("cost", 0.0) or 0.0)
-                    + float(expert.get("cost", 0.0) or 0.0)
-                    + float(queue.get("cost", 0.0) or 0.0)
-                ),
-                "kv_migration_cost": float(kv.get("cost", 0.0) or 0.0),
-                "expert_dispatch_cost": float(
-                    expert.get("cost", 0.0) or 0.0
-                ),
-                "queue_penalty_cost": float(queue.get("cost", 0.0) or 0.0),
-                "hot_expert_locality_ratio": float(
-                    expert.get("locality_ratio", 0.0) or 0.0
-                ),
-                "estimated_remote_routing_ratio": float(
-                    expert.get("estimated_remote_routing_ratio", 0.0) or 0.0
-                ),
-                "queue_pressure": float(
-                    queue.get("queue_pressure", 0.0) or 0.0
-                ),
-            }
-    return rows
 
 
 def summarize_run(
@@ -270,15 +223,27 @@ def run_ablation(
             "planner_config": planner_config,
         }
         decision = plan_low_cost_migration_from_dict(run_payload).to_dict()
+        source_objects = [
+            ContextMetadata.from_dict(row)
+            for row in payload.get("sources", [])
+        ]
+        target_objects = [
+            MigrationTarget.from_dict(row)
+            for row in payload.get("targets", [])
+        ]
+        candidate_costs = build_candidate_component_costs(
+            sources=source_objects,
+            targets=target_objects,
+            planner_config=planner_config,
+        )
+        decision["context_source_count"] = len(source_objects)
+        decision["context_target_count"] = len(target_objects)
+        decision["candidate_component_costs_enabled"] = True
+        decision["candidate_component_costs"] = candidate_costs
         event = make_context_migration_event(
             model=model,
             decision=decision,
             reason="phase2_synthetic_ablation",
-        )
-        candidate_costs = candidate_component_costs(
-            payload.get("sources", []),
-            payload.get("targets", []),
-            planner_config,
         )
         summary = summarize_run(
             run,

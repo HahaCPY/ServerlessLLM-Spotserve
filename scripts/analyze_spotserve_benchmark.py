@@ -798,7 +798,26 @@ def summarize_context_migration_metrics(
     reuse_numerator = (
         total_reusable_blocks if total_context_blocks else total_reusable_tokens
     )
-    latest_plans = migration_rows[-1].get("plans", []) if migration_rows else []
+    latest_event = migration_rows[-1] if migration_rows else {}
+    latest_plans = latest_event.get("plans", []) if latest_event else []
+    latest_selected_target_ids = latest_event.get("selected_target_ids", [])
+    if not isinstance(latest_selected_target_ids, list):
+        latest_selected_target_ids = []
+    if not latest_selected_target_ids and isinstance(latest_plans, list):
+        latest_selected_target_ids = [
+            str(plan.get("new_instance_id", ""))
+            for plan in latest_plans
+            if isinstance(plan, dict) and plan.get("new_instance_id")
+        ]
+    latest_selected_request_ids = latest_event.get("selected_request_ids", [])
+    if not isinstance(latest_selected_request_ids, list):
+        latest_selected_request_ids = []
+    if not latest_selected_request_ids and isinstance(latest_plans, list):
+        latest_selected_request_ids = [
+            str(plan.get("request_id", ""))
+            for plan in latest_plans
+            if isinstance(plan, dict) and plan.get("request_id")
+        ]
     kv_rows = [
         row.get("kv_cache_migration") or {}
         for row in migration_rows
@@ -835,6 +854,96 @@ def summarize_context_migration_metrics(
         "context_migration_total_estimated_cost": total_estimated_cost,
         "context_migration_avg_estimated_cost": (
             total_estimated_cost / total_plan_count if total_plan_count else 0.0
+        ),
+        "context_migration_selected_target_ids": compact_values(
+            [str(value) for value in latest_selected_target_ids]
+        ),
+        "context_migration_selected_request_ids": compact_values(
+            [str(value) for value in latest_selected_request_ids]
+        ),
+        "context_migration_selected_plan_total_estimated_cost": sum(
+            safe_float(row.get("selected_plan_total_estimated_cost"), 0.0)
+            for row in migration_rows
+        ),
+        "context_migration_selected_plan_kv_migration_cost": sum(
+            safe_float(row.get("selected_plan_kv_migration_cost"), 0.0)
+            for row in migration_rows
+        ),
+        "context_migration_selected_plan_expert_dispatch_cost": sum(
+            safe_float(row.get("selected_plan_expert_dispatch_cost"), 0.0)
+            for row in migration_rows
+        ),
+        "context_migration_selected_plan_queue_penalty_cost": sum(
+            safe_float(row.get("selected_plan_queue_penalty_cost"), 0.0)
+            for row in migration_rows
+        ),
+        "context_migration_selected_plan_avg_queue_pressure": (
+            mean([
+                safe_float(
+                    row.get("selected_plan_avg_queue_pressure"), 0.0
+                )
+                for row in migration_rows
+            ])
+            if migration_rows
+            else 0.0
+        ),
+        "context_migration_selected_plan_max_queue_depth": max(
+            (
+                safe_int(row.get("selected_plan_max_queue_depth"), 0)
+                for row in migration_rows
+            ),
+            default=0,
+        ),
+        "context_migration_selected_plan_avg_hot_expert_locality_ratio": (
+            mean([
+                safe_float(
+                    row.get(
+                        "selected_plan_avg_hot_expert_locality_ratio"
+                    ),
+                    0.0,
+                )
+                for row in migration_rows
+            ])
+            if migration_rows
+            else 0.0
+        ),
+        "context_migration_selected_plan_avg_estimated_remote_routing_ratio": (
+            mean([
+                safe_float(
+                    row.get(
+                        "selected_plan_avg_estimated_remote_routing_ratio"
+                    ),
+                    0.0,
+                )
+                for row in migration_rows
+            ])
+            if migration_rows
+            else 0.0
+        ),
+        "context_migration_selected_plan_estimated_remote_routed_tokens": sum(
+            safe_int(
+                row.get("selected_plan_estimated_remote_routed_tokens"), 0
+            )
+            for row in migration_rows
+        ),
+        "context_migration_context_source_count": max(
+            (
+                safe_int(row.get("context_source_count"), 0)
+                for row in migration_rows
+            ),
+            default=0,
+        ),
+        "context_migration_context_target_count": max(
+            (
+                safe_int(row.get("context_target_count"), 0)
+                for row in migration_rows
+            ),
+            default=0,
+        ),
+        "context_migration_candidate_component_cost_events": sum(
+            1
+            for row in migration_rows
+            if row.get("candidate_component_costs")
         ),
         "context_migration_reusable_tokens": total_reusable_tokens,
         "context_migration_reusable_context_blocks": total_reusable_blocks,

@@ -42,6 +42,7 @@ from sllm.spot.metrics import (
 from sllm.spot.context_migration import (
     ContextMetadata,
     MigrationTarget,
+    build_candidate_component_costs,
     plan_low_cost_migration,
 )
 from sllm.spot.recovery_policy import RecoveryPolicy, normalize_policy
@@ -125,6 +126,14 @@ class RoundRobinRouter(SllmRouter):
         )
         self.context_migration_config = dict(
             router_config.get("context_migration_config", {})
+        )
+        self.emit_context_migration_candidate_costs = bool(
+            self.context_migration_config.get(
+                "emit_candidate_component_costs",
+                self.context_migration_config.get(
+                    "emit_candidate_costs", False
+                ),
+            )
         )
         self.enable_kv_cache_migration = bool(
             router_config.get(
@@ -1496,6 +1505,19 @@ class RoundRobinRouter(SllmRouter):
             targets=targets,
             planner_config=planner_config,
         ).to_dict()
+        decision["context_source_count"] = len(sources)
+        decision["context_target_count"] = len(targets)
+        decision["candidate_component_costs_enabled"] = (
+            self.emit_context_migration_candidate_costs
+        )
+        if self.emit_context_migration_candidate_costs:
+            decision["candidate_component_costs"] = (
+                build_candidate_component_costs(
+                    sources=sources,
+                    targets=targets,
+                    planner_config=planner_config,
+                )
+            )
         prefix_warmup = await self._execute_prefix_warmup(
             decision,
             matches,

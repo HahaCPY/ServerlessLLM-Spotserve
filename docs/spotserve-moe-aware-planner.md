@@ -612,9 +612,18 @@ expert placement result
 - `sllm/backends/vllm_context_metadata.py` 與
   `sllm/backends/vllm_state_metadata.py` 已允許這些 aware 欄位通過 metadata
   export。
-- vLLM backend 目前尚未取得真實 expert placement / per-request route histogram，
-  因此會明確標示 placement 與 route histogram 為 unavailable，而不是假裝已有
-  runtime instrumentation。
+- vLLM backend 已補上 Phase 2 runtime instrumentation path：若 patched runtime
+  hook 回傳 `per_request_expert_route_histogram`，會優先保留為 runtime-provided
+  metadata；若 benchmark request 帶
+  `_spotserve_per_request_expert_route_histogram`，backend 會在建立
+  `SamplingParams` 前移除該私有欄位，並轉成 canonical
+  `per_request_expert_route_histogram`。若兩者都沒有，會明確標示 route
+  histogram unavailable。
+- target placement 目前支援 configured `expert_placement_snapshot`，或在本地
+  MoE model `config.json` 可讀時由 `num_hidden_layers` 與 expert count 推導一份
+  instance-level coverage snapshot，並標示 `placement_source` 為
+  `derived_from_model_config`。這是 observability / planner input，不宣稱已完成
+  physical expert migration。
 - stateful recovery planner 已改成不把 EP mismatch 預設視為 KV restore
   incompatibility；只有 `state_restore_requires_ep_layout=true` 時才把 EP layout
   mismatch 當 hard reject。
@@ -663,12 +672,29 @@ weights。（已開始實作）
 - `make_context_migration_event()` 與 benchmark analyzer 已新增
   `moe_hot_expert_locality_ratio`、`moe_estimated_remote_routing_ratio`、
   `moe_estimated_remote_routed_tokens`、`moe_estimated_dispatch_cost`、
+  `context_migration_selected_target_ids`、
+  `context_migration_selected_plan_kv_migration_cost`、
+  `context_migration_selected_plan_expert_dispatch_cost`、
+  `context_migration_selected_plan_queue_penalty_cost`、
   `context_migration_queue_penalty_cost`、
   `context_migration_avg_queue_pressure`、`context_migration_max_queue_depth`
   等欄位。
 - context migration / core applied benchmark config 已設定
   `queue_penalty_weight=1.0`，因此 standard benchmark 會啟用這個 queue cost
   component；若 target 當下沒有 queue pressure，對應 metric 仍會自然為 0。
+- context migration / core applied benchmark config 已啟用
+  `enable_moe_expert_locality=true` 與 `expert_dispatch_weight=10.0`；
+  `context_migration_vllm_performance.jsonl` 與
+  `spotserve_core_vllm_performance.jsonl` 的 warm-prefix request 會注入
+  `_spotserve_per_request_expert_route_histogram`，用來驗證 runtime
+  instrumentation 到 planner/metrics 的資料流。
+- V7 runtime observability 已補上 selected-plan cost breakdown：
+  `selected_target_ids`、`selected_plan_total_estimated_cost`、
+  `selected_plan_kv_migration_cost`、`selected_plan_expert_dispatch_cost`、
+  `selected_plan_queue_penalty_cost`、`context_source_count`、
+  `context_target_count`。applied performance configs 會額外開啟
+  `emit_candidate_component_costs=true`，因此 router metrics 會保留每個 source
+  request 對每個 candidate target 的 KV / expert / queue / total cost。
 
 ### Phase 2 可驗證實驗
 
@@ -708,7 +734,7 @@ python scripts/run_context_migration_phase2_ablation.py \
 - 四個 run 的 `selected_targets` 符合上表。
 - `candidate_component_costs` 中可以看到每個 candidate 的
   `kv_migration_cost`、`expert_dispatch_cost`、`queue_penalty_cost` 和
-  `total_cost`，因此能解釋 target 為什麼改變。
+  `total_estimated_cost`，因此能解釋 target 為什麼改變。
 - `phase2-kv-plus-queue` 中 busy same-node target 的 queue cost 必須高於 idle
   target，證明 queue cost 不是只出現在 metrics，而是真的進入 target ranking。
 

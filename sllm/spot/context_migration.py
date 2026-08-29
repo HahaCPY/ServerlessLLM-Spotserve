@@ -120,10 +120,10 @@ class MigrationPlan:
     old_node_id: str
     new_node_id: str
     estimated_cost: float
+    kv_migration_cost: float = 0.0
     reusable_tokens: int = 0
     reusable_context_blocks: int = 0
     reason: str = "low_cost_mapping"
-    kv_migration_cost: float = 0.0
     expert_locality_available: bool = False
     hot_expert_locality_ratio: float = 0.0
     estimated_remote_routing_ratio: float = 0.0
@@ -141,10 +141,10 @@ class MigrationPlan:
             "old_node_id": self.old_node_id,
             "new_node_id": self.new_node_id,
             "estimated_cost": self.estimated_cost,
+            "kv_migration_cost": self.kv_migration_cost,
             "reusable_tokens": self.reusable_tokens,
             "reusable_context_blocks": self.reusable_context_blocks,
             "reason": self.reason,
-            "kv_migration_cost": self.kv_migration_cost,
             "expert_locality_available": self.expert_locality_available,
             "hot_expert_locality_ratio": self.hot_expert_locality_ratio,
             "estimated_remote_routing_ratio": (
@@ -356,6 +356,18 @@ def source_expert_route_histogram(
     return _flatten_expert_histogram(raw, request_id=source.request_id)
 
 
+def source_has_available_expert_route_histogram(
+    source: ContextMetadata,
+) -> bool:
+    histogram = source_expert_route_histogram(source)
+    if not histogram:
+        return False
+    return _to_bool(
+        _metadata_value(source, "moe_route_histogram_available"),
+        default=True,
+    )
+
+
 def target_expert_placement_keys(target: MigrationTarget) -> set[str]:
     raw = _metadata_value(
         target,
@@ -564,27 +576,32 @@ def estimate_kv_migration_cost(
     reusable_tokens, reusable_blocks = reusable_context(
         source, target, planner_config
     )
-    token_cost = max(source.num_tokens - reusable_tokens, 0)
-    block_cost = max(source.context_blocks - reusable_blocks, 0)
-    estimated_cost = (
-        base_migration_cost
-        + token_cost * token_transfer_cost
-        + block_cost * context_block_transfer_cost
+    non_reusable_tokens = max(source.num_tokens - reusable_tokens, 0)
+    non_reusable_blocks = max(source.context_blocks - reusable_blocks, 0)
+    token_cost = non_reusable_tokens * token_transfer_cost
+    block_cost = non_reusable_blocks * context_block_transfer_cost
+    warmup_cost = target.warmup_cost if include_warmup else 0.0
+    cross_node_cost = (
+        cross_node_penalty if source.node_id != target.node_id else 0.0
     )
-    if include_warmup:
-        estimated_cost += target.warmup_cost
-    if source.node_id != target.node_id:
-        estimated_cost += cross_node_penalty
+    cost = (
+        base_migration_cost
+        + token_cost
+        + block_cost
+        + warmup_cost
+        + cross_node_cost
+    )
     return {
-        "cost": float(estimated_cost),
-        "reusable_tokens": reusable_tokens,
-        "reusable_context_blocks": reusable_blocks,
-        "token_transfer_units": token_cost,
-        "context_block_transfer_units": block_cost,
-        "warmup_cost": target.warmup_cost if include_warmup else 0.0,
-        "cross_node_penalty": (
-            cross_node_penalty if source.node_id != target.node_id else 0.0
-        ),
+        "cost": float(cost),
+        "base_migration_cost": float(base_migration_cost),
+        "token_migration_cost": float(token_cost),
+        "context_block_migration_cost": float(block_cost),
+        "warmup_cost": float(warmup_cost),
+        "cross_node_penalty_cost": float(cross_node_cost),
+        "reusable_tokens": int(reusable_tokens),
+        "reusable_context_blocks": int(reusable_blocks),
+        "non_reusable_tokens": int(non_reusable_tokens),
+        "non_reusable_context_blocks": int(non_reusable_blocks),
     }
 
 
@@ -602,7 +619,7 @@ def estimate_migration_cost(
         planner_config,
         include_warmup=include_warmup,
     )
-    estimated_cost = float(kv_migration.get("cost", 0.0) or 0.0)
+    estimated_cost = float(kv_migration["cost"])
     expert_dispatch = estimate_expert_dispatch_cost(
         source, target, planner_config
     )
@@ -615,8 +632,8 @@ def estimate_migration_cost(
     estimated_cost += float(queue_penalty.get("cost", 0.0) or 0.0)
     return (
         float(estimated_cost),
-        int(kv_migration.get("reusable_tokens", 0) or 0),
-        int(kv_migration.get("reusable_context_blocks", 0) or 0),
+        int(kv_migration["reusable_tokens"]),
+        int(kv_migration["reusable_context_blocks"]),
     )
 
 
@@ -641,6 +658,76 @@ def build_cost_matrix(
             row.append(estimated_cost)
         cost_matrix.append(row)
     return cost_matrix, target_slots
+
+
+def build_candidate_component_costs(
+    sources: Sequence[ContextMetadata],
+    targets: Sequence[MigrationTarget],
+    planner_config: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    planner_config = planner_config or {}
+    rows: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for source in sources:
+        source_key = str(source.request_id or source.instance_id)
+        rows[source_key] = {}
+        for target in targets:
+            kv_migration = estimate_kv_migration_cost(
+                source,
+                target,
+                planner_config,
+                include_warmup=True,
+            )
+            expert_dispatch = estimate_expert_dispatch_cost(
+                source,
+                target,
+                planner_config,
+            )
+            queue_penalty = estimate_queue_penalty_cost(
+                target,
+                planner_config,
+                planned_requests_ahead=0,
+            )
+            rows[source_key][target.instance_id] = {
+                "total_estimated_cost": float(
+                    kv_migration["cost"]
+                    + float(expert_dispatch.get("cost", 0.0) or 0.0)
+                    + float(queue_penalty.get("cost", 0.0) or 0.0)
+                ),
+                "kv_migration_cost": float(kv_migration["cost"]),
+                "expert_dispatch_cost": float(
+                    expert_dispatch.get("cost", 0.0) or 0.0
+                ),
+                "queue_penalty_cost": float(
+                    queue_penalty.get("cost", 0.0) or 0.0
+                ),
+                "reusable_tokens": int(kv_migration["reusable_tokens"]),
+                "reusable_context_blocks": int(
+                    kv_migration["reusable_context_blocks"]
+                ),
+                "hot_expert_locality_ratio": float(
+                    expert_dispatch.get("locality_ratio", 0.0) or 0.0
+                ),
+                "estimated_remote_routing_ratio": float(
+                    expert_dispatch.get(
+                        "estimated_remote_routing_ratio", 0.0
+                    )
+                    or 0.0
+                ),
+                "estimated_remote_routed_tokens": int(
+                    expert_dispatch.get(
+                        "estimated_remote_routed_tokens", 0
+                    )
+                    or 0
+                ),
+                "queue_depth": int(queue_penalty.get("queue_depth", 0) or 0),
+                "queue_pressure": float(
+                    queue_penalty.get("queue_pressure", 0.0) or 0.0
+                ),
+                "expert_locality_available": bool(
+                    expert_dispatch.get("available", False)
+                ),
+            }
+    return rows
 
 
 def _fixed_warmup_assignment(
@@ -755,16 +842,16 @@ def plan_low_cost_migration(
         expert_dispatch = estimate_expert_dispatch_cost(
             source, target, planner_config
         )
-        queue_penalty = estimate_queue_penalty_cost(
-            target,
-            planner_config,
-            planned_requests_ahead=planned_requests_ahead,
-        )
         kv_migration = estimate_kv_migration_cost(
             source,
             target,
             planner_config,
             include_warmup=include_warmup,
+        )
+        queue_penalty = estimate_queue_penalty_cost(
+            target,
+            planner_config,
+            planned_requests_ahead=planned_requests_ahead,
         )
         plans.append(
             MigrationPlan(
@@ -774,15 +861,13 @@ def plan_low_cost_migration(
                 old_node_id=source.node_id,
                 new_node_id=target.node_id,
                 estimated_cost=estimated_cost,
+                kv_migration_cost=float(kv_migration.get("cost", 0.0) or 0.0),
                 reusable_tokens=reusable_tokens,
                 reusable_context_blocks=reusable_blocks,
                 reason=(
                     "kv_and_expert_locality"
                     if expert_dispatch.get("available")
                     else "low_cost_mapping"
-                ),
-                kv_migration_cost=float(
-                    kv_migration.get("cost", 0.0) or 0.0
                 ),
                 expert_locality_available=bool(
                     expert_dispatch.get("available", False)
@@ -850,7 +935,7 @@ def plan_low_cost_migration(
         if plan.expert_locality_available
     ]
     route_histogram_available_count = sum(
-        1 for source in sources if source_expert_route_histogram(source)
+        1 for source in sources if source_has_available_expert_route_histogram(source)
     )
     target_placement_available_count = sum(
         1 for target in targets if target_expert_placement_keys(target)
@@ -859,7 +944,7 @@ def plan_low_cost_migration(
         {
             str(_metadata_value(source, "moe_route_histogram_source") or "")
             for source in sources
-            if source_expert_route_histogram(source)
+            if source_has_available_expert_route_histogram(source)
         }
     )
     reuse_denominator = total_context_blocks or total_context_tokens

@@ -72,6 +72,31 @@ class FakeMetadataEngine:
         }
 
 
+class FakeMoeMetadataEngine(FakeMetadataEngine):
+    def get_request_moe_metadata(self, request_id):
+        return {
+            "per_request_expert_route_histogram": {
+                request_id: {
+                    "layer:0/expert:1": 5,
+                    "layer:0/expert:2": 1,
+                }
+            },
+            "moe_route_histogram_source": "runtime_hook",
+        }
+
+    def get_moe_runtime_metadata(self, instance_id="", node_id=""):
+        return {
+            "expert_placement_available": True,
+            "expert_placement_snapshot": {
+                "layer:0/expert:1": {
+                    "rank_id": "rank-1",
+                    "node_id": node_id,
+                }
+            },
+            "placement_source": "runtime_hook",
+        }
+
+
 class FakeEmptyRestoreEngine(FakeStatefulEngine):
     def restore_inference_state(self, state, request_id, **kwargs):
         return {"restored": True, "restored_blocks": 0}
@@ -96,6 +121,11 @@ def make_backend(engine=None, **backend_config):
     backend.engine = engine
     backend.request_trace = LLMEngineStatusDict()
     backend.pending_kv_restores = {}
+    backend.request_expert_route_histograms = {}
+    backend.request_expert_route_histogram_sources = {}
+    backend.global_expert_hotness = {}
+    backend.recent_window_expert_hotness = {}
+    backend._model_config_cache = None
     backend._forced_failures_seen = set()
     backend.status = BackendStatus.RUNNING
     backend.status_lock = asyncio.Lock()
@@ -136,6 +166,38 @@ def test_spotserve_request_controls_skip_replay_requests():
 
     assert forced_failure is None
     assert request_data == {"temperature": 0.0, "input_tokens": [1, 2]}
+
+
+def test_spotserve_moe_route_histogram_is_private_request_instrumentation():
+    backend = make_backend(object())
+    request_data = {
+        "temperature": 0.0,
+        "_spotserve_per_request_expert_route_histogram": {
+            "layer:0/expert:1": 4,
+            "layer:1/expert:2": 3,
+        },
+        "_spotserve_moe_route_histogram_source": "request_fixture",
+    }
+
+    backend._pop_request_expert_route_histogram(request_data, "req-live")
+
+    assert request_data == {"temperature": 0.0}
+    assert backend.request_expert_route_histograms == {
+        "req-live": {
+            "layer:0/expert:1": 4,
+            "layer:1/expert:2": 3,
+        }
+    }
+    assert backend._request_expert_route_metadata("req-live") == {
+        "per_request_expert_route_histogram": {
+            "req-live": {
+                "layer:0/expert:1": 4,
+                "layer:1/expert:2": 3,
+            }
+        },
+        "moe_route_histogram_available": True,
+        "moe_route_histogram_source": "request_fixture",
+    }
 
 
 def test_spotserve_nixl_side_channel_port_is_actor_specific():
@@ -299,6 +361,90 @@ async def test_context_metadata_reads_active_requests_from_runtime():
     }
     assert contexts[0]["metadata"]["cache_dtype"] == "torch.float16"
     assert contexts[0]["supports_state_restore"] is False
+
+
+@pytest.mark.asyncio
+async def test_context_metadata_merges_moe_route_histogram_instrumentation():
+    backend = make_backend(FakeMetadataEngine())
+    backend._record_request_expert_route_histogram(
+        "req-live",
+        {"layer:0/expert:1": 6},
+        "request_fixture",
+    )
+
+    contexts = await backend.get_context_metadata("instance-0", "node-0")
+
+    assert contexts[0]["metadata"]["moe_route_histogram_available"] is True
+    assert contexts[0]["metadata"]["moe_route_histogram_source"] == (
+        "request_fixture"
+    )
+    assert contexts[0]["metadata"]["per_request_expert_route_histogram"] == {
+        "req-live": {"layer:0/expert:1": 6}
+    }
+
+
+@pytest.mark.asyncio
+async def test_context_metadata_reads_moe_route_histogram_from_runtime_hook():
+    backend = make_backend(FakeMoeMetadataEngine())
+
+    contexts = await backend.get_context_metadata("instance-0", "node-0")
+
+    assert contexts[0]["metadata"]["moe_route_histogram_available"] is True
+    assert contexts[0]["metadata"]["moe_route_histogram_source"] == (
+        "runtime_hook"
+    )
+    assert contexts[0]["metadata"]["per_request_expert_route_histogram"] == {
+        "req-live": {
+            "layer:0/expert:1": 5,
+            "layer:0/expert:2": 1,
+        }
+    }
+
+
+def test_engine_parallel_metadata_derives_moe_placement_from_model_config(
+    tmp_path,
+):
+    model_path = tmp_path / "moe-model"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        '{"num_hidden_layers": 2, "num_experts": 3}',
+        encoding="utf-8",
+    )
+    backend = make_backend(
+        object(),
+        pretrained_model_name_or_path=str(model_path),
+        enable_expert_parallel=True,
+        tensor_parallel_size=2,
+    )
+
+    metadata = backend._engine_parallel_metadata(
+        instance_id="instance-0",
+        node_id="node-0",
+    )
+
+    assert metadata["expert_placement_available"] is True
+    assert len(metadata["expert_placement_snapshot"]) == 6
+    assert metadata["placement_source"] == "derived_from_model_config"
+    assert metadata["expert_placement_snapshot"]["layer:0/expert:2"][
+        "rank_id"
+    ] == "ep-rank-0"
+
+
+@pytest.mark.asyncio
+async def test_runtime_metadata_reads_moe_placement_from_runtime_hook():
+    backend = make_backend(FakeMoeMetadataEngine())
+
+    metadata = await backend.get_runtime_metadata("instance-0", "node-0")
+
+    profile = metadata["model_resource_profile"]
+    assert profile["expert_placement_available"] is True
+    assert profile["placement_source"] == "runtime_hook"
+    assert profile["expert_placement_snapshot"] == {
+        "layer:0/expert:1": {
+            "rank_id": "rank-1",
+            "node_id": "node-0",
+        }
+    }
 
 
 @pytest.mark.asyncio

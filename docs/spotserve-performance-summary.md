@@ -1,6 +1,6 @@
 # SpotServe Performance Summary
 
-Last updated: 2026-08-04
+Last updated: 2026-08-28
 
 This page is intentionally short. It keeps only the commands needed to rerun
 each version's benchmark path and a compact performance summary. V6, V7, V8,
@@ -151,6 +151,9 @@ V7 context migration performance:
 
 The MoE-side run uses the 1.5s `busy` preemption trace so Qwen2-MoE is still
 serving the warm-prefix requests when preemption is injected.
+If backend/router code changed, omit `--skip-build` for the first run so the
+container image includes the latest context migration observability hooks. For
+plain benchmark reruns, keep `--skip-build`.
 
 ```bash
 MODEL_FOLDER=/work/spotserve-models \
@@ -167,6 +170,23 @@ cd /tmp/spotserve-work &&
   --ray-address auto \
   --ray-namespace sllm
 '
+```
+
+After the run, the summary should print the selected target and selected-plan
+cost breakdown:
+
+```text
+selected=...
+kv_cost=...
+expert_cost=...
+queue_cost=...
+```
+
+The applied router metrics should also include candidate-level cost breakdown:
+
+```bash
+grep -R '"candidate_component_costs"' -n \
+  results/spotserve_context_migration_performance
 ```
 
 V8 stateful recovery correctness:
@@ -259,7 +279,7 @@ cd /tmp/spotserve-work &&
 | V4 | `benchmark_matrix_vllm_dense.yaml` | Dense vLLM compatibility milestone; black-box recovery smoke only. | Rerun if backend image/model changed. |
 | V5 | `benchmark_matrix_vllm_moe.yaml`, `benchmark_matrix_vllm_dense_vs_moe.yaml` | MoE compatibility milestone; no MoE-specific speedup claim. | Rerun after backend/model changes. |
 | V6 | `benchmark_matrix_reparallelization_performance.yaml` | Shared Qwen2 run keeps both versions at 100% success; reparallelization executes once, succeeds, and lowers overall p95. Post-replan p95 stays near parity. | Refreshed 2026-07-27. |
-| V7 | `benchmark_matrix_context_migration_performance.yaml` | Shared Qwen2 MoE run keeps both versions at 100% success; preemption is injected, one context-migration plan executes, and one KV migration succeeds. | Refreshed 2026-07-28. |
+| V7 | `benchmark_matrix_context_migration_performance.yaml` | Shared Qwen2 MoE run keeps both versions at 100% success; preemption is injected, one context-migration plan executes, and selected-plan KV/expert/queue costs are reported. V7 can verify prefix warmup/context planning, not true KV block migration. | Performance numbers refreshed 2026-07-28; command/observability updated 2026-08-28. |
 | V8 | `benchmark_matrix_stateful_recovery_performance.yaml` | Shared Qwen2 MoE run keeps both versions at 100% success; stateful recovery restores once, restores 16 tokens, and has no fallback. | Refreshed 2026-07-28. |
 | V9 | `risk_aware_scheduling_synthetic.json` | Placement-quality improvement: lower-risk / longer-lived node selection. | Synthetic result; live latency/SLO impact still requires a real workload. |
 | V7-V9 core | `benchmark_matrix_spotserve_core_performance.yaml` | One live matrix deploys baseline and applied variants of the same model. Applied enables context/KV migration, stateful recovery, and risk-aware scheduling together. | Refreshed 2026-08-04. |
@@ -276,7 +296,7 @@ cd /tmp/spotserve-work &&
 | V7 MoE overall p95 | Context migration disabled | Context migration applied | `45668.11ms -> 2541.99ms` | Applied reduces overall p95 by `43126.12ms`. |
 | V7 MoE migration-window p95 | Context migration disabled | Context migration applied | `34090.02ms -> 1023.38ms` | Migration window improved by `33066.64ms`. |
 | V7 MoE post-migration p95 | Context migration disabled | Context migration applied | `1021.80ms -> 1042.07ms` | Near parity after migration. |
-| V7 MoE migration signals | Context migration disabled | Context migration applied | `0 -> 1 context migration, 1 plan, 1 KV success, 245 KV tokens` | KV migration path verified; reusable blocks stayed `0`. |
+| V7 MoE migration signals | Context migration disabled | Context migration applied | `0 -> 1 context migration, 1 plan, 1 prefix-warmup success, 245 warmed tokens` | Context migration planning and warmup path verified; reusable blocks stayed `0`, so do not claim true KV block transfer from this V7 row. |
 | V8 MoE success rate | Token replay | Stateful recovery | `100.00% -> 100.00%` | New backend, `3/3 -> 3/3`. |
 | V8 MoE overall p95 | Token replay | Stateful recovery | `48887.83ms -> 3302.37ms` | Stateful recovery reduces overall p95 by `45585.46ms`. |
 | V8 MoE failure-window p95 | Token replay | Stateful recovery | `48887.83ms -> 3302.37ms` | Failure-window p95 improves by `93.25%`. |
@@ -293,9 +313,11 @@ cd /tmp/spotserve-work &&
 Notes:
 
 - Keep latency claims tied to the matrix that produced them.
-- For V7, require `context_migration_plan_count > 0` and
-  `kv_cache_migration_successes > 0` before claiming the migration path worked.
-  Only claim prefix/block reuse when
+- For V7, require `context_migration_plan_count > 0`,
+  `context_migration_selected_target_ids`, and selected-plan cost fields before
+  claiming the target-selection path worked. `kv_cache_migration_successes > 0`
+  means the prefix warmup/token replay path ran; it is not true vLLM KV block
+  serialization. Only claim prefix/block reuse when
   `context_migration_reusable_context_blocks > 0`.
 - For V8, require `state_restore_successes_total > 0` and
   `state_restore_fallback_count = 0` before claiming true stateful restore.
@@ -304,8 +326,8 @@ Notes:
 - A 2026-07-28 V7 dense-side run used `/models/vllm/vllm-dense-baseline`;
   do not use it as the V7 MoE result.
 - The 2026-07-28 V7 MoE table uses shared `Qwen2-MoE-Tiny` with
-  `SPOTSERVE_CONTEXT_MIGRATION_LOAD_FORMAT=auto`; this run migrated KV tokens
-  but did not report reusable context blocks.
+  `SPOTSERVE_CONTEXT_MIGRATION_LOAD_FORMAT=auto`; this run warmed/replayed
+  prefix tokens but did not report reusable context blocks.
 - The 2026-07-28 V8 MoE table uses shared `Qwen2-MoE-Tiny` with
   `SPOTSERVE_STATEFUL_RECOVERY_LOAD_FORMAT=auto`.
 - For the live V7-V9 core benchmark, require the applied summary to show

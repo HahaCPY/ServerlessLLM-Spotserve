@@ -227,6 +227,22 @@ show `context_migration_events > 0`,
 the conservative target warmup path ran; it is still prefill/replay based, not
 vLLM KV block serialization.
 
+The applied config enables runtime observability for candidate costs. After a
+run, inspect:
+
+```bash
+grep -R '"candidate_component_costs"' -n \
+  results/spotserve_context_migration_performance
+```
+
+The context migration summary should also expose selected-plan fields such as
+`context_migration_selected_target_ids`,
+`context_migration_selected_plan_kv_migration_cost`,
+`context_migration_selected_plan_expert_dispatch_cost`,
+`context_migration_selected_plan_queue_penalty_cost`,
+`context_migration_context_source_count`, and
+`context_migration_context_target_count`.
+
 On clusters where the two replicas land on different worker nodes, the
 proof-only V7 router may report migration with zero reusable blocks because it
 does not assume cross-node cache reuse without explicit runtime proof. For a
@@ -253,9 +269,9 @@ phase2-kv-plus-expert-plus-queue  -> target-expert-idle
 ```
 
 The report includes candidate-level `kv_migration_cost`,
-`expert_dispatch_cost`, `queue_penalty_cost`, and `total_cost`, so the target
-change can be attributed to a specific Phase 2 cost component instead of only
-observing the final selected target.
+`expert_dispatch_cost`, `queue_penalty_cost`, and `total_estimated_cost`, so
+the target change can be attributed to a specific Phase 2 cost component
+instead of only observing the final selected target.
 
 For vLLM stateful-recovery performance, deploy the V8 live restore pair and run
 the dedicated matrix:

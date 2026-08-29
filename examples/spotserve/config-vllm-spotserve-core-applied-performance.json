@@ -36,6 +36,7 @@
     "enable_kv_cache_migration": true,
     "count_preempting_toward_capacity": true,
     "context_migration_config": {
+      "emit_candidate_component_costs": true,
       "require_target_runtime_reuse": true,
       "target_capacity": 1,
       "target_warmup_cost": 1.0,
@@ -44,6 +45,8 @@
         "token_transfer_cost": 1.0,
         "context_block_transfer_cost": 4.0,
         "cross_node_penalty": 10.0,
+        "enable_moe_expert_locality": true,
+        "expert_dispatch_weight": 10.0,
         "queue_penalty_weight": 1.0,
         "unmatched_penalty": 1000000.0
       }

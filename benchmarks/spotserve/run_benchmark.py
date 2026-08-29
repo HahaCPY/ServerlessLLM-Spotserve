@@ -1083,13 +1083,24 @@ async def main_async(args):
                 )
             context_migration_suffix = ""
             if int(summary.get("context_migration_events", 0) or 0) > 0:
+                selected_targets = (
+                    summary.get("context_migration_selected_target_ids", "")
+                    or "none"
+                )
                 context_migration_suffix = (
                     f", context_migrations="
                     f"{summary.get('context_migration_events', 0)}, "
+                    f"selected={selected_targets}, "
                     f"reusable_blocks="
                     f"{summary.get('context_migration_reusable_context_blocks', 0)}, "
                     f"reuse_ratio="
                     f"{summary.get('context_migration_reuse_ratio', 0.0)}, "
+                    f"kv_cost="
+                    f"{summary.get('context_migration_selected_plan_kv_migration_cost', 0.0):.2f}, "
+                    f"expert_cost="
+                    f"{summary.get('context_migration_selected_plan_expert_dispatch_cost', 0.0):.2f}, "
+                    f"queue_cost="
+                    f"{summary.get('context_migration_selected_plan_queue_penalty_cost', 0.0):.2f}, "
                     f"kv_successes="
                     f"{summary.get('kv_cache_migration_successes', 0)}"
                 )

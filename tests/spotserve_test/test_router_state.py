@@ -55,6 +55,51 @@ class FakeContextBackendNoExplicitReuse(FakeContextBackend):
         return rows
 
 
+class FakeMoeContextBackend(FakeContextBackendNoExplicitReuse):
+    async def get_context_metadata(self, instance_id="", node_id=""):
+        rows = await super().get_context_metadata(instance_id, node_id)
+        for row in rows:
+            row["metadata"].update(
+                {
+                    "moe_route_histogram_available": True,
+                    "moe_route_histogram_source": "request_fixture",
+                    "per_request_expert_route_histogram": {
+                        "request-live-0": {
+                            "layer:0/expert:1": 8,
+                            "layer:0/expert:2": 2,
+                        }
+                    },
+                }
+            )
+        return rows
+
+
+class FakeMoeRuntimeTargetBackend:
+    def __init__(self, expert_ids):
+        self.expert_ids = tuple(expert_ids)
+
+    async def get_context_metadata(self, instance_id="", node_id=""):
+        return []
+
+    async def get_runtime_metadata(self, instance_id="", node_id=""):
+        return {
+            "instance_id": instance_id,
+            "node_id": node_id,
+            "backend": "vllm",
+            "model_name": "test-model",
+            "model_resource_profile": {
+                "expert_placement_available": True,
+                "expert_placement_snapshot": {
+                    f"layer:0/expert:{expert_id}": {
+                        "rank_id": f"rank-{expert_id}",
+                    }
+                    for expert_id in self.expert_ids
+                },
+                "placement_source": "runtime_fixture",
+            },
+        }
+
+
 class FakeKvTargetBackend:
     def __init__(self):
         self.resumed_batches = []
@@ -640,6 +685,7 @@ async def test_router_plans_live_context_migration_on_preemption(tmp_path):
             "metrics_path": str(metrics_path),
             "enable_context_migration": True,
             "context_migration_config": {
+                "emit_candidate_component_costs": True,
                 "target_warmup_cost": 1.0,
                 "planner_config": {
                     "cross_node_penalty": 0.0,
@@ -673,6 +719,12 @@ async def test_router_plans_live_context_migration_on_preemption(tmp_path):
     assert decision["plans"][0]["new_instance_id"] == "instance-target"
     assert decision["plans"][0]["reusable_tokens"] == 6
     assert decision["plans"][0]["reusable_context_blocks"] == 2
+    assert decision["context_source_count"] == 1
+    assert decision["context_target_count"] == 1
+    assert decision["candidate_component_costs_enabled"] is True
+    assert decision["candidate_component_costs"][
+        "request-live-0"
+    ]["instance-target"]["kv_migration_cost"] == 3.0
 
     rows = [
         json.loads(line)
@@ -684,6 +736,16 @@ async def test_router_plans_live_context_migration_on_preemption(tmp_path):
     assert len(context_rows) == 1
     assert context_rows[0]["action"] == "migrate"
     assert context_rows[0]["migration_plan_count"] == 1
+    assert context_rows[0]["selected_target_ids"] == ["instance-target"]
+    assert context_rows[0]["selected_plan_kv_migration_cost"] == 3.0
+    assert context_rows[0]["selected_plan_expert_dispatch_cost"] == 0.0
+    assert context_rows[0]["selected_plan_queue_penalty_cost"] == 0.0
+    assert context_rows[0]["context_source_count"] == 1
+    assert context_rows[0]["context_target_count"] == 1
+    assert context_rows[0]["candidate_component_costs_enabled"] is True
+    assert context_rows[0]["candidate_component_costs"][
+        "request-live-0"
+    ]["instance-target"]["kv_migration_cost"] == 3.0
     assert context_rows[0]["plans"][0]["new_instance_id"] == "instance-target"
 
 
@@ -905,6 +967,83 @@ async def test_router_rejects_incompatible_runtime_cache_metadata(tmp_path):
 
     assert plan["reusable_tokens"] == 0
     assert plan["reusable_context_blocks"] == 0
+
+
+@pytest.mark.asyncio
+async def test_router_uses_runtime_moe_metadata_for_context_migration(tmp_path):
+    metrics_path = tmp_path / "router-metrics.jsonl"
+    router = RoundRobinRouter(
+        model_name="test-model",
+        resource_requirements={"num_cpus": 1, "num_gpus": 0},
+        backend="dummy",
+        backend_config={},
+        router_config={
+            "metrics_path": str(metrics_path),
+            "enable_context_migration": True,
+            "context_migration_config": {
+                "emit_candidate_component_costs": True,
+                "planner_config": {
+                    "base_migration_cost": 0.0,
+                    "token_transfer_cost": 0.0,
+                    "context_block_transfer_cost": 0.0,
+                    "cross_node_penalty": 0.0,
+                    "enable_moe_expert_locality": True,
+                    "expert_dispatch_weight": 10.0,
+                },
+            },
+        },
+    )
+    source = InstanceHandle(
+        instance_id="instance-source",
+        max_queue_length=1,
+        num_gpu=0,
+        backend_instance=FakeMoeContextBackend(),
+    )
+    cold_target = InstanceHandle(
+        instance_id="instance-cold-target",
+        max_queue_length=1,
+        num_gpu=0,
+        backend_instance=FakeMoeRuntimeTargetBackend(expert_ids=[3]),
+    )
+    local_target = InstanceHandle(
+        instance_id="instance-local-target",
+        max_queue_length=1,
+        num_gpu=0,
+        backend_instance=FakeMoeRuntimeTargetBackend(expert_ids=[1, 2]),
+    )
+    await source.mark_ready(node_id="node-source")
+    await cold_target.mark_ready(node_id="node-cold")
+    await local_target.mark_ready(node_id="node-local")
+    router.ready_inference_instances[source.instance_id] = source
+    router.ready_inference_instances[cold_target.instance_id] = cold_target
+    router.ready_inference_instances[local_target.instance_id] = local_target
+
+    result = await router.handle_preemption(instance_id="instance-source")
+
+    plan = result["context_migration"]["plans"][0]
+    assert plan["new_instance_id"] == "instance-local-target"
+    assert plan["expert_locality_available"] is True
+    assert plan["hot_expert_locality_ratio"] == 1.0
+    assert plan["expert_dispatch_cost"] == 0.0
+    assert result["context_migration"][
+        "moe_route_histogram_available_count"
+    ] == 1
+    assert result["context_migration"][
+        "moe_target_placement_available_count"
+    ] == 2
+
+    rows = [
+        json.loads(line)
+        for line in metrics_path.read_text(encoding="utf-8").splitlines()
+    ]
+    context_rows = [
+        row for row in rows if row["type"] == "context_migration"
+    ]
+    assert context_rows[-1]["moe_route_histogram_available"] is True
+    assert context_rows[-1]["moe_route_histogram_source"] == (
+        "request_fixture"
+    )
+    assert context_rows[-1]["moe_hot_expert_locality_ratio"] == 1.0
 
 
 @pytest.mark.asyncio
