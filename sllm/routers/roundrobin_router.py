@@ -152,6 +152,9 @@ class RoundRobinRouter(SllmRouter):
         self.enable_stateful_target_planner = bool(
             router_config.get("enable_stateful_target_planner", True)
         )
+        self.stateful_recovery_config = dict(
+            router_config.get("stateful_recovery_config", {})
+        )
         synthetic_worker_nodes = self.reparallelization_config.get(
             "synthetic_worker_nodes", {}
         )
@@ -1322,6 +1325,7 @@ class RoundRobinRouter(SllmRouter):
                 "placement_source",
                 "moe_route_histogram_available",
                 "moe_route_histogram_source",
+                "moe_route_histogram_kind",
                 "effective_expert_parallel_size",
                 "runtime_effective_expert_parallel_size",
                 "expert_parallel_size_source",
@@ -1958,6 +1962,7 @@ class RoundRobinRouter(SllmRouter):
             state=state,
             candidates=candidates,
             source_instance_id=source_instance_id,
+            planner_config=self.stateful_recovery_config,
         )
         target_id = decision.get("target_instance_id")
         if not target_id:
@@ -2049,6 +2054,7 @@ class RoundRobinRouter(SllmRouter):
                     "reason", "stateful_recovery"
                 )
             ),
+            target_selection=target_selection,
         )
         self._emit_metric(
             make_state_recovery_event(

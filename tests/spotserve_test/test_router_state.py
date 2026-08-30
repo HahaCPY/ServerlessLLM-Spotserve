@@ -1043,6 +1043,9 @@ async def test_router_uses_runtime_moe_metadata_for_context_migration(tmp_path):
     assert context_rows[-1]["moe_route_histogram_source"] == (
         "request_fixture"
     )
+    assert context_rows[-1]["moe_route_histogram_kind"] == (
+        "request_instrumentation"
+    )
     assert context_rows[-1]["moe_hot_expert_locality_ratio"] == 1.0
 
 

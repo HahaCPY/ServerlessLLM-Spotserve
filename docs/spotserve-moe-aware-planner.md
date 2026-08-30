@@ -352,9 +352,23 @@ Phase 2 planner 的 canonical input key 固定為
 request_id -> "layer:{layer_id}/expert:{expert_id}" -> routed_token_count
 ```
 
-這個 profile 是 optional runtime capability。若 runtime 不能直接提供，MVP 可以先
-用 patched tracing 或 offline instrumentation 收集；若完全沒有 routing history，
-planner 應退化成 KV-only / queue-only target selection。
+這個 profile 是 optional runtime capability。Phase 2 已新增 vLLM patch path：
+當 backend config 開啟 `enable_moe_route_instrumentation=true` 時，
+ServerlessLLM 會設定 `VLLM_SPOTSERVE_MOE_TRACE=1`，patched vLLM runtime 會在
+fused MoE layer 取得實際 selected top-k expert ids，並輸出 canonical
+`per_request_expert_route_histogram`。若 runtime 沒有這個能力，benchmark fixture
+仍可注入 `_spotserve_per_request_expert_route_histogram` 做 ablation；若完全沒有
+routing history，planner 應退化成 KV-only / queue-only target selection。
+
+runtime-provided histogram 必須用 source 標清楚：
+
+```text
+moe_route_histogram_source = vllm_runtime_topk
+moe_route_histogram_kind = runtime_observed_topk
+```
+
+benchmark/request fixture 只能標成 `request_instrumentation`，不能拿來宣稱已經從
+vLLM router kernel 真實量到每個 token 的 expert routing。
 
 ### Target Scoring
 
@@ -695,13 +709,24 @@ weights。（已開始實作）
   `context_target_count`。applied performance configs 會額外開啟
   `emit_candidate_component_costs=true`，因此 router metrics 會保留每個 source
   request 對每個 candidate target 的 KV / expert / queue / total cost。
+- runtime observability 欄位已補上 `moe_route_histogram_kind`。因此 benchmark
+  summary 會同時顯示 `route_source` 與 `route_kind`：
+  `vllm_runtime_topk/runtime_observed_topk` 才能用來主張已從 patched vLLM
+  fused MoE top-k path 取得 routing；`request_instrumentation/request_fixture`
+  只能作為 deterministic benchmark fixture；`synthetic/synthetic_ablation`
+  只能作為 planner cost ablation。
+- 新增 real-GPU smoke：
+  `python -m sllm.spot.moe_route_instrumentation_smoke`。它不注入
+  `_spotserve_per_request_expert_route_histogram`，只在 live context metadata
+  回報 `moe_route_histogram_source=vllm_runtime_topk` 時通過。
 
 ### Phase 2 可驗證實驗
 
-Phase 2 的 MVP 應先用 synthetic ablation 驗證 planner，而不是直接依賴
-end-to-end vLLM latency。原因是 vLLM runtime 目前還不一定能穩定輸出真實
-per-request expert routing instrumentation；synthetic workload 可以先確認 cost
-model 本身是否正確影響 target selection。
+Phase 2 的 MVP 先用 synthetic ablation 驗證 planner，再用 end-to-end vLLM
+benchmark 驗證 runtime instrumentation 是否真的接到 planner。synthetic workload
+可以隔離 cost model 本身，確認 KV / expert / queue component 會正確影響 target
+selection；end-to-end run 則用來確認 patched vLLM 的 runtime top-k routing
+metadata 真的被 V7 flow 消費到。
 
 執行：
 
@@ -738,9 +763,86 @@ python scripts/run_context_migration_phase2_ablation.py \
 - `phase2-kv-plus-queue` 中 busy same-node target 的 queue cost 必須高於 idle
   target，證明 queue cost 不是只出現在 metrics，而是真的進入 target ranking。
 
+### Runtime Top-k Observability Smoke
+
+若要驗證 patched vLLM runtime 真的量到 MoE selected top-k，而不是 request
+fixture，先重新 build 含 `runtime_moe_metadata.patch` 的 image。因為
+`--skip-build` 只會同步 ServerlessLLM Python package，不會重新 patch 已安裝的
+vLLM，所以第一次驗證 runtime top-k hook 時不要加 `--skip-build`：
+
+```bash
+MODEL_FOLDER=/work/spotserve-models \
+SPOTSERVE_CONTEXT_MIGRATION_MODEL_PATH=/models/Qwen2-MoE-Tiny \
+SPOTSERVE_CONTEXT_MIGRATION_LOAD_FORMAT=auto \
+SPOTSERVE_REQUIRE_MOE_ROUTE_INSTRUMENTATION=1 \
+scripts/prepare_spotserve.sh --deploy-set context-migration-performance
+```
+
+再在 worker venv 執行：
+
+```bash
+podman exec sllm_worker_0 bash -lc '
+SPOTSERVE_MOE_ROUTE_INSTRUMENTATION_MODEL=/models/Qwen2-MoE-Tiny \
+  /opt/venvs/worker/bin/python -m sllm.spot.moe_route_instrumentation_smoke
+'
+```
+
+通過條件：
+
+- `status=passed`
+- `moe_route_histogram_source=vllm_runtime_topk`
+- `moe_route_histogram_kind=runtime_observed_topk`
+- `per_request_expert_route_histogram` 非空
+
+如果這支 smoke 還沒通過，V7 end-to-end benchmark 中的 expert locality
+結果仍應標成 planner/fixture validation，不能宣稱已完成 true runtime routing
+instrumentation。
+
+### V7 End-to-end Runtime Top-k Check
+
+2026-08-30 的 V7 context migration performance run 已確認 end-to-end path 可以吃到
+patched vLLM runtime routing metadata：
+
+```text
+Benchmark:
+  benchmark_matrix_context_migration_performance.yaml
+Model:
+  /models/Qwen2-MoE-Tiny
+Disabled:
+  successes=8/8
+  p95=48238.92ms
+Applied:
+  successes=8/8
+  p95=4010.09ms
+  context_migrations=1
+  kv_successes=1
+  route_source=vllm_runtime_topk
+  route_kind=runtime_observed_topk
+  kv_cost=293.00
+  expert_cost=0.00
+  queue_cost=0.00
+```
+
+這代表：
+
+- vLLM fused MoE top-k path 的 runtime instrumentation 已產生
+  `per_request_expert_route_histogram`。
+- V7 context migration planner / metrics 已消費到 runtime-provided histogram，
+  不是只靠 request fixture。
+- selected-plan cost breakdown 已能分開回報 KV cost、expert dispatch cost、queue
+  cost。
+
+仍不能宣稱：
+
+- 已完成 physical expert migration。
+- 已量到真實 remote expert dispatch traffic。
+- V7 已完成 true KV block transfer。此 run 的 reusable blocks 仍為 `0`，所以它
+  驗證的是 low-cost target selection 與 prefix warmup/context planning。
+
 ### Milestone C: MoE-aware Stateful Recovery
 
 目標：recovery target selection 分離 KV restore correctness 與 expert locality。
+（已開始實作）
 
 完成條件：
 
@@ -753,7 +855,73 @@ python scripts/run_context_migration_phase2_ablation.py \
   correctness fallback。
 - `expert_placement_fingerprint` mismatch 只作為 topology/locality signal，除非
   runtime 明確宣告 state encoding 對 placement 有硬相依。
-- restore 後量測 remote expert dispatch / locality penalty。
+- restore 後量測或估計 remote expert dispatch / locality penalty。
+
+目前實作進度：
+
+- `sllm/spot/stateful_recovery.py` 已把 restore target compatibility 拆成三層：
+  model semantic compatibility、state serialization compatibility、KV layout
+  compatibility。
+- EP layout compatibility 已從 KV restore correctness 中分離。預設情況下，
+  `effective_expert_parallel_size`、`expert_parallel_enabled` 或
+  `expert_placement_fingerprint` mismatch 不會直接 reject restore；只有 source
+  state 或 target metadata 明確宣告 `state_restore_requires_ep_layout=true` 時，
+  EP mismatch 才會變成 hard incompatibility。
+- 通過 correctness gate 的候選 target 會再用 routing-weighted expert locality
+  排序，並輸出 recovery-side `hot_expert_locality_ratio`、
+  `estimated_remote_routing_ratio`、`estimated_remote_routed_tokens`、
+  `expert_dispatch_cost`。
+- `VllmBackend.restore_inference_state()` 已移除
+  `expert_parallel_enabled` 的預設 hard cache-config check，改成只在
+  `state_restore_requires_ep_layout=true` 時檢查 EP layout。這避免
+  `KV compatible != expert-locality optimal` 的情況被錯誤 fallback。
+- `InferenceState.metadata` / vLLM metadata pass-through 已補上
+  `expert_placement_fingerprint`、`expert_placement_epoch`、
+  `state_restore_requires_ep_layout`、`gate_model_revision`、`moe_backend`、
+  `top_k`、`sampling_state_encoding`、`request_metadata_encoding`。
+- `make_state_recovery_event()`、benchmark analyzer、V8/core comparison fields
+  已新增 recovery compatibility 與 locality metrics。
+- 目前 recovery-side expert dispatch 是由 request route histogram + target
+  placement metadata 估計，不是真實 vLLM all-to-all / remote dispatch traffic
+  counter。真實 traffic counter 仍屬後續工作。
+
+2026-08-30 的 V8 stateful recovery performance run 已驗證 Phase 3 的主要
+control-plane path：
+
+```text
+Benchmark:
+  benchmark_matrix_stateful_recovery_performance.yaml
+Model:
+  /models/Qwen2-MoE-Tiny
+Token replay:
+  successes=3/3
+  p95=49201.94ms
+Stateful recovery:
+  successes=3/3
+  p95=2374.77ms
+  state_restores=1/1
+  state_tokens=16
+  state_blocks=6
+  state_fallbacks=0
+  true_kv_restores=1
+  true_kv_rate=100.00%
+  recovery_kv_compatible=1
+  recovery_ep_required=0
+  recovery_ep_mismatch=1
+  recovery_locality=1.00
+  recovery_remote_tokens=0
+  recovery_expert_cost=0.00
+```
+
+這個結果的重點不是 `EP mismatch=1` 有問題，而是相反：planner/runtime
+正確把它視為 topology/locality signal。因為 `recovery_ep_required=0`，
+EP mismatch 不會硬擋 KV restore；同一個 run 同時有
+`recovery_kv_compatible=1`、`state_blocks=6`、`true_kv_restores=1`，代表
+KV restore correctness 與 expert locality 已經被分開報告。
+
+仍不能宣稱已量測真實 remote expert dispatch traffic；這次
+`recovery_remote_tokens=0` / `recovery_expert_cost=0.00` 是根據 route histogram
+與 target placement metadata 的估計結果。
 
 ### Milestone D: Expert-aware Re-parallelization
 

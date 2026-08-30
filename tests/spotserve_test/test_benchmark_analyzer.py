@@ -46,6 +46,64 @@ def test_router_summary_exposes_state_restore_evidence():
     assert summary["state_restore_reasons"] == "nixl_kv_attach_completed"
 
 
+def test_state_recovery_summary_exposes_phase3_moe_metrics():
+    analyzer = load_analyzer()
+
+    summary = analyzer.summarize_state_recovery_metrics(
+        [
+            {
+                "type": "state_recovery",
+                "action": "restore_state",
+                "recovered_tokens": 16,
+                "model_semantic_compatible": True,
+                "model_semantic_reason": "compatible_model_semantics",
+                "state_serialization_compatible": True,
+                "state_serialization_reason": (
+                    "compatible_state_serialization"
+                ),
+                "kv_layout_compatible": True,
+                "kv_layout_reason": "compatible_kv_layout",
+                "kv_restore_compatible": True,
+                "ep_layout_required": False,
+                "ep_layout_compatible": True,
+                "ep_layout_reason": "ep_layout_mismatch_is_locality_only",
+                "expert_placement_mismatch": True,
+                "expert_locality_available": True,
+                "hot_expert_locality_ratio": 0.25,
+                "estimated_remote_routing_ratio": 0.75,
+                "estimated_remote_routed_tokens": 12,
+                "expert_dispatch_cost": 7.5,
+                "moe_route_histogram_source": "vllm_runtime_topk",
+                "moe_route_histogram_kind": "runtime_observed_topk",
+            }
+        ]
+    )
+
+    assert summary["state_recovery_events"] == 1
+    assert summary["state_recovery_restore_events"] == 1
+    assert summary["state_recovery_model_semantic_compatible_count"] == 1
+    assert summary["state_recovery_state_serialization_compatible_count"] == 1
+    assert summary["state_recovery_kv_layout_compatible_count"] == 1
+    assert summary["state_recovery_kv_restore_compatible_count"] == 1
+    assert summary["state_recovery_ep_layout_required_count"] == 0
+    assert summary["state_recovery_ep_layout_compatible_count"] == 1
+    assert summary["state_recovery_expert_placement_mismatch_count"] == 1
+    assert summary["state_recovery_expert_locality_available_count"] == 1
+    assert summary["state_recovery_avg_hot_expert_locality_ratio"] == 0.25
+    assert summary["state_recovery_avg_estimated_remote_routing_ratio"] == 0.75
+    assert summary["state_recovery_estimated_remote_routed_tokens"] == 12
+    assert summary["state_recovery_estimated_dispatch_cost"] == 7.5
+    assert summary["state_recovery_moe_route_histogram_sources"] == (
+        "vllm_runtime_topk"
+    )
+    assert summary["state_recovery_moe_route_histogram_kinds"] == (
+        "runtime_observed_topk"
+    )
+    assert summary["state_recovery_ep_layout_reasons"] == (
+        "ep_layout_mismatch_is_locality_only"
+    )
+
+
 def test_router_summary_separates_success_from_fallback():
     analyzer = load_analyzer()
 
@@ -195,6 +253,7 @@ def test_replanning_summary_exposes_workload_cost_metrics():
                 "selected_runtime_effective_expert_parallel_size": 2,
                 "moe_route_histogram_available": False,
                 "moe_route_histogram_source": "unavailable",
+                "moe_route_histogram_kind": "unavailable",
                 "moe_expert_parallel_size_source": "derived_from_tp_dp",
                 "cross_node_target": True,
                 "multi_worker_target": False,
@@ -221,6 +280,7 @@ def test_replanning_summary_exposes_workload_cost_metrics():
     assert summary["replanning_max_selected_effective_expert_parallel_size"] == 2
     assert summary["replanning_moe_route_histogram_available_events"] == 0
     assert summary["replanning_moe_route_histogram_sources"] == "unavailable"
+    assert summary["replanning_moe_route_histogram_kinds"] == "unavailable"
     assert summary["replanning_moe_expert_parallel_size_sources"] == "derived_from_tp_dp"
     assert summary["replanning_max_runtime_worker_node_count"] == 2
     assert summary["replanning_max_physical_worker_node_count"] == 2
@@ -263,6 +323,7 @@ def test_context_migration_summary_exposes_moe_locality_metrics():
                 "moe_route_histogram_available_count": 1,
                 "moe_target_placement_available_count": 2,
                 "moe_route_histogram_source": "instrumentation",
+                "moe_route_histogram_kind": "request_fixture",
                 "moe_hot_expert_locality_ratio": 0.75,
                 "moe_estimated_remote_routing_ratio": 0.25,
                 "moe_estimated_remote_routed_tokens": 4,
@@ -305,6 +366,10 @@ def test_context_migration_summary_exposes_moe_locality_metrics():
     assert summary["context_migration_moe_route_histogram_available_count"] == 1
     assert summary["context_migration_moe_target_placement_available_count"] == 2
     assert summary["context_migration_moe_route_histogram_sources"] == "instrumentation"
+    assert (
+        summary["context_migration_moe_route_histogram_kinds"]
+        == "request_fixture"
+    )
     assert summary["context_migration_kv_migration_cost"] == 1.0
     assert summary["context_migration_queue_penalty_cost"] == 2.0
     assert summary["context_migration_avg_queue_pressure"] == 0.5

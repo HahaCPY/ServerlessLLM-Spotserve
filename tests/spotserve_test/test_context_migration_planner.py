@@ -187,6 +187,7 @@ def test_expert_locality_cost_prefers_target_with_hot_experts():
         metadata={
             "moe_route_histogram_available": True,
             "moe_route_histogram_source": "instrumentation",
+            "moe_route_histogram_kind": "request_fixture",
             "per_request_expert_route_histogram": {
                 "req-hot": {"layer:0/expert:1": 10}
             },
@@ -236,6 +237,8 @@ def test_expert_locality_cost_prefers_target_with_hot_experts():
     assert decision.avg_estimated_remote_routing_ratio == 0.0
     assert decision.total_estimated_remote_routed_tokens == 0
     assert decision.moe_route_histogram_available_count == 1
+    assert decision.moe_route_histogram_source == "instrumentation"
+    assert decision.moe_route_histogram_kind == "request_fixture"
     assert decision.moe_target_placement_available_count == 2
 
 
@@ -298,10 +301,12 @@ def test_expert_dispatch_cost_uses_routing_weighted_locality():
             instance_id="old-a",
             node_id="node-0",
             metadata={
-                "moe_route_histogram_available": True,
-                "per_request_expert_route_histogram": {
-                    "req-weighted": {
-                        "layer:0/expert:1": 6,
+            "moe_route_histogram_available": True,
+            "moe_route_histogram_source": "runtime_hook",
+            "moe_route_histogram_kind": "runtime_observed_topk",
+            "per_request_expert_route_histogram": {
+                "req-weighted": {
+                    "layer:0/expert:1": 6,
                         "layer:0/expert:2": 4,
                     }
                 },
@@ -328,6 +333,8 @@ def test_expert_dispatch_cost_uses_routing_weighted_locality():
     assert result["estimated_remote_routing_ratio"] == 0.4
     assert result["estimated_remote_routed_tokens"] == 4
     assert result["cost"] == 0.8
+    assert result["route_histogram_source"] == "runtime_hook"
+    assert result["route_histogram_kind"] == "runtime_observed_topk"
 
 
 def test_queue_penalty_prefers_less_loaded_target():
@@ -468,6 +475,7 @@ def test_context_migration_metric_contains_summary_fields():
     assert event["avg_queue_pressure"] == 0.0
     assert event["max_queue_depth"] == 0
     assert event["moe_route_histogram_available"] is False
+    assert event["moe_route_histogram_kind"] == "unavailable"
     assert event["moe_target_placement_available"] is False
     assert event["moe_hot_expert_locality_ratio"] == 0.0
     assert event["moe_estimated_remote_routing_ratio"] == 0.0

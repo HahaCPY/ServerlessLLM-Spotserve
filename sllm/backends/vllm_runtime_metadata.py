@@ -196,6 +196,7 @@ def get_vllm_model_resource_profile(
         _first_present(
             runtime_metadata.get("placement_epoch"),
             runtime_metadata.get("placement_version"),
+            runtime_metadata.get("expert_placement_epoch"),
             backend_config.get("placement_epoch"),
         )
     )
@@ -217,6 +218,17 @@ def get_vllm_model_resource_profile(
             runtime_metadata.get("moe_route_histogram_source"),
             runtime_metadata.get("route_histogram_source"),
             "runtime_or_instrumentation"
+            if route_histogram_available
+            else "unavailable",
+        )
+    )
+    route_histogram_kind = str(
+        _first_present(
+            runtime_metadata.get("moe_route_histogram_kind"),
+            runtime_metadata.get("route_histogram_kind"),
+            "runtime_observed_topk"
+            if route_histogram_source == "vllm_runtime_topk"
+            else "instrumentation_derived"
             if route_histogram_available
             else "unavailable",
         )
@@ -250,9 +262,15 @@ def get_vllm_model_resource_profile(
         "expert_placement_available": placement_available,
         "placement_epoch": placement_epoch,
         "placement_version": placement_epoch,
+        "expert_placement_epoch": placement_epoch,
         "placement_source": placement_source,
+        "expert_placement_fingerprint": _first_present(
+            runtime_metadata.get("expert_placement_fingerprint"),
+            backend_config.get("expert_placement_fingerprint"),
+        ),
         "moe_route_histogram_available": route_histogram_available,
         "moe_route_histogram_source": route_histogram_source,
+        "moe_route_histogram_kind": route_histogram_kind,
         "parallel_plan_mismatch": (
             planned_expert_parallel_size != effective_expert_parallel_size
         ),
@@ -327,13 +345,18 @@ def get_vllm_runtime_metadata(
             profile["expert_placement_available"]
         ),
         "placement_epoch": profile["placement_epoch"],
+        "expert_placement_epoch": profile["expert_placement_epoch"],
         "placement_source": profile["placement_source"],
+        "expert_placement_fingerprint": (
+            profile["expert_placement_fingerprint"]
+        ),
         "moe_route_histogram_available": (
             profile["moe_route_histogram_available"]
         ),
         "moe_route_histogram_source": (
             profile["moe_route_histogram_source"]
         ),
+        "moe_route_histogram_kind": profile["moe_route_histogram_kind"],
         "free_gpu": int(runtime_metadata.get("free_gpu", 0) or 0),
         "total_gpu": int(runtime_metadata.get("total_gpu", 0) or 0),
         "free_gpu_memory_gb": _non_negative_float(

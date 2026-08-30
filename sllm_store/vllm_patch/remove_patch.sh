@@ -20,6 +20,8 @@ set -e
 
 SCRIPT_DIR=$(cd "$(dirname "$0")"; pwd)
 PATCH_FILES=(
+    "$SCRIPT_DIR/runtime_moe_metadata.patch"
+    "$SCRIPT_DIR/runtime_kv_restore.patch"
     "$SCRIPT_DIR/runtime_kv_metadata.patch"
     "$SCRIPT_DIR/sllm_load.patch"
 )

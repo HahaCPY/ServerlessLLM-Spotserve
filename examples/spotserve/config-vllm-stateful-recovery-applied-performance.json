@@ -21,6 +21,7 @@
     "tensor_parallel_size": 1,
     "pipeline_parallel_size": 1,
     "enable_prefix_caching": true,
+    "enable_moe_route_instrumentation": true,
     "enforce_eager": true,
     "trace_debug": true,
     "trust_remote_code": true,
@@ -33,6 +34,10 @@
     "recovery_policy": "stateful_recovery",
     "max_retries": 2,
     "count_preempting_toward_capacity": true,
+    "stateful_recovery_config": {
+      "enable_moe_expert_locality": true,
+      "expert_dispatch_weight": 10.0
+    },
     "metrics_path": "/tmp/spotserve-work/results/spotserve_stateful_recovery_performance/vllm-stateful-recovery-applied-router.jsonl"
   }
 }

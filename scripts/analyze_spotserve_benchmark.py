@@ -724,6 +724,12 @@ def summarize_replanning_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
                 for row in replanning_rows
             ]
         ),
+        "replanning_moe_route_histogram_kinds": compact_values(
+            [
+                str(row.get("moe_route_histogram_kind", ""))
+                for row in replanning_rows
+            ]
+        ),
         "replanning_moe_expert_parallel_size_sources": compact_values(
             [
                 str(row.get("moe_expert_parallel_size_source", ""))
@@ -982,6 +988,12 @@ def summarize_context_migration_metrics(
                 for row in migration_rows
             ]
         ),
+        "context_migration_moe_route_histogram_kinds": compact_values(
+            [
+                str(row.get("moe_route_histogram_kind", ""))
+                for row in migration_rows
+            ]
+        ),
         "context_migration_moe_avg_hot_expert_locality_ratio": (
             mean(moe_locality_ratios) if moe_locality_ratios else 0.0
         ),
@@ -1020,12 +1032,94 @@ def summarize_state_recovery_metrics(
     recovered_tokens = sum(
         int(row.get("recovered_tokens", 0) or 0) for row in state_rows
     )
+    locality_rows = [
+        row for row in state_rows if row.get("expert_locality_available")
+    ]
+    locality_ratios = [
+        safe_float(row.get("hot_expert_locality_ratio"), 0.0)
+        for row in locality_rows
+    ]
+    remote_routing_ratios = [
+        safe_float(row.get("estimated_remote_routing_ratio"), 0.0)
+        for row in locality_rows
+    ]
+    expert_dispatch_costs = [
+        safe_float(row.get("expert_dispatch_cost"), 0.0)
+        for row in locality_rows
+    ]
     latest_plan = state_rows[-1].get("plan") if state_rows else None
     return {
         "state_recovery_events": len(state_rows),
         "state_recovery_restore_events": len(restore_rows),
         "state_recovery_fallback_events": len(fallback_rows),
         "state_recovery_recovered_tokens": recovered_tokens,
+        "state_recovery_model_semantic_compatible_count": sum(
+            1 for row in state_rows if row.get("model_semantic_compatible")
+        ),
+        "state_recovery_state_serialization_compatible_count": sum(
+            1
+            for row in state_rows
+            if row.get("state_serialization_compatible")
+        ),
+        "state_recovery_kv_layout_compatible_count": sum(
+            1 for row in state_rows if row.get("kv_layout_compatible")
+        ),
+        "state_recovery_kv_restore_compatible_count": sum(
+            1 for row in state_rows if row.get("kv_restore_compatible")
+        ),
+        "state_recovery_ep_layout_required_count": sum(
+            1 for row in state_rows if row.get("ep_layout_required")
+        ),
+        "state_recovery_ep_layout_compatible_count": sum(
+            1 for row in state_rows if row.get("ep_layout_compatible")
+        ),
+        "state_recovery_expert_placement_mismatch_count": sum(
+            1 for row in state_rows if row.get("expert_placement_mismatch")
+        ),
+        "state_recovery_expert_locality_available_count": len(locality_rows),
+        "state_recovery_avg_hot_expert_locality_ratio": (
+            mean(locality_ratios) if locality_ratios else 0.0
+        ),
+        "state_recovery_avg_estimated_remote_routing_ratio": (
+            mean(remote_routing_ratios) if remote_routing_ratios else 0.0
+        ),
+        "state_recovery_estimated_remote_routed_tokens": sum(
+            safe_int(row.get("estimated_remote_routed_tokens"), 0)
+            for row in locality_rows
+        ),
+        "state_recovery_estimated_dispatch_cost": sum(
+            expert_dispatch_costs
+        ),
+        "state_recovery_moe_route_histogram_sources": compact_values(
+            [
+                str(row.get("moe_route_histogram_source", ""))
+                for row in state_rows
+            ]
+        ),
+        "state_recovery_moe_route_histogram_kinds": compact_values(
+            [
+                str(row.get("moe_route_histogram_kind", ""))
+                for row in state_rows
+            ]
+        ),
+        "state_recovery_model_semantic_reasons": compact_values(
+            [
+                str(row.get("model_semantic_reason", ""))
+                for row in state_rows
+            ]
+        ),
+        "state_recovery_state_serialization_reasons": compact_values(
+            [
+                str(row.get("state_serialization_reason", ""))
+                for row in state_rows
+            ]
+        ),
+        "state_recovery_kv_layout_reasons": compact_values(
+            [str(row.get("kv_layout_reason", "")) for row in state_rows]
+        ),
+        "state_recovery_ep_layout_reasons": compact_values(
+            [str(row.get("ep_layout_reason", "")) for row in state_rows]
+        ),
         "state_recovery_latest_plan": (
             json.dumps(latest_plan, sort_keys=True) if latest_plan else ""
         ),

@@ -1,6 +1,12 @@
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
+from sllm.spot.context_migration import (
+    ContextMetadata,
+    MigrationTarget,
+    estimate_expert_dispatch_cost,
+)
+
 
 # 統一 token 格式
 def _token_list(tokens: Any) -> List[int]:
@@ -106,9 +112,10 @@ class StateRecoveryPlan:
     state_kind: str = ""
     fallback_policy: str = ""
     reason: str = "stateful_recovery"
+    target_selection: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        payload = {
             "request_id": self.request_id,
             "action": self.action,
             "source_instance_id": self.source_instance_id,
@@ -118,6 +125,29 @@ class StateRecoveryPlan:
             "fallback_policy": self.fallback_policy,
             "reason": self.reason,
         }
+        if self.target_selection:
+            payload["target_selection"] = dict(self.target_selection)
+            selected = self.target_selection.get("selected_candidate")
+            if isinstance(selected, Mapping):
+                for key in (
+                    "model_semantic_compatible",
+                    "state_serialization_compatible",
+                    "kv_layout_compatible",
+                    "kv_restore_compatible",
+                    "ep_layout_required",
+                    "ep_layout_compatible",
+                    "expert_placement_mismatch",
+                    "expert_locality_available",
+                    "hot_expert_locality_ratio",
+                    "estimated_remote_routing_ratio",
+                    "estimated_remote_routed_tokens",
+                    "expert_dispatch_cost",
+                    "moe_route_histogram_source",
+                    "moe_route_histogram_kind",
+                ):
+                    if key in selected:
+                        payload[key] = selected[key]
+        return payload
 
 
 @dataclass(frozen=True)
@@ -148,7 +178,12 @@ def _candidate_value(candidate: Mapping[str, Any], key: str) -> Any:
         return candidate.get(key)
     profile = candidate.get("model_resource_profile")
     if isinstance(profile, Mapping):
-        return profile.get(key)
+        value = profile.get(key)
+        if value is not None:
+            return value
+    metadata = candidate.get("metadata")
+    if isinstance(metadata, Mapping):
+        return metadata.get(key)
     return None
 
 
@@ -170,30 +205,78 @@ def _boolish(value: Any) -> bool:
     return bool(value)
 
 
-def _parallel_and_cache_compatible(
+def _compatibility_check(
+    compatible: bool,
+    reason: str,
+) -> Dict[str, Any]:
+    return {"compatible": compatible, "reason": reason}
+
+
+def _model_semantic_compatible(
     state: InferenceState,
     candidate: Mapping[str, Any],
-) -> tuple[bool, str]:
-    """Require evidence that a restore target has the same cache shape.
+) -> Dict[str, Any]:
+    if str(_candidate_value(candidate, "backend") or "") not in {
+        "",
+        str(state.backend or ""),
+    }:
+        return _compatibility_check(False, "backend_mismatch")
+    candidate_model = _candidate_value(candidate, "model_name")
+    if candidate_model and state.model_name and str(candidate_model) != str(
+        state.model_name
+    ):
+        return _compatibility_check(False, "model_mismatch")
+    for key in (
+        "model_revision",
+        "tokenizer_revision",
+        "gate_model_revision",
+        "moe_backend",
+    ):
+        source_value = _state_value(state, key)
+        target_value = _candidate_value(candidate, key)
+        if source_value is None or target_value is None:
+            continue
+        if str(source_value) != str(target_value):
+            return _compatibility_check(False, f"{key}_mismatch")
+    return _compatibility_check(True, "compatible_model_semantics")
+
+
+def _state_serialization_compatible(
+    state: InferenceState,
+    candidate: Mapping[str, Any],
+) -> Dict[str, Any]:
+    if not state.supports_restore or state.state_kind != "vllm_kv_snapshot":
+        return _compatibility_check(False, "state_restore_not_advertised")
+    supported_state_kinds = _candidate_value(candidate, "supported_state_kinds")
+    if isinstance(supported_state_kinds, (list, tuple, set)):
+        if state.state_kind not in {str(kind) for kind in supported_state_kinds}:
+            return _compatibility_check(False, "state_kind_unsupported")
+    elif _candidate_value(candidate, "state_kind"):
+        target_kind = str(_candidate_value(candidate, "state_kind"))
+        if target_kind and target_kind != state.state_kind:
+            return _compatibility_check(False, "state_kind_mismatch")
+    for key in ("sampling_state_encoding", "request_metadata_encoding"):
+        source_value = _state_value(state, key)
+        target_value = _candidate_value(candidate, key)
+        if source_value is None or target_value is None:
+            continue
+        if str(source_value) != str(target_value):
+            return _compatibility_check(False, f"{key}_mismatch")
+    return _compatibility_check(True, "compatible_state_serialization")
+
+
+def _kv_layout_compatible(
+    state: InferenceState,
+    candidate: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Require evidence that a restore target has the same KV/cache shape.
 
     Unknown optional fields are tolerated because older backends do not expose
     every runtime field.  A field exposed by both source and target must match;
     this prevents the planner from selecting a different TP/PP or cache layout
     and hoping that NIXL will repartition it.
     """
-    if str(_candidate_value(candidate, "backend") or "") not in {
-        "",
-        str(state.backend or ""),
-    }:
-        return False, "backend_mismatch"
-    candidate_model = _candidate_value(candidate, "model_name")
-    if candidate_model and state.model_name and str(candidate_model) != str(
-        state.model_name
-    ):
-        return False, "model_mismatch"
-
     compatibility_keys = (
-        "model_revision",
         "tensor_parallel_size",
         "pipeline_parallel_size",
         "cache_block_size",
@@ -209,29 +292,192 @@ def _parallel_and_cache_compatible(
         if source_value is None or target_value is None:
             continue
         if str(source_value) != str(target_value):
-            return False, f"{key}_mismatch"
+            return _compatibility_check(False, f"{key}_mismatch")
+    return _compatibility_check(True, "compatible_kv_layout")
+
+
+def _ep_layout_compatible(
+    state: InferenceState,
+    candidate: Mapping[str, Any],
+) -> Dict[str, Any]:
     ep_required = _boolish(
         _state_value(state, "state_restore_requires_ep_layout")
     ) or _boolish(_candidate_value(candidate, "state_restore_requires_ep_layout"))
+    mismatch_keys: List[str] = []
+    for key in (
+        "effective_expert_parallel_size",
+        "expert_parallel_enabled",
+        "expert_placement_fingerprint",
+    ):
+        source_value = _state_value(state, key)
+        target_value = _candidate_value(candidate, key)
+        if source_value is None or target_value is None:
+            continue
+        if str(source_value) != str(target_value):
+            mismatch_keys.append(key)
     if ep_required:
-        for key in (
-            "effective_expert_parallel_size",
-            "expert_parallel_enabled",
-            "expert_placement_fingerprint",
-        ):
-            source_value = _state_value(state, key)
-            target_value = _candidate_value(candidate, key)
-            if source_value is None or target_value is None:
-                continue
-            if str(source_value) != str(target_value):
-                return False, f"{key}_mismatch"
-    return True, "compatible_parallel_and_cache_shape"
+        if mismatch_keys:
+            return {
+                "compatible": False,
+                "reason": f"{mismatch_keys[0]}_mismatch",
+                "required": True,
+                "mismatch_keys": mismatch_keys,
+            }
+        return {
+            "compatible": True,
+            "reason": "compatible_ep_layout",
+            "required": True,
+            "mismatch_keys": [],
+        }
+    return {
+        "compatible": True,
+        "reason": (
+            "ep_layout_mismatch_is_locality_only"
+            if mismatch_keys
+            else "ep_layout_not_required"
+        ),
+        "required": False,
+        "mismatch_keys": mismatch_keys,
+    }
+
+
+def _merged_candidate_metadata(candidate: Mapping[str, Any]) -> Dict[str, Any]:
+    metadata: Dict[str, Any] = {}
+    profile = candidate.get("model_resource_profile")
+    if isinstance(profile, Mapping):
+        metadata.update(profile)
+    nested = candidate.get("metadata")
+    if isinstance(nested, Mapping):
+        metadata.update(nested)
+    for key, value in candidate.items():
+        if key not in {"model_resource_profile", "metadata"}:
+            metadata[key] = value
+    return metadata
+
+
+def _state_context_metadata(state: InferenceState) -> ContextMetadata:
+    metadata = dict(state.metadata or {})
+    try:
+        context_blocks = int(metadata.get("kv_block_count", 0) or 0)
+    except (TypeError, ValueError):
+        context_blocks = 0
+    return ContextMetadata(
+        request_id=state.request_id,
+        instance_id=state.instance_id,
+        node_id=state.node_id,
+        num_tokens=state.completed_tokens or len(state.tokens),
+        context_blocks=max(0, context_blocks),
+        tokens=tuple(state.tokens),
+        metadata=metadata,
+    )
+
+
+def _candidate_migration_target(
+    candidate: Mapping[str, Any],
+) -> MigrationTarget:
+    return MigrationTarget(
+        instance_id=str(candidate.get("instance_id", "")),
+        node_id=str(candidate.get("node_id", "") or ""),
+        warmup_cost=float(candidate.get("warmup_cost", 0.0) or 0.0),
+        concurrency=max(0, int(candidate.get("concurrency", 0) or 0)),
+        metadata=_merged_candidate_metadata(candidate),
+    )
+
+
+def _expert_recovery_locality(
+    state: InferenceState,
+    candidate: Mapping[str, Any],
+    planner_config: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    estimate = estimate_expert_dispatch_cost(
+        _state_context_metadata(state),
+        _candidate_migration_target(candidate),
+        planner_config or {},
+    )
+    return {
+        "expert_locality_available": bool(estimate.get("available", False)),
+        "hot_expert_locality_ratio": float(
+            estimate.get("locality_ratio", 0.0) or 0.0
+        ),
+        "estimated_remote_routing_ratio": float(
+            estimate.get("estimated_remote_routing_ratio", 0.0) or 0.0
+        ),
+        "estimated_remote_routed_tokens": int(
+            estimate.get("estimated_remote_routed_tokens", 0) or 0
+        ),
+        "expert_dispatch_cost": float(estimate.get("cost", 0.0) or 0.0),
+        "moe_route_histogram_source": str(
+            estimate.get("route_histogram_source", "unavailable")
+            or "unavailable"
+        ),
+        "moe_route_histogram_kind": str(
+            estimate.get("route_histogram_kind", "unavailable")
+            or "unavailable"
+        ),
+    }
+
+
+def _candidate_restore_score(
+    state: InferenceState,
+    candidate: Mapping[str, Any],
+    planner_config: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    model_check = _model_semantic_compatible(state, candidate)
+    serialization_check = _state_serialization_compatible(state, candidate)
+    kv_check = _kv_layout_compatible(state, candidate)
+    ep_check = _ep_layout_compatible(state, candidate)
+    locality = _expert_recovery_locality(state, candidate, planner_config)
+    source_node = str(state.node_id or "")
+    target_node = str(candidate.get("node_id", "") or "")
+    same_node = bool(source_node and target_node and source_node == target_node)
+    scope_cost = 0.0 if same_node else float(
+        (planner_config or {}).get("cross_node_restore_cost", 1.0) or 0.0
+    )
+    warmup_cost = float(candidate.get("warmup_cost", 0.0) or 0.0)
+    concurrency = max(0, int(candidate.get("concurrency", 0) or 0))
+    total_cost = (
+        scope_cost
+        + warmup_cost
+        + float(locality["expert_dispatch_cost"])
+        + float((planner_config or {}).get("concurrency_weight", 0.0) or 0.0)
+        * concurrency
+    )
+    return {
+        "instance_id": str(candidate.get("instance_id", "")),
+        "node_id": target_node,
+        "same_node": same_node,
+        "model_semantic_compatible": bool(model_check["compatible"]),
+        "model_semantic_reason": str(model_check["reason"]),
+        "state_serialization_compatible": bool(
+            serialization_check["compatible"]
+        ),
+        "state_serialization_reason": str(serialization_check["reason"]),
+        "kv_layout_compatible": bool(kv_check["compatible"]),
+        "kv_layout_reason": str(kv_check["reason"]),
+        "kv_restore_compatible": bool(
+            model_check["compatible"]
+            and serialization_check["compatible"]
+            and kv_check["compatible"]
+            and ep_check["compatible"]
+        ),
+        "ep_layout_required": bool(ep_check.get("required", False)),
+        "ep_layout_compatible": bool(ep_check["compatible"]),
+        "ep_layout_reason": str(ep_check["reason"]),
+        "ep_layout_mismatch_keys": list(ep_check.get("mismatch_keys", [])),
+        "expert_placement_mismatch": bool(ep_check.get("mismatch_keys", [])),
+        "restore_scope_cost": float(scope_cost),
+        "warmup_cost": float(warmup_cost),
+        "concurrency": concurrency,
+        "total_estimated_cost": float(total_cost),
+        **locality,
+    }
 
 
 def plan_compatible_state_target(
     state: InferenceState,
     candidates: Sequence[Mapping[str, Any]],
     source_instance_id: str = "",
+    planner_config: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Choose a READY target on which the exported state may be restored.
 
@@ -239,6 +485,7 @@ def plan_compatible_state_target(
     chooses an already-ready target whose runtime proves a compatible cache
     shape.  It never changes TP/PP/EP and never creates an engine.
     """
+    planner_config = planner_config or {}
     if not state.supports_restore or state.state_kind != "vllm_kv_snapshot":
         return {
             "action": "fallback_token_replay",
@@ -252,6 +499,7 @@ def plan_compatible_state_target(
     )
     ranked = []
     rejected = []
+    accepted = []
     for candidate in candidates:
         instance_id = str(candidate.get("instance_id", ""))
         if not instance_id or instance_id == str(source_instance_id):
@@ -273,16 +521,35 @@ def plan_compatible_state_target(
                     "reason": "cross_node_restore_unsupported",
                 })
                 continue
-        compatible, reason = _parallel_and_cache_compatible(state, candidate)
-        if not compatible:
-            rejected.append({"instance_id": instance_id, "reason": reason})
+        score = _candidate_restore_score(
+            state=state,
+            candidate=candidate,
+            planner_config=planner_config,
+        )
+        if not score["kv_restore_compatible"]:
+            rejected.append({
+                "instance_id": instance_id,
+                "reason": (
+                    score["ep_layout_reason"]
+                    if not score["ep_layout_compatible"]
+                    else score["kv_layout_reason"]
+                    if not score["kv_layout_compatible"]
+                    else score["state_serialization_reason"]
+                    if not score["state_serialization_compatible"]
+                    else score["model_semantic_reason"]
+                ),
+                "compatibility": score,
+            })
             continue
+        accepted.append(score)
         ranked.append(
             (
+                float(score["total_estimated_cost"]),
                 0 if source_node == target_node else 1,
-                float(candidate.get("warmup_cost", 0.0) or 0.0),
-                int(candidate.get("concurrency", 0) or 0),
+                float(score["warmup_cost"]),
+                int(score["concurrency"]),
                 instance_id,
+                score,
             )
         )
 
@@ -295,15 +562,25 @@ def plan_compatible_state_target(
         }
 
     ranked.sort()
-    target_instance_id = ranked[0][-1]
+    target_instance_id = ranked[0][4]
+    selected = dict(ranked[0][5])
+    selected["rank"] = 0
     return {
         "action": "restore_state",
         "target_instance_id": target_instance_id,
         "reason": "planner_selected_compatible_ready_target",
+        "selected_candidate": selected,
         "candidates": [
-            {"instance_id": item[-1], "rank": index}
+            {
+                "instance_id": item[4],
+                "rank": index,
+                "compatibility": item[5],
+            }
             for index, item in enumerate(ranked)
         ],
+        "rejected_candidates": rejected,
+        "accepted_candidate_count": len(accepted),
+        "rejected_candidate_count": len(rejected),
     }
 
 
@@ -315,7 +592,9 @@ def plan_stateful_recovery(
     restore_supported: bool,
     fallback_policy: str = "generated_token_replay",
     reason: str = "stateful_recovery",
+    target_selection: Optional[Mapping[str, Any]] = None,
 ) -> StateRecoveryDecision:
+    target_selection_dict = dict(target_selection or {})
     if state is None or not state.tokens:
         plan = StateRecoveryPlan(
             request_id=request_id,
@@ -324,6 +603,7 @@ def plan_stateful_recovery(
             target_instance_id=target_instance_id,
             fallback_policy="naive_retry",
             reason="no_state_available",
+            target_selection=target_selection_dict,
         )
         return StateRecoveryDecision(
             action="retry",
@@ -345,6 +625,7 @@ def plan_stateful_recovery(
             recovered_tokens=recovered_tokens,
             state_kind=state.state_kind,
             reason="backend_state_restore",
+            target_selection=target_selection_dict,
         )
         return StateRecoveryDecision(
             action="restore_state",
@@ -365,6 +646,7 @@ def plan_stateful_recovery(
         state_kind=state.state_kind,
         fallback_policy=fallback_policy,
         reason="state_restore_unsupported",
+        target_selection=target_selection_dict,
     )
     return StateRecoveryDecision(
         action="fallback_token_replay",

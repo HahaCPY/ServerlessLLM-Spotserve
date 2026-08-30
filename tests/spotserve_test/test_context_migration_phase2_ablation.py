@@ -48,6 +48,12 @@ def test_phase2_ablation_selects_expected_targets():
         "phase2-kv-plus-expert-locality"
     ]["context_migration_moe_estimated_dispatch_cost"] > 0.0
     assert summaries[
+        "phase2-kv-plus-expert-locality"
+    ]["context_migration_moe_route_histogram_sources"] == "synthetic"
+    assert summaries[
+        "phase2-kv-plus-expert-locality"
+    ]["context_migration_moe_route_histogram_kinds"] == "synthetic_ablation"
+    assert summaries[
         "phase2-kv-plus-queue"
     ]["context_migration_queue_penalty_cost"] == 0.0
     assert summaries[
@@ -61,17 +67,17 @@ def test_phase2_ablation_selects_expected_targets():
     ]["queue_penalty_cost"] == 20.0
     assert queue_costs[
         "target-kv-busy-remote-expert"
-    ]["total_cost"] > queue_costs[
+    ]["total_estimated_cost"] > queue_costs[
         "target-idle-remote-expert"
-    ]["total_cost"]
+    ]["total_estimated_cost"]
     combined_costs = summaries[
         "phase2-kv-plus-expert-plus-queue"
     ]["candidate_component_costs"]["phase2-req-hot-expert-1"]
     assert combined_costs[
         "target-expert-idle"
-    ]["total_cost"] < combined_costs[
+    ]["total_estimated_cost"] < combined_costs[
         "target-idle-remote-expert"
-    ]["total_cost"]
+    ]["total_estimated_cost"]
     assert combined_costs[
         "target-expert-idle"
     ]["expert_dispatch_cost"] < combined_costs[

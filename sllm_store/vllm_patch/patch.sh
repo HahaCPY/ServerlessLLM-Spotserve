@@ -23,6 +23,7 @@ PATCH_FILES=(
     "$SCRIPT_DIR/sllm_load.patch"
     "$SCRIPT_DIR/runtime_kv_metadata.patch"
     "$SCRIPT_DIR/runtime_kv_restore.patch"
+    "$SCRIPT_DIR/runtime_moe_metadata.patch"
 )
 
 for PATCH_FILE in "${PATCH_FILES[@]}"; do
@@ -57,3 +58,33 @@ for PATCH_FILE in "${PATCH_FILES[@]}"; do
         exit 1
     fi
 done
+
+MISSING_MOE_MARKERS=()
+if [[ ! -f "$VLLM_PATH/spotserve_moe.py" ]] ||
+    ! grep -q "def record_moe_routing" "$VLLM_PATH/spotserve_moe.py"; then
+    MISSING_MOE_MARKERS+=("vllm.spotserve_moe")
+fi
+if [[ -f "$VLLM_PATH/spotserve_moe.py" ]] &&
+    ! python -m py_compile "$VLLM_PATH/spotserve_moe.py"; then
+    MISSING_MOE_MARKERS+=("vllm.spotserve_moe.py_compile")
+fi
+if ! grep -q "record_moe_routing(" \
+    "$VLLM_PATH/model_executor/layers/fused_moe/fused_moe_modular_method.py"; then
+    MISSING_MOE_MARKERS+=("fused_moe_modular_method.record_moe_routing")
+fi
+if ! grep -q "record_moe_routing(" \
+    "$VLLM_PATH/model_executor/layers/fused_moe/unquantized_fused_moe_method.py"; then
+    MISSING_MOE_MARKERS+=("unquantized_fused_moe_method.record_moe_routing")
+fi
+if ! grep -q "moe_request_context(req_ids, num_scheduled_tokens_np)" \
+    "$VLLM_PATH/v1/worker/gpu_model_runner.py"; then
+    MISSING_MOE_MARKERS+=("gpu_model_runner.moe_request_context")
+fi
+if ! grep -q "def get_request_moe_metadata" \
+    "$VLLM_PATH/v1/worker/worker_base.py"; then
+    MISSING_MOE_MARKERS+=("worker_base.get_request_moe_metadata")
+fi
+if [[ "${#MISSING_MOE_MARKERS[@]}" -gt 0 ]]; then
+    echo "Missing patched vLLM MoE route markers: ${MISSING_MOE_MARKERS[*]}" >&2
+    exit 1
+fi

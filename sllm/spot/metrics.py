@@ -153,6 +153,9 @@ def make_replanning_event(
         "moe_route_histogram_source": decision.get(
             "moe_route_histogram_source", "unavailable"
         ),
+        "moe_route_histogram_kind": decision.get(
+            "moe_route_histogram_kind", "unavailable"
+        ),
         "selected_score": decision.get(
             "selected_score", selected_config.get("score", 0.0)
         ),
@@ -384,6 +387,9 @@ def make_context_migration_event(
         "moe_route_histogram_source": decision.get(
             "moe_route_histogram_source", "unavailable"
         ),
+        "moe_route_histogram_kind": decision.get(
+            "moe_route_histogram_kind", "unavailable"
+        ),
         "moe_hot_expert_locality_ratio": decision.get(
             "avg_hot_expert_locality_ratio", 0.0
         ),
@@ -431,6 +437,14 @@ def make_state_recovery_event(
     target_instance_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     plan = decision.get("plan") or {}
+    target_selection = plan.get("target_selection") or {}
+    selected_candidate = (
+        target_selection.get("selected_candidate")
+        if isinstance(target_selection, dict)
+        else {}
+    )
+    if not isinstance(selected_candidate, dict):
+        selected_candidate = {}
     return {
         "type": "state_recovery",
         "model": model,
@@ -447,6 +461,62 @@ def make_state_recovery_event(
         "fallback_used": decision.get("fallback_used", False),
         "recovered_tokens": decision.get("recovered_tokens", 0),
         "reason": decision.get("reason"),
+        "target_selection_reason": target_selection.get("reason", "")
+        if isinstance(target_selection, dict)
+        else "",
+        "model_semantic_compatible": selected_candidate.get(
+            "model_semantic_compatible", False
+        ),
+        "model_semantic_reason": selected_candidate.get(
+            "model_semantic_reason", ""
+        ),
+        "state_serialization_compatible": selected_candidate.get(
+            "state_serialization_compatible", False
+        ),
+        "state_serialization_reason": selected_candidate.get(
+            "state_serialization_reason", ""
+        ),
+        "kv_layout_compatible": selected_candidate.get(
+            "kv_layout_compatible", False
+        ),
+        "kv_layout_reason": selected_candidate.get("kv_layout_reason", ""),
+        "kv_restore_compatible": selected_candidate.get(
+            "kv_restore_compatible", False
+        ),
+        "ep_layout_required": selected_candidate.get(
+            "ep_layout_required", False
+        ),
+        "ep_layout_compatible": selected_candidate.get(
+            "ep_layout_compatible", False
+        ),
+        "ep_layout_reason": selected_candidate.get("ep_layout_reason", ""),
+        "ep_layout_mismatch_keys": selected_candidate.get(
+            "ep_layout_mismatch_keys", []
+        ),
+        "expert_placement_mismatch": selected_candidate.get(
+            "expert_placement_mismatch", False
+        ),
+        "expert_locality_available": selected_candidate.get(
+            "expert_locality_available", False
+        ),
+        "hot_expert_locality_ratio": selected_candidate.get(
+            "hot_expert_locality_ratio", 0.0
+        ),
+        "estimated_remote_routing_ratio": selected_candidate.get(
+            "estimated_remote_routing_ratio", 0.0
+        ),
+        "estimated_remote_routed_tokens": selected_candidate.get(
+            "estimated_remote_routed_tokens", 0
+        ),
+        "expert_dispatch_cost": selected_candidate.get(
+            "expert_dispatch_cost", 0.0
+        ),
+        "moe_route_histogram_source": selected_candidate.get(
+            "moe_route_histogram_source", ""
+        ),
+        "moe_route_histogram_kind": selected_candidate.get(
+            "moe_route_histogram_kind", ""
+        ),
         "plan": plan or None,
     }
 

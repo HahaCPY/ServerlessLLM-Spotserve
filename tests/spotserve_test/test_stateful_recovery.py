@@ -151,6 +151,9 @@ def test_planner_does_not_reject_ep_mismatch_without_hard_dependency():
 
     assert decision["action"] == "restore_state"
     assert decision["target_instance_id"] == "ep-target"
+    assert decision["selected_candidate"]["ep_layout_required"] is False
+    assert decision["selected_candidate"]["expert_placement_mismatch"] is True
+    assert decision["selected_candidate"]["kv_restore_compatible"] is True
 
 
 def test_planner_rejects_ep_mismatch_when_state_requires_ep_layout():
@@ -191,10 +194,91 @@ def test_planner_rejects_ep_mismatch_when_state_requires_ep_layout():
     )
 
     assert decision["action"] == "fallback_token_replay"
-    assert decision["candidates"] == [{
-        "instance_id": "ep-target",
-        "reason": "effective_expert_parallel_size_mismatch",
-    }]
+    assert decision["candidates"][0]["instance_id"] == "ep-target"
+    assert decision["candidates"][0]["reason"] == (
+        "effective_expert_parallel_size_mismatch"
+    )
+    assert decision["candidates"][0]["compatibility"][
+        "ep_layout_required"
+    ] is True
+
+
+def test_planner_ranks_compatible_targets_by_expert_locality():
+    state = InferenceState.from_tokens(
+        tokens=[1, 2, 3],
+        request_id="req-moe-locality",
+        instance_id="source",
+        node_id="node-0",
+        backend="vllm",
+        model_name="model",
+        state_kind="vllm_kv_snapshot",
+        supports_restore=True,
+        metadata={
+            "tensor_parallel_size": 1,
+            "pipeline_parallel_size": 1,
+            "cache_block_size": 16,
+            "can_restore_same_node": True,
+            "moe_route_histogram_available": True,
+            "moe_route_histogram_source": "vllm_runtime_topk",
+            "moe_route_histogram_kind": "runtime_observed_topk",
+            "per_request_expert_route_histogram": {
+                "req-moe-locality": {
+                    "layer:0/expert:1": 10,
+                }
+            },
+        },
+    )
+
+    decision = plan_compatible_state_target(
+        state,
+        [
+            {
+                "instance_id": "remote-expert-target",
+                "node_id": "node-0",
+                "ready": True,
+                "supports_state_restore": True,
+                "backend": "vllm",
+                "model_name": "model",
+                "tensor_parallel_size": 1,
+                "pipeline_parallel_size": 1,
+                "cache_block_size": 16,
+                "expert_placement_available": True,
+                "expert_placement_snapshot": {
+                    "layer:0/expert:2": {"rank_id": "rank-0"}
+                },
+            },
+            {
+                "instance_id": "local-expert-target",
+                "node_id": "node-0",
+                "ready": True,
+                "supports_state_restore": True,
+                "backend": "vllm",
+                "model_name": "model",
+                "tensor_parallel_size": 1,
+                "pipeline_parallel_size": 1,
+                "cache_block_size": 16,
+                "expert_placement_available": True,
+                "expert_placement_snapshot": {
+                    "layer:0/expert:1": {"rank_id": "rank-1"}
+                },
+            },
+        ],
+        source_instance_id="source",
+        planner_config={
+            "enable_moe_expert_locality": True,
+            "expert_dispatch_weight": 10.0,
+        },
+    )
+
+    assert decision["action"] == "restore_state"
+    assert decision["target_instance_id"] == "local-expert-target"
+    selected = decision["selected_candidate"]
+    assert selected["expert_locality_available"] is True
+    assert selected["hot_expert_locality_ratio"] == 1.0
+    assert selected["estimated_remote_routing_ratio"] == 0.0
+    assert selected["expert_dispatch_cost"] == 0.0
+    assert selected["moe_route_histogram_source"] == "vllm_runtime_topk"
+    assert selected["moe_route_histogram_kind"] == "runtime_observed_topk"
 
 
 def test_planner_rejects_cross_node_without_capability():
@@ -250,6 +334,70 @@ def test_state_recovery_metric_contains_restore_summary():
     assert event["action"] == "restore_state"
     assert event["recovered_tokens"] == 2
     assert event["fallback_used"] is False
+
+
+def test_state_recovery_metric_contains_phase3_locality_summary():
+    state = InferenceState.from_tokens(
+        tokens=[1, 2],
+        request_id="req-stateful",
+        instance_id="old-a",
+        node_id="node-0",
+        backend="vllm",
+        model_name="model",
+        completed_tokens=2,
+        state_kind="vllm_kv_snapshot",
+        supports_restore=True,
+        metadata={
+            "moe_route_histogram_available": True,
+            "moe_route_histogram_source": "vllm_runtime_topk",
+            "moe_route_histogram_kind": "runtime_observed_topk",
+            "per_request_expert_route_histogram": {
+                "req-stateful": {"layer:0/expert:1": 2}
+            },
+        },
+    )
+    target_selection = plan_compatible_state_target(
+        state,
+        [{
+            "instance_id": "new-a",
+            "node_id": "node-0",
+            "ready": True,
+            "supports_state_restore": True,
+            "backend": "vllm",
+            "model_name": "model",
+            "expert_placement_available": True,
+            "expert_placement_snapshot": {
+                "layer:0/expert:2": {"rank_id": "rank-0"}
+            },
+        }],
+        source_instance_id="old-a",
+        planner_config={
+            "enable_moe_expert_locality": True,
+            "expert_dispatch_weight": 5.0,
+        },
+    )
+    decision = plan_stateful_recovery(
+        request_id="req-stateful",
+        source_instance_id="old-a",
+        target_instance_id="new-a",
+        state=state,
+        restore_supported=True,
+        target_selection=target_selection,
+    )
+
+    event = make_state_recovery_event(
+        model="dummy-stateful",
+        request_id="req-stateful",
+        decision=decision.to_dict(),
+    )
+
+    assert event["kv_restore_compatible"] is True
+    assert event["ep_layout_required"] is False
+    assert event["expert_locality_available"] is True
+    assert event["hot_expert_locality_ratio"] == 0.0
+    assert event["estimated_remote_routed_tokens"] == 2
+    assert event["expert_dispatch_cost"] == 5.0
+    assert event["moe_route_histogram_source"] == "vllm_runtime_topk"
 
 
 def test_inference_state_preserves_runtime_restore_payload():

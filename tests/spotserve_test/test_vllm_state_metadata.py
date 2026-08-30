@@ -62,6 +62,7 @@ def test_vllm_inference_state_can_use_runtime_tokens():
             "placement_source": "runtime_snapshot",
             "moe_route_histogram_available": True,
             "moe_route_histogram_source": "instrumentation",
+            "moe_route_histogram_kind": "request_fixture",
             "per_request_expert_route_histogram": {
                 "req-2": {"layer:0/expert:1": 2}
             },
@@ -88,6 +89,7 @@ def test_vllm_inference_state_can_use_runtime_tokens():
     assert state["metadata"]["placement_source"] == "runtime_snapshot"
     assert state["metadata"]["moe_route_histogram_available"] is True
     assert state["metadata"]["moe_route_histogram_source"] == "instrumentation"
+    assert state["metadata"]["moe_route_histogram_kind"] == "request_fixture"
     assert state["metadata"]["per_request_expert_route_histogram"] == {
         "req-2": {"layer:0/expert:1": 2}
     }

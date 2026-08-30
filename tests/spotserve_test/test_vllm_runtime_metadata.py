@@ -47,6 +47,7 @@ def test_vllm_model_resource_profile_reports_parallel_shape():
     assert profile["placement_source"] == "unavailable"
     assert profile["moe_route_histogram_available"] is False
     assert profile["moe_route_histogram_source"] == "unavailable"
+    assert profile["moe_route_histogram_kind"] == "unavailable"
     assert profile["parallel_plan_mismatch"] is False
     assert profile["estimated_load_time_s"] == 12.5
     assert profile["gpu_memory_required_gb"] == 28.0
@@ -126,6 +127,7 @@ def test_vllm_model_resource_profile_prefers_runtime_effective_ep():
     assert profile["placement_source"] == "runtime_snapshot"
     assert profile["moe_route_histogram_available"] is True
     assert profile["moe_route_histogram_source"] == "instrumentation"
+    assert profile["moe_route_histogram_kind"] == "instrumentation_derived"
 
 
 def test_vllm_model_resource_profile_requires_canonical_route_histogram():
@@ -172,6 +174,7 @@ def test_vllm_runtime_metadata_can_feed_risk_score():
     assert metadata["sllm_replica_count"] == 1
     assert metadata["expert_placement_available"] is False
     assert metadata["moe_route_histogram_available"] is False
+    assert metadata["moe_route_histogram_kind"] == "unavailable"
 
     score = node_risk_score(
         node_id=metadata["node_id"],

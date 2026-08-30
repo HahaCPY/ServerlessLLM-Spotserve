@@ -22,6 +22,7 @@
       "metadata": {
         "moe_route_histogram_available": true,
         "moe_route_histogram_source": "synthetic",
+        "moe_route_histogram_kind": "synthetic_ablation",
         "per_request_expert_route_histogram": {
           "phase2-req-hot-expert-1": {
             "layer:0/expert:1": 9,

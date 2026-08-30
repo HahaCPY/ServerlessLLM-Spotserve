@@ -182,6 +182,7 @@ class MigrationDecision:
     avg_hot_expert_locality_ratio: float = 0.0
     avg_estimated_remote_routing_ratio: float = 0.0
     moe_route_histogram_source: str = "unavailable"
+    moe_route_histogram_kind: str = "unavailable"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -218,6 +219,7 @@ class MigrationDecision:
                 self.avg_estimated_remote_routing_ratio
             ),
             "moe_route_histogram_source": self.moe_route_histogram_source,
+            "moe_route_histogram_kind": self.moe_route_histogram_kind,
         }
 
 
@@ -418,6 +420,10 @@ def estimate_expert_dispatch_cost(
                 _metadata_value(source, "moe_route_histogram_source")
                 or "unavailable"
             ),
+            "route_histogram_kind": str(
+                _metadata_value(source, "moe_route_histogram_kind")
+                or "unavailable"
+            ),
         }
 
     total_tokens = sum(histogram.values())
@@ -442,6 +448,10 @@ def estimate_expert_dispatch_cost(
         "route_histogram_source": str(
             _metadata_value(source, "moe_route_histogram_source")
             or "runtime_or_instrumentation"
+        ),
+        "route_histogram_kind": str(
+            _metadata_value(source, "moe_route_histogram_kind")
+            or "instrumentation_derived"
         ),
     }
 
@@ -726,6 +736,16 @@ def build_candidate_component_costs(
                 "expert_locality_available": bool(
                     expert_dispatch.get("available", False)
                 ),
+                "route_histogram_source": str(
+                    expert_dispatch.get(
+                        "route_histogram_source", "unavailable"
+                    )
+                ),
+                "route_histogram_kind": str(
+                    expert_dispatch.get(
+                        "route_histogram_kind", "unavailable"
+                    )
+                ),
             }
     return rows
 
@@ -947,6 +967,13 @@ def plan_low_cost_migration(
             if source_has_available_expert_route_histogram(source)
         }
     )
+    route_kinds = sorted(
+        {
+            str(_metadata_value(source, "moe_route_histogram_kind") or "")
+            for source in sources
+            if source_has_available_expert_route_histogram(source)
+        }
+    )
     reuse_denominator = total_context_blocks or total_context_tokens
     reuse_numerator = (
         total_reusable_blocks if total_context_blocks else total_reusable_tokens
@@ -999,6 +1026,10 @@ def plan_low_cost_migration(
         ),
         moe_route_histogram_source=(
             ",".join(source for source in route_sources if source)
+            or "unavailable"
+        ),
+        moe_route_histogram_kind=(
+            ",".join(kind for kind in route_kinds if kind)
             or "unavailable"
         ),
     )

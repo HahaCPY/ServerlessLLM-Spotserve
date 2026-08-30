@@ -1,0 +1,528 @@
+diff --git a/vllm/spotserve_moe.py b/vllm/spotserve_moe.py
+new file mode 100644
+index 000000000..5b1bb3f55
+--- /dev/null
++++ b/vllm/spotserve_moe.py
+@@ -0,0 +1,250 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Lightweight SpotServe MoE routing instrumentation.
++
++This module records request-level MoE routing histograms from the actual
++selected top-k expert IDs produced by vLLM's fused MoE layer.  It is disabled
++unless VLLM_SPOTSERVE_MOE_TRACE is set to a truthy value.
++"""
++
++from __future__ import annotations
++
++import os
++import re
++import threading
++from collections import deque
++from contextlib import contextmanager
++from contextvars import ContextVar
++from dataclasses import dataclass, field
++from typing import Any, Iterable, Iterator, Mapping, Sequence
++
++import torch
++
++_TRUTHY = {"1", "true", "yes", "on"}
++_ROUTE_CONTEXT: ContextVar["_RouteContext | None"] = ContextVar(
++    "spotserve_moe_route_context", default=None
++)
++_LOCK = threading.Lock()
++_PER_REQUEST_HISTOGRAMS: dict[str, dict[str, int]] = {}
++_GLOBAL_HISTOGRAM: dict[str, int] = {}
++_RECENT_EVENTS: deque[dict[str, int]] = deque(maxlen=64)
++
++
++@dataclass
++class _RouteContext:
++    request_ids: tuple[str, ...]
++    token_counts: tuple[int, ...]
++    spans: tuple[tuple[int, int, str], ...]
++    layer_offsets: dict[str, int] = field(default_factory=dict)
++
++
++def _enabled() -> bool:
++    return os.environ.get("VLLM_SPOTSERVE_MOE_TRACE", "").lower() in _TRUTHY
++
++
++def _positive_int(value: Any) -> int:
++    try:
++        return max(0, int(value))
++    except (TypeError, ValueError):
++        return 0
++
++
++def _layer_id_from_name(layer_name: str | None) -> str:
++    if not layer_name:
++        return "unknown"
++    match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", str(layer_name))
++    if match:
++        return match.group(1)
++    match = re.search(r"(?:^|/)layer[:/_-]?(\d+)(?:/|$)", str(layer_name))
++    if match:
++        return match.group(1)
++    return "unknown"
++
++
++def _expert_key(layer_name: str | None, expert_id: int) -> str:
++    layer_id = _layer_id_from_name(layer_name)
++    if layer_id == "unknown":
++        return f"expert:{expert_id}"
++    return f"layer:{layer_id}/expert:{expert_id}"
++
++
++def _merge_histogram(
++    target: dict[str, int],
++    source: Mapping[str, int],
++) -> None:
++    for key, value in source.items():
++        parsed = _positive_int(value)
++        if parsed > 0:
++            target[str(key)] = target.get(str(key), 0) + parsed
++
++
++def _event_histogram(topk_ids: torch.Tensor, layer_name: str | None) -> dict[str, int]:
++    if topk_ids.numel() == 0:
++        return {}
++    ids = topk_ids.detach()
++    if ids.is_cuda:
++        ids = ids.cpu()
++    ids = ids.reshape(-1).to(torch.int64)
++    ids = ids[ids >= 0]
++    if ids.numel() == 0:
++        return {}
++    unique_ids, counts = torch.unique(ids, return_counts=True)
++    return {
++        _expert_key(layer_name, int(expert_id.item())): int(count.item())
++        for expert_id, count in zip(unique_ids, counts)
++        if int(count.item()) > 0
++    }
++
++
++@contextmanager
++def moe_request_context(
++    request_ids: Sequence[str],
++    token_counts: Sequence[int],
++) -> Iterator[None]:
++    if not _enabled():
++        yield
++        return
++
++    spans: list[tuple[int, int, str]] = []
++    offset = 0
++    normalized_request_ids: list[str] = []
++    normalized_token_counts: list[int] = []
++    for request_id, token_count in zip(request_ids, token_counts):
++        count = _positive_int(token_count)
++        if count <= 0:
++            continue
++        request_key = str(request_id)
++        spans.append((offset, offset + count, request_key))
++        normalized_request_ids.append(request_key)
++        normalized_token_counts.append(count)
++        offset += count
++
++    if not spans:
++        yield
++        return
++
++    token = _ROUTE_CONTEXT.set(
++        _RouteContext(
++            request_ids=tuple(normalized_request_ids),
++            token_counts=tuple(normalized_token_counts),
++            spans=tuple(spans),
++        )
++    )
++    try:
++        yield
++    finally:
++        _ROUTE_CONTEXT.reset(token)
++
++
++def record_moe_routing(
++    *,
++    layer_name: str | None,
++    topk_ids: torch.Tensor,
++) -> None:
++    if not _enabled():
++        return
++    context = _ROUTE_CONTEXT.get()
++    if context is None or topk_ids.numel() == 0:
++        return
++
++    num_rows = int(topk_ids.shape[0])
++    if num_rows <= 0:
++        return
++    layer_key = str(layer_name or "unknown")
++    start = context.layer_offsets.get(layer_key, 0)
++    end = start + num_rows
++    context.layer_offsets[layer_key] = end
++
++    request_updates: dict[str, dict[str, int]] = {}
++    for span_start, span_end, request_id in context.spans:
++        overlap_start = max(start, span_start)
++        overlap_end = min(end, span_end)
++        if overlap_start >= overlap_end:
++            continue
++        local_start = overlap_start - start
++        local_end = overlap_end - start
++        histogram = _event_histogram(topk_ids[local_start:local_end], layer_name)
++        if histogram:
++            request_updates.setdefault(request_id, {})
++            _merge_histogram(request_updates[request_id], histogram)
++
++    if not request_updates:
++        return
++
++    with _LOCK:
++        event_total: dict[str, int] = {}
++        for request_id, histogram in request_updates.items():
++            _PER_REQUEST_HISTOGRAMS.setdefault(request_id, {})
++            _merge_histogram(_PER_REQUEST_HISTOGRAMS[request_id], histogram)
++            _merge_histogram(_GLOBAL_HISTOGRAM, histogram)
++            _merge_histogram(event_total, histogram)
++        if event_total:
++            _RECENT_EVENTS.append(event_total)
++
++
++def clear_moe_request_metadata(request_ids: Iterable[str]) -> None:
++    request_keys = [str(request_id) for request_id in request_ids]
++    if not request_keys:
++        return
++    with _LOCK:
++        for request_id in request_keys:
++            _PER_REQUEST_HISTOGRAMS.pop(request_id, None)
++
++
++def get_request_moe_metadata(
++    request_id: str,
++    *,
++    worker_rank: int | None = None,
++) -> dict[str, Any]:
++    request_key = str(request_id)
++    with _LOCK:
++        histogram = dict(_PER_REQUEST_HISTOGRAMS.get(request_key, {}))
++    if not histogram:
++        return {
++            "request_id": request_key,
++            "found": False,
++            "moe_route_histogram_available": False,
++            "moe_route_histogram_source": (
++                "vllm_runtime_topk" if _enabled() else "disabled"
++            ),
++            "reason": (
++                "no_moe_route_histogram"
++                if _enabled()
++                else "moe_route_tracing_disabled"
++            ),
++            "worker_rank": worker_rank,
++        }
++    return {
++        "request_id": request_key,
++        "found": True,
++        "moe_route_histogram_available": True,
++        "moe_route_histogram_source": "vllm_runtime_topk",
++        "moe_route_histogram_kind": "runtime_observed_topk",
++        "per_request_expert_route_histogram": {request_key: histogram},
++        "worker_rank": worker_rank,
++    }
++
++
++def get_moe_runtime_metadata(
++    *,
++    worker_rank: int | None = None,
++) -> dict[str, Any]:
++    with _LOCK:
++        recent: dict[str, int] = {}
++        for event in _RECENT_EVENTS:
++            _merge_histogram(recent, event)
++        global_histogram = dict(_GLOBAL_HISTOGRAM)
++    available = bool(global_histogram)
++    return {
++        "moe_route_tracing_enabled": _enabled(),
++        "moe_route_histogram_available": available,
++        "moe_route_histogram_source": (
++            "vllm_runtime_topk" if available else "unavailable"
++        ),
++        "moe_route_histogram_kind": (
++            "runtime_observed_topk" if available else "unavailable"
++        ),
++        "global_expert_hotness": global_histogram,
++        "recent_window_expert_hotness": recent,
++        "worker_rank": worker_rank,
++    }
+diff --git a/vllm/model_executor/layers/fused_moe/fused_moe_modular_method.py b/vllm/model_executor/layers/fused_moe/fused_moe_modular_method.py
+index d8f0ec4fd..31e42f653 100644
+--- a/vllm/model_executor/layers/fused_moe/fused_moe_modular_method.py
++++ b/vllm/model_executor/layers/fused_moe/fused_moe_modular_method.py
+@@ -147,6 +147,11 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
+             zero_expert_type=zero_expert_type,
+         )
+ 
++        from vllm.spotserve_moe import record_moe_routing
++
++        record_moe_routing(
++            layer_name=getattr(layer, "layer_name", None), topk_ids=topk_ids
++        )
+         result = self.fused_experts(
+             hidden_states=x,
+             w1=layer.w13_weight,
+diff --git a/vllm/model_executor/layers/fused_moe/unquantized_fused_moe_method.py b/vllm/model_executor/layers/fused_moe/unquantized_fused_moe_method.py
+index 59c38bc8f..262599c26 100644
+--- a/vllm/model_executor/layers/fused_moe/unquantized_fused_moe_method.py
++++ b/vllm/model_executor/layers/fused_moe/unquantized_fused_moe_method.py
+@@ -377,6 +377,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
+             num_fused_shared_experts=layer.num_fused_shared_experts,
+         )
+ 
++        from vllm.spotserve_moe import record_moe_routing
++
++        record_moe_routing(
++            layer_name=getattr(layer, "layer_name", None), topk_ids=topk_ids
++        )
+         if self.rocm_aiter_moe_enabled:
+             result = self.rocm_aiter_fused_experts(
+                 hidden_states=x,
+diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
+index c0c1f913b..ab4269b7e 100644
+--- a/vllm/v1/engine/async_llm.py
++++ b/vllm/v1/engine/async_llm.py
+@@ -355,6 +355,54 @@ class AsyncLLM(EngineClient):
+             "staged": True,
+             "expected_blocks": len(params["remote_block_ids"]),
+         }
++
++    async def get_request_moe_metadata(
++        self, request_id: str
++    ) -> dict[str, Any]:
++        resolver = getattr(self, "_spotserve_internal_request_ids", None)
++        internal_ids = (
++            resolver(request_id)
++            if callable(resolver)
++            else [request_id]
++            if request_id in self.output_processor.request_states
++            else []
++        )
++        if len(internal_ids) != 1:
++            return {
++                "request_id": request_id,
++                "found": False,
++                "moe_route_histogram_available": False,
++                "moe_route_histogram_source": "vllm_runtime_topk",
++                "reason": "request_not_active"
++                if not internal_ids
++                else "parallel_sampling_moe_metadata_not_supported",
++            }
++        internal_id = internal_ids[0]
++        engine_core = self.engine_core
++        request_engine = getattr(engine_core, "reqs_in_flight", {}).get(
++            internal_id
++        )
++        if request_engine is not None:
++            metadata = await engine_core._call_utility_async(
++                "get_request_moe_metadata", internal_id, engine=request_engine
++            )
++        else:
++            metadata = await engine_core.call_utility_async(
++                "get_request_moe_metadata", internal_id
++            )
++        if internal_id != request_id:
++            histogram = metadata.get("per_request_expert_route_histogram")
++            if isinstance(histogram, dict) and internal_id in histogram:
++                metadata["per_request_expert_route_histogram"] = {
++                    request_id: histogram[internal_id]
++                }
++        metadata["request_id"] = request_id
++        return metadata
++
++    async def get_moe_runtime_metadata(self, **_: Any) -> dict[str, Any]:
++        return await self.engine_core.call_utility_async(
++            "get_moe_runtime_metadata"
++        )
+ 
+     async def add_request(
+         self,
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index 5bc564f36..7fbdc4101 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -14,5 +14,5 @@ from inspect import isclass, signature
+ from logging import DEBUG
+-from typing import Any, TypeVar, cast
++from typing import Any, Mapping, TypeVar, cast
+ 
+ import msgspec
+ import zmq
+@@ -654,6 +654,113 @@ class EngineCore:
+             for request_id in list(requests)
+         ]
+ 
++    @staticmethod
++    def _merge_int_histogram(
++        target: dict[str, int],
++        source: Mapping[str, Any],
++    ) -> None:
++        for key, value in source.items():
++            try:
++                parsed = int(value)
++            except (TypeError, ValueError):
++                continue
++            if parsed > 0:
++                target[str(key)] = target.get(str(key), 0) + parsed
++
++    def get_request_moe_metadata(self, request_id: str) -> dict[str, Any]:
++        snapshots = self.model_executor.collective_rpc(
++            "get_request_moe_metadata", args=(request_id,)
++        )
++        selected_histogram: dict[str, int] = {}
++        worker_histograms: dict[str, dict[str, int]] = {}
++        sources: set[str] = set()
++        reasons: set[str] = set()
++        for index, snapshot in enumerate(snapshots or []):
++            if not isinstance(snapshot, dict):
++                continue
++            source = snapshot.get("moe_route_histogram_source")
++            if source:
++                sources.add(str(source))
++            reason = snapshot.get("reason")
++            if reason:
++                reasons.add(str(reason))
++            histogram_payload = snapshot.get(
++                "per_request_expert_route_histogram"
++            )
++            histogram = {}
++            if isinstance(histogram_payload, dict):
++                request_histogram = histogram_payload.get(request_id)
++                if isinstance(request_histogram, dict):
++                    for key, value in request_histogram.items():
++                        try:
++                            parsed = int(value)
++                        except (TypeError, ValueError):
++                            continue
++                        if parsed > 0:
++                            histogram[str(key)] = parsed
++            if not histogram:
++                continue
++            worker_key = str(snapshot.get("worker_rank", index))
++            worker_histograms[worker_key] = histogram
++            if not selected_histogram or sum(histogram.values()) > sum(
++                selected_histogram.values()
++            ):
++                selected_histogram = histogram
++
++        if not selected_histogram:
++            return {
++                "request_id": request_id,
++                "found": False,
++                "moe_route_histogram_available": False,
++                "moe_route_histogram_source": ",".join(sorted(sources))
++                or "vllm_runtime_topk",
++                "reason": ",".join(sorted(reasons))
++                or "no_moe_route_histogram",
++            }
++        return {
++            "request_id": request_id,
++            "found": True,
++            "moe_route_histogram_available": True,
++            "moe_route_histogram_source": ",".join(sorted(sources))
++            or "vllm_runtime_topk",
++            "moe_route_histogram_kind": "runtime_observed_topk",
++            "per_request_expert_route_histogram": {
++                request_id: selected_histogram
++            },
++            "worker_route_histograms": worker_histograms,
++        }
++
++    def get_moe_runtime_metadata(self) -> dict[str, Any]:
++        snapshots = self.model_executor.collective_rpc(
++            "get_moe_runtime_metadata"
++        )
++        global_histogram: dict[str, int] = {}
++        recent_histogram: dict[str, int] = {}
++        enabled = False
++        for snapshot in snapshots or []:
++            if not isinstance(snapshot, dict):
++                continue
++            enabled = enabled or bool(snapshot.get("moe_route_tracing_enabled"))
++            histogram = snapshot.get("global_expert_hotness")
++            if isinstance(histogram, dict):
++                self._merge_int_histogram(global_histogram, histogram)
++            recent = snapshot.get("recent_window_expert_hotness")
++            if isinstance(recent, dict):
++                self._merge_int_histogram(recent_histogram, recent)
++        available = bool(global_histogram)
++        return {
++            "moe_route_tracing_enabled": enabled,
++            "moe_route_histogram_available": available,
++            "moe_route_histogram_source": (
++                "vllm_runtime_topk" if available else "unavailable"
++            ),
++            "moe_route_histogram_kind": (
++                "runtime_observed_topk" if available else "unavailable"
++            ),
++            "global_expert_hotness": global_histogram,
++            "recent_window_expert_hotness": recent_histogram,
++        }
++
+     def supports_state_restore(self) -> bool:
+         connector = self.scheduler.get_kv_connector()
+         if connector is None:
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 520dc4be7..8a240bc37 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -66,6 +66,7 @@ from vllm.utils.torch_utils import (
+     kv_cache_dtype_str_to_dtype,
+     supports_dynamo,
+ )
++from vllm.spotserve_moe import clear_moe_request_metadata, moe_request_context
+ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
+ from vllm.v1.attention.backends.utils import CommonAttentionMetadata
+ from vllm.v1.core.encoder_cache_manager import compute_encoder_budget
+@@ -2665,7 +2666,8 @@ class GPUModelRunner(
+         with record_function_or_nullcontext("gpu_model_runner: preprocess"):
+             with self.synchronize_input_prep():
+                 # Update persistent batch states.
+                 self._update_states(scheduler_output)
++                clear_moe_request_metadata(scheduler_output.finished_req_ids)
+ 
+                 if has_ec_transfer() and get_ec_transfer().is_producer:
+                     with self.maybe_get_ec_connector_output(
+@@ -2798,7 +2800,8 @@ class GPUModelRunner(
+                 cudagraph_runtime_mode=cudagraph_runtime_mode,
+                 batch_descriptor=batch_descriptor,
+                 ubatch_slices=ubatch_slices,
+             ),
++            moe_request_context(req_ids, num_scheduled_tokens_np),
+             record_function_or_nullcontext("gpu_model_runner: forward"),
+             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
+         ):
+diff --git a/vllm/v1/worker/worker_base.py b/vllm/v1/worker/worker_base.py
+index 3fc13c233..46849bb1e 100644
+--- a/vllm/v1/worker/worker_base.py
++++ b/vllm/v1/worker/worker_base.py
+@@ -109,6 +109,21 @@ class WorkerBase:
+             ),
+         }
+ 
++    def get_request_moe_metadata(self, request_id: str) -> dict[str, Any]:
++        """Return request-level MoE routing metadata observed by this worker."""
++        from vllm.spotserve_moe import get_request_moe_metadata
++
++        return get_request_moe_metadata(
++            request_id,
++            worker_rank=self.rank,
++        )
++
++    def get_moe_runtime_metadata(self) -> dict[str, Any]:
++        """Return aggregate MoE routing metadata observed by this worker."""
++        from vllm.spotserve_moe import get_moe_runtime_metadata
++
++        return get_moe_runtime_metadata(worker_rank=self.rank)
++
+     def compile_or_warm_up_model(self) -> None:
+         """Prepare model for execution through compilation/warmup."""
+         raise NotImplementedError

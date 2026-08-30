@@ -21,6 +21,7 @@
     "tensor_parallel_size": 1,
     "pipeline_parallel_size": 1,
     "enable_prefix_caching": true,
+    "enable_moe_route_instrumentation": true,
     "enforce_eager": true,
     "trust_remote_code": true
   },

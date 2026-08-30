@@ -243,6 +243,31 @@ The context migration summary should also expose selected-plan fields such as
 `context_migration_context_source_count`, and
 `context_migration_context_target_count`.
 
+For MoE-aware runs, also check
+`context_migration_moe_route_histogram_sources` and
+`context_migration_moe_route_histogram_kinds`. A runtime-observed result should
+show `vllm_runtime_topk` and `runtime_observed_topk`; request fixtures show
+`request_instrumentation` / `request_fixture` and should be interpreted as
+deterministic planner validation.
+
+After rebuilding an image with `runtime_moe_metadata.patch`, the narrow smoke
+for true runtime top-k observability is:
+
+```bash
+MODEL_FOLDER=/work/spotserve-models \
+SPOTSERVE_CONTEXT_MIGRATION_MODEL_PATH=/models/Qwen2-MoE-Tiny \
+SPOTSERVE_CONTEXT_MIGRATION_LOAD_FORMAT=auto \
+SPOTSERVE_REQUIRE_MOE_ROUTE_INSTRUMENTATION=1 \
+scripts/prepare_spotserve.sh --deploy-set context-migration-performance
+```
+
+```bash
+podman exec sllm_worker_0 bash -lc '
+SPOTSERVE_MOE_ROUTE_INSTRUMENTATION_MODEL=/models/Qwen2-MoE-Tiny \
+  /opt/venvs/worker/bin/python -m sllm.spot.moe_route_instrumentation_smoke
+'
+```
+
 On clusters where the two replicas land on different worker nodes, the
 proof-only V7 router may report migration with zero reusable blocks because it
 does not assume cross-node cache reuse without explicit runtime proof. For a

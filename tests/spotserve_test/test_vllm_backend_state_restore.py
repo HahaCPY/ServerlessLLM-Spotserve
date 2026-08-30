@@ -1,4 +1,5 @@
 import asyncio
+import os
 
 import pytest
 
@@ -82,6 +83,7 @@ class FakeMoeMetadataEngine(FakeMetadataEngine):
                 }
             },
             "moe_route_histogram_source": "runtime_hook",
+            "moe_route_histogram_kind": "runtime_observed_topk",
         }
 
     def get_moe_runtime_metadata(self, instance_id="", node_id=""):
@@ -123,6 +125,7 @@ def make_backend(engine=None, **backend_config):
     backend.pending_kv_restores = {}
     backend.request_expert_route_histograms = {}
     backend.request_expert_route_histogram_sources = {}
+    backend.request_expert_route_histogram_kinds = {}
     backend.global_expert_hotness = {}
     backend.recent_window_expert_hotness = {}
     backend._model_config_cache = None
@@ -177,6 +180,7 @@ def test_spotserve_moe_route_histogram_is_private_request_instrumentation():
             "layer:1/expert:2": 3,
         },
         "_spotserve_moe_route_histogram_source": "request_fixture",
+        "_spotserve_moe_route_histogram_kind": "request_fixture",
     }
 
     backend._pop_request_expert_route_histogram(request_data, "req-live")
@@ -197,6 +201,7 @@ def test_spotserve_moe_route_histogram_is_private_request_instrumentation():
         },
         "moe_route_histogram_available": True,
         "moe_route_histogram_source": "request_fixture",
+        "moe_route_histogram_kind": "request_fixture",
     }
 
 
@@ -224,6 +229,23 @@ def test_spotserve_nixl_side_channel_port_allows_exact_override():
     )
 
     assert backend._derive_spotserve_nixl_side_channel_port("actor-a") == 6123
+
+
+def test_spotserve_moe_route_tracing_env_is_configured(monkeypatch):
+    backend = make_backend(
+        object(),
+        enable_moe_route_instrumentation="true",
+    )
+    monkeypatch.delenv("VLLM_SPOTSERVE_MOE_TRACE", raising=False)
+
+    backend._configure_spotserve_moe_route_tracing()
+
+    assert os.environ["VLLM_SPOTSERVE_MOE_TRACE"] == "1"
+
+    backend.backend_config["enable_moe_route_instrumentation"] = False
+    backend._configure_spotserve_moe_route_tracing()
+
+    assert os.environ["VLLM_SPOTSERVE_MOE_TRACE"] == "0"
 
 
 @pytest.mark.asyncio
@@ -286,14 +308,24 @@ async def test_restore_attaches_state_and_rejects_incompatible_cache():
     assert result["reason"] == "incompatible_cache_config"
 
     state["metadata"]["expert_parallel_enabled"] = True
-    incompatible_ep = make_backend(
+    ep_mismatch = make_backend(
         FakeStatefulEngine(), enable_expert_parallel=False
     )
-    result = await incompatible_ep.restore_inference_state(
+    result = await ep_mismatch.restore_inference_state(
+        state, {"request_id": "req-1", "node_id": "node-0"}
+    )
+    assert result["restored"] is True
+    assert result["restored_blocks"] == 2
+
+    state["metadata"]["state_restore_requires_ep_layout"] = True
+    ep_required = make_backend(
+        FakeStatefulEngine(), enable_expert_parallel=False
+    )
+    result = await ep_required.restore_inference_state(
         state, {"request_id": "req-1", "node_id": "node-0"}
     )
     assert result["restored"] is False
-    assert result["reason"] == "incompatible_cache_config"
+    assert result["reason"] == "incompatible_ep_layout"
 
 
 @pytest.mark.asyncio
@@ -370,12 +402,16 @@ async def test_context_metadata_merges_moe_route_histogram_instrumentation():
         "req-live",
         {"layer:0/expert:1": 6},
         "request_fixture",
+        "request_fixture",
     )
 
     contexts = await backend.get_context_metadata("instance-0", "node-0")
 
     assert contexts[0]["metadata"]["moe_route_histogram_available"] is True
     assert contexts[0]["metadata"]["moe_route_histogram_source"] == (
+        "request_fixture"
+    )
+    assert contexts[0]["metadata"]["moe_route_histogram_kind"] == (
         "request_fixture"
     )
     assert contexts[0]["metadata"]["per_request_expert_route_histogram"] == {
@@ -392,6 +428,9 @@ async def test_context_metadata_reads_moe_route_histogram_from_runtime_hook():
     assert contexts[0]["metadata"]["moe_route_histogram_available"] is True
     assert contexts[0]["metadata"]["moe_route_histogram_source"] == (
         "runtime_hook"
+    )
+    assert contexts[0]["metadata"]["moe_route_histogram_kind"] == (
+        "runtime_observed_topk"
     )
     assert contexts[0]["metadata"]["per_request_expert_route_histogram"] == {
         "req-live": {

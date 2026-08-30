@@ -165,6 +165,22 @@ def _as_non_negative_int(value: Any) -> Optional[int]:
     return max(parsed, 0)
 
 
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off", ""}:
+            return False
+    return bool(value)
+
+
 def _expert_key_from_parts(parts: Sequence[Any]) -> str:
     cleaned = [str(part) for part in parts if str(part) not in {"", "None"}]
     if not cleaned:
@@ -308,6 +324,16 @@ class VllmBackend(SllmBackend):
             self.request_expert_route_histogram_sources[request_id] = (
                 configured_histogram_source
             )
+        self.request_expert_route_histogram_kinds: Dict[str, str] = {
+            request_id: str(
+                backend_config.get(
+                    "moe_route_histogram_kind",
+                    "request_instrumentation",
+                )
+                or "request_instrumentation"
+            )
+            for request_id in self.request_expert_route_histograms
+        }
         self.global_expert_hotness: Dict[str, int] = (
             _normalize_expert_route_histogram(
                 backend_config.get("global_expert_hotness")
@@ -493,6 +519,7 @@ class VllmBackend(SllmBackend):
         request_id: str,
         histogram: Mapping[str, int],
         source: str,
+        kind: str = "request_instrumentation",
     ) -> None:
         normalized: Dict[str, int] = {}
         for key, value in histogram.items():
@@ -506,11 +533,16 @@ class VllmBackend(SllmBackend):
             self.request_expert_route_histograms = {}
         if not hasattr(self, "request_expert_route_histogram_sources"):
             self.request_expert_route_histogram_sources = {}
+        if not hasattr(self, "request_expert_route_histogram_kinds"):
+            self.request_expert_route_histogram_kinds = {}
         if not hasattr(self, "global_expert_hotness"):
             self.global_expert_hotness = {}
         self.request_expert_route_histograms[request_key] = normalized
         self.request_expert_route_histogram_sources[request_key] = (
             str(source or "instrumentation")
+        )
+        self.request_expert_route_histogram_kinds[request_key] = (
+            str(kind or "request_instrumentation")
         )
         _merge_int_histogram(self.global_expert_hotness, normalized)
 
@@ -520,6 +552,9 @@ class VllmBackend(SllmBackend):
             request_key, None
         )
         getattr(self, "request_expert_route_histogram_sources", {}).pop(
+            request_key, None
+        )
+        getattr(self, "request_expert_route_histogram_kinds", {}).pop(
             request_key, None
         )
 
@@ -539,6 +574,10 @@ class VllmBackend(SllmBackend):
             "_spotserve_moe_route_histogram_source",
             "request_instrumentation",
         )
+        kind = request_data.pop(
+            "_spotserve_moe_route_histogram_kind",
+            "request_instrumentation",
+        )
         histogram = _normalize_expert_route_histogram(
             raw_histogram,
             request_id=request_id,
@@ -548,6 +587,7 @@ class VllmBackend(SllmBackend):
                 request_id=request_id,
                 histogram=histogram,
                 source=str(source or "request_instrumentation"),
+                kind=str(kind or "request_instrumentation"),
             )
 
     def _request_expert_route_metadata(
@@ -571,6 +611,15 @@ class VllmBackend(SllmBackend):
                     runtime_metadata.get("moe_route_histogram_source")
                     or "runtime"
                 ),
+                "moe_route_histogram_kind": str(
+                    runtime_metadata.get("moe_route_histogram_kind")
+                    or (
+                        "runtime_observed_topk"
+                        if runtime_metadata.get("moe_route_histogram_source")
+                        == "vllm_runtime_topk"
+                        else "runtime"
+                    )
+                ),
             }
 
         histogram = getattr(
@@ -591,6 +640,16 @@ class VllmBackend(SllmBackend):
                 ).get(
                     request_key,
                     "instrumentation",
+                )
+            ),
+            "moe_route_histogram_kind": (
+                getattr(
+                    self,
+                    "request_expert_route_histogram_kinds",
+                    {},
+                ).get(
+                    request_key,
+                    "request_instrumentation",
                 )
             ),
         }
@@ -710,10 +769,23 @@ class VllmBackend(SllmBackend):
         )
         if placement_snapshot:
             metadata["expert_placement_snapshot"] = placement_snapshot
+            placement_blob = json.dumps(
+                placement_snapshot,
+                sort_keys=True,
+                default=str,
+            ).encode("utf-8")
+            metadata["expert_placement_fingerprint"] = format(
+                zlib.crc32(placement_blob) & 0xFFFFFFFF,
+                "08x",
+            )
+        metadata["expert_placement_epoch"] = metadata["placement_epoch"]
         request_histograms = getattr(
             self, "request_expert_route_histograms", {}
         )
         route_histogram_available = bool(request_histograms)
+        request_histogram_kinds = getattr(
+            self, "request_expert_route_histogram_kinds", {}
+        )
         metadata["moe_route_histogram_available"] = route_histogram_available
         metadata["moe_route_histogram_source"] = (
             ",".join(
@@ -728,6 +800,19 @@ class VllmBackend(SllmBackend):
                             )
                         ).values()
                         if source
+                    }
+                )
+            )
+            if route_histogram_available
+            else "unavailable"
+        )
+        metadata["moe_route_histogram_kind"] = (
+            ",".join(
+                sorted(
+                    {
+                        kind
+                        for kind in request_histogram_kinds.values()
+                        if kind
                     }
                 )
             )
@@ -854,6 +939,7 @@ class VllmBackend(SllmBackend):
                 return
             started_at = time.monotonic()
             self._configure_spotserve_nixl_side_channel_port()
+            self._configure_spotserve_moe_route_tracing()
             self.engine = AsyncLLMEngine.from_engine_args(self.engine_args)
             self.model_load_time_s = time.monotonic() - started_at
             self.status = BackendStatus.RUNNING
@@ -912,6 +998,17 @@ class VllmBackend(SllmBackend):
         )
         os.environ["VLLM_NIXL_SIDE_CHANNEL_PORT"] = str(port)
         logger.info("Configured vLLM NIXL side-channel port: %s", port)
+
+    def _configure_spotserve_moe_route_tracing(self) -> None:
+        configured = self.backend_config.get(
+            "enable_moe_route_instrumentation",
+            self.backend_config.get("spotserve_moe_route_tracing"),
+        )
+        if configured is None:
+            return
+        enabled = _as_bool(configured)
+        os.environ["VLLM_SPOTSERVE_MOE_TRACE"] = "1" if enabled else "0"
+        logger.info("Configured vLLM MoE route tracing: %s", enabled)
 
     def _pop_spotserve_request_controls(
         self,
@@ -1631,16 +1728,37 @@ class VllmBackend(SllmBackend):
             ),
             "placement_epoch": parallel_metadata.get("placement_epoch"),
             "placement_version": parallel_metadata.get("placement_version"),
+            "expert_placement_epoch": parallel_metadata.get(
+                "expert_placement_epoch"
+            ),
             "placement_source": parallel_metadata.get("placement_source"),
+            "expert_placement_fingerprint": parallel_metadata.get(
+                "expert_placement_fingerprint"
+            ),
             "moe_route_histogram_available": parallel_metadata.get(
                 "moe_route_histogram_available"
             ),
             "moe_route_histogram_source": parallel_metadata.get(
                 "moe_route_histogram_source"
             ),
+            "moe_route_histogram_kind": parallel_metadata.get(
+                "moe_route_histogram_kind"
+            ),
+            "per_request_expert_route_histogram": parallel_metadata.get(
+                "per_request_expert_route_histogram"
+            ),
+            "global_expert_hotness": parallel_metadata.get(
+                "global_expert_hotness"
+            ),
+            "recent_window_expert_hotness": parallel_metadata.get(
+                "recent_window_expert_hotness"
+            ),
             "cache_block_size": self.backend_config.get("block_size"),
             "cache_dtype": self.backend_config.get("kv_cache_dtype"),
             "cache_layout": self.backend_config.get("kv_cache_layout"),
+            "state_restore_requires_ep_layout": self.backend_config.get(
+                "state_restore_requires_ep_layout"
+            ),
         }
         config_metadata["expert_parallel_size"] = parallel_metadata.get(
             "expert_parallel_size"
@@ -1711,7 +1829,6 @@ class VllmBackend(SllmBackend):
             "model_revision": "revision",
             "tensor_parallel_size": "tensor_parallel_size",
             "pipeline_parallel_size": "pipeline_parallel_size",
-            "expert_parallel_enabled": "enable_expert_parallel",
             "cache_block_size": "block_size",
             "cache_dtype": "kv_cache_dtype",
             "cache_layout": "kv_cache_layout",
@@ -1729,6 +1846,36 @@ class VllmBackend(SllmBackend):
                     "reason": "incompatible_cache_config",
                     "state_kind": state_kind,
                 }
+
+        ep_required = _as_bool(
+            metadata.get(
+                "state_restore_requires_ep_layout",
+                self.backend_config.get("state_restore_requires_ep_layout"),
+            ),
+            False,
+        )
+        if ep_required:
+            target_parallel_metadata = self._engine_parallel_metadata(
+                instance_id=str(request_data.get("target_instance_id", "")),
+                node_id=str(target_node or ""),
+            )
+            for state_key in (
+                "effective_expert_parallel_size",
+                "expert_parallel_enabled",
+                "expert_placement_fingerprint",
+            ):
+                source_value = metadata.get(state_key)
+                target_value = target_parallel_metadata.get(state_key)
+                if (
+                    source_value is not None
+                    and target_value is not None
+                    and str(source_value) != str(target_value)
+                ):
+                    return {
+                        "restored": False,
+                        "reason": "incompatible_ep_layout",
+                        "state_kind": state_kind,
+                    }
 
         try:
             restored = await self._call_runtime_hook(

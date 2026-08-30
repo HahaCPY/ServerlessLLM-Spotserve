@@ -33,6 +33,8 @@ Environment overrides:
   SPOTSERVE_COMPOSE_BUILD_SERVICES
                             Space-separated compose services to build.
                             Default: sllm_head because head/worker share one image.
+  SPOTSERVE_BUILD_NO_CACHE   Set to 1 to run docker compose build --no-cache.
+                            Useful when validating vLLM patch layer changes.
   SPOTSERVE_HOST_TMPDIR     Host temp dir for prepare logs.
                             Default: <repo>/.spotserve-tmp
   SPOTSERVE_WORKDIR          Container workdir. Default: /tmp/spotserve-work
@@ -51,12 +53,18 @@ Environment overrides:
   SPOTSERVE_CLEANUP_BUILD_ARTIFACTS
                             Prune dangling images/build cache after build.
                             Default: 1
+  SPOTSERVE_CLEANUP_UNTAGGED_IMAGES
+                            Remove unused <none>:<none> images after cleanup.
+                            Default: same as SPOTSERVE_CLEANUP_BUILD_ARTIFACTS.
   SPOTSERVE_CLEANUP_STOPPED_CONTAINERS
                             Remove stopped sllm_head/sllm_worker_* containers.
                             Default: 1
   SPOTSERVE_SYNC_SOURCE     Copy local sllm/ into running containers and restart
                             before readiness checks. Default: 1 with
                             --skip-build, otherwise 0.
+  SPOTSERVE_REQUIRE_MOE_ROUTE_INSTRUMENTATION
+                            When set to 1, require patched vLLM MoE routing
+                            hooks during vLLM deploy checks. Default: 0.
   SPOTSERVE_REPARALLELIZATION_MODEL_PATH
                             vLLM model path/id used by V6 reparallelization.
                             Default: /models/vllm/vllm-dense-baseline
@@ -107,6 +115,7 @@ SKIP_DEPLOY=0
 BUILD_ONLY=0
 CLEANUP_ONLY=0
 CLEANUP_BUILD_ARTIFACTS="${SPOTSERVE_CLEANUP_BUILD_ARTIFACTS:-1}"
+CLEANUP_UNTAGGED_IMAGES="${SPOTSERVE_CLEANUP_UNTAGGED_IMAGES:-$CLEANUP_BUILD_ARTIFACTS}"
 CLEANUP_STOPPED_CONTAINERS="${SPOTSERVE_CLEANUP_STOPPED_CONTAINERS:-1}"
 CLEANUP_RAN=0
 DEPLOY_SET="${SPOTSERVE_DEPLOY_SET:-standard}"
@@ -192,6 +201,7 @@ HEAD_PYTHON="/opt/venvs/head/bin/python"
 HEAD_SLLM="/opt/venvs/head/bin/sllm"
 HEAD_RAY="/opt/venvs/head/bin/ray"
 WORKER_PYTHON="/opt/venvs/worker/bin/python"
+BUILD_NO_CACHE="${SPOTSERVE_BUILD_NO_CACHE:-0}"
 SYNC_SOURCE="${SPOTSERVE_SYNC_SOURCE:-}"
 
 MODEL_FOLDER_WAS_SET=0
@@ -273,7 +283,7 @@ log() {
 }
 
 cleanup_build_artifacts() {
-  if [[ "$CLEANUP_BUILD_ARTIFACTS" -ne 1 && "$CLEANUP_STOPPED_CONTAINERS" -ne 1 ]]; then
+  if [[ "$CLEANUP_BUILD_ARTIFACTS" -ne 1 && "$CLEANUP_UNTAGGED_IMAGES" -ne 1 && "$CLEANUP_STOPPED_CONTAINERS" -ne 1 ]]; then
     return
   fi
   CLEANUP_RAN=1
@@ -283,6 +293,20 @@ cleanup_build_artifacts() {
     if podman builder prune --help >/dev/null 2>&1; then
       podman builder prune -f || true
     fi
+  fi
+  if [[ "$CLEANUP_UNTAGGED_IMAGES" -eq 1 ]]; then
+    local image_id
+    while read -r image_id; do
+      if [[ -z "${image_id:-}" ]]; then
+        continue
+      fi
+      podman rmi "$image_id" >/dev/null 2>&1 || true
+    done < <(
+      podman images -a \
+        --format "{{.Repository}} {{.Tag}} {{.ID}}" 2>/dev/null |
+        awk '$1 == "<none>" && $2 == "<none>" {print $3}' |
+        sort -u
+    )
   fi
   if [[ "$CLEANUP_STOPPED_CONTAINERS" -eq 1 ]]; then
     local status id name
@@ -348,7 +372,11 @@ trap cleanup_on_exit EXIT
 
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
   log "Building ${COMPOSE_BUILD_SERVICES[*]}"
-  docker compose build "${COMPOSE_BUILD_SERVICES[@]}"
+  BUILD_ARGS=()
+  if [[ "$BUILD_NO_CACHE" == "1" ]]; then
+    BUILD_ARGS+=(--no-cache)
+  fi
+  docker compose build "${BUILD_ARGS[@]}" "${COMPOSE_BUILD_SERVICES[@]}"
   cleanup_build_artifacts
 fi
 
@@ -388,7 +416,10 @@ if [[ "$DEPLOY_SET" == "reparallelization" || "$DEPLOY_SET" == "reparallelizatio
   log "Checking vLLM worker resources"
   podman exec "$WORKER_CONTAINER" bash -lc \
     "mkdir -p /hf-cache/hub /hf-cache/modules && chmod -R a+rwX /hf-cache && touch /hf-cache/modules/.spotserve-write-test"
-  if ! podman exec -i "$WORKER_CONTAINER" "$WORKER_PYTHON" - "$DEPLOY_SET" >"$VLLM_RUNTIME_LOG" 2>&1 <<'PY'
+  if ! podman exec -i "$WORKER_CONTAINER" "$WORKER_PYTHON" - \
+      "$DEPLOY_SET" \
+      "${SPOTSERVE_REQUIRE_MOE_ROUTE_INSTRUMENTATION:-0}" \
+      >"$VLLM_RUNTIME_LOG" 2>&1 <<'PY'
 import inspect
 import sys
 from importlib.metadata import PackageNotFoundError, version
@@ -396,6 +427,7 @@ from importlib.metadata import PackageNotFoundError, version
 from vllm import AsyncLLMEngine
 
 deploy_set = sys.argv[1]
+require_moe_route_instrumentation = sys.argv[2] == "1"
 required_hooks = ()
 if deploy_set == "context-migration-performance":
     required_hooks = (
@@ -411,6 +443,12 @@ elif deploy_set not in ("reparallelization", "reparallelization-performance", "r
         "export_inference_state",
         "restore_inference_state",
         "supports_state_restore",
+    )
+if require_moe_route_instrumentation:
+    required_hooks = (
+        *required_hooks,
+        "get_request_moe_metadata",
+        "get_moe_runtime_metadata",
     )
 missing = [name for name in required_hooks if not hasattr(AsyncLLMEngine, name)]
 try:
@@ -432,6 +470,52 @@ PY
     exit 1
   fi
   cat "$VLLM_RUNTIME_LOG"
+  if [[ "${SPOTSERVE_REQUIRE_MOE_ROUTE_INSTRUMENTATION:-0}" == "1" ]]; then
+    VLLM_PATH="$(
+      podman exec "$WORKER_CONTAINER" "$WORKER_PYTHON" -c \
+        'import os, vllm; print(os.path.dirname(os.path.abspath(vllm.__file__)))'
+    )"
+    MISSING_MOE_MARKERS=()
+    check_moe_marker() {
+      local name="$1"
+      local path="$2"
+      local marker="$3"
+      if ! podman exec "$WORKER_CONTAINER" test -f "$path" ||
+          ! podman exec "$WORKER_CONTAINER" grep -q "$marker" "$path"; then
+        MISSING_MOE_MARKERS+=("$name")
+      fi
+    }
+    check_moe_marker \
+      "vllm.spotserve_moe" \
+      "$VLLM_PATH/spotserve_moe.py" \
+      "def record_moe_routing"
+    check_moe_marker \
+      "fused_moe_modular_method.record_moe_routing" \
+      "$VLLM_PATH/model_executor/layers/fused_moe/fused_moe_modular_method.py" \
+      "record_moe_routing("
+    check_moe_marker \
+      "unquantized_fused_moe_method.record_moe_routing" \
+      "$VLLM_PATH/model_executor/layers/fused_moe/unquantized_fused_moe_method.py" \
+      "record_moe_routing("
+    check_moe_marker \
+      "gpu_model_runner.moe_request_context" \
+      "$VLLM_PATH/v1/worker/gpu_model_runner.py" \
+      "moe_request_context(req_ids, num_scheduled_tokens_np)"
+    check_moe_marker \
+      "worker_base.get_request_moe_metadata" \
+      "$VLLM_PATH/v1/worker/worker_base.py" \
+      "def get_request_moe_metadata"
+    if ! podman exec "$WORKER_CONTAINER" "$WORKER_PYTHON" -m py_compile \
+        "$VLLM_PATH/spotserve_moe.py"; then
+      MISSING_MOE_MARKERS+=("vllm.spotserve_moe.py_compile")
+    fi
+    printf 'MoE route instrumentation markers: missing=%s\n' \
+      "${MISSING_MOE_MARKERS[*]:-none}"
+    if [[ "${#MISSING_MOE_MARKERS[@]}" -gt 0 ]]; then
+      echo "Missing patched vLLM MoE route markers: ${MISSING_MOE_MARKERS[*]}" >&2
+      exit 1
+    fi
+  fi
   if [[ -n "$VLLM_DENSE_MODEL_PATH" ]]; then
     for attempt in $(seq 1 90); do
       if podman exec "$WORKER_CONTAINER" test -f "${VLLM_DENSE_MODEL_PATH}/config.json"; then
