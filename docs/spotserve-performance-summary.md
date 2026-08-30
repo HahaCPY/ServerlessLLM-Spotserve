@@ -304,7 +304,7 @@ cd /tmp/spotserve-work &&
 | V7 | `benchmark_matrix_context_migration_performance.yaml` | Shared Qwen2 MoE run keeps both versions at 100% success; preemption is injected, one context-migration plan executes, selected-plan KV/expert/queue costs are reported, and route metadata is consumed from patched vLLM runtime top-k instrumentation. V7 verifies low-cost target selection and prefix warmup/context planning, not physical expert migration or true remote expert-dispatch traffic. | Runtime top-k MoE run refreshed 2026-08-30. |
 | V8 | `benchmark_matrix_stateful_recovery_performance.yaml` | Shared Qwen2 MoE run keeps both versions at 100% success; stateful recovery restores once, restores 16 tokens and 6 KV blocks, has no fallback, and reports separated KV compatibility vs EP/locality signals. | Phase 3 MoE-aware recovery run refreshed 2026-08-30. |
 | V9 | `risk_aware_scheduling_synthetic.json` | Placement-quality improvement: lower-risk / longer-lived node selection. | Synthetic result; live latency/SLO impact still requires a real workload. |
-| V7-V9 core | `benchmark_matrix_spotserve_core_performance.yaml` | One live matrix deploys baseline and applied variants of the same model. Applied enables context/KV migration, stateful recovery, and risk-aware scheduling together. | Refreshed 2026-08-04. |
+| V7-V9 core | `benchmark_matrix_spotserve_core_performance.yaml` | One live matrix deploys baseline and applied variants of the same model. Applied enables context/KV migration, stateful recovery, and risk-aware scheduling together, with runtime MoE top-k route metadata and Phase 3 recovery compatibility/locality signals. | Refreshed 2026-08-30. |
 | V7-V9 trace sweep | `benchmark_matrix_spotserve_core_trace_sweep.yaml` | Runs the same baseline/applied core pair across busy-recover, fast-recover, slow-recover, no-recover, dead-after-preempt, and double-preempt traces. | Pending run. |
 
 | Metric | Baseline | Applied | Result | Status |
@@ -326,10 +326,12 @@ cd /tmp/spotserve-work &&
 | V8 MoE restore signals | Token replay | Stateful recovery | `0 -> 1 restore, 16 restored tokens, 6 restored blocks, 0 fallback, true_kv_rate=100.00%` | True KV restore path verified for this run. |
 | V8 MoE recovery compatibility | Token replay | Stateful recovery | `0 -> 1 KV-compatible, 0 EP-required, 1 EP mismatch, locality=1.00, remote_tokens=0, expert_cost=0.00` | Confirms EP mismatch was reported as topology/locality information, not used as a hard KV restore rejection. |
 | V7-V9 live combined success rate | Token replay + no context migration + health-only scheduling | Stateful recovery + context/KV migration + risk-aware scheduling | `100.00% -> 100.00%` | New live combined run, `8/8 -> 8/8`. |
-| V7-V9 live combined overall p95 | Token replay + no context migration + health-only scheduling | Stateful recovery + context/KV migration + risk-aware scheduling | `48793.75ms -> 3109.22ms` | Overall p95 improves by `93.63%`, about `15.69x` faster. |
-| V7-V9 live migration-window p95 | Context migration disabled | Context/KV migration applied | `37078.66ms -> 1024.55ms` | Migration window improves by `97.24%`. |
-| V7-V9 live failure-window p95 | Token replay | Stateful recovery | `2222.02ms -> 3109.22ms` | In this combined timing, stateful failure window is slower by `887.20ms`; standalone V8 remains the cleaner stateful-recovery speedup result. |
-| V7-V9 live core signals | Baseline policies | Applied policies | `0 -> 1 context migration, 1 KV success, 1 state restore, 2 risk scheduling events` | All three core code paths ran in one applied benchmark. |
+| V7-V9 live combined overall p95 | Token replay + no context migration + health-only scheduling | Stateful recovery + context/KV migration + risk-aware scheduling | `48965.38ms -> 2656.23ms` | Overall p95 improves by `46309.15ms`, about `18.43x` faster. |
+| V7-V9 live migration-window p95 | Context migration disabled | Context/KV migration applied | `37195.15ms -> 1026.63ms` | Migration window improves by `36168.52ms`. |
+| V7-V9 live failure-window p95 | Token replay | Stateful recovery | `2226.07ms -> 2429.70ms` | In this combined timing, stateful failure window is slower by `203.62ms`; standalone V8 remains the cleaner stateful-recovery speedup result. |
+| V7-V9 live post-recovery p95 | Token replay | Stateful recovery | `1042.62ms -> 1041.89ms` | Post-recovery steady-state latency is near parity. |
+| V7-V9 live core signals | Baseline policies | Applied policies | `0 -> 1 context migration, 1 KV success, route=vllm_runtime_topk/runtime_observed_topk, 1 state restore, 3 true KV blocks, 3 risk scheduling events` | All three core code paths ran in one applied benchmark. |
+| V7-V9 live recovery compatibility | Token replay | Stateful recovery | `0 -> 1 KV-compatible, 0 EP-required, 1 EP mismatch, locality=1.00, remote_tokens=0, expert_cost=0.00` | Combined run also preserves the Phase 3 separation between KV restore correctness and EP/locality signals. |
 | V7-V9 live selected spot risk | Health-only scheduling | Risk-aware scheduling | `0.9000 -> 0.9000` | Single worker node, so V9 decision path ran but had no alternate lower-risk placement. |
 | V9 avg selected spot risk | Health-only scheduling | Risk-aware scheduling | `0.6333 -> 0.1500` | `76.32%` lower synthetic placement risk. |
 
@@ -369,6 +371,13 @@ Notes:
   `context_migration_events > 0`, `state_restore_successes_total > 0`, and
   `risk_scheduling_events > 0` before claiming that all three core paths ran
   together.
+- The 2026-08-30 V7-V9 core table uses shared `Qwen2-MoE-Tiny` with
+  `SPOTSERVE_CORE_LOAD_FORMAT=auto`. The applied run reported
+  `context_migrations=1`, `route_source=vllm_runtime_topk`,
+  `route_kind=runtime_observed_topk`, `kv_successes=1`,
+  `state_restores=1/1`, `true_kv_restores=1`, `true_kv_blocks=3`,
+  `recovery_kv_compatible=1`, `recovery_ep_required=0`,
+  `recovery_ep_mismatch=1`, and `risk_scheduling_events=3`.
 - For the V7-V9 trace sweep, baseline and applied use the same trace file
   inside each scenario. The benchmark runner fills in each run's model name at
   replay time. After the sweep, compare scenarios in

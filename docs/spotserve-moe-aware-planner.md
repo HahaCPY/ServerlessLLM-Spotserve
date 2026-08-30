@@ -923,6 +923,37 @@ KV restore correctness 與 expert locality 已經被分開報告。
 `recovery_remote_tokens=0` / `recovery_expert_cost=0.00` 是根據 route histogram
 與 target placement metadata 的估計結果。
 
+2026-08-30 的 V7-V9 core combined run 也確認三個核心可以在同一個 applied
+benchmark 中一起運作：
+
+```text
+Benchmark:
+  benchmark_matrix_spotserve_core_performance.yaml
+Baseline:
+  successes=8/8
+  p95=48965.38ms
+Applied:
+  successes=8/8
+  p95=2656.23ms
+  context_migrations=1
+  route_source=vllm_runtime_topk
+  route_kind=runtime_observed_topk
+  kv_successes=1
+  state_restores=1/1
+  true_kv_restores=1
+  true_kv_blocks=3
+  recovery_kv_compatible=1
+  recovery_ep_required=0
+  recovery_ep_mismatch=1
+  recovery_locality=1.00
+  risk_scheduling_events=3
+```
+
+這組結果可以用來 claim「V7 context planning、V8 stateful recovery、V9
+risk-aware scheduling 的 code paths 可以合在同一個 live benchmark 內執行」。
+但它仍不應被寫成 physical expert migration 或真實 remote expert dispatch traffic
+已完成。
+
 ### Milestone D: Expert-aware Re-parallelization
 
 目標：re-parallelization planner 真的能決定 expert placement。
