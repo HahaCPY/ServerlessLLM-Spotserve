@@ -616,6 +616,21 @@ def summarize_replanning_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         for row in replanning_rows
         if row.get("execution_status")
     ]
+    execution_models = [
+        str(row.get("reparallelization_execution_model", "") or "")
+        for row in replanning_rows
+        if row.get("reparallelization_execution_model")
+    ]
+    expert_execution_models = [
+        str(row.get("expert_placement_execution_model", "") or "")
+        for row in replanning_rows
+        if row.get("expert_placement_execution_model")
+    ]
+    expert_contract_modes = [
+        str(row.get("expert_placement_runtime_contract_mode", "") or "")
+        for row in replanning_rows
+        if row.get("expert_placement_runtime_contract_mode")
+    ]
     latest_execution = (
         replanning_rows[-1].get("execution") if replanning_rows else None
     )
@@ -740,6 +755,32 @@ def summarize_replanning_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         ),
         "replanning_execution_applied": execution_statuses.count("applied"),
         "replanning_execution_failed": execution_statuses.count("failed"),
+        "replanning_execution_models": compact_values(execution_models),
+        "replanning_expert_placement_execution_models": compact_values(
+            expert_execution_models
+        ),
+        "replanning_expert_placement_contract_modes": compact_values(
+            expert_contract_modes
+        ),
+        "replanning_expert_placement_actor_recreate_events": sum(
+            1
+            for row in replanning_rows
+            if row.get("expert_placement_actor_recreate")
+            or row.get("expert_placement_execution_model")
+            == "expert_aware_actor_recreate"
+        ),
+        "replanning_expert_placement_live_migration_events": sum(
+            1
+            for row in replanning_rows
+            if row.get("expert_placement_live_migration")
+            or row.get("expert_placement_execution_model")
+            == "live_expert_weight_migration"
+        ),
+        "replanning_expert_placement_physical_migration_required_events": sum(
+            1
+            for row in replanning_rows
+            if row.get("expert_placement_physical_migration_required")
+        ),
         "replanning_latest_execution": (
             json.dumps(latest_execution, sort_keys=True)
             if latest_execution
@@ -990,6 +1031,40 @@ def summarize_replanning_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
                 str(row.get("expert_placement_runtime_contract_reasons", ""))
                 for row in replanning_rows
             ]
+        ),
+        "replanning_expert_placement_runtime_execution_models": (
+            compact_values(
+                [
+                    str(
+                        row.get(
+                            "expert_placement_runtime_execution_models", ""
+                        )
+                    )
+                    for row in replanning_rows
+                ]
+            )
+        ),
+        "replanning_expert_placement_runtime_contract_modes": compact_values(
+            [
+                str(row.get("expert_placement_runtime_contract_modes", ""))
+                for row in replanning_rows
+            ]
+        ),
+        "replanning_expert_placement_runtime_live_migration": sum(
+            safe_int(
+                row.get("expert_placement_runtime_live_migration_count"),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_expert_placement_runtime_physical_migration_required": sum(
+            safe_int(
+                row.get(
+                    "expert_placement_runtime_physical_migration_required_count"
+                ),
+                0,
+            )
+            for row in replanning_rows
         ),
         "replanning_max_expert_placement_plan_required_experts": (
             max(expert_plan_required) if expert_plan_required else 0

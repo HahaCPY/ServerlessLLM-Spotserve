@@ -634,6 +634,89 @@ class VllmBackend(SllmBackend):
             reason = "verified_runtime_plan"
         else:
             reason = "runtime_applied_unverified"
+        replanning_execution_model = str(
+            runtime_status.get("reparallelization_execution_model")
+            or self._config_value_for_runtime(
+                "reparallelization_execution_model",
+                instance_id=instance_id,
+                node_id=node_id,
+            )
+            or ("actor_recreate" if plan_available else "unavailable")
+        )
+        replanning_execution_model_reason = str(
+            runtime_status.get("reparallelization_execution_model_reason")
+            or self._config_value_for_runtime(
+                "reparallelization_execution_model_reason",
+                instance_id=instance_id,
+                node_id=node_id,
+            )
+            or (
+                "vllm_actor_recreate"
+                if plan_available
+                else "no_reparallelization_execution_model"
+            )
+        )
+        expert_execution_model = str(
+            runtime_status.get("expert_placement_execution_model")
+            or self._config_value_for_runtime(
+                "expert_placement_execution_model",
+                instance_id=instance_id,
+                node_id=node_id,
+            )
+            or (
+                "expert_aware_actor_recreate"
+                if plan_available
+                else "unavailable"
+            )
+        )
+        expert_execution_model_reason = str(
+            runtime_status.get("expert_placement_execution_model_reason")
+            or self._config_value_for_runtime(
+                "expert_placement_execution_model_reason",
+                instance_id=instance_id,
+                node_id=node_id,
+            )
+            or (
+                "logical_expert_placement_plan_carried_into_recreated_actor"
+                if plan_available
+                else "no_expert_placement_plan"
+            )
+        )
+        contract_mode = str(
+            runtime_status.get("expert_placement_runtime_contract_mode")
+            or self._config_value_for_runtime(
+                "expert_placement_runtime_contract_mode",
+                instance_id=instance_id,
+                node_id=node_id,
+            )
+            or ("observe_only_contract" if plan_available else "unavailable")
+        )
+        raw_live_migration_enabled = runtime_status.get(
+            "expert_placement_live_migration_enabled"
+        )
+        raw_physical_migration_required = runtime_status.get(
+            "expert_placement_physical_migration_required"
+        )
+        live_migration_enabled = _as_bool(
+            raw_live_migration_enabled
+            if raw_live_migration_enabled is not None
+            else self._config_value_for_runtime(
+                "expert_placement_live_migration_enabled",
+                instance_id=instance_id,
+                node_id=node_id,
+            ),
+            default=False,
+        )
+        physical_migration_required = _as_bool(
+            raw_physical_migration_required
+            if raw_physical_migration_required is not None
+            else self._config_value_for_runtime(
+                "expert_placement_physical_migration_required",
+                instance_id=instance_id,
+                node_id=node_id,
+            ),
+            default=False,
+        )
 
         return {
             "expert_placement_contract_available": plan_available,
@@ -683,6 +766,21 @@ class VllmBackend(SllmBackend):
             "expert_placement_verify_reason": str(
                 runtime_status.get("expert_placement_verify_reason", "")
                 or ""
+            ),
+            "reparallelization_execution_model": replanning_execution_model,
+            "reparallelization_execution_model_reason": (
+                replanning_execution_model_reason
+            ),
+            "expert_placement_execution_model": expert_execution_model,
+            "expert_placement_execution_model_reason": (
+                expert_execution_model_reason
+            ),
+            "expert_placement_runtime_contract_mode": contract_mode,
+            "expert_placement_live_migration_enabled": (
+                live_migration_enabled
+            ),
+            "expert_placement_physical_migration_required": (
+                physical_migration_required
             ),
         }
 

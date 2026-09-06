@@ -406,6 +406,63 @@ def get_vllm_model_resource_profile(
             else "unavailable",
         )
     )
+    replanning_execution_model = str(
+        _first_present(
+            runtime_metadata.get("reparallelization_execution_model"),
+            backend_config.get("reparallelization_execution_model"),
+            "actor_recreate" if contract_available else "unavailable",
+        )
+    )
+    replanning_execution_model_reason = str(
+        _first_present(
+            runtime_metadata.get("reparallelization_execution_model_reason"),
+            backend_config.get("reparallelization_execution_model_reason"),
+            "vllm_actor_recreate"
+            if contract_available
+            else "no_reparallelization_execution_model",
+        )
+    )
+    expert_execution_model = str(
+        _first_present(
+            runtime_metadata.get("expert_placement_execution_model"),
+            backend_config.get("expert_placement_execution_model"),
+            "expert_aware_actor_recreate"
+            if contract_available
+            else "unavailable",
+        )
+    )
+    expert_execution_model_reason = str(
+        _first_present(
+            runtime_metadata.get("expert_placement_execution_model_reason"),
+            backend_config.get("expert_placement_execution_model_reason"),
+            "logical_expert_placement_plan_carried_into_recreated_actor"
+            if contract_available
+            else "no_expert_placement_plan",
+        )
+    )
+    expert_contract_mode = str(
+        _first_present(
+            runtime_metadata.get("expert_placement_runtime_contract_mode"),
+            backend_config.get("expert_placement_runtime_contract_mode"),
+            "observe_only_contract" if contract_available else "unavailable",
+        )
+    )
+    expert_live_migration_enabled = _to_bool(
+        _first_present(
+            runtime_metadata.get("expert_placement_live_migration_enabled"),
+            backend_config.get("expert_placement_live_migration_enabled"),
+        ),
+        default=False,
+    )
+    expert_physical_migration_required = _to_bool(
+        _first_present(
+            runtime_metadata.get(
+                "expert_placement_physical_migration_required"
+            ),
+            backend_config.get("expert_placement_physical_migration_required"),
+        ),
+        default=False,
+    )
 
     profile = {
         "model_name": model_name,
@@ -457,6 +514,21 @@ def get_vllm_model_resource_profile(
         "expert_placement_plan_applied": plan_applied,
         "expert_placement_plan_verified": plan_verified,
         "expert_placement_contract_reason": str(contract_reason),
+        "reparallelization_execution_model": replanning_execution_model,
+        "reparallelization_execution_model_reason": (
+            replanning_execution_model_reason
+        ),
+        "expert_placement_execution_model": expert_execution_model,
+        "expert_placement_execution_model_reason": (
+            expert_execution_model_reason
+        ),
+        "expert_placement_runtime_contract_mode": expert_contract_mode,
+        "expert_placement_live_migration_enabled": (
+            expert_live_migration_enabled
+        ),
+        "expert_placement_physical_migration_required": (
+            expert_physical_migration_required
+        ),
         "expert_placement_apply_hook_available": apply_hook_available,
         "expert_placement_apply_attempted": apply_attempted,
         "expert_placement_apply_success": apply_success,
@@ -583,6 +655,27 @@ def get_vllm_runtime_metadata(
         ),
         "expert_placement_contract_reason": (
             profile["expert_placement_contract_reason"]
+        ),
+        "reparallelization_execution_model": (
+            profile["reparallelization_execution_model"]
+        ),
+        "reparallelization_execution_model_reason": (
+            profile["reparallelization_execution_model_reason"]
+        ),
+        "expert_placement_execution_model": (
+            profile["expert_placement_execution_model"]
+        ),
+        "expert_placement_execution_model_reason": (
+            profile["expert_placement_execution_model_reason"]
+        ),
+        "expert_placement_runtime_contract_mode": (
+            profile["expert_placement_runtime_contract_mode"]
+        ),
+        "expert_placement_live_migration_enabled": (
+            profile["expert_placement_live_migration_enabled"]
+        ),
+        "expert_placement_physical_migration_required": (
+            profile["expert_placement_physical_migration_required"]
         ),
         "expert_placement_apply_hook_available": (
             profile["expert_placement_apply_hook_available"]

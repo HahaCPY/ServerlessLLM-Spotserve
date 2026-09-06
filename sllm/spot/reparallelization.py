@@ -9,6 +9,35 @@ PREEMPTING = "preempting"
 DEAD = "dead"
 
 
+def _truthy_flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _counts_as_runtime_worker(node_info: Mapping[str, Any]) -> bool:
+    return _truthy_flag(
+        node_info.get("_spotserve_counts_as_runtime_worker")
+        or node_info.get("counts_as_runtime_worker")
+        or node_info.get("count_as_runtime_worker")
+        or node_info.get("runtime_worker_placeholder")
+    )
+
+
+def _is_synthetic_worker_node(node_info: Mapping[str, Any]) -> bool:
+    if _counts_as_runtime_worker(node_info):
+        return False
+    return (
+        _truthy_flag(node_info.get("_spotserve_synthetic", False))
+        or str(node_info.get("ray_node_id", "")).startswith("synthetic-")
+        or str(node_info.get("address", "")).startswith("synthetic-")
+    )
+
+
 @dataclass(frozen=True)
 class GpuAvailability:
     total_gpus: int
@@ -1271,9 +1300,7 @@ def plan_dynamic_reparallelization(
     synthetic_worker_node_count = sum(
         1
         for node_info in worker_nodes.values()
-        if bool(node_info.get("_spotserve_synthetic", False))
-        or str(node_info.get("ray_node_id", "")).startswith("synthetic-")
-        or str(node_info.get("address", "")).startswith("synthetic-")
+        if _is_synthetic_worker_node(node_info)
     )
     runtime_worker_node_count = max(
         len(worker_nodes) - synthetic_worker_node_count,

@@ -100,6 +100,10 @@ class VllmDeploymentAdapter:
         config["expert_parallel_size_verified"] = False
         config["enable_expert_parallel"] = plan.enable_expert_parallel
         config["placement_epoch"] = plan.placement_epoch
+        config["reparallelization_execution_model"] = "actor_recreate"
+        config["reparallelization_execution_model_reason"] = (
+            "vllm_actor_recreate"
+        )
         expert_placement_plan = (
             dict(plan.expert_placement_plan)
             if isinstance(plan.expert_placement_plan, Mapping)
@@ -107,6 +111,17 @@ class VllmDeploymentAdapter:
         )
         if expert_placement_plan:
             config["expert_placement_plan"] = expert_placement_plan
+            config["expert_placement_execution_model"] = (
+                "expert_aware_actor_recreate"
+            )
+            config["expert_placement_execution_model_reason"] = (
+                "logical_expert_placement_plan_carried_into_recreated_actor"
+            )
+            config["expert_placement_runtime_contract_mode"] = (
+                "observe_only_contract"
+            )
+            config["expert_placement_live_migration_enabled"] = False
+            config["expert_placement_physical_migration_required"] = False
             config["placement_source"] = str(
                 expert_placement_plan.get(
                     "placement_source",

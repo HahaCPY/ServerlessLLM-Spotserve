@@ -38,6 +38,8 @@
         "0": {
           "ray_node_id": "synthetic-worker-0",
           "address": "synthetic-0",
+          "_spotserve_counts_as_runtime_worker": true,
+          "runtime_worker_placeholder_reason": "same_node_recreate_capacity_override",
           "free_gpu": 1,
           "total_gpu": 1,
           "state": "ready"

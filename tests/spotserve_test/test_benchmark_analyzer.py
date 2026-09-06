@@ -389,6 +389,16 @@ def test_replanning_summary_exposes_workload_cost_metrics():
                 "execution_status": "applied",
                 "execution": {"status": "applied"},
                 "execution_duration_ms": 2500,
+                "reparallelization_execution_model": "actor_recreate",
+                "expert_placement_execution_model": (
+                    "expert_aware_actor_recreate"
+                ),
+                "expert_placement_runtime_contract_mode": (
+                    "observe_only_contract"
+                ),
+                "expert_placement_actor_recreate": True,
+                "expert_placement_live_migration": False,
+                "expert_placement_physical_migration_required": False,
                 "workload_cost_model_enabled": True,
                 "selected_replan_window_cost_ms": 5200,
                 "selected_load_time_estimate_ms": 5000,
@@ -443,6 +453,14 @@ def test_replanning_summary_exposes_workload_cost_metrics():
                 "expert_placement_runtime_contract_reasons": (
                     "physical_expert_placement_migration_not_supported"
                 ),
+                "expert_placement_runtime_execution_models": (
+                    "expert_aware_actor_recreate"
+                ),
+                "expert_placement_runtime_contract_modes": (
+                    "observe_only_contract"
+                ),
+                "expert_placement_runtime_live_migration_count": 0,
+                "expert_placement_runtime_physical_migration_required_count": 0,
                 "cross_node_target": True,
                 "multi_worker_target": False,
                 "target_worker_node_count": 1,
@@ -456,6 +474,21 @@ def test_replanning_summary_exposes_workload_cost_metrics():
 
     assert summary["replanning_events"] == 1
     assert summary["replanning_execution_applied"] == 1
+    assert summary["replanning_execution_models"] == "actor_recreate"
+    assert summary["replanning_expert_placement_execution_models"] == (
+        "expert_aware_actor_recreate"
+    )
+    assert summary["replanning_expert_placement_contract_modes"] == (
+        "observe_only_contract"
+    )
+    assert summary["replanning_expert_placement_actor_recreate_events"] == 1
+    assert summary["replanning_expert_placement_live_migration_events"] == 0
+    assert (
+        summary[
+            "replanning_expert_placement_physical_migration_required_events"
+        ]
+        == 0
+    )
     assert summary["replanning_workload_cost_model_events"] == 1
     assert summary["replanning_avg_execution_duration_ms"] == 2500
     assert summary["replanning_avg_selected_replan_window_cost_ms"] == 5200
@@ -549,6 +582,19 @@ def test_replanning_summary_exposes_workload_cost_metrics():
     assert summary["replanning_expert_placement_runtime_plan_verified"] == 0
     assert summary["replanning_expert_placement_runtime_contract_reasons"] == (
         "physical_expert_placement_migration_not_supported"
+    )
+    assert summary["replanning_expert_placement_runtime_execution_models"] == (
+        "expert_aware_actor_recreate"
+    )
+    assert summary["replanning_expert_placement_runtime_contract_modes"] == (
+        "observe_only_contract"
+    )
+    assert summary["replanning_expert_placement_runtime_live_migration"] == 0
+    assert (
+        summary[
+            "replanning_expert_placement_runtime_physical_migration_required"
+        ]
+        == 0
     )
     assert summary["replanning_max_expert_placement_plan_required_experts"] == 6
     assert summary["replanning_max_expert_placement_plan_covered_experts"] == 6

@@ -90,6 +90,43 @@ def make_replanning_event(
         and target_nodes
         and any(target_node != source_node for target_node in target_nodes)
     )
+    replanning_execution_model = str(
+        execution.get("reparallelization_execution_model")
+        or decision.get("reparallelization_execution_model")
+        or "unavailable"
+    )
+    replanning_execution_model_reason = str(
+        execution.get("reparallelization_execution_model_reason")
+        or decision.get("reparallelization_execution_model_reason")
+        or ""
+    )
+    expert_execution_model = str(
+        execution.get("expert_placement_execution_model")
+        or decision.get("expert_placement_execution_model")
+        or "unavailable"
+    )
+    expert_execution_model_reason = str(
+        execution.get("expert_placement_execution_model_reason")
+        or decision.get("expert_placement_execution_model_reason")
+        or ""
+    )
+    expert_contract_mode = str(
+        execution.get("expert_placement_runtime_contract_mode")
+        or decision.get("expert_placement_runtime_contract_mode")
+        or "unavailable"
+    )
+    expert_live_migration_enabled = bool(
+        execution.get(
+            "expert_placement_live_migration_enabled",
+            decision.get("expert_placement_live_migration_enabled", False),
+        )
+    )
+    expert_physical_migration_required = bool(
+        execution.get(
+            "expert_placement_physical_migration_required",
+            decision.get("expert_placement_physical_migration_required", False),
+        )
+    )
     return {
         "type": "reparallelization",
         "model": model,
@@ -298,6 +335,56 @@ def make_replanning_event(
         ),
         "expert_placement_runtime_contract_reasons": (
             expert_placement_runtime.get("contract_reasons", "")
+        ),
+        "expert_placement_runtime_reparallelization_execution_models": (
+            expert_placement_runtime.get(
+                "reparallelization_execution_models", ""
+            )
+        ),
+        "expert_placement_runtime_execution_models": (
+            expert_placement_runtime.get(
+                "expert_placement_execution_models", ""
+            )
+        ),
+        "expert_placement_runtime_execution_reasons": (
+            expert_placement_runtime.get(
+                "expert_placement_execution_reasons", ""
+            )
+        ),
+        "expert_placement_runtime_contract_modes": (
+            expert_placement_runtime.get(
+                "expert_placement_contract_modes", ""
+            )
+        ),
+        "expert_placement_runtime_live_migration_count": (
+            expert_placement_runtime.get("expert_placement_live_migration_count", 0)
+        ),
+        "expert_placement_runtime_physical_migration_required_count": (
+            expert_placement_runtime.get(
+                "expert_placement_physical_migration_required_count", 0
+            )
+        ),
+        "reparallelization_execution_model": replanning_execution_model,
+        "reparallelization_execution_model_reason": (
+            replanning_execution_model_reason
+        ),
+        "expert_placement_execution_model": expert_execution_model,
+        "expert_placement_execution_model_reason": (
+            expert_execution_model_reason
+        ),
+        "expert_placement_runtime_contract_mode": expert_contract_mode,
+        "expert_placement_live_migration_enabled": (
+            expert_live_migration_enabled
+        ),
+        "expert_placement_physical_migration_required": (
+            expert_physical_migration_required
+        ),
+        "expert_placement_actor_recreate": (
+            expert_execution_model == "expert_aware_actor_recreate"
+        ),
+        "expert_placement_live_migration": (
+            expert_live_migration_enabled
+            or expert_execution_model == "live_expert_weight_migration"
         ),
         "selected_score": decision.get(
             "selected_score", selected_config.get("score", 0.0)

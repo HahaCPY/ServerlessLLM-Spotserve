@@ -177,6 +177,15 @@ def test_vllm_model_resource_profile_reports_placement_contract():
     assert profile["expert_placement_plan_applied"] is True
     assert profile["expert_placement_plan_verified"] is True
     assert profile["expert_placement_contract_reason"] == "verified_runtime_plan"
+    assert profile["reparallelization_execution_model"] == "actor_recreate"
+    assert profile["expert_placement_execution_model"] == (
+        "expert_aware_actor_recreate"
+    )
+    assert profile["expert_placement_runtime_contract_mode"] == (
+        "observe_only_contract"
+    )
+    assert profile["expert_placement_live_migration_enabled"] is False
+    assert profile["expert_placement_physical_migration_required"] is False
     assert profile["expert_placement_apply_hook_available"] is True
     assert profile["expert_placement_apply_attempted"] is True
     assert profile["expert_placement_apply_success"] is True
@@ -226,6 +235,15 @@ def test_vllm_runtime_metadata_exposes_placement_contract():
     assert metadata["expert_placement_contract_bound"] is True
     assert metadata["expert_placement_plan_applied"] is True
     assert metadata["expert_placement_plan_verified"] is True
+    assert metadata["reparallelization_execution_model"] == "actor_recreate"
+    assert metadata["expert_placement_execution_model"] == (
+        "expert_aware_actor_recreate"
+    )
+    assert metadata["expert_placement_runtime_contract_mode"] == (
+        "observe_only_contract"
+    )
+    assert metadata["expert_placement_live_migration_enabled"] is False
+    assert metadata["expert_placement_physical_migration_required"] is False
     assert metadata["expert_placement_apply_hook_available"] is True
     assert metadata["expert_placement_apply_attempted"] is True
     assert metadata["expert_placement_apply_success"] is True
@@ -290,6 +308,11 @@ def test_vllm_runtime_metadata_can_feed_risk_score():
     assert metadata["expert_placement_verify_hook_available"] is False
     assert metadata["expert_placement_verify_attempted"] is False
     assert metadata["expert_placement_verify_success"] is False
+    assert metadata["reparallelization_execution_model"] == "unavailable"
+    assert metadata["expert_placement_execution_model"] == "unavailable"
+    assert metadata["expert_placement_runtime_contract_mode"] == "unavailable"
+    assert metadata["expert_placement_live_migration_enabled"] is False
+    assert metadata["expert_placement_physical_migration_required"] is False
 
     score = node_risk_score(
         node_id=metadata["node_id"],

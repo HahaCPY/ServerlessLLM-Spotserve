@@ -797,6 +797,59 @@ class RoundRobinRouter(SllmRouter):
                 return dict(metadata)
         return {}
 
+    @staticmethod
+    def _reparallelization_execution_model_fields(
+        decision: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        action = str(decision.get("action") or "")
+        parallel_plan = decision.get("parallel_plan")
+        if not isinstance(parallel_plan, Mapping):
+            parallel_plan = {}
+        expert_plan = (
+            decision.get("expert_placement_plan")
+            or parallel_plan.get("expert_placement_plan")
+            or {}
+        )
+        expert_plan_available = bool(
+            decision.get(
+                "expert_placement_plan_available",
+                isinstance(expert_plan, Mapping) and bool(expert_plan),
+            )
+        )
+        executed = action == "reparallelize"
+        fields: Dict[str, Any] = {
+            "reparallelization_execution_model": (
+                "actor_recreate" if executed else "not_executed"
+            ),
+            "reparallelization_execution_model_reason": (
+                "vllm_actor_recreate"
+                if executed
+                else f"{action or 'unknown'}_without_actor_recreate"
+            ),
+            "expert_placement_execution_model": (
+                "expert_aware_actor_recreate"
+                if executed and expert_plan_available
+                else "no_expert_placement_plan"
+                if executed
+                else "not_executed"
+            ),
+            "expert_placement_execution_model_reason": (
+                "logical_expert_placement_plan_carried_into_recreated_actor"
+                if executed and expert_plan_available
+                else "planner_did_not_emit_expert_placement_plan"
+                if executed
+                else f"{action or 'unknown'}_without_actor_recreate"
+            ),
+            "expert_placement_runtime_contract_mode": (
+                "observe_only_contract"
+                if executed and expert_plan_available
+                else "unavailable"
+            ),
+            "expert_placement_live_migration_enabled": False,
+            "expert_placement_physical_migration_required": False,
+        }
+        return fields
+
     async def _replan_after_spot_event(
         self,
         event: str,
@@ -888,6 +941,10 @@ class RoundRobinRouter(SllmRouter):
             instance_id=instance_id,
             backend=self.backend,
         )
+        execution_model = self._reparallelization_execution_model_fields(
+            decision
+        )
+        decision.update(execution_model)
         selected_plan = decision.get("parallel_plan")
         active_deployment = self._vllm_active_deployment()
         if (
@@ -903,8 +960,13 @@ class RoundRobinRouter(SllmRouter):
             # change.  Keep the current engine and in-flight requests alive
             # when the newly selected plan is identical.
             decision["action"] = "unchanged"
+            execution_model = self._reparallelization_execution_model_fields(
+                decision
+            )
+            decision.update(execution_model)
             decision["execution"] = {
                 "status": "unchanged",
+                **execution_model,
                 "parallel_plan": selected_plan,
                 "reason": "planner_selected_existing_plan",
             }
@@ -926,6 +988,7 @@ class RoundRobinRouter(SllmRouter):
                     )
                     decision["execution"] = {
                         "status": "applied",
+                        **execution_model,
                         "instance_ids": sorted(deployment.instances),
                         "parallel_plan": plan.to_dict(),
                         "expert_placement_runtime": (
@@ -947,6 +1010,7 @@ class RoundRobinRouter(SllmRouter):
                     )
                     decision["execution"] = {
                         "status": "failed",
+                        **execution_model,
                         "reason": str(exc),
                         "duration_ms": (
                             time.time() - apply_started_at
@@ -954,8 +1018,22 @@ class RoundRobinRouter(SllmRouter):
                         * 1000,
                     }
             else:
+                not_executed_model = {
+                    "reparallelization_execution_model": "not_executed",
+                    "reparallelization_execution_model_reason": (
+                        "vllm_deployment_adapter_unavailable"
+                    ),
+                    "expert_placement_execution_model": "not_executed",
+                    "expert_placement_execution_model_reason": (
+                        "vllm_deployment_adapter_unavailable"
+                    ),
+                    "expert_placement_runtime_contract_mode": "unavailable",
+                    "expert_placement_live_migration_enabled": False,
+                    "expert_placement_physical_migration_required": False,
+                }
                 decision["execution"] = {
                     "status": "decision_only",
+                    **not_executed_model,
                     "reason": "vllm_deployment_adapter_unavailable",
                 }
         self._emit_metric(
@@ -1460,6 +1538,13 @@ class RoundRobinRouter(SllmRouter):
                 "expert_placement_verify_attempted",
                 "expert_placement_verify_success",
                 "expert_placement_verify_reason",
+                "reparallelization_execution_model",
+                "reparallelization_execution_model_reason",
+                "expert_placement_execution_model",
+                "expert_placement_execution_model_reason",
+                "expert_placement_runtime_contract_mode",
+                "expert_placement_live_migration_enabled",
+                "expert_placement_physical_migration_required",
                 "moe_route_histogram_available",
                 "moe_route_histogram_source",
                 "moe_route_histogram_kind",
@@ -1529,6 +1614,24 @@ class RoundRobinRouter(SllmRouter):
             ),
             "contract_reasons": compact_values(
                 "expert_placement_contract_reason"
+            ),
+            "reparallelization_execution_models": compact_values(
+                "reparallelization_execution_model"
+            ),
+            "expert_placement_execution_models": compact_values(
+                "expert_placement_execution_model"
+            ),
+            "expert_placement_execution_reasons": compact_values(
+                "expert_placement_execution_model_reason"
+            ),
+            "expert_placement_contract_modes": compact_values(
+                "expert_placement_runtime_contract_mode"
+            ),
+            "expert_placement_live_migration_count": count_truthy(
+                "expert_placement_live_migration_enabled"
+            ),
+            "expert_placement_physical_migration_required_count": (
+                count_truthy("expert_placement_physical_migration_required")
             ),
         }
 

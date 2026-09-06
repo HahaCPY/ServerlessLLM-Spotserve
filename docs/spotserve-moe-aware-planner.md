@@ -1295,18 +1295,22 @@ model = /models/Qwen2-MoE-Tiny
 Disabled:
   successes=3/8
   success_rate=37.50%
-  p95=180084.27ms
+  p95=180041.97ms
   trace_success=1
 
 Applied:
   successes=8/8
   success_rate=100.00%
-  p95=14123.75ms
+  p95=14143.22ms
   trace_success=1
   replans=1
   applied=1
   failed=0
-  exec_ms=15530.65
+  exec_model=expert_aware_actor_recreate
+  actor_recreate=1
+  live_migration=0
+  runtime_workers=1
+  exec_ms=15413.68
   cost_model=1
   expert_plan=1
   expert_plan_shards=8
@@ -1345,10 +1349,162 @@ Applied:
   hook 仍是 observe-only，沒有真的改 vLLM EP rank mapping 或搬 expert weights。
 
 這組 run 使用 single-worker same-node recreate mode，因此
-`runtime_workers=0` 是預期結果：它驗證的是 controller、logical plan、metric
-path，不是 multi-worker relocation。`physical_expert_migration=0` 也仍然是預期
-結果；真正的 expert weight movement 要等 vLLM EP runtime hook 可以回報
-`applied=true` 且 `verified=true` 之後才能宣稱。
+`runtime_workers=1` 是預期結果：它表示 same-node recreate capacity entry 代表
+一個真實 runtime worker node。這仍只驗證 controller、logical plan、metric path，
+不是 multi-worker relocation。`actor_recreate=1`、`live_migration=0` 和
+`physical_expert_migration=0` 也仍然是預期結果；真正的 expert weight movement
+要等 vLLM EP runtime hook 可以回報 `applied=true` 且 `verified=true` 之後才能
+宣稱。
+
+### Phase 5A: vLLM EP Runtime Capability Audit
+
+Phase 5 的第一步不是直接搬 expert weights，而是先檢查 vLLM runtime 是否具備
+可安全套用 `ExpertPlacementPlan` 的能力。這一步新增
+`sllm.spot.vllm_ep_runtime_audit`，用來回答：
+
+```text
+1. patched vLLM 是否有 MoE top-k routing instrumentation
+2. gpu_model_runner forward path 是否包住 moe_request_context(...)
+3. fused MoE method 是否真的呼叫 record_moe_routing(...)
+4. WorkerBase / EngineCore / AsyncLLM 是否有 apply/verify placement hook
+5. apply/verify hook 是 observe-only，還是真的回報 physical migration applied
+```
+
+在 worker container 裡可以這樣跑：
+
+```bash
+podman exec sllm_worker_0 bash -lc '
+/opt/venvs/worker/bin/python -m sllm.spot.vllm_ep_runtime_audit
+'
+```
+
+如果 running container 回 `No module named sllm.spot.vllm_ep_runtime_audit`，
+代表目前 container 還沒同步這個新 module；先用 `SPOTSERVE_SYNC_SOURCE=1`
+重新 prepare 一次同一個 deploy set，或 rebuild image 後再跑 audit。
+
+若只想檢查 source tree、不 import runtime：
+
+```bash
+/opt/venvs/worker/bin/python -m sllm.spot.vllm_ep_runtime_audit \
+  --source-root /opt/venvs/worker/lib/python3.11/site-packages/vllm \
+  --no-runtime-probe
+```
+
+目前預期分類是：
+
+```text
+phase5_gate.classification = observe_only_expert_placement_contract
+phase5_gate.can_claim_physical_expert_migration = false
+phase5_gate.recommended_execution_model = expert_aware_actor_recreate
+```
+
+這代表 Phase 4 產生的 `ExpertPlacementPlan` 已經能被 runtime hook 看到，但
+vLLM 仍沒有真的更新 live EP rank mapping 或搬 expert weight tensor。若未來
+runtime hook 回報：
+
+```text
+apply_expert_placement_plan -> applied=true, physical_weight_migration=true
+verify_expert_placement_plan -> verified=true, physical_weight_migration=true
+```
+
+audit 才能把 gate 推進到：
+
+```text
+phase5_gate.classification = physical_expert_migration_supported
+phase5_gate.can_claim_physical_expert_migration = true
+```
+
+所以 Phase 5A 的階段性結論會是：
+
+```text
+Current implementation supports expert-aware actor recreate planning.
+It does not yet support live physical expert weight migration.
+```
+
+2026-09-06 在 `sllm_worker_0` 實際執行 Phase 5A audit 的結果符合這個 gate：
+
+```text
+vLLM version = 0.11.2
+spotserve_moe_importable = true
+forward_path_has_moe_request_context = true
+route_recording_hooks = 2
+apply_verify_boundary_present = true
+observe_only_markers_present = true
+
+apply_expert_placement_plan:
+  callable = true
+  applied = false
+  physical_weight_migration = false
+  reason = physical_expert_placement_migration_not_supported
+  hook_kind = spotserve_observation_only
+
+verify_expert_placement_plan:
+  callable = true
+  verified = false
+  physical_weight_migration = false
+  contract_seen_by_runtime = true
+  reason = physical_expert_placement_verification_not_supported
+  hook_kind = spotserve_observation_only
+
+phase5_gate:
+  classification = observe_only_expert_placement_contract
+  can_claim_physical_expert_migration = false
+  recommended_execution_model = expert_aware_actor_recreate
+```
+
+這代表 Phase 5A 已經確認 runtime boundary 是存在且可被呼叫的，但目前仍只
+能作為 placement contract / observability boundary，不能把它寫成 live
+physical expert migration。
+
+### Phase 5B: Expert-aware Actor Recreate Execution Model
+
+Phase 5B 先把目前能安全宣稱的 execution model 固定下來：
+
+```text
+ExpertPlacementPlan is consumed by recreated vLLM actors.
+It is not applied by live in-place expert weight migration.
+```
+
+也就是說，Phase 4 的 `ExpertPlacementPlan` 會進入
+`VllmDeploymentAdapter._plan_backend_config(...)`，再隨著新的 vLLM actor
+建立流程一起交給 runtime metadata / observe-only hook。這讓系統可以用新的
+logical placement 來做後續 migration / recovery planning，但目前不宣稱：
+
+```text
+live EP rank remapping = true
+expert weight tensor moved in-place = true
+remote expert dispatch traffic directly measured = true
+```
+
+新的 benchmark / metrics 欄位會明確呈現這個邊界：
+
+```text
+reparallelization_execution_model = actor_recreate
+expert_placement_execution_model = expert_aware_actor_recreate
+expert_placement_runtime_contract_mode = observe_only_contract
+expert_placement_live_migration_enabled = false
+expert_placement_physical_migration_required = false
+
+replanning_expert_placement_actor_recreate_events > 0
+replanning_expert_placement_live_migration_events = 0
+replanning_expert_placement_physical_migration_required_events = 0
+```
+
+如果未來真的完成 physical expert migration，這些欄位才應該轉成：
+
+```text
+expert_placement_execution_model = live_expert_weight_migration
+expert_placement_live_migration_enabled = true
+expert_placement_physical_migration_required = true
+```
+
+所以目前 Phase 5B 的 claim 是：
+
+```text
+Current implementation executes expert-aware re-parallelization by recreating
+vLLM actors with a logical expert placement contract.
+It does not execute live physical expert weight migration.
+```
 
 ### Milestone E: Physical Cross-node Validation
 

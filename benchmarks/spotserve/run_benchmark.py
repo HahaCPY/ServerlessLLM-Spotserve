@@ -195,6 +195,9 @@ def build_comparisons(
         "replanning_events",
         "replanning_execution_applied",
         "replanning_execution_failed",
+        "replanning_expert_placement_actor_recreate_events",
+        "replanning_expert_placement_live_migration_events",
+        "replanning_expert_placement_physical_migration_required_events",
         "replanning_workload_cost_model_events",
         "replanning_avg_execution_duration_ms",
         "replanning_avg_selected_replan_window_cost_ms",
@@ -211,6 +214,8 @@ def build_comparisons(
         "replanning_max_expert_placement_plan_moved_experts",
         "replanning_total_expert_placement_plan_moved_weight_bytes",
         "replanning_avg_expert_placement_plan_weight_movement_cost_ms",
+        "replanning_expert_placement_runtime_live_migration",
+        "replanning_expert_placement_runtime_physical_migration_required",
         "replanning_max_ready_worker_node_count",
         "replanning_max_runtime_worker_node_count",
         "replanning_max_physical_worker_node_count",
@@ -1160,6 +1165,12 @@ async def main_async(args):
                     f"{summary.get('replanning_execution_applied', 0)}, "
                     f"failed="
                     f"{summary.get('replanning_execution_failed', 0)}, "
+                    f"exec_model="
+                    f"{summary.get('replanning_expert_placement_execution_models', '') or summary.get('replanning_execution_models', 'unavailable')}, "
+                    f"actor_recreate="
+                    f"{summary.get('replanning_expert_placement_actor_recreate_events', 0)}, "
+                    f"live_migration="
+                    f"{summary.get('replanning_expert_placement_live_migration_events', 0)}, "
                     f"exec_ms="
                     f"{summary.get('replanning_avg_execution_duration_ms', 0.0):.2f}, "
                     f"cost_model="

@@ -28,6 +28,21 @@ def test_replanning_event_exposes_runtime_expert_placement_hook_status():
             "execution": {
                 "status": "applied",
                 "duration_ms": 1234,
+                "reparallelization_execution_model": "actor_recreate",
+                "reparallelization_execution_model_reason": (
+                    "vllm_actor_recreate"
+                ),
+                "expert_placement_execution_model": (
+                    "expert_aware_actor_recreate"
+                ),
+                "expert_placement_execution_model_reason": (
+                    "logical_expert_placement_plan_carried_into_recreated_actor"
+                ),
+                "expert_placement_runtime_contract_mode": (
+                    "observe_only_contract"
+                ),
+                "expert_placement_live_migration_enabled": False,
+                "expert_placement_physical_migration_required": False,
                 "expert_placement_runtime": {
                     "metadata_count": 1,
                     "apply_hook_available_count": 1,
@@ -47,6 +62,14 @@ def test_replanning_event_exposes_runtime_expert_placement_hook_status():
                     "contract_reasons": (
                         "physical_expert_placement_migration_not_supported"
                     ),
+                    "expert_placement_execution_models": (
+                        "expert_aware_actor_recreate"
+                    ),
+                    "expert_placement_contract_modes": (
+                        "observe_only_contract"
+                    ),
+                    "expert_placement_live_migration_count": 0,
+                    "expert_placement_physical_migration_required_count": 0,
                 },
             },
         },
@@ -72,3 +95,20 @@ def test_replanning_event_exposes_runtime_expert_placement_hook_status():
     assert event["expert_placement_runtime_verify_success_count"] == 0
     assert event["expert_placement_runtime_plan_applied_count"] == 0
     assert event["expert_placement_runtime_plan_verified_count"] == 0
+    assert event["reparallelization_execution_model"] == "actor_recreate"
+    assert event["expert_placement_execution_model"] == (
+        "expert_aware_actor_recreate"
+    )
+    assert event["expert_placement_runtime_contract_mode"] == (
+        "observe_only_contract"
+    )
+    assert event["expert_placement_live_migration_enabled"] is False
+    assert event["expert_placement_physical_migration_required"] is False
+    assert event["expert_placement_actor_recreate"] is True
+    assert event["expert_placement_live_migration"] is False
+    assert event["expert_placement_runtime_execution_models"] == (
+        "expert_aware_actor_recreate"
+    )
+    assert event["expert_placement_runtime_contract_modes"] == (
+        "observe_only_contract"
+    )

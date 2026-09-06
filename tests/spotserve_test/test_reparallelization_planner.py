@@ -104,6 +104,60 @@ def test_dynamic_reparallelization_plan_after_gpu_loss():
     assert decision["parallel_plan"]["expert_placement_plan"] is None
 
 
+def test_reparallelization_counts_runtime_worker_placeholders():
+    pure_synthetic = {
+        "0": {
+            "ray_node_id": "synthetic-worker-0",
+            "address": "synthetic-0",
+            "free_gpu": 1,
+            "total_gpu": 1,
+            "state": "ready",
+        }
+    }
+    synthetic_decision = plan_dynamic_reparallelization(
+        model_name="same-node-recreate",
+        worker_nodes=pure_synthetic,
+        model_config={"num_gpus": 1},
+        planner_config={
+            "target_replica_gpus": 1,
+            "max_tensor_parallel_size": 1,
+            "max_pipeline_parallel_size": 1,
+        },
+        event="preempt",
+        node_id="0",
+    )
+
+    assert synthetic_decision["synthetic_worker_node_count"] == 1
+    assert synthetic_decision["runtime_worker_node_count"] == 0
+    assert synthetic_decision["physical_worker_node_count"] == 0
+
+    runtime_placeholder = {
+        "0": {
+            **pure_synthetic["0"],
+            "_spotserve_counts_as_runtime_worker": True,
+            "runtime_worker_placeholder_reason": (
+                "same_node_recreate_capacity_override"
+            ),
+        }
+    }
+    runtime_decision = plan_dynamic_reparallelization(
+        model_name="same-node-recreate",
+        worker_nodes=runtime_placeholder,
+        model_config={"num_gpus": 1},
+        planner_config={
+            "target_replica_gpus": 1,
+            "max_tensor_parallel_size": 1,
+            "max_pipeline_parallel_size": 1,
+        },
+        event="preempt",
+        node_id="0",
+    )
+
+    assert runtime_decision["synthetic_worker_node_count"] == 0
+    assert runtime_decision["runtime_worker_node_count"] == 1
+    assert runtime_decision["physical_worker_node_count"] == 1
+
+
 def test_reparallelization_respects_backend_capability_supported_shape():
     decision = plan_dynamic_reparallelization(
         model_name="qwen3-dense",

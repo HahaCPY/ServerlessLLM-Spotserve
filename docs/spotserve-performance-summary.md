@@ -328,7 +328,7 @@ cd /tmp/spotserve-work &&
 | V3 | `benchmark_matrix_recovery_correctness.yaml` | Recovery policies turn forced failures into successes; latency is not the main metric. | Stable correctness check. |
 | V4 | `benchmark_matrix_vllm_dense.yaml` | Dense vLLM compatibility milestone; black-box recovery smoke only. | Rerun if backend image/model changed. |
 | V5 | `benchmark_matrix_vllm_moe.yaml`, `benchmark_matrix_vllm_dense_vs_moe.yaml` | MoE compatibility milestone; no MoE-specific speedup claim. | Rerun after backend/model changes. |
-| V6 | `benchmark_matrix_reparallelization_performance.yaml` | Shared Qwen2 MoE single-worker same-node recreate run improves success from 37.50% to 100.00%; trace replay succeeds, one replan is applied, the logical expert placement plan is emitted with 8 shards/full coverage, movement diff is observed, and observe-only vLLM placement hooks are available/attempted. This validates the control-plane/logical placement/runtime-hook plumbing path, not physical expert weight movement. | Phase 4E movement-diff run refreshed 2026-09-06. |
+| V6 | `benchmark_matrix_reparallelization_performance.yaml` | Shared Qwen2 MoE single-worker same-node recreate run improves success from 37.50% to 100.00%; trace replay succeeds, one replan is applied, the logical expert placement plan is emitted with 8 shards/full coverage, movement diff is observed, observe-only vLLM placement hooks are available/attempted, and the execution model is reported as expert-aware actor recreate. This validates the control-plane/logical placement/runtime-hook plumbing path, not physical expert weight movement. | Phase 5B actor-recreate run refreshed 2026-09-06. |
 | V7 | `benchmark_matrix_context_migration_performance.yaml` | Shared Qwen2 MoE run keeps both versions at 100% success; preemption is injected, one context-migration plan executes, selected-plan KV/expert/queue costs are reported, and route metadata is consumed from patched vLLM runtime top-k instrumentation. V7 verifies low-cost target selection and prefix warmup/context planning, not physical expert migration or true remote expert-dispatch traffic. | Runtime top-k MoE run refreshed 2026-08-30. |
 | V8 | `benchmark_matrix_stateful_recovery_performance.yaml` | Shared Qwen2 MoE run keeps both versions at 100% success; stateful recovery restores once, restores 16 tokens and 6 KV blocks, has no fallback, and reports separated KV compatibility vs EP/locality signals. | Phase 3 MoE-aware recovery run refreshed 2026-08-30. |
 | V9 | `risk_aware_scheduling_synthetic.json` | Placement-quality improvement: lower-risk / longer-lived node selection. | Synthetic result; live latency/SLO impact still requires a real workload. |
@@ -339,10 +339,11 @@ cd /tmp/spotserve-work &&
 |---|---|---|---|---|
 | V6 success rate | Reparallelization disabled | Reparallelization applied | `37.50% -> 100.00%` | `3/8 -> 8/8`; clean success also improves from `37.50%` to `100.00%`, with `0` fallbacks. |
 | V6 trace replay | Reparallelization disabled | Reparallelization applied | `1 success, 0 failed -> 1 success, 0 failed` | The preemption event replay completed on both runs, so the replan metrics are valid. |
-| V6 overall p95 | Reparallelization disabled | Reparallelization applied | `180084.27ms -> 14123.75ms` | Applied reduces overall p95 by `165960.52ms`. |
-| V6 replan-window p95 | Reparallelization disabled | Reparallelization applied | `180084.27ms -> 14123.75ms` | Replan-window success improves from `0.00%` to `100.00%`. |
-| V6 post-replan p95 | Reparallelization disabled | Reparallelization applied | `180045.72ms -> 1062.94ms` | Post-replan success improves from `0.00%` to `100.00%`. |
-| V6 replan execution | Reparallelization disabled | Reparallelization applied | `0 replans -> 1 replan, 1 applied, 0 failed` | Lifecycle verified; average execution duration was `15530.65ms`. |
+| V6 overall p95 | Reparallelization disabled | Reparallelization applied | `180041.97ms -> 14143.22ms` | Applied reduces overall p95 by `165898.75ms`. |
+| V6 replan-window p95 | Reparallelization disabled | Reparallelization applied | `180041.97ms -> 14143.22ms` | Replan-window success improves from `0.00%` to `100.00%`. |
+| V6 post-replan p95 | Reparallelization disabled | Reparallelization applied | `180007.45ms -> 1060.02ms` | Post-replan success improves from `0.00%` to `100.00%`. |
+| V6 replan execution | Reparallelization disabled | Reparallelization applied | `0 replans -> 1 replan, 1 applied, 0 failed` | Lifecycle verified; average execution duration was `15413.68ms`. |
+| V6 expert execution model | Reparallelization disabled | Reparallelization applied | `0 -> actor_recreate=1, live_migration=0, runtime_workers=1` | Phase 5B confirms expert-aware actor recreate with observe-only placement contract. |
 | V6 workload-aware cost model | Reparallelization disabled | Reparallelization applied | `0 -> 1 cost-model event` | Selected estimates: replan window `5800.00ms`, model load `5500.00ms`, migration `300.00ms`. |
 | V6 logical expert placement | Reparallelization disabled | Reparallelization applied | `0 -> 1 plan, 8 shards, coverage=1.00` | Phase 4 logical placement was emitted; physical expert migration remains `0`. |
 | V6 expert movement diff | Reparallelization disabled | Reparallelization applied | `0 -> 1 movement observation, moved=0, moved_bytes=0, move_cost=0.00ms` | Phase 4E compared selected placement against the current runtime snapshot. `moved=0` is expected for this single-worker same-node recreate run. |
@@ -397,9 +398,12 @@ Notes:
   After Phase 4D observe-only hook plumbing, it reported
   `runtime_apply_hooks=1`, `runtime_apply_success=0`,
   `runtime_verify_hooks=1`, and `runtime_verify_success=0`.
-  `runtime_workers=0` is expected for this single-worker same-node recreate
-  matrix because the extra capacity is represented through the planner's
-  same-node recreate path, not through a multi-worker runtime relocation.
+  After Phase 5B, the single-worker same-node recreate capacity entry is marked
+  `_spotserve_counts_as_runtime_worker=true`, so the expected summary is
+  `runtime_workers=1`, `exec_model=expert_aware_actor_recreate`,
+  `actor_recreate=1`, and `live_migration=0`. The refreshed run reported those
+  values. This still represents same-node actor recreate, not multi-worker
+  runtime relocation.
   `replanning_expert_placement_plan_physical_migration_events=0`, so this row
   must not be used as evidence of physical expert weight movement.
 - A 2026-07-28 V7 dense-side run used `/models/vllm/vllm-dense-baseline`;
@@ -472,6 +476,26 @@ Notes:
   patch is rebuilt into the image, availability/attempt counts may be non-zero,
   but apply/verify success and plan applied/verified counts should still remain
   `0` with physical expert migration unsupported reasons.
+- For Phase 5A, run `python -m sllm.spot.vllm_ep_runtime_audit` inside the
+  worker runtime. The current expected gate is
+  `observe_only_expert_placement_contract` with
+  `can_claim_physical_expert_migration=false`. Only treat Phase 5 as physical
+  migration when `apply` returns `applied=true`,
+  `verify` returns `verified=true`, and both report
+  `physical_weight_migration=true`. If the running container cannot import the
+  audit module, sync local source with `SPOTSERVE_SYNC_SOURCE=1` or rebuild
+  before running the audit. The 2026-09-06 `sllm_worker_0` audit reported vLLM
+  `0.11.2`, source markers present, `contract_seen_by_runtime=true`, but
+  `applied=false`, `verified=false`, and `physical_weight_migration=false`.
+- For Phase 5B, the current execution claim should be actor recreate, not live
+  weight movement. A valid re-parallelization run should report
+  `replanning_expert_placement_actor_recreate_events > 0`,
+  `replanning_expert_placement_live_migration_events = 0`, and
+  `replanning_expert_placement_physical_migration_required_events = 0`. The
+  string fields in `latest_summary.json` should include
+  `replanning_execution_models=actor_recreate`,
+  `replanning_expert_placement_execution_models=expert_aware_actor_recreate`,
+  and `replanning_expert_placement_contract_modes=observe_only_contract`.
 - For the placement ordering guard, require
   `context_migration_placement_handshake_stale = 0` and
   `state_recovery_placement_handshake_stale = 0` before claiming that migration

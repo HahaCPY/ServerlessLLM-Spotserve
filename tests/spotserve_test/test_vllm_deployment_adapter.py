@@ -107,6 +107,31 @@ async def test_vllm_adapter_creates_real_shape_and_honors_target_node(monkeypatc
     assert deployment.backend_config["enable_expert_parallel"] is True
     assert deployment.backend_config["expert_parallel_size_verified"] is False
     assert deployment.backend_config["placement_epoch"] == 7
+    assert deployment.backend_config["reparallelization_execution_model"] == (
+        "actor_recreate"
+    )
+    assert deployment.backend_config[
+        "reparallelization_execution_model_reason"
+    ] == "vllm_actor_recreate"
+    assert deployment.backend_config["expert_placement_execution_model"] == (
+        "expert_aware_actor_recreate"
+    )
+    assert deployment.backend_config[
+        "expert_placement_execution_model_reason"
+    ] == "logical_expert_placement_plan_carried_into_recreated_actor"
+    assert deployment.backend_config[
+        "expert_placement_runtime_contract_mode"
+    ] == "observe_only_contract"
+    assert (
+        deployment.backend_config["expert_placement_live_migration_enabled"]
+        is False
+    )
+    assert (
+        deployment.backend_config[
+            "expert_placement_physical_migration_required"
+        ]
+        is False
+    )
     assert deployment.backend_config["placement_source"] == (
         "logical_reparallelization_planner"
     )

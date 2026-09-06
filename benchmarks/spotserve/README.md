@@ -171,6 +171,10 @@ stops the old actor first, and the vLLM adapter recreates the actor on the same
 real scheduler node. This keeps the benchmark executable on a one-worker
 machine and validates the controller/apply/placement metric path, but it is not
 a cross-failure-domain relocation claim.
+Because this path uses a synthetic capacity entry for real scheduler node `0`,
+that entry is marked `_spotserve_counts_as_runtime_worker=true`; the expected
+single-worker summary is therefore `replanning_max_runtime_worker_node_count=1`,
+not `0`.
 The applied run enables the workload/cost-aware planner hook, so summaries also
 include `replanning_avg_execution_duration_ms`,
 `replanning_avg_selected_replan_window_cost_ms`,
@@ -356,6 +360,44 @@ be non-zero, but `*_apply_success`, `*_verify_success`, `*_plan_applied`, and
 `physical_expert_placement_verification_not_supported` reasons. They should
 only turn true after a patched vLLM EP runtime explicitly applies and verifies
 the planned rank mapping / expert weight layout.
+
+Phase 5A adds a dedicated runtime capability audit for that boundary:
+
+```bash
+podman exec sllm_worker_0 bash -lc '
+/opt/venvs/worker/bin/python -m sllm.spot.vllm_ep_runtime_audit
+'
+```
+
+If the running container reports `No module named
+sllm.spot.vllm_ep_runtime_audit`, sync the local source into the container with
+`SPOTSERVE_SYNC_SOURCE=1` or rebuild the image, then rerun the audit.
+
+The current expected gate is
+`classification=observe_only_expert_placement_contract` and
+`can_claim_physical_expert_migration=false`. A true physical migration claim
+requires both runtime hook success and `physical_weight_migration=true`.
+
+Phase 5B names the current executable model explicitly. Re-parallelization
+creates fresh vLLM actors and carries the logical `ExpertPlacementPlan` into
+their backend config/runtime metadata:
+
+```text
+reparallelization_execution_model = actor_recreate
+expert_placement_execution_model = expert_aware_actor_recreate
+expert_placement_runtime_contract_mode = observe_only_contract
+```
+
+For current runs, the expected comparison counters are:
+
+```text
+replanning_expert_placement_actor_recreate_events > 0
+replanning_expert_placement_live_migration_events = 0
+replanning_expert_placement_physical_migration_required_events = 0
+```
+
+This is the correct Phase 5B claim boundary: expert-aware actor recreate with
+an observe-only placement contract, not live physical expert weight migration.
 
 After rebuilding an image with `runtime_moe_metadata.patch`, the narrow smoke
 for true runtime top-k observability is:
