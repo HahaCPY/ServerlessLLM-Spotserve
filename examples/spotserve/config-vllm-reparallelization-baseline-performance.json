@@ -1,5 +1,5 @@
 {
-  "model": "vllm-reparallelization-gpu-smoke",
+  "model": "vllm-reparallelization-baseline",
   "backend": "vllm",
   "router_num_cpus": 0,
   "num_cpus": 1,
@@ -26,14 +26,13 @@
   },
   "router_config": {
     "count_preempting_toward_capacity": true,
-    "enable_reparallelization": true,
+    "enable_reparallelization": false,
     "reparallelization_config": {
       "target_replica_gpus": 1,
       "max_tensor_parallel_size": 1,
       "max_pipeline_parallel_size": 1,
       "drain_timeout_s": 30,
       "allow_stop_before_recreate": true,
-      "allow_preempting_target_recreate": true,
       "synthetic_worker_nodes": {
         "0": {
           "ray_node_id": "synthetic-worker-0",
@@ -41,9 +40,16 @@
           "free_gpu": 1,
           "total_gpu": 1,
           "state": "ready"
+        },
+        "1": {
+          "ray_node_id": "synthetic-worker-1",
+          "address": "synthetic-1",
+          "free_gpu": 1,
+          "total_gpu": 1,
+          "state": "ready"
         }
       }
     },
-    "metrics_path": "/tmp/spotserve-work/results/spotserve_reparallelization/vllm-reparallelization-router.jsonl"
+    "metrics_path": "/tmp/spotserve-work/results/spotserve_reparallelization_performance/vllm-reparallelization-baseline-router.jsonl"
   }
 }

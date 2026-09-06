@@ -75,28 +75,109 @@ class FakeMoeContextBackend(FakeContextBackendNoExplicitReuse):
 
 
 class FakeMoeRuntimeTargetBackend:
-    def __init__(self, expert_ids):
+    def __init__(
+        self,
+        expert_ids,
+        *,
+        placement_epoch=1,
+        expert_placement_fingerprint="placement-a",
+        expert_placement_plan_fingerprint="",
+        expert_placement_snapshot_fingerprint="",
+        expert_placement_contract_available=False,
+        expert_placement_plan_applied=False,
+        expert_placement_plan_verified=False,
+        expert_placement_contract_reason="no_expert_placement_contract",
+    ):
         self.expert_ids = tuple(expert_ids)
+        self.placement_epoch = placement_epoch
+        self.expert_placement_fingerprint = expert_placement_fingerprint
+        self.expert_placement_plan_fingerprint = (
+            expert_placement_plan_fingerprint
+        )
+        self.expert_placement_snapshot_fingerprint = (
+            expert_placement_snapshot_fingerprint
+        )
+        self.expert_placement_contract_available = (
+            expert_placement_contract_available
+        )
+        self.expert_placement_plan_applied = expert_placement_plan_applied
+        self.expert_placement_plan_verified = expert_placement_plan_verified
+        self.expert_placement_contract_reason = (
+            expert_placement_contract_reason
+        )
 
     async def get_context_metadata(self, instance_id="", node_id=""):
         return []
 
     async def get_runtime_metadata(self, instance_id="", node_id=""):
+        profile = {
+            "expert_placement_available": True,
+            "expert_placement_snapshot": {
+                f"layer:0/expert:{expert_id}": {
+                    "rank_id": f"rank-{expert_id}",
+                }
+                for expert_id in self.expert_ids
+            },
+            "placement_epoch": self.placement_epoch,
+            "expert_placement_epoch": self.placement_epoch,
+            "expert_placement_fingerprint": (
+                self.expert_placement_fingerprint
+            ),
+            "placement_source": "runtime_fixture",
+        }
+        if self.expert_placement_contract_available:
+            profile.update(
+                {
+                    "expert_placement_plan_fingerprint": (
+                        self.expert_placement_plan_fingerprint
+                    ),
+                    "expert_placement_snapshot_fingerprint": (
+                        self.expert_placement_snapshot_fingerprint
+                    ),
+                    "expert_placement_contract_available": True,
+                    "expert_placement_contract_bound": True,
+                    "expert_placement_contract_source": (
+                        "logical_reparallelization_planner"
+                    ),
+                    "expert_placement_contract_epoch": (
+                        self.placement_epoch
+                    ),
+                    "expert_placement_contract_fingerprint": (
+                        self.expert_placement_plan_fingerprint
+                    ),
+                    "expert_placement_contract_snapshot_fingerprint": (
+                        self.expert_placement_snapshot_fingerprint
+                    ),
+                    "expert_placement_contract_snapshot_match": True,
+                    "expert_placement_plan_applied": (
+                        self.expert_placement_plan_applied
+                    ),
+                    "expert_placement_plan_verified": (
+                        self.expert_placement_plan_verified
+                    ),
+                    "expert_placement_contract_reason": (
+                        self.expert_placement_contract_reason
+                    ),
+                    "expert_placement_apply_hook_available": False,
+                    "expert_placement_apply_attempted": False,
+                    "expert_placement_apply_success": False,
+                    "expert_placement_apply_reason": (
+                        "runtime_apply_hook_unavailable"
+                    ),
+                    "expert_placement_verify_hook_available": False,
+                    "expert_placement_verify_attempted": False,
+                    "expert_placement_verify_success": False,
+                    "expert_placement_verify_reason": (
+                        "runtime_verify_hook_unavailable"
+                    ),
+                }
+            )
         return {
             "instance_id": instance_id,
             "node_id": node_id,
             "backend": "vllm",
             "model_name": "test-model",
-            "model_resource_profile": {
-                "expert_placement_available": True,
-                "expert_placement_snapshot": {
-                    f"layer:0/expert:{expert_id}": {
-                        "rank_id": f"rank-{expert_id}",
-                    }
-                    for expert_id in self.expert_ids
-                },
-                "placement_source": "runtime_fixture",
-            },
+            "model_resource_profile": profile,
         }
 
 
@@ -107,6 +188,36 @@ class FakeKvTargetBackend:
     async def resume_kv_cache(self, request_datas):
         self.resumed_batches.append(request_datas)
         return True
+
+
+class FakeChangingPlacementKvTargetBackend(FakeKvTargetBackend):
+    def __init__(self):
+        super().__init__()
+        self.runtime_metadata_calls = 0
+
+    async def get_context_metadata(self, instance_id="", node_id=""):
+        return []
+
+    async def get_runtime_metadata(self, instance_id="", node_id=""):
+        self.runtime_metadata_calls += 1
+        epoch = 1 if self.runtime_metadata_calls == 1 else 2
+        fingerprint = "placement-a" if epoch == 1 else "placement-b"
+        return {
+            "instance_id": instance_id,
+            "node_id": node_id,
+            "backend": "vllm",
+            "model_name": "test-model",
+            "model_resource_profile": {
+                "expert_placement_available": True,
+                "expert_placement_snapshot": {
+                    "layer:0/expert:1": {"rank_id": "rank-1"}
+                },
+                "placement_epoch": epoch,
+                "expert_placement_epoch": epoch,
+                "expert_placement_fingerprint": fingerprint,
+                "placement_source": "runtime_fixture",
+            },
+        }
 
 
 class FakeReusableTargetBackend:
@@ -380,6 +491,62 @@ async def test_busy_instance_can_accept_when_concurrency_has_capacity():
     assert await instance.can_accept_request()
 
 
+def test_parallel_plan_match_detects_expert_placement_change():
+    base_kwargs = {
+        "model_name": "tiny-moe",
+        "backend": "vllm",
+        "tensor_parallel_size": 2,
+        "data_parallel_size": 1,
+        "pipeline_parallel_size": 1,
+        "replica_count": 1,
+        "enable_expert_parallel": True,
+        "num_gpus": 2,
+        "target_nodes": ["node-a", "node-b"],
+    }
+    left = ParallelPlan(
+        **base_kwargs,
+        placement_epoch=1,
+        expert_placement_plan={
+            "expert_placement_available": True,
+            "placement_fingerprint": "placement-a",
+        },
+    )
+    same = ParallelPlan(
+        **base_kwargs,
+        placement_epoch=2,
+        expert_placement_plan={
+            "expert_placement_available": True,
+            "placement_fingerprint": "placement-a",
+        },
+    )
+    changed = ParallelPlan(
+        **base_kwargs,
+        placement_epoch=2,
+        expert_placement_plan={
+            "expert_placement_available": True,
+            "placement_fingerprint": "placement-b",
+        },
+    )
+    unfingerprinted = ParallelPlan(
+        **base_kwargs,
+        placement_epoch=2,
+        expert_placement_plan={
+            "expert_placement_available": True,
+            "expert_to_target_rank": {
+                "layer:0/expert:1": "replica:0/ep-rank:1",
+            },
+        },
+    )
+    no_placement = ParallelPlan(**base_kwargs)
+
+    assert RoundRobinRouter._parallel_plans_match(left, same)
+    assert not RoundRobinRouter._parallel_plans_match(left, changed)
+    assert not RoundRobinRouter._parallel_plans_match(
+        no_placement,
+        unfingerprinted,
+    )
+
+
 @pytest.mark.asyncio
 async def test_router_marks_matching_node_instances_preempting():
     router = RoundRobinRouter(
@@ -531,6 +698,52 @@ async def test_router_records_reparallelization_decision(tmp_path):
     ]
     assert rows[-1]["type"] == "reparallelization"
     assert rows[-1]["parallel_plan"] == replanning["parallel_plan"]
+
+
+@pytest.mark.asyncio
+async def test_router_replans_same_node_recreate_only_when_explicit(tmp_path):
+    metrics_path = tmp_path / "router-recreate-metrics.jsonl"
+    router = RoundRobinRouter(
+        model_name="test-model",
+        resource_requirements={"num_cpus": 1, "num_gpus": 1},
+        backend="dummy",
+        backend_config={},
+        router_config={
+            "metrics_path": str(metrics_path),
+            "enable_reparallelization": True,
+            "reparallelization_config": {
+                "model_gpu_requirement": 1,
+                "target_replica_gpus": 1,
+                "max_tensor_parallel_size": 1,
+                "max_pipeline_parallel_size": 1,
+                "allow_stop_before_recreate": True,
+                "allow_preempting_target_recreate": True,
+                "synthetic_worker_nodes": {
+                    "0": {
+                        "ray_node_id": "node-0",
+                        "address": "10.0.0.1",
+                        "free_gpu": 1,
+                        "total_gpu": 1,
+                        "state": "ready",
+                    }
+                },
+            },
+        },
+    )
+
+    result = await router.handle_preemption(node_id="0")
+
+    replanning = result["reparallelization"]
+    assert replanning["action"] == "reparallelize"
+    assert replanning["parallel_plan"]["target_nodes"] == ["0"]
+
+    rows = [
+        json.loads(line)
+        for line in metrics_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert rows[-1]["type"] == "reparallelization"
+    assert rows[-1]["parallel_plan"]["target_nodes"] == ["0"]
+    assert rows[-1]["ready_worker_node_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -820,6 +1033,78 @@ async def test_router_executes_prefix_warmup_on_preemption(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_router_skips_prefix_warmup_when_placement_epoch_changes(
+    tmp_path,
+):
+    metrics_path = tmp_path / "router-metrics.jsonl"
+    router = RoundRobinRouter(
+        model_name="test-model",
+        resource_requirements={"num_cpus": 1, "num_gpus": 0},
+        backend="dummy",
+        backend_config={},
+        router_config={
+            "metrics_path": str(metrics_path),
+            "enable_context_migration": True,
+            "enable_kv_cache_migration": True,
+            "context_migration_config": {
+                "target_warmup_cost": 0.0,
+                "planner_config": {
+                    "cross_node_penalty": 0.0,
+                },
+            },
+        },
+    )
+    target_backend = FakeChangingPlacementKvTargetBackend()
+    source = InstanceHandle(
+        instance_id="instance-source",
+        max_queue_length=1,
+        num_gpu=0,
+        backend_instance=FakeKvSourceBackend(),
+    )
+    target = InstanceHandle(
+        instance_id="instance-target",
+        max_queue_length=1,
+        num_gpu=0,
+        backend_instance=target_backend,
+    )
+    await source.mark_ready(node_id="node-source")
+    await target.mark_ready(node_id="node-target")
+
+    router.ready_inference_instances[source.instance_id] = source
+    router.ready_inference_instances[target.instance_id] = target
+
+    result = await router.handle_preemption(node_id="node-source")
+
+    plan = result["context_migration"]["plans"][0]
+    execution = result["context_migration"]["prefix_warmup"]
+    assert plan["target_placement_epoch"] == 1
+    assert plan["target_expert_placement_fingerprint"] == "placement-a"
+    assert execution["attempted"] == 0
+    assert execution["succeeded"] == 0
+    assert execution["placement_handshake_attempts"] == 1
+    assert execution["placement_handshake_successes"] == 0
+    assert execution["placement_handshake_failures"] == 1
+    assert execution["placement_handshake_stale"] == 1
+    assert execution["skipped"][0]["reason"] == "target_placement_changed"
+    assert target_backend.resumed_batches == []
+
+    rows = [
+        json.loads(line)
+        for line in metrics_path.read_text(encoding="utf-8").splitlines()
+    ]
+    context_rows = [
+        row for row in rows if row["type"] == "context_migration"
+    ]
+    assert context_rows[-1]["placement_handshake_attempts"] == 1
+    assert context_rows[-1]["placement_handshake_successes"] == 0
+    assert context_rows[-1]["placement_handshake_failures"] == 1
+    assert context_rows[-1]["placement_handshake_stale"] == 1
+    assert context_rows[-1]["placement_handshake_reasons"] == [
+        "target_placement_changed"
+    ]
+
+
+@pytest.mark.asyncio
 async def test_router_derives_target_specific_reuse_from_runtime_prefix(tmp_path):
     metrics_path = tmp_path / "router-metrics.jsonl"
     router = RoundRobinRouter(
@@ -1009,7 +1294,13 @@ async def test_router_uses_runtime_moe_metadata_for_context_migration(tmp_path):
         instance_id="instance-local-target",
         max_queue_length=1,
         num_gpu=0,
-        backend_instance=FakeMoeRuntimeTargetBackend(expert_ids=[1, 2]),
+        backend_instance=FakeMoeRuntimeTargetBackend(
+            expert_ids=[1, 2],
+            expert_placement_plan_fingerprint="plan-a",
+            expert_placement_snapshot_fingerprint="snapshot-a",
+            expert_placement_contract_available=True,
+            expert_placement_contract_reason="runtime_not_applied",
+        ),
     )
     await source.mark_ready(node_id="node-source")
     await cold_target.mark_ready(node_id="node-cold")
@@ -1025,6 +1316,31 @@ async def test_router_uses_runtime_moe_metadata_for_context_migration(tmp_path):
     assert plan["expert_locality_available"] is True
     assert plan["hot_expert_locality_ratio"] == 1.0
     assert plan["expert_dispatch_cost"] == 0.0
+    assert plan["target_placement_epoch"] == 1
+    assert plan["target_expert_placement_fingerprint"] == "placement-a"
+    assert plan["target_expert_placement_plan_fingerprint"] == "plan-a"
+    assert (
+        plan["target_expert_placement_snapshot_fingerprint"] == "snapshot-a"
+    )
+    assert plan["target_expert_placement_contract_available"] is True
+    assert plan["target_expert_placement_plan_applied"] is False
+    assert plan["target_expert_placement_plan_verified"] is False
+    assert plan["target_expert_placement_contract_reason"] == (
+        "runtime_not_applied"
+    )
+    assert plan["target_expert_placement_apply_hook_available"] is False
+    assert plan["target_expert_placement_apply_attempted"] is False
+    assert plan["target_expert_placement_apply_success"] is False
+    assert plan["target_expert_placement_apply_reason"] == (
+        "runtime_apply_hook_unavailable"
+    )
+    assert plan["target_expert_placement_verify_hook_available"] is False
+    assert plan["target_expert_placement_verify_attempted"] is False
+    assert plan["target_expert_placement_verify_success"] is False
+    assert plan["target_expert_placement_verify_reason"] == (
+        "runtime_verify_hook_unavailable"
+    )
+    assert plan["target_placement_source"] == "runtime_fixture"
     assert result["context_migration"][
         "moe_route_histogram_available_count"
     ] == 1
@@ -1047,6 +1363,30 @@ async def test_router_uses_runtime_moe_metadata_for_context_migration(tmp_path):
         "request_instrumentation"
     )
     assert context_rows[-1]["moe_hot_expert_locality_ratio"] == 1.0
+    assert context_rows[-1]["selected_plan_target_placement_epochs"] == [
+        "1"
+    ]
+    assert context_rows[-1][
+        "selected_plan_target_expert_placement_fingerprints"
+    ] == ["placement-a"]
+    assert context_rows[-1][
+        "selected_plan_target_expert_placement_plan_fingerprints"
+    ] == ["plan-a"]
+    assert context_rows[-1][
+        "selected_plan_target_expert_placement_snapshot_fingerprints"
+    ] == ["snapshot-a"]
+    assert context_rows[-1][
+        "selected_plan_target_expert_placement_contract_available_count"
+    ] == 1
+    assert context_rows[-1][
+        "selected_plan_target_expert_placement_plan_applied_count"
+    ] == 0
+    assert context_rows[-1][
+        "selected_plan_target_expert_placement_plan_verified_count"
+    ] == 0
+    assert context_rows[-1][
+        "selected_plan_target_expert_placement_contract_reasons"
+    ] == ["runtime_not_applied"]
 
 
 @pytest.mark.asyncio

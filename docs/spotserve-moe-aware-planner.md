@@ -162,6 +162,24 @@ vLLM runtime DP，也不代表 expert 的完整 replica 數。若要描述 exper
 必須同時記錄 `placement_epoch` 或 `placement_version`，避免用過期 placement 做
 target selection。
 
+Default ordering 應該是：
+
+```text
+spot / preemption event
+-> re-parallelization
+   decide deployment topology / expert placement view
+-> context migration
+   choose request targets using the selected placement epoch
+-> stateful recovery
+   verify KV/state compatibility and restore request state
+```
+
+因此 Phase 2 / Phase 3 的 planner decision 需要帶上 target-side
+`placement_epoch` / `expert_placement_fingerprint`。在真正執行 prefix warmup 或
+state restore 前，router 需重新讀取 target runtime metadata；若 current placement
+與 planner 使用的 placement marker 不一致，就把這次 decision 標記為 stale，並避免
+用舊 placement 的 expert locality 做成功 claim。
+
 其中 routed-token statistics 應分成三層，不要全部混成同一個 histogram：
 
 | Metadata | 用途 |
@@ -220,8 +238,13 @@ class ExpertPlacementPlan:
     target_parallel_plan: ParallelPlan
     expert_to_target_rank: dict[str, str]
     placement_epoch: int
+    movement_observation_available: bool
+    movement_source: str
     moved_expert_count: int
+    stationary_expert_count: int
+    unknown_movement_expert_count: int
     moved_weight_bytes: int
+    estimated_expert_weight_movement_cost_ms: float
     estimated_dispatch_cost: float
     estimated_load_balance_penalty: float
     reason: str
@@ -567,7 +590,10 @@ moe_expert_physical_replication_factor
 moe_placement_epoch
 moe_placement_source
 moe_moved_expert_count
+moe_stationary_expert_count
+moe_unknown_movement_expert_count
 moe_moved_weight_bytes
+moe_estimated_expert_weight_movement_cost_ms
 moe_expert_weight_resident_count
 moe_expert_weight_loading_required_count
 moe_hot_expert_locality_ratio
@@ -655,6 +681,10 @@ weights。（已開始實作）
 - metric 顯示 `moe_hot_expert_locality_ratio`、
   `moe_estimated_remote_routing_ratio`、
   `moe_estimated_remote_routed_tokens`、`moe_estimated_dispatch_cost`。
+- metric 顯示 placement-derived dispatch breakdown：
+  `moe_routed_tokens`、`moe_local_routed_tokens`、
+  `moe_remote_routed_tokens`、`moe_remote_routing_ratio`，以及
+  by-layer / by-expert routed-token breakdown。
 - metric 顯示 `context_migration_queue_penalty_cost`、
   `context_migration_avg_queue_pressure`、`context_migration_max_queue_depth`。
 - 若沒有 route histogram，planner 可退化成 KV-only target selection，並在
@@ -686,6 +716,12 @@ weights。（已開始實作）
 - `make_context_migration_event()` 與 benchmark analyzer 已新增
   `moe_hot_expert_locality_ratio`、`moe_estimated_remote_routing_ratio`、
   `moe_estimated_remote_routed_tokens`、`moe_estimated_dispatch_cost`、
+  `moe_routed_tokens`、`moe_local_routed_tokens`、
+  `moe_remote_routed_tokens`、`moe_remote_routing_ratio`、
+  `moe_local_routed_tokens_by_layer`、
+  `moe_remote_routed_tokens_by_layer`、
+  `moe_local_routed_tokens_by_expert`、
+  `moe_remote_routed_tokens_by_expert`、
   `context_migration_selected_target_ids`、
   `context_migration_selected_plan_kv_migration_cost`、
   `context_migration_selected_plan_expert_dispatch_cost`、
@@ -954,18 +990,365 @@ risk-aware scheduling 的 code paths 可以合在同一個 live benchmark 內執
 但它仍不應被寫成 physical expert migration 或真實 remote expert dispatch traffic
 已完成。
 
+### Phase 4 前置小步：Expert Dispatch Observability
+
+在真正做 expert-aware re-parallelization 以前，先補一個可驗證的 observability
+baseline：用 runtime-observed MoE route histogram 加上 target expert placement，
+推導 restore/migration 後有多少 routed-token weight 會命中 target-local experts，
+以及多少會落到 target-local placement 之外。
+
+目前 local expert 的定義是 planner-level target placement coverage：
+
+```text
+expert key in target expert_placement_snapshot
+=> counted as local / placement-covered
+
+expert key missing from target expert_placement_snapshot
+=> counted as remote / outside target placement
+```
+
+因此 `moe_local_routed_tokens` / `moe_remote_routed_tokens` 的 granularity 是
+`target_instance_or_deployment`，不是 per-rank GPU locality。若 target snapshot
+本身覆蓋所有 experts，remote routed tokens 可以是 0；這只代表 planner
+metadata 看起來都 target-covered，不代表 vLLM runtime 沒有 EP all-to-all 或
+remote NCCL traffic。
+
+這一步已補的欄位：
+
+```text
+moe_dispatch_observation_available_count
+moe_routed_tokens
+moe_local_routed_tokens
+moe_remote_routed_tokens
+moe_remote_routing_ratio
+moe_local_routed_tokens_by_layer
+moe_remote_routed_tokens_by_layer
+moe_local_routed_tokens_by_expert
+moe_remote_routed_tokens_by_expert
+moe_locality_definition = target_placement_coverage
+moe_locality_granularity = target_instance_or_deployment
+moe_remote_routing_definition = missing_from_target_placement_snapshot
+moe_rank_locality_available = false
+moe_physical_dispatch_traffic_available = false
+```
+
+這些欄位會出現在：
+
+- context migration event / analyzer summary：
+  `context_migration_moe_*`
+- stateful recovery event / analyzer summary：
+  `state_recovery_moe_*`
+- benchmark summary：
+  `remote_dispatch_tokens`、`remote_dispatch_ratio`、
+  `recovery_remote_dispatch_tokens`、`recovery_remote_dispatch_ratio`
+
+Phase 4 前置也補了 placement epoch handshake：
+
+```text
+target_placement_epoch
+target_expert_placement_fingerprint
+placement_handshake_attempts
+placement_handshake_successes
+placement_handshake_failures
+placement_handshake_stale
+```
+
+context migration prefix warmup 與 stateful recovery restore 前都會重新讀 target
+runtime metadata。如果 target placement marker 已經改變，migration 會 skip 該
+prefix warmup，recovery 會退回 token replay fallback。這讓 V7/V8 的 locality
+結果可以明確綁定 planner 當下看到的 placement epoch。
+
+語意邊界：
+
+- `moe_routed_tokens` 來自 runtime top-k route histogram，是 observed routing
+  signal。
+- `moe_local_routed_tokens` / `moe_remote_routed_tokens` 是根據 target
+  expert placement metadata 推導出的 placement-locality breakdown。
+- 這仍不是 NIC / NCCL / all-to-all byte counter，也不是 physical expert
+  migration。它的用途是建立 Phase 4 的 baseline：之後如果改 expert placement
+  或做 hot expert replication，應該能讓 `moe_remote_routed_tokens` /
+  `moe_remote_routing_ratio` 下降。
+
 ### Milestone D: Expert-aware Re-parallelization
 
 目標：re-parallelization planner 真的能決定 expert placement。
 
 完成條件：
 
-- `ExpertPlacementPlan` 可序列化到 metrics。
-- preempted GPU 上的 experts 可被重新配置到 ready GPUs。
+- `ExpertPlacementPlan` 可序列化到 metrics。（已完成 logical plan）
+- preempted GPU 上的 experts 可被重新配置到 ready GPUs。（尚未完成
+  physical weight movement）
 - planner cost 同時考慮 GPU capacity、expert movement、dispatch cost。
 - 明確定義 SpotServe planner 與 vLLM EPLB 的責任邊界：SpotServe 負責
   resource-change / preemption-aware topology planning，vLLM EPLB 負責
   deployment 內部 steady-state expert balancing。
+
+目前 Phase 4 的第一個前置小步已完成：
+
+- V6 re-parallelization planner 會從 selected `ParallelPlan` 與 MoE model
+  topology 產生 deterministic logical `ExpertPlacementPlan`。
+- 若 router/head container 看不到模型的 `config.json`，planner 會嘗試使用
+  active vLLM worker runtime metadata；只要 runtime 回報
+  `expert_placement_snapshot`，logical planner 可以從 snapshot 反推出
+  layer/expert topology。
+- plan 會輸出 `placement_epoch`、`placement_fingerprint`、
+  `required_expert_count`、`covered_expert_count`、`planned_shard_count`、
+  `target_rank_count` 與 `physical_weight_migration=false`。
+- 若 replan 真正建立新的 vLLM actor，adapter 會把 logical placement plan、
+  epoch、fingerprint、placement snapshot 放進新 actor backend config，讓後續
+  context migration/recovery target metadata 可以綁定同一個 placement marker。
+
+這一步仍然不是 physical expert migration。它只是讓 controller 先能說清楚
+「新 topology 下 experts 應該在哪裡」，下一步才是把這個 plan 接到 vLLM EP
+runtime 的 rank mapping / weight loading / expert movement。
+
+目前 Phase 4 的第二個前置小步也已完成：
+
+- vLLM backend/runtime metadata 會把 placement contract 與 placement snapshot
+  拆開回報。`expert_placement_plan_fingerprint` 代表 planner 產生的
+  `ExpertPlacementPlan` contract；`expert_placement_snapshot_fingerprint`
+  代表 target runtime 當下提供的 expert placement snapshot。
+- 舊欄位 `expert_placement_fingerprint` 保留為相容 marker；若有 planner
+  contract，會優先代表 plan fingerprint，否則才退回 snapshot fingerprint。
+- 新增 `expert_placement_contract_available`、
+  `expert_placement_contract_bound`、`expert_placement_contract_snapshot_match`、
+  `expert_placement_plan_applied`、`expert_placement_plan_verified` 與
+  `expert_placement_contract_reason`。
+- `expert_placement_plan_applied=false` / `verified=false` 是目前預期狀態：
+  表示 controller 已把 logical placement contract 傳到 backend config，但
+  vLLM runtime 還沒有真的回報它已套用新的 EP rank mapping 或完成 expert
+  weight movement。
+- context migration / stateful recovery 事件與 analyzer summary 會輸出 target
+  contract 狀態，例如
+  `context_migration_selected_target_expert_placement_contracts`、
+  `context_migration_selected_target_expert_placement_plan_applied`、
+  `context_migration_selected_target_expert_placement_plan_verified`、
+  `state_recovery_target_expert_placement_contracts`、
+  `state_recovery_target_expert_placement_plan_applied` 和
+  `state_recovery_target_expert_placement_plan_verified`。
+- V7 context migration target metadata allowlist 會保留上述 contract / hook
+  欄位，因此若 target 是由 V6 logical `ExpertPlacementPlan` 建出來的，
+  migration planner 的 selected plan 可以看見 plan fingerprint、snapshot
+  fingerprint、contract reason，以及 apply/verify hook 狀態。
+- V6 deployment plan matching 會把 expert placement marker 納入比較。也就是
+  TP/DP/PP/replica/target nodes 相同時，若 `ExpertPlacementPlan` fingerprint
+  不同，仍會被視為新的 plan，而不是誤判成 `unchanged`。
+
+因此 Phase 4 現在可以驗證：
+
+```text
+logical placement plan generated
+-> movement diff computed against current runtime placement when available
+-> placement contract delivered to vLLM backend metadata
+-> target migration/recovery sees the same contract marker
+-> runtime-applied / verified remain false until vLLM EP runtime integration
+```
+
+Phase 4 的第三個前置小步定義了 runtime apply/verify hook 邊界：
+
+```text
+apply_expert_placement_plan(expert_placement_plan=...)
+verify_expert_placement_plan(expert_placement_plan=...)
+```
+
+backend 初始化 vLLM engine 後，若 backend config 帶有
+`expert_placement_plan`，會嘗試呼叫上述 hook。為了相容現有 vLLM，hook
+不存在時不會讓部署失敗，而是輸出：
+
+```text
+expert_placement_apply_hook_available=false
+expert_placement_apply_attempted=false
+expert_placement_apply_success=false
+expert_placement_apply_reason=runtime_apply_hook_unavailable
+expert_placement_verify_hook_available=false
+expert_placement_verify_attempted=false
+expert_placement_verify_success=false
+expert_placement_verify_reason=runtime_verify_hook_unavailable
+expert_placement_plan_applied=false
+expert_placement_plan_verified=false
+```
+
+Phase 4D 補上 patched vLLM observe-only hook plumbing。也就是
+`runtime_moe_metadata.patch` 會在 `AsyncLLM -> EngineCore -> WorkerBase`
+暴露 `apply_expert_placement_plan()` 與 `verify_expert_placement_plan()`。
+目前這兩個 hook 只確認 runtime 看到了 SpotServe 的 logical placement
+contract，不會改 vLLM EP rank mapping，也不會搬 expert weights。因此重建 image
+後，新的預期輸出會變成：
+
+```text
+expert_placement_apply_hook_available=true
+expert_placement_apply_attempted=true
+expert_placement_apply_success=false
+expert_placement_apply_reason=physical_expert_placement_migration_not_supported
+expert_placement_verify_hook_available=true
+expert_placement_verify_attempted=true
+expert_placement_verify_success=false
+expert_placement_verify_reason=physical_expert_placement_verification_not_supported
+expert_placement_plan_applied=false
+expert_placement_plan_verified=false
+```
+
+Phase 4E 補上 logical expert movement diff / cost estimate。planner 在產生
+新的 `ExpertPlacementPlan` 時，會把 target placement 和 replan 前從 runtime
+metadata 收到的 current `expert_placement_snapshot` 做 normalized diff：
+
+```text
+current expert placement snapshot
++ selected target ExpertPlacementPlan
+-> movement_observation_available
+-> moved_expert_count
+-> stationary_expert_count
+-> unknown_movement_expert_count
+-> moved_weight_bytes
+-> estimated_expert_weight_movement_cost_ms
+```
+
+這一步解決的是「planner 是否知道新地圖和舊地圖差在哪裡」。它仍然不是
+physical expert migration：`physical_weight_migration=false`、runtime
+`apply/verify success=false` 仍然是正確狀態。若 runtime 沒有提供 current
+placement snapshot，movement observation 會是 unavailable，planner 不會憑空
+宣稱 expert 被搬動。
+
+movement cost 目前只作為 cost model 的可觀測 component；若設定
+`expert_weight_movement_cost_ms_per_gib`、
+`expert_weight_movement_cost_ms_per_expert` 或
+`expert_weight_movement_bandwidth_bytes_per_s`，它會被加進 selected
+`replan_window_cost_ms`，並受
+`expert_weight_movement_penalty_weight` 控制。沒有設定 expert weight size 或
+movement cost 時，moved bytes / movement cost 會自然為 0，不會改變既有 V6
+benchmark 行為。
+
+benchmark/analyzer 會新增檢查：
+
+```text
+replanning_expert_placement_plan_movement_observation_events
+replanning_max_expert_placement_plan_moved_experts
+replanning_total_expert_placement_plan_moved_weight_bytes
+replanning_avg_expert_placement_plan_weight_movement_cost_ms
+replanning_avg_selected_expert_weight_movement_cost_estimate_ms
+```
+
+Phase 4F 補上 controlled movement ablation。這不是 live vLLM benchmark，
+而是一個不用 GPU/Ray 的 synthetic planner test：它刻意讓 current placement
+把 4 個 experts 都放在 `node-a/ep-rank-0`，再提供兩個 candidate plan：
+
+```text
+stationary_single_rank
+-> all experts remain on node-a/ep-rank-0
+-> moved_experts = 0
+
+split_across_two_ep_ranks
+-> expert 1/3 move to node-b/ep-rank-1
+-> moved_experts = 2
+-> moved_weight_bytes = 2 MiB
+-> estimated movement cost = 20 ms
+```
+
+跑法：
+
+```bash
+python scripts/run_reparallelization_phase4_movement_ablation.py \
+  --input benchmarks/spotserve/reparallelization_phase4_movement_ablation.json \
+  --output-dir results/spotserve_reparallelization_phase4_movement_ablation
+```
+
+通過條件：
+
+```text
+report.json: passed = true
+
+phase4-movement-unpenalized:
+  selected_reason = split_across_two_ep_ranks
+  selected_expert_placement_moved_expert_count = 2
+  selected_expert_placement_moved_weight_bytes = 2097152
+  selected_expert_weight_movement_cost_estimate_ms = 20
+
+phase4-movement-penalized:
+  selected_reason = stationary_single_rank
+  selected_expert_placement_moved_expert_count = 0
+  selected_expert_weight_movement_cost_estimate_ms = 0
+```
+
+這個 ablation 的重點是驗證兩件事：
+
+- planner 的 movement diff 真的能產生非零 moved expert / bytes / cost。
+- `expert_weight_movement_penalty_weight` 真的會影響 selected plan。
+
+它仍然不是 physical expert migration；`physical_weight_migration=false` 仍是
+正確狀態。
+
+若未來 patched vLLM EP runtime 實作 hook，`apply` 應該只在 runtime 已接受並
+套用 planned rank mapping / expert layout 時回 `applied=true`；
+`verify` 應該重新讀 runtime 實際 placement，確認和 contract 相符後才回
+`verified=true`。只有 `expert_placement_plan_verified=true` 時，才能把 Phase
+4 claim 從「logical/control-plane placement」推進到「runtime-applied
+placement」。
+
+2026-09-06 的 V6 re-parallelization performance benchmark 已驗證目前
+logical/control-plane placement、movement diff 與 observe-only runtime hook
+plumbing path：
+
+```text
+benchmark_matrix_reparallelization_performance.yaml
+model = /models/Qwen2-MoE-Tiny
+
+Disabled:
+  successes=3/8
+  success_rate=37.50%
+  p95=180084.27ms
+  trace_success=1
+
+Applied:
+  successes=8/8
+  success_rate=100.00%
+  p95=14123.75ms
+  trace_success=1
+  replans=1
+  applied=1
+  failed=0
+  exec_ms=15530.65
+  cost_model=1
+  expert_plan=1
+  expert_plan_shards=8
+  expert_plan_coverage=1.00
+  expert_movement_observation=1
+  expert_plan_moved=0
+  expert_plan_moved_bytes=0
+  expert_move_ms=0.00
+  runtime_apply_hooks=1
+  runtime_apply_attempted=1
+  runtime_apply_success=0
+  runtime_verify_hooks=1
+  runtime_verify_attempted=1
+  runtime_verify_success=0
+  runtime_plan_applied=0
+  runtime_plan_verified=0
+  physical_expert_migration=0
+```
+
+這代表：
+
+- preemption trace replay 本身成功，不是 benchmark 忽略 `/spot/event` timeout。
+- V6 planner 有進入 replan，並成功 apply 新的 actor/recreate plan。
+- workload-aware cost model 有輸出 selected replan-window / load / migration
+  estimate。
+- logical `ExpertPlacementPlan` 有產生並被 metrics/analyzer 看到，8 個 logical
+  expert shards 都被 placement 覆蓋。
+- Phase 4E movement diff 有被 metrics/analyzer 看到；這次
+  `moved_expert_count=0`、`moved_weight_bytes=0` 是合理結果，因為此 matrix 是
+  single-worker same-node recreate，selected logical placement 和 current runtime
+  snapshot 沒有 expert location 差異。
+- patched vLLM observe-only placement hook 已被 runtime 暴露且被呼叫，所以
+  metrics 從 `runtime_apply_hook_unavailable` 推進到 hook available/attempted。
+- `runtime_apply_success=0`、`runtime_verify_success=0`、
+  `runtime_plan_applied=0`、`runtime_plan_verified=0` 是目前正確結果，因為
+  hook 仍是 observe-only，沒有真的改 vLLM EP rank mapping 或搬 expert weights。
+
+這組 run 使用 single-worker same-node recreate mode，因此
+`runtime_workers=0` 是預期結果：它驗證的是 controller、logical plan、metric
+path，不是 multi-worker relocation。`physical_expert_migration=0` 也仍然是預期
+結果；真正的 expert weight movement 要等 vLLM EP runtime hook 可以回報
+`applied=true` 且 `verified=true` 之後才能宣稱。
 
 ### Milestone E: Physical Cross-node Validation
 
@@ -1057,13 +1440,20 @@ MoE-aware stateful recovery
 -> measure remote expert dispatch after restore
 
 Phase 4
+Expert dispatch observability baseline
+-> runtime routing + placement-derived local/remote routed-token breakdown
+-> per-layer / per-expert remote routed-token reports
+-> placement_epoch / expert_placement_fingerprint handshake
+-> no physical expert movement yet
+
+Phase 5
 True expert-aware re-parallelization
 -> EP shape
 -> expert remapping / replication
 -> weight movement
 -> clear responsibility boundary with vLLM EPLB
 
-Phase 5
+Phase 6
 physical cross-node validation
 ```
 

@@ -76,7 +76,8 @@ if ! grep -q '"can_restore_cross_node": False' \
     exit 1
 fi
 
-if [[ "${SPOTSERVE_REQUIRE_MOE_ROUTE_INSTRUMENTATION:-0}" == "1" ]]; then
+if [[ "${SPOTSERVE_REQUIRE_MOE_ROUTE_INSTRUMENTATION:-0}" == "1" ||
+    "${SPOTSERVE_REQUIRE_EXPERT_PLACEMENT_RUNTIME_HOOKS:-0}" == "1" ]]; then
     MISSING_MOE_MARKERS=()
     if [[ ! -f "$VLLM_PATH/spotserve_moe.py" ]] ||
         ! grep -q "def record_moe_routing" "$VLLM_PATH/spotserve_moe.py"; then
@@ -102,8 +103,24 @@ if [[ "${SPOTSERVE_REQUIRE_MOE_ROUTE_INSTRUMENTATION:-0}" == "1" ]]; then
         "$VLLM_PATH/v1/worker/worker_base.py"; then
         MISSING_MOE_MARKERS+=("worker_base.get_request_moe_metadata")
     fi
+    if ! grep -q "def apply_expert_placement_plan" \
+        "$VLLM_PATH/v1/engine/async_llm.py"; then
+        MISSING_MOE_MARKERS+=("async_llm.apply_expert_placement_plan")
+    fi
+    if ! grep -q "def verify_expert_placement_plan" \
+        "$VLLM_PATH/v1/engine/async_llm.py"; then
+        MISSING_MOE_MARKERS+=("async_llm.verify_expert_placement_plan")
+    fi
+    if ! grep -q "def apply_expert_placement_plan" \
+        "$VLLM_PATH/v1/worker/worker_base.py"; then
+        MISSING_MOE_MARKERS+=("worker_base.apply_expert_placement_plan")
+    fi
+    if ! grep -q "def verify_expert_placement_plan" \
+        "$VLLM_PATH/v1/worker/worker_base.py"; then
+        MISSING_MOE_MARKERS+=("worker_base.verify_expert_placement_plan")
+    fi
     if [[ "${#MISSING_MOE_MARKERS[@]}" -gt 0 ]]; then
-        echo "Missing patched vLLM MoE route markers: ${MISSING_MOE_MARKERS[*]}" >&2
+        echo "Missing patched vLLM MoE/placement markers: ${MISSING_MOE_MARKERS[*]}" >&2
         exit 1
     fi
 fi

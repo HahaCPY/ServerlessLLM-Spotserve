@@ -48,17 +48,11 @@
       "queue_penalty_weight": 0.1,
       "drain_timeout_s": 30,
       "allow_stop_before_recreate": true,
+      "allow_preempting_target_recreate": true,
       "synthetic_worker_nodes": {
         "0": {
           "ray_node_id": "synthetic-worker-0",
           "address": "synthetic-0",
-          "free_gpu": 1,
-          "total_gpu": 1,
-          "state": "ready"
-        },
-        "1": {
-          "ray_node_id": "synthetic-worker-1",
-          "address": "synthetic-1",
           "free_gpu": 1,
           "total_gpu": 1,
           "state": "ready"

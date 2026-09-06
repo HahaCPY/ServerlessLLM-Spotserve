@@ -20,6 +20,20 @@ class JsonlMetricsWriter:
                 metrics_file.write(json.dumps(payload, sort_keys=True) + "\n")
 
 
+def _merge_int_maps(values: list[Any]) -> Dict[str, int]:
+    merged: Dict[str, int] = {}
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        for key, count in value.items():
+            try:
+                parsed = int(count)
+            except (TypeError, ValueError):
+                continue
+            merged[str(key)] = merged.get(str(key), 0) + parsed
+    return merged
+
+
 def make_instance_state_event(
     model: str,
     instance_id: str,
@@ -56,10 +70,18 @@ def make_replanning_event(
     instance_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     parallel_plan = decision.get("parallel_plan") or {}
+    expert_placement_plan = (
+        decision.get("expert_placement_plan")
+        or parallel_plan.get("expert_placement_plan")
+        or {}
+    )
     selected_config = decision.get("selected_config") or {}
     availability = decision.get("availability") or {}
     workload_cost_model = decision.get("workload_cost_model") or {}
     execution = decision.get("execution") or {}
+    expert_placement_runtime = (
+        execution.get("expert_placement_runtime") or {}
+    )
     target_nodes = [str(node) for node in parallel_plan.get("target_nodes", [])]
     ready_nodes = [str(node) for node in availability.get("ready_nodes", [])]
     source_node = str(node_id) if node_id is not None else ""
@@ -156,6 +178,127 @@ def make_replanning_event(
         "moe_route_histogram_kind": decision.get(
             "moe_route_histogram_kind", "unavailable"
         ),
+        "expert_placement_plan_available": bool(
+            decision.get(
+                "expert_placement_plan_available",
+                expert_placement_plan.get("expert_placement_available", False),
+            )
+        ),
+        "expert_placement_plan_epoch": decision.get(
+            "expert_placement_plan_epoch",
+            expert_placement_plan.get(
+                "placement_epoch",
+                parallel_plan.get("placement_epoch", 0),
+            ),
+        ),
+        "expert_placement_plan_fingerprint": decision.get(
+            "expert_placement_plan_fingerprint",
+            expert_placement_plan.get("placement_fingerprint", ""),
+        ),
+        "expert_placement_plan_source": decision.get(
+            "expert_placement_plan_source",
+            expert_placement_plan.get("placement_source", "unavailable"),
+        ),
+        "expert_placement_plan_required_experts": decision.get(
+            "expert_placement_plan_required_experts",
+            expert_placement_plan.get("required_expert_count", 0),
+        ),
+        "expert_placement_plan_covered_experts": decision.get(
+            "expert_placement_plan_covered_experts",
+            expert_placement_plan.get("covered_expert_count", 0),
+        ),
+        "expert_placement_plan_shards": decision.get(
+            "expert_placement_plan_shards",
+            expert_placement_plan.get("planned_shard_count", 0),
+        ),
+        "expert_placement_plan_target_ranks": decision.get(
+            "expert_placement_plan_target_ranks",
+            expert_placement_plan.get("target_rank_count", 0),
+        ),
+        "expert_placement_plan_physical_weight_migration": bool(
+            decision.get(
+                "expert_placement_plan_physical_weight_migration",
+                expert_placement_plan.get(
+                    "physical_weight_migration", False
+                ),
+            )
+        ),
+        "expert_placement_plan_movement_observation_available": bool(
+            decision.get(
+                "expert_placement_plan_movement_observation_available",
+                expert_placement_plan.get(
+                    "movement_observation_available", False
+                ),
+            )
+        ),
+        "expert_placement_plan_movement_source": decision.get(
+            "expert_placement_plan_movement_source",
+            expert_placement_plan.get("movement_source", "unavailable"),
+        ),
+        "expert_placement_plan_moved_experts": decision.get(
+            "expert_placement_plan_moved_experts",
+            expert_placement_plan.get("moved_expert_count", 0),
+        ),
+        "expert_placement_plan_stationary_experts": decision.get(
+            "expert_placement_plan_stationary_experts",
+            expert_placement_plan.get("stationary_expert_count", 0),
+        ),
+        "expert_placement_plan_unknown_movement_experts": decision.get(
+            "expert_placement_plan_unknown_movement_experts",
+            expert_placement_plan.get("unknown_movement_expert_count", 0),
+        ),
+        "expert_placement_plan_moved_weight_bytes": decision.get(
+            "expert_placement_plan_moved_weight_bytes",
+            expert_placement_plan.get("moved_weight_bytes", 0),
+        ),
+        "expert_placement_plan_estimated_weight_movement_cost_ms": (
+            decision.get(
+                "expert_placement_plan_estimated_weight_movement_cost_ms",
+                expert_placement_plan.get(
+                    "estimated_expert_weight_movement_cost_ms", 0.0
+                ),
+            )
+        ),
+        "expert_placement_plan_reason": decision.get(
+            "expert_placement_plan_reason",
+            expert_placement_plan.get("reason", "unavailable"),
+        ),
+        "expert_placement_runtime_metadata_count": (
+            expert_placement_runtime.get("metadata_count", 0)
+        ),
+        "expert_placement_runtime_apply_hook_available_count": (
+            expert_placement_runtime.get("apply_hook_available_count", 0)
+        ),
+        "expert_placement_runtime_apply_attempted_count": (
+            expert_placement_runtime.get("apply_attempted_count", 0)
+        ),
+        "expert_placement_runtime_apply_success_count": (
+            expert_placement_runtime.get("apply_success_count", 0)
+        ),
+        "expert_placement_runtime_apply_reasons": (
+            expert_placement_runtime.get("apply_reasons", "")
+        ),
+        "expert_placement_runtime_verify_hook_available_count": (
+            expert_placement_runtime.get("verify_hook_available_count", 0)
+        ),
+        "expert_placement_runtime_verify_attempted_count": (
+            expert_placement_runtime.get("verify_attempted_count", 0)
+        ),
+        "expert_placement_runtime_verify_success_count": (
+            expert_placement_runtime.get("verify_success_count", 0)
+        ),
+        "expert_placement_runtime_verify_reasons": (
+            expert_placement_runtime.get("verify_reasons", "")
+        ),
+        "expert_placement_runtime_plan_applied_count": (
+            expert_placement_runtime.get("plan_applied_count", 0)
+        ),
+        "expert_placement_runtime_plan_verified_count": (
+            expert_placement_runtime.get("plan_verified_count", 0)
+        ),
+        "expert_placement_runtime_contract_reasons": (
+            expert_placement_runtime.get("contract_reasons", "")
+        ),
         "selected_score": decision.get(
             "selected_score", selected_config.get("score", 0.0)
         ),
@@ -189,6 +332,20 @@ def make_replanning_event(
             "selected_migration_cost_estimate_ms",
             selected_config.get("migration_cost_estimate_ms", 0.0),
         ),
+        "selected_expert_weight_movement_cost_estimate_ms": decision.get(
+            "selected_expert_weight_movement_cost_estimate_ms",
+            selected_config.get(
+                "expert_weight_movement_cost_estimate_ms", 0.0
+            ),
+        ),
+        "selected_expert_placement_moved_expert_count": decision.get(
+            "selected_expert_placement_moved_expert_count",
+            selected_config.get("expert_placement_moved_expert_count", 0),
+        ),
+        "selected_expert_placement_moved_weight_bytes": decision.get(
+            "selected_expert_placement_moved_weight_bytes",
+            selected_config.get("expert_placement_moved_weight_bytes", 0),
+        ),
         "selected_queue_penalty_ms": decision.get(
             "selected_queue_penalty_ms",
             selected_config.get("queue_penalty_ms", 0.0),
@@ -212,6 +369,7 @@ def make_replanning_event(
         "cross_node_target": cross_node_target,
         "multi_worker_target": len(set(target_nodes)) > 1,
         "parallel_plan": parallel_plan or None,
+        "expert_placement_plan": expert_placement_plan or None,
         "execution": execution or None,
         "execution_status": execution.get("status", ""),
         "execution_duration_ms": execution.get("duration_ms", 0.0),
@@ -269,6 +427,110 @@ def make_context_migration_event(
         for plan in plans
         if plan.get("expert_locality_available")
     ]
+    selected_target_placement_epochs = [
+        str(plan.get("target_placement_epoch"))
+        for plan in plans
+        if plan.get("target_placement_epoch") is not None
+    ]
+    selected_target_placement_fingerprints = [
+        str(plan.get("target_expert_placement_fingerprint"))
+        for plan in plans
+        if plan.get("target_expert_placement_fingerprint")
+    ]
+    selected_target_plan_fingerprints = [
+        str(plan.get("target_expert_placement_plan_fingerprint"))
+        for plan in plans
+        if plan.get("target_expert_placement_plan_fingerprint")
+    ]
+    selected_target_snapshot_fingerprints = [
+        str(plan.get("target_expert_placement_snapshot_fingerprint"))
+        for plan in plans
+        if plan.get("target_expert_placement_snapshot_fingerprint")
+    ]
+    selected_target_contract_reasons = sorted(
+        {
+            str(plan.get("target_expert_placement_contract_reason"))
+            for plan in plans
+            if plan.get("target_expert_placement_contract_reason")
+            and plan.get("target_expert_placement_contract_reason")
+            != "unavailable"
+        }
+    )
+    selected_target_apply_reasons = sorted(
+        {
+            str(plan.get("target_expert_placement_apply_reason"))
+            for plan in plans
+            if plan.get("target_expert_placement_apply_reason")
+        }
+    )
+    selected_target_verify_reasons = sorted(
+        {
+            str(plan.get("target_expert_placement_verify_reason"))
+            for plan in plans
+            if plan.get("target_expert_placement_verify_reason")
+        }
+    )
+    selected_target_placement_sources = [
+        str(plan.get("target_placement_source"))
+        for plan in plans
+        if plan.get("target_placement_source")
+    ]
+    selected_moe_remote_routing_ratios = [
+        float(plan.get("moe_remote_routing_ratio", 0.0) or 0.0)
+        for plan in plans
+        if plan.get("moe_dispatch_observation_available")
+    ]
+    selected_moe_routed_tokens = sum(
+        int(plan.get("moe_routed_tokens", 0) or 0) for plan in plans
+    )
+    selected_moe_local_routed_tokens = sum(
+        int(plan.get("moe_local_routed_tokens", 0) or 0)
+        for plan in plans
+    )
+    selected_moe_remote_routed_tokens = sum(
+        int(plan.get("moe_remote_routed_tokens", 0) or 0)
+        for plan in plans
+    )
+    selected_moe_local_by_layer = _merge_int_maps([
+        plan.get("moe_local_routed_tokens_by_layer", {})
+        for plan in plans
+    ])
+    selected_moe_remote_by_layer = _merge_int_maps([
+        plan.get("moe_remote_routed_tokens_by_layer", {})
+        for plan in plans
+    ])
+    selected_moe_local_by_expert = _merge_int_maps([
+        plan.get("moe_local_routed_tokens_by_expert", {})
+        for plan in plans
+    ])
+    selected_moe_remote_by_expert = _merge_int_maps([
+        plan.get("moe_remote_routed_tokens_by_expert", {})
+        for plan in plans
+    ])
+    selected_moe_locality_definitions = sorted(
+        {
+            str(plan.get("moe_locality_definition"))
+            for plan in plans
+            if plan.get("moe_locality_definition")
+            and plan.get("moe_locality_definition") != "unavailable"
+        }
+    )
+    selected_moe_locality_granularities = sorted(
+        {
+            str(plan.get("moe_locality_granularity"))
+            for plan in plans
+            if plan.get("moe_locality_granularity")
+            and plan.get("moe_locality_granularity") != "unavailable"
+        }
+    )
+    selected_moe_remote_routing_definitions = sorted(
+        {
+            str(plan.get("moe_remote_routing_definition"))
+            for plan in plans
+            if plan.get("moe_remote_routing_definition")
+            and plan.get("moe_remote_routing_definition") != "unavailable"
+        }
+    )
     prefix_warmup = (
         decision.get("prefix_warmup")
         or decision.get("kv_cache_migration")
@@ -282,6 +544,13 @@ def make_context_migration_event(
     kv_restore_restored_blocks = int(
         kv_restore.get("restored_blocks", 0) or 0
     )
+    placement_handshake_checks = []
+    if isinstance(prefix_warmup, dict):
+        checks = prefix_warmup.get("placement_handshake_checks", [])
+        if isinstance(checks, list):
+            placement_handshake_checks = [
+                check for check in checks if isinstance(check, dict)
+            ]
     true_kv_block_transfer = bool(
         kv_restore_successes > 0 and kv_restore_restored_blocks > 0
     )
@@ -355,6 +624,127 @@ def make_context_migration_event(
             int(plan.get("estimated_remote_routed_tokens", 0) or 0)
             for plan in plans
         ),
+        "selected_plan_target_placement_epochs": (
+            selected_target_placement_epochs
+        ),
+        "selected_plan_target_expert_placement_fingerprints": (
+            selected_target_placement_fingerprints
+        ),
+        "selected_plan_target_expert_placement_plan_fingerprints": (
+            selected_target_plan_fingerprints
+        ),
+        "selected_plan_target_expert_placement_snapshot_fingerprints": (
+            selected_target_snapshot_fingerprints
+        ),
+        "selected_plan_target_expert_placement_contract_available_count": (
+            sum(
+                1
+                for plan in plans
+                if plan.get("target_expert_placement_contract_available")
+            )
+        ),
+        "selected_plan_target_expert_placement_plan_applied_count": (
+            sum(
+                1
+                for plan in plans
+                if plan.get("target_expert_placement_plan_applied")
+            )
+        ),
+        "selected_plan_target_expert_placement_plan_verified_count": (
+            sum(
+                1
+                for plan in plans
+                if plan.get("target_expert_placement_plan_verified")
+            )
+        ),
+        "selected_plan_target_expert_placement_contract_reasons": (
+            selected_target_contract_reasons
+        ),
+        "selected_plan_target_expert_placement_apply_hook_available_count": (
+            sum(
+                1
+                for plan in plans
+                if plan.get("target_expert_placement_apply_hook_available")
+            )
+        ),
+        "selected_plan_target_expert_placement_apply_attempted_count": (
+            sum(
+                1
+                for plan in plans
+                if plan.get("target_expert_placement_apply_attempted")
+            )
+        ),
+        "selected_plan_target_expert_placement_apply_success_count": (
+            sum(
+                1
+                for plan in plans
+                if plan.get("target_expert_placement_apply_success")
+            )
+        ),
+        "selected_plan_target_expert_placement_apply_reasons": (
+            selected_target_apply_reasons
+        ),
+        "selected_plan_target_expert_placement_verify_hook_available_count": (
+            sum(
+                1
+                for plan in plans
+                if plan.get("target_expert_placement_verify_hook_available")
+            )
+        ),
+        "selected_plan_target_expert_placement_verify_attempted_count": (
+            sum(
+                1
+                for plan in plans
+                if plan.get("target_expert_placement_verify_attempted")
+            )
+        ),
+        "selected_plan_target_expert_placement_verify_success_count": (
+            sum(
+                1
+                for plan in plans
+                if plan.get("target_expert_placement_verify_success")
+            )
+        ),
+        "selected_plan_target_expert_placement_verify_reasons": (
+            selected_target_verify_reasons
+        ),
+        "selected_plan_target_placement_sources": (
+            selected_target_placement_sources
+        ),
+        "selected_plan_moe_routed_tokens": selected_moe_routed_tokens,
+        "selected_plan_moe_local_routed_tokens": (
+            selected_moe_local_routed_tokens
+        ),
+        "selected_plan_moe_remote_routed_tokens": (
+            selected_moe_remote_routed_tokens
+        ),
+        "selected_plan_moe_avg_remote_routing_ratio": (
+            sum(selected_moe_remote_routing_ratios)
+            / len(selected_moe_remote_routing_ratios)
+            if selected_moe_remote_routing_ratios
+            else 0.0
+        ),
+        "selected_plan_moe_local_routed_tokens_by_layer": (
+            selected_moe_local_by_layer
+        ),
+        "selected_plan_moe_remote_routed_tokens_by_layer": (
+            selected_moe_remote_by_layer
+        ),
+        "selected_plan_moe_local_routed_tokens_by_expert": (
+            selected_moe_local_by_expert
+        ),
+        "selected_plan_moe_remote_routed_tokens_by_expert": (
+            selected_moe_remote_by_expert
+        ),
+        "selected_plan_moe_locality_definitions": (
+            selected_moe_locality_definitions
+        ),
+        "selected_plan_moe_locality_granularities": (
+            selected_moe_locality_granularities
+        ),
+        "selected_plan_moe_remote_routing_definitions": (
+            selected_moe_remote_routing_definitions
+        ),
         "unassigned_context_count": len(
             decision.get("unassigned_contexts", [])
         ),
@@ -398,6 +788,45 @@ def make_context_migration_event(
         ),
         "moe_estimated_remote_routed_tokens": total_remote_routed_tokens,
         "moe_estimated_dispatch_cost": total_expert_dispatch_cost,
+        "moe_dispatch_observation_available_count": decision.get(
+            "moe_dispatch_observation_available_count", 0
+        ),
+        "moe_routed_tokens": decision.get("total_moe_routed_tokens", 0),
+        "moe_local_routed_tokens": decision.get(
+            "total_moe_local_routed_tokens", 0
+        ),
+        "moe_remote_routed_tokens": decision.get(
+            "total_moe_remote_routed_tokens", 0
+        ),
+        "moe_remote_routing_ratio": decision.get(
+            "avg_moe_remote_routing_ratio", 0.0
+        ),
+        "moe_local_routed_tokens_by_layer": selected_moe_local_by_layer,
+        "moe_remote_routed_tokens_by_layer": selected_moe_remote_by_layer,
+        "moe_local_routed_tokens_by_expert": selected_moe_local_by_expert,
+        "moe_remote_routed_tokens_by_expert": selected_moe_remote_by_expert,
+        "moe_locality_definition": decision.get(
+            "moe_locality_definition",
+            ",".join(selected_moe_locality_definitions) or "unavailable",
+        ),
+        "moe_locality_granularity": decision.get(
+            "moe_locality_granularity",
+            ",".join(selected_moe_locality_granularities) or "unavailable",
+        ),
+        "moe_remote_routing_definition": decision.get(
+            "moe_remote_routing_definition",
+            ",".join(selected_moe_remote_routing_definitions)
+            or "unavailable",
+        ),
+        "moe_rank_locality_available_count": int(
+            decision.get("moe_rank_locality_available_count", 0) or 0
+        ),
+        "moe_physical_dispatch_traffic_available_count": int(
+            decision.get(
+                "moe_physical_dispatch_traffic_available_count", 0
+            )
+            or 0
+        ),
         "context_source_count": int(
             decision.get("context_source_count", len(plans)) or 0
         ),
@@ -425,6 +854,31 @@ def make_context_migration_event(
         "kv_restore_successes": kv_restore_successes,
         "kv_restore_restored_blocks": kv_restore_restored_blocks,
         "true_kv_block_transfer": true_kv_block_transfer,
+        "placement_handshake_attempts": int(
+            prefix_warmup.get("placement_handshake_attempts", 0) or 0
+        )
+        if isinstance(prefix_warmup, dict)
+        else 0,
+        "placement_handshake_successes": int(
+            prefix_warmup.get("placement_handshake_successes", 0) or 0
+        )
+        if isinstance(prefix_warmup, dict)
+        else 0,
+        "placement_handshake_failures": int(
+            prefix_warmup.get("placement_handshake_failures", 0) or 0
+        )
+        if isinstance(prefix_warmup, dict)
+        else 0,
+        "placement_handshake_stale": int(
+            prefix_warmup.get("placement_handshake_stale", 0) or 0
+        )
+        if isinstance(prefix_warmup, dict)
+        else 0,
+        "placement_handshake_reasons": [
+            str(check.get("reason", ""))
+            for check in placement_handshake_checks
+            if check.get("reason")
+        ],
         "kv_cache_migration": decision.get("kv_cache_migration"),
     }
 
@@ -510,6 +964,140 @@ def make_state_recovery_event(
         ),
         "expert_dispatch_cost": selected_candidate.get(
             "expert_dispatch_cost", 0.0
+        ),
+        "target_placement_epoch": selected_candidate.get(
+            "target_placement_epoch"
+        ),
+        "target_placement_version": selected_candidate.get(
+            "target_placement_version"
+        ),
+        "target_expert_placement_epoch": selected_candidate.get(
+            "target_expert_placement_epoch"
+        ),
+        "target_expert_placement_fingerprint": selected_candidate.get(
+            "target_expert_placement_fingerprint", ""
+        ),
+        "target_expert_placement_plan_fingerprint": selected_candidate.get(
+            "target_expert_placement_plan_fingerprint", ""
+        ),
+        "target_expert_placement_snapshot_fingerprint": (
+            selected_candidate.get(
+                "target_expert_placement_snapshot_fingerprint", ""
+            )
+        ),
+        "target_expert_placement_contract_available": (
+            selected_candidate.get(
+                "target_expert_placement_contract_available", False
+            )
+        ),
+        "target_expert_placement_plan_applied": selected_candidate.get(
+            "target_expert_placement_plan_applied", False
+        ),
+        "target_expert_placement_plan_verified": selected_candidate.get(
+            "target_expert_placement_plan_verified", False
+        ),
+        "target_expert_placement_contract_reason": selected_candidate.get(
+            "target_expert_placement_contract_reason", "unavailable"
+        ),
+        "target_expert_placement_apply_hook_available": (
+            selected_candidate.get(
+                "target_expert_placement_apply_hook_available", False
+            )
+        ),
+        "target_expert_placement_apply_attempted": selected_candidate.get(
+            "target_expert_placement_apply_attempted", False
+        ),
+        "target_expert_placement_apply_success": selected_candidate.get(
+            "target_expert_placement_apply_success", False
+        ),
+        "target_expert_placement_apply_reason": selected_candidate.get(
+            "target_expert_placement_apply_reason", ""
+        ),
+        "target_expert_placement_verify_hook_available": (
+            selected_candidate.get(
+                "target_expert_placement_verify_hook_available", False
+            )
+        ),
+        "target_expert_placement_verify_attempted": selected_candidate.get(
+            "target_expert_placement_verify_attempted", False
+        ),
+        "target_expert_placement_verify_success": selected_candidate.get(
+            "target_expert_placement_verify_success", False
+        ),
+        "target_expert_placement_verify_reason": selected_candidate.get(
+            "target_expert_placement_verify_reason", ""
+        ),
+        "target_placement_source": selected_candidate.get(
+            "target_placement_source", ""
+        ),
+        "current_placement_epoch": selected_candidate.get(
+            "current_placement_epoch"
+        ),
+        "current_expert_placement_fingerprint": selected_candidate.get(
+            "current_expert_placement_fingerprint", ""
+        ),
+        "placement_handshake_attempted": selected_candidate.get(
+            "placement_handshake_attempted", False
+        ),
+        "placement_handshake_verified": selected_candidate.get(
+            "placement_handshake_verified", False
+        ),
+        "placement_handshake_compatible": selected_candidate.get(
+            "placement_handshake_compatible", True
+        ),
+        "placement_handshake_stale": selected_candidate.get(
+            "placement_handshake_stale", False
+        ),
+        "placement_handshake_reason": selected_candidate.get(
+            "placement_handshake_reason", ""
+        ),
+        "placement_handshake_mismatch_keys": selected_candidate.get(
+            "placement_handshake_mismatch_keys", []
+        ),
+        "moe_dispatch_observation_available": selected_candidate.get(
+            "moe_dispatch_observation_available", False
+        ),
+        "moe_routed_tokens": selected_candidate.get(
+            "moe_routed_tokens", 0
+        ),
+        "moe_local_routed_tokens": selected_candidate.get(
+            "moe_local_routed_tokens", 0
+        ),
+        "moe_remote_routed_tokens": selected_candidate.get(
+            "moe_remote_routed_tokens", 0
+        ),
+        "moe_local_routing_ratio": selected_candidate.get(
+            "moe_local_routing_ratio", 0.0
+        ),
+        "moe_remote_routing_ratio": selected_candidate.get(
+            "moe_remote_routing_ratio", 0.0
+        ),
+        "moe_local_routed_tokens_by_layer": selected_candidate.get(
+            "moe_local_routed_tokens_by_layer", {}
+        ),
+        "moe_remote_routed_tokens_by_layer": selected_candidate.get(
+            "moe_remote_routed_tokens_by_layer", {}
+        ),
+        "moe_local_routed_tokens_by_expert": selected_candidate.get(
+            "moe_local_routed_tokens_by_expert", {}
+        ),
+        "moe_remote_routed_tokens_by_expert": selected_candidate.get(
+            "moe_remote_routed_tokens_by_expert", {}
+        ),
+        "moe_locality_definition": selected_candidate.get(
+            "moe_locality_definition", "unavailable"
+        ),
+        "moe_locality_granularity": selected_candidate.get(
+            "moe_locality_granularity", "unavailable"
+        ),
+        "moe_remote_routing_definition": selected_candidate.get(
+            "moe_remote_routing_definition", "unavailable"
+        ),
+        "moe_rank_locality_available": selected_candidate.get(
+            "moe_rank_locality_available", False
+        ),
+        "moe_physical_dispatch_traffic_available": selected_candidate.get(
+            "moe_physical_dispatch_traffic_available", False
         ),
         "moe_route_histogram_source": selected_candidate.get(
             "moe_route_histogram_source", ""

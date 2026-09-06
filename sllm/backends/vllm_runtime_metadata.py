@@ -207,6 +207,179 @@ def get_vllm_model_resource_profile(
             "runtime" if placement_available else "unavailable",
         )
     )
+    expert_placement_plan = _first_present(
+        runtime_metadata.get("expert_placement_plan"),
+        backend_config.get("expert_placement_plan"),
+    )
+    if not isinstance(expert_placement_plan, Mapping):
+        expert_placement_plan = {}
+    contract_available = _to_bool(
+        _first_present(
+            runtime_metadata.get("expert_placement_contract_available"),
+            backend_config.get("expert_placement_contract_available"),
+        ),
+        default=_has_payload(expert_placement_plan),
+    )
+    contract_bound = _to_bool(
+        _first_present(
+            runtime_metadata.get("expert_placement_contract_bound"),
+            backend_config.get("expert_placement_contract_bound"),
+        ),
+        default=contract_available and placement_available,
+    )
+    contract_source = str(
+        _first_present(
+            runtime_metadata.get("expert_placement_contract_source"),
+            backend_config.get("expert_placement_contract_source"),
+            expert_placement_plan.get("placement_source"),
+            "unavailable",
+        )
+    )
+    contract_epoch = _optional_non_negative_int(
+        _first_present(
+            runtime_metadata.get("expert_placement_contract_epoch"),
+            backend_config.get("expert_placement_contract_epoch"),
+            expert_placement_plan.get("placement_epoch"),
+            placement_epoch,
+        )
+    )
+    contract_fingerprint = _first_present(
+        runtime_metadata.get("expert_placement_contract_fingerprint"),
+        runtime_metadata.get("expert_placement_plan_fingerprint"),
+        backend_config.get("expert_placement_contract_fingerprint"),
+        backend_config.get("expert_placement_plan_fingerprint"),
+        expert_placement_plan.get("placement_fingerprint"),
+    )
+    plan_fingerprint = _first_present(
+        runtime_metadata.get("expert_placement_plan_fingerprint"),
+        backend_config.get("expert_placement_plan_fingerprint"),
+        expert_placement_plan.get("placement_fingerprint"),
+        contract_fingerprint,
+    )
+    snapshot_fingerprint = _first_present(
+        runtime_metadata.get("expert_placement_snapshot_fingerprint"),
+        backend_config.get("expert_placement_snapshot_fingerprint"),
+    )
+    contract_snapshot_fingerprint = _first_present(
+        runtime_metadata.get("expert_placement_contract_snapshot_fingerprint"),
+        backend_config.get("expert_placement_contract_snapshot_fingerprint"),
+    )
+    contract_snapshot_match = _to_bool(
+        _first_present(
+            runtime_metadata.get("expert_placement_contract_snapshot_match"),
+            backend_config.get("expert_placement_contract_snapshot_match"),
+        ),
+        default=bool(
+            snapshot_fingerprint
+            and contract_snapshot_fingerprint
+            and snapshot_fingerprint == contract_snapshot_fingerprint
+        ),
+    )
+    raw_apply_success = _first_present(
+        runtime_metadata.get("expert_placement_apply_success"),
+        backend_config.get("expert_placement_apply_success"),
+    )
+    raw_verify_success = _first_present(
+        runtime_metadata.get("expert_placement_verify_success"),
+        backend_config.get("expert_placement_verify_success"),
+    )
+    plan_applied = bool(contract_available) and _to_bool(
+        _first_present(
+            runtime_metadata.get("expert_placement_plan_applied"),
+            backend_config.get("expert_placement_plan_applied"),
+            raw_apply_success,
+            raw_verify_success,
+        ),
+        default=False,
+    )
+    explicit_plan_verified = _to_bool(
+        _first_present(
+            runtime_metadata.get("expert_placement_plan_verified"),
+            backend_config.get("expert_placement_plan_verified"),
+            raw_verify_success,
+        ),
+        default=False,
+    )
+    plan_verified = bool(
+        contract_available
+        and plan_applied
+        and explicit_plan_verified
+    )
+    apply_hook_available = _to_bool(
+        _first_present(
+            runtime_metadata.get("expert_placement_apply_hook_available"),
+            backend_config.get("expert_placement_apply_hook_available"),
+        ),
+        default=False,
+    )
+    apply_attempted = _to_bool(
+        _first_present(
+            runtime_metadata.get("expert_placement_apply_attempted"),
+            backend_config.get("expert_placement_apply_attempted"),
+        ),
+        default=False,
+    )
+    apply_success = _to_bool(
+        _first_present(
+            raw_apply_success,
+        ),
+        default=plan_applied,
+    )
+    apply_duration_ms = _non_negative_float(
+        _first_present(
+            runtime_metadata.get("expert_placement_apply_duration_ms"),
+            backend_config.get("expert_placement_apply_duration_ms"),
+        ),
+        0.0,
+    )
+    apply_reason = str(
+        _first_present(
+            runtime_metadata.get("expert_placement_apply_reason"),
+            backend_config.get("expert_placement_apply_reason"),
+            "",
+        )
+        or ""
+    )
+    verify_hook_available = _to_bool(
+        _first_present(
+            runtime_metadata.get("expert_placement_verify_hook_available"),
+            backend_config.get("expert_placement_verify_hook_available"),
+        ),
+        default=False,
+    )
+    verify_attempted = _to_bool(
+        _first_present(
+            runtime_metadata.get("expert_placement_verify_attempted"),
+            backend_config.get("expert_placement_verify_attempted"),
+        ),
+        default=False,
+    )
+    verify_success = _to_bool(
+        _first_present(
+            raw_verify_success,
+        ),
+        default=plan_verified,
+    )
+    verify_reason = str(
+        _first_present(
+            runtime_metadata.get("expert_placement_verify_reason"),
+            backend_config.get("expert_placement_verify_reason"),
+            "",
+        )
+        or ""
+    )
+    if not contract_available:
+        contract_reason = "no_expert_placement_contract"
+    elif not contract_bound:
+        contract_reason = "contract_without_runtime_snapshot"
+    elif not contract_snapshot_match:
+        contract_reason = "contract_snapshot_mismatch"
+    elif not plan_applied:
+        contract_reason = apply_reason or "runtime_not_applied"
+    elif plan_verified:
+        contract_reason = "verified_runtime_plan"
+    else:
+        contract_reason = "runtime_applied_unverified"
     route_histogram = runtime_metadata.get("per_request_expert_route_histogram")
     route_histogram_payload_available = _has_payload(route_histogram)
     route_histogram_available = _to_bool(
@@ -266,8 +439,33 @@ def get_vllm_model_resource_profile(
         "placement_source": placement_source,
         "expert_placement_fingerprint": _first_present(
             runtime_metadata.get("expert_placement_fingerprint"),
+            contract_fingerprint,
+            snapshot_fingerprint,
             backend_config.get("expert_placement_fingerprint"),
         ),
+        "expert_placement_plan_fingerprint": plan_fingerprint,
+        "expert_placement_snapshot_fingerprint": snapshot_fingerprint,
+        "expert_placement_contract_available": contract_available,
+        "expert_placement_contract_bound": contract_bound,
+        "expert_placement_contract_source": contract_source,
+        "expert_placement_contract_epoch": contract_epoch,
+        "expert_placement_contract_fingerprint": contract_fingerprint,
+        "expert_placement_contract_snapshot_fingerprint": (
+            contract_snapshot_fingerprint
+        ),
+        "expert_placement_contract_snapshot_match": contract_snapshot_match,
+        "expert_placement_plan_applied": plan_applied,
+        "expert_placement_plan_verified": plan_verified,
+        "expert_placement_contract_reason": str(contract_reason),
+        "expert_placement_apply_hook_available": apply_hook_available,
+        "expert_placement_apply_attempted": apply_attempted,
+        "expert_placement_apply_success": apply_success,
+        "expert_placement_apply_duration_ms": apply_duration_ms,
+        "expert_placement_apply_reason": apply_reason,
+        "expert_placement_verify_hook_available": verify_hook_available,
+        "expert_placement_verify_attempted": verify_attempted,
+        "expert_placement_verify_success": verify_success,
+        "expert_placement_verify_reason": verify_reason,
         "moe_route_histogram_available": route_histogram_available,
         "moe_route_histogram_source": route_histogram_source,
         "moe_route_histogram_kind": route_histogram_kind,
@@ -350,6 +548,69 @@ def get_vllm_runtime_metadata(
         "expert_placement_fingerprint": (
             profile["expert_placement_fingerprint"]
         ),
+        "expert_placement_plan_fingerprint": (
+            profile["expert_placement_plan_fingerprint"]
+        ),
+        "expert_placement_snapshot_fingerprint": (
+            profile["expert_placement_snapshot_fingerprint"]
+        ),
+        "expert_placement_contract_available": (
+            profile["expert_placement_contract_available"]
+        ),
+        "expert_placement_contract_bound": (
+            profile["expert_placement_contract_bound"]
+        ),
+        "expert_placement_contract_source": (
+            profile["expert_placement_contract_source"]
+        ),
+        "expert_placement_contract_epoch": (
+            profile["expert_placement_contract_epoch"]
+        ),
+        "expert_placement_contract_fingerprint": (
+            profile["expert_placement_contract_fingerprint"]
+        ),
+        "expert_placement_contract_snapshot_fingerprint": (
+            profile["expert_placement_contract_snapshot_fingerprint"]
+        ),
+        "expert_placement_contract_snapshot_match": (
+            profile["expert_placement_contract_snapshot_match"]
+        ),
+        "expert_placement_plan_applied": (
+            profile["expert_placement_plan_applied"]
+        ),
+        "expert_placement_plan_verified": (
+            profile["expert_placement_plan_verified"]
+        ),
+        "expert_placement_contract_reason": (
+            profile["expert_placement_contract_reason"]
+        ),
+        "expert_placement_apply_hook_available": (
+            profile["expert_placement_apply_hook_available"]
+        ),
+        "expert_placement_apply_attempted": (
+            profile["expert_placement_apply_attempted"]
+        ),
+        "expert_placement_apply_success": (
+            profile["expert_placement_apply_success"]
+        ),
+        "expert_placement_apply_duration_ms": (
+            profile["expert_placement_apply_duration_ms"]
+        ),
+        "expert_placement_apply_reason": (
+            profile["expert_placement_apply_reason"]
+        ),
+        "expert_placement_verify_hook_available": (
+            profile["expert_placement_verify_hook_available"]
+        ),
+        "expert_placement_verify_attempted": (
+            profile["expert_placement_verify_attempted"]
+        ),
+        "expert_placement_verify_success": (
+            profile["expert_placement_verify_success"]
+        ),
+        "expert_placement_verify_reason": (
+            profile["expert_placement_verify_reason"]
+        ),
         "moe_route_histogram_available": (
             profile["moe_route_histogram_available"]
         ),
@@ -367,6 +628,10 @@ def get_vllm_runtime_metadata(
         ),
         "metadata": dict(runtime_metadata.get("metadata", {}) or {}),
     }
+    if profile.get("expert_placement_snapshot"):
+        result["expert_placement_snapshot"] = profile[
+            "expert_placement_snapshot"
+        ]
     if runtime_metadata.get("spot_risk") is not None:
         result["spot_risk"] = _non_negative_float(
             runtime_metadata.get("spot_risk"), 0.0

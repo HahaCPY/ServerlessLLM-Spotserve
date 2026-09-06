@@ -88,21 +88,20 @@ def test_dynamic_reparallelization_plan_after_gpu_loss():
     assert decision["selected_enable_expert_parallel"] is False
     assert decision["selected_effective_expert_parallel_size"] == 1
     assert decision["selected_expert_parallel_size"] == 1
-    assert decision["parallel_plan"] == {
-        "model_name": "dummy-reparallelization",
-        "backend": "unknown",
-        "tensor_parallel_size": 2,
-        "data_parallel_size": 1,
-        "pipeline_parallel_size": 1,
-        "replica_count": 1,
-        "enable_expert_parallel": False,
-        "effective_expert_parallel_size": 1,
-        "expert_parallel_size": 1,
-        "num_replicas": 1,
-        "num_gpus": 2,
-        "target_nodes": ["1"],
-        "reason": "preempt_replan",
-    }
+    assert decision["parallel_plan"]["model_name"] == "dummy-reparallelization"
+    assert decision["parallel_plan"]["backend"] == "unknown"
+    assert decision["parallel_plan"]["tensor_parallel_size"] == 2
+    assert decision["parallel_plan"]["data_parallel_size"] == 1
+    assert decision["parallel_plan"]["pipeline_parallel_size"] == 1
+    assert decision["parallel_plan"]["replica_count"] == 1
+    assert decision["parallel_plan"]["enable_expert_parallel"] is False
+    assert decision["parallel_plan"]["effective_expert_parallel_size"] == 1
+    assert decision["parallel_plan"]["expert_parallel_size"] == 1
+    assert decision["parallel_plan"]["num_replicas"] == 1
+    assert decision["parallel_plan"]["num_gpus"] == 2
+    assert decision["parallel_plan"]["target_nodes"] == ["1"]
+    assert decision["parallel_plan"]["reason"] == "preempt_replan"
+    assert decision["parallel_plan"]["expert_placement_plan"] is None
 
 
 def test_reparallelization_respects_backend_capability_supported_shape():
@@ -346,6 +345,213 @@ def test_workload_cost_model_can_prefer_higher_throughput_under_queue_pressure()
     assert decision["selected_score"] > decision["top_candidates"][1]["score"]
 
 
+def test_reparallelization_emits_logical_expert_placement_plan():
+    nodes = apply_spot_event_to_worker_nodes(
+        synthetic_nodes(), "preempt", "0"
+    )
+
+    decision = plan_dynamic_reparallelization(
+        model_name="tiny-moe",
+        worker_nodes=nodes,
+        model_config={
+            "model": "tiny-moe",
+            "backend": "vllm",
+            "num_gpus": 2,
+            "backend_config": {
+                "enable_expert_parallel": True,
+                "placement_epoch": 3,
+                "model_config": {
+                    "num_hidden_layers": 2,
+                    "num_experts": 4,
+                },
+            },
+            "backend_capability": {
+                "supported_configs": [
+                    {
+                        "tensor_parallel_size": 2,
+                        "pipeline_parallel_size": 1,
+                        "data_parallel_size": 1,
+                        "replica_count": 1,
+                        "enable_expert_parallel": True,
+                        "num_gpus": 2,
+                        "reason": "moe_ep_candidate",
+                    }
+                ]
+            },
+        },
+        event="preempt",
+        node_id="0",
+        backend="vllm",
+    )
+
+    assert decision["action"] == "reparallelize"
+    assert decision["expert_placement_plan_available"] is True
+    assert decision["expert_placement_plan_epoch"] == 4
+    assert decision["expert_placement_plan_required_experts"] == 8
+    assert decision["expert_placement_plan_covered_experts"] == 8
+    assert decision["expert_placement_plan_shards"] == 8
+    assert decision["expert_placement_plan_target_ranks"] == 2
+    assert decision["expert_placement_plan_physical_weight_migration"] is False
+    assert decision["expert_placement_plan_source"] == (
+        "logical_reparallelization_planner"
+    )
+
+    plan = decision["expert_placement_plan"]
+    assert plan["expert_placement_available"] is True
+    assert plan["placement_fingerprint"]
+    assert plan["expert_to_target_rank"]["layer:0/expert:1"] == (
+        "replica:0/ep-rank:1"
+    )
+    assert plan["expert_placement_snapshot"]["layer:0/expert:1"][
+        "node_id"
+    ] == "1"
+    assert decision["parallel_plan"]["expert_placement_plan"] == plan
+
+
+def test_reparallelization_can_penalize_expert_weight_movement():
+    decision = plan_dynamic_reparallelization(
+        model_name="tiny-moe",
+        worker_nodes=synthetic_nodes(),
+        model_config={
+            "model": "tiny-moe",
+            "backend": "vllm",
+            "num_gpus": 2,
+            "runtime_metadata": {
+                "expert_placement_snapshot": {
+                    "layer:0/expert:0": {
+                        "layer_id": 0,
+                        "expert_id": 0,
+                        "rank_id": "ep-rank-0",
+                        "node_id": "0",
+                        "gpu_id": "0",
+                        "weight_size_bytes": 1024,
+                    },
+                    "layer:0/expert:1": {
+                        "layer_id": 0,
+                        "expert_id": 1,
+                        "rank_id": "ep-rank-0",
+                        "node_id": "0",
+                        "gpu_id": "0",
+                        "weight_size_bytes": 1024,
+                    },
+                }
+            },
+            "backend_config": {
+                "model_config": {
+                    "num_hidden_layers": 1,
+                    "num_experts": 2,
+                },
+            },
+            "backend_capability": {
+                "supported_configs": [
+                    {
+                        "tensor_parallel_size": 1,
+                        "pipeline_parallel_size": 1,
+                        "data_parallel_size": 1,
+                        "replica_count": 1,
+                        "enable_expert_parallel": False,
+                        "num_gpus": 1,
+                        "reason": "stationary_single_rank",
+                    },
+                    {
+                        "tensor_parallel_size": 2,
+                        "pipeline_parallel_size": 1,
+                        "data_parallel_size": 1,
+                        "replica_count": 1,
+                        "enable_expert_parallel": True,
+                        "num_gpus": 2,
+                        "reason": "movement_two_ep_ranks",
+                    },
+                ]
+            },
+        },
+        planner_config={
+            "enable_workload_cost_model": True,
+            "base_score_weight": 0,
+            "throughput_score_weight": 0,
+            "latency_penalty_weight": 0,
+            "load_time_penalty_weight": 0,
+            "migration_cost_penalty_weight": 0,
+            "queue_penalty_weight": 0,
+            "expert_weight_movement_penalty_weight": 1,
+            "expert_weight_movement_cost_ms_per_expert": 100,
+            "latency_estimate_ms": 1000,
+            "batch_size": 1,
+        },
+        event="preempt",
+        node_id="0",
+        backend="vllm",
+    )
+
+    assert decision["action"] == "reparallelize"
+    assert decision["selected_config"]["reason"] == "stationary_single_rank"
+    assert decision["selected_expert_weight_movement_cost_estimate_ms"] == 0
+    assert decision["top_candidates"][0]["reason"] == "stationary_single_rank"
+    assert decision["top_candidates"][1]["reason"] == "movement_two_ep_ranks"
+    assert (
+        decision["top_candidates"][1][
+            "expert_weight_movement_cost_estimate_ms"
+        ]
+        == 100
+    )
+
+
+def test_reparallelization_uses_runtime_metadata_for_moe_topology():
+    nodes = {
+        "0": {
+            "ray_node_id": "node-0",
+            "address": "10.0.0.1",
+            "free_gpu": 1,
+            "total_gpu": 1,
+            "state": "ready",
+        }
+    }
+
+    decision = plan_dynamic_reparallelization(
+        model_name="tiny-moe",
+        worker_nodes=nodes,
+        model_config={
+            "model": "tiny-moe",
+            "backend": "vllm",
+            "num_gpus": 1,
+            "backend_config": {
+                "runtime_metadata": {
+                    "expert_placement_snapshot": {
+                        "layer:0/expert:0": {},
+                        "layer:0/expert:3": {},
+                        "layer:1/expert:0": {},
+                        "layer:1/expert:3": {},
+                    }
+                }
+            },
+            "runtime_metadata": {
+                "expert_placement_snapshot": {
+                    "layer:0/expert:0": {},
+                    "layer:0/expert:3": {},
+                    "layer:1/expert:0": {},
+                    "layer:1/expert:3": {},
+                }
+            },
+        },
+        planner_config={
+            "target_replica_gpus": 1,
+            "max_tensor_parallel_size": 1,
+            "max_pipeline_parallel_size": 1,
+        },
+        event="preempt",
+        node_id="0",
+        backend="vllm",
+    )
+
+    assert decision["action"] == "reparallelize"
+    assert decision["expert_placement_plan_available"] is True
+    assert decision["expert_placement_plan_required_experts"] == 8
+    assert decision["expert_placement_plan_shards"] == 8
+    assert decision["expert_placement_plan_source"] == (
+        "logical_reparallelization_planner"
+    )
+
+
 def test_parallel_plan_shared_interface_serializes_to_dict():
     plan = ParallelPlan(
         model_name="moe-model",
@@ -359,18 +565,22 @@ def test_parallel_plan_shared_interface_serializes_to_dict():
         reason="spot_preempt",
     )
 
-    assert plan.to_dict() == {
-        "model_name": "moe-model",
-        "backend": "vllm",
-        "tensor_parallel_size": 2,
-        "data_parallel_size": 1,
-        "pipeline_parallel_size": 1,
-        "replica_count": 4,
-        "enable_expert_parallel": True,
-        "effective_expert_parallel_size": 2,
-        "expert_parallel_size": 2,
-        "num_replicas": 4,
-        "num_gpus": 8,
-        "target_nodes": ["node-a", "node-b"],
-        "reason": "spot_preempt",
-    }
+    payload = plan.to_dict()
+
+    assert payload["model_name"] == "moe-model"
+    assert payload["backend"] == "vllm"
+    assert payload["tensor_parallel_size"] == 2
+    assert payload["data_parallel_size"] == 1
+    assert payload["vllm_data_parallel_size"] == 1
+    assert payload["pipeline_parallel_size"] == 1
+    assert payload["replica_count"] == 4
+    assert payload["sllm_replica_count"] == 4
+    assert payload["enable_expert_parallel"] is True
+    assert payload["effective_expert_parallel_size"] == 2
+    assert payload["expert_parallel_size"] == 2
+    assert payload["num_replicas"] == 4
+    assert payload["num_gpus"] == 8
+    assert payload["target_nodes"] == ["node-a", "node-b"]
+    assert payload["placement_epoch"] == 0
+    assert payload["expert_placement_plan"] is None
+    assert payload["reason"] == "spot_preempt"

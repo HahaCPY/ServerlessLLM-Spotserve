@@ -99,6 +99,41 @@ class VllmDeploymentAdapter:
         )
         config["expert_parallel_size_verified"] = False
         config["enable_expert_parallel"] = plan.enable_expert_parallel
+        config["placement_epoch"] = plan.placement_epoch
+        expert_placement_plan = (
+            dict(plan.expert_placement_plan)
+            if isinstance(plan.expert_placement_plan, Mapping)
+            else {}
+        )
+        if expert_placement_plan:
+            config["expert_placement_plan"] = expert_placement_plan
+            config["placement_source"] = str(
+                expert_placement_plan.get(
+                    "placement_source",
+                    "logical_reparallelization_planner",
+                )
+            )
+            fingerprint = expert_placement_plan.get("placement_fingerprint")
+            if fingerprint:
+                config["expert_placement_fingerprint"] = str(fingerprint)
+                config["expert_placement_plan_fingerprint"] = str(fingerprint)
+                config["expert_placement_contract_fingerprint"] = str(
+                    fingerprint
+                )
+            config["expert_placement_contract_available"] = True
+            config["expert_placement_contract_source"] = config[
+                "placement_source"
+            ]
+            config["expert_placement_contract_epoch"] = plan.placement_epoch
+            config["expert_placement_plan_applied"] = False
+            config["expert_placement_plan_verified"] = False
+            placement_snapshot = expert_placement_plan.get(
+                "expert_placement_snapshot"
+            )
+            if isinstance(placement_snapshot, Mapping):
+                config["expert_placement_snapshot"] = dict(
+                    placement_snapshot
+                )
         return config
 
     def _replica_gpu_count(self, plan: ParallelPlan) -> int:
@@ -116,6 +151,27 @@ class VllmDeploymentAdapter:
                 f"{plan.num_gpus} < {expected}"
             )
         return replica_gpus
+
+    async def _known_scheduler_node_ids(self) -> Optional[set[str]]:
+        scheduler_snapshot = getattr(self.scheduler, "_get_worker_nodes", None)
+        if scheduler_snapshot is None:
+            return None
+        try:
+            remote = getattr(scheduler_snapshot, "remote", None)
+            worker_nodes = (
+                await remote()
+                if remote is not None
+                else await scheduler_snapshot()
+            )
+        except Exception:
+            logger.info(
+                "Could not query scheduler worker nodes before vLLM replan",
+                exc_info=True,
+            )
+            return None
+        if not isinstance(worker_nodes, Mapping):
+            return None
+        return {str(node_id) for node_id in worker_nodes}
 
     async def create_workers(self, plan: ParallelPlan) -> VllmDeployment:
         if plan.backend != "vllm":
@@ -141,6 +197,7 @@ class VllmDeploymentAdapter:
             resource_requirements=resource_requirements,
         )
         target_nodes = list(plan.target_nodes)
+        known_scheduler_node_ids = await self._known_scheduler_node_ids()
 
         try:
             for replica in range(max(plan.replica_count, 1)):
@@ -152,6 +209,15 @@ class VllmDeploymentAdapter:
                     if target_nodes
                     else None
                 )
+                if (
+                    target_node_id is not None
+                    and known_scheduler_node_ids is not None
+                    and str(target_node_id) not in known_scheduler_node_ids
+                ):
+                    raise RuntimeError(
+                        "target_worker_node_not_in_scheduler_snapshot: "
+                        f"{target_node_id}"
+                    )
                 allocation_kwargs = {
                     "model_name": self.model_name,
                     "instance_id": instance_id,
@@ -307,6 +373,17 @@ class VllmDeploymentAdapter:
                 for handle in instances.values()
                 if handle.node_id is not None
             ],
+            placement_epoch=max(
+                0, int(self.backend_config.get("placement_epoch", 0) or 0)
+            ),
+            expert_placement_plan=(
+                self.backend_config.get("expert_placement_plan")
+                if isinstance(
+                    self.backend_config.get("expert_placement_plan"),
+                    Mapping,
+                )
+                else None
+            ),
             reason="active_deployment",
         )
         return VllmDeployment(

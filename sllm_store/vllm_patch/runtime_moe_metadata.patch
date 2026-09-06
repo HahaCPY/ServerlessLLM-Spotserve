@@ -3,7 +3,7 @@ new file mode 100644
 index 000000000..5b1bb3f55
 --- /dev/null
 +++ b/vllm/spotserve_moe.py
-@@ -0,0 +1,250 @@
+@@ -0,0 +1,340 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Lightweight SpotServe MoE routing instrumentation.
@@ -34,6 +34,7 @@ index 000000000..5b1bb3f55
 +_PER_REQUEST_HISTOGRAMS: dict[str, dict[str, int]] = {}
 +_GLOBAL_HISTOGRAM: dict[str, int] = {}
 +_RECENT_EVENTS: deque[dict[str, int]] = deque(maxlen=64)
++_LAST_EXPERT_PLACEMENT_PLAN: dict[str, Any] = {}
 +
 +
 +@dataclass
@@ -82,6 +83,22 @@ index 000000000..5b1bb3f55
 +        parsed = _positive_int(value)
 +        if parsed > 0:
 +            target[str(key)] = target.get(str(key), 0) + parsed
++
++
++def _placement_plan_payload(
++    expert_placement_plan: Mapping[str, Any] | None = None,
++    placement_plan: Mapping[str, Any] | None = None,
++    plan: Mapping[str, Any] | None = None,
++) -> dict[str, Any]:
++    for candidate in (expert_placement_plan, placement_plan, plan):
++        if isinstance(candidate, Mapping):
++            return dict(candidate)
++    return {}
++
++
++def _placement_plan_fingerprint(plan: Mapping[str, Any]) -> str:
++    value = plan.get("placement_fingerprint")
++    return str(value or "")
 +
 +
 +def _event_histogram(topk_ids: torch.Tensor, layer_name: str | None) -> dict[str, int]:
@@ -254,6 +271,79 @@ index 000000000..5b1bb3f55
 +        "recent_window_expert_hotness": recent,
 +        "worker_rank": worker_rank,
 +    }
++
++
++def apply_expert_placement_plan(
++    expert_placement_plan: Mapping[str, Any] | None = None,
++    *,
++    placement_plan: Mapping[str, Any] | None = None,
++    plan: Mapping[str, Any] | None = None,
++    worker_rank: int | None = None,
++    **_: Any,
++) -> dict[str, Any]:
++    """Accept the SpotServe placement contract without moving weights.
++
++    This patched vLLM hook is intentionally observation-only. It lets the
++    ServerlessLLM controller verify that the runtime saw the requested
++    ExpertPlacementPlan, while keeping `applied=false` until vLLM exposes real
++    EP rank remapping / expert weight movement.
++    """
++    payload = _placement_plan_payload(
++        expert_placement_plan=expert_placement_plan,
++        placement_plan=placement_plan,
++        plan=plan,
++    )
++    with _LOCK:
++        _LAST_EXPERT_PLACEMENT_PLAN.clear()
++        _LAST_EXPERT_PLACEMENT_PLAN.update(payload)
++    return {
++        "applied": False,
++        "success": False,
++        "ok": False,
++        "reason": "physical_expert_placement_migration_not_supported",
++        "hook_kind": "spotserve_observation_only",
++        "physical_weight_migration": False,
++        "expert_placement_plan_available": bool(payload),
++        "placement_fingerprint": _placement_plan_fingerprint(payload),
++        "worker_rank": worker_rank,
++    }
++
++
++def verify_expert_placement_plan(
++    expert_placement_plan: Mapping[str, Any] | None = None,
++    *,
++    placement_plan: Mapping[str, Any] | None = None,
++    plan: Mapping[str, Any] | None = None,
++    worker_rank: int | None = None,
++    **_: Any,
++) -> dict[str, Any]:
++    """Report that real runtime placement verification is not implemented."""
++    payload = _placement_plan_payload(
++        expert_placement_plan=expert_placement_plan,
++        placement_plan=placement_plan,
++        plan=plan,
++    )
++    requested_fingerprint = _placement_plan_fingerprint(payload)
++    with _LOCK:
++        seen_fingerprint = _placement_plan_fingerprint(
++            _LAST_EXPERT_PLACEMENT_PLAN
++        )
++    return {
++        "verified": False,
++        "success": False,
++        "ok": False,
++        "reason": "physical_expert_placement_verification_not_supported",
++        "hook_kind": "spotserve_observation_only",
++        "physical_weight_migration": False,
++        "expert_placement_plan_available": bool(payload),
++        "placement_fingerprint": requested_fingerprint,
++        "last_seen_placement_fingerprint": seen_fingerprint,
++        "contract_seen_by_runtime": bool(
++            requested_fingerprint
++            and requested_fingerprint == seen_fingerprint
++        ),
++        "worker_rank": worker_rank,
++    }
 diff --git a/vllm/model_executor/layers/fused_moe/fused_moe_modular_method.py b/vllm/model_executor/layers/fused_moe/fused_moe_modular_method.py
 index d8f0ec4fd..31e42f653 100644
 --- a/vllm/model_executor/layers/fused_moe/fused_moe_modular_method.py
@@ -290,7 +380,7 @@ diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
 index c0c1f913b..ab4269b7e 100644
 --- a/vllm/v1/engine/async_llm.py
 +++ b/vllm/v1/engine/async_llm.py
-@@ -355,6 +355,54 @@ class AsyncLLM(EngineClient):
+@@ -355,6 +355,84 @@ class AsyncLLM(EngineClient):
              "staged": True,
              "expected_blocks": len(params["remote_block_ids"]),
          }
@@ -342,6 +432,36 @@ index c0c1f913b..ab4269b7e 100644
 +        return await self.engine_core.call_utility_async(
 +            "get_moe_runtime_metadata"
 +        )
++
++    async def apply_expert_placement_plan(
++        self,
++        expert_placement_plan: dict[str, Any] | None = None,
++        **kwargs: Any,
++    ) -> dict[str, Any]:
++        plan = (
++            expert_placement_plan
++            or kwargs.get("placement_plan")
++            or kwargs.get("plan")
++            or {}
++        )
++        return await self.engine_core.call_utility_async(
++            "apply_expert_placement_plan", plan
++        )
++
++    async def verify_expert_placement_plan(
++        self,
++        expert_placement_plan: dict[str, Any] | None = None,
++        **kwargs: Any,
++    ) -> dict[str, Any]:
++        plan = (
++            expert_placement_plan
++            or kwargs.get("placement_plan")
++            or kwargs.get("plan")
++            or {}
++        )
++        return await self.engine_core.call_utility_async(
++            "verify_expert_placement_plan", plan
++        )
  
      async def add_request(
          self,
@@ -356,7 +476,7 @@ index 5bc564f36..7fbdc4101 100644
  
  import msgspec
  import zmq
-@@ -654,6 +654,113 @@ class EngineCore:
+@@ -654,6 +654,186 @@ class EngineCore:
              for request_id in list(requests)
          ]
  
@@ -467,6 +587,79 @@ index 5bc564f36..7fbdc4101 100644
 +            "recent_window_expert_hotness": recent_histogram,
 +        }
 +
++    @staticmethod
++    def _aggregate_expert_placement_hook_results(
++        snapshots: Any,
++        success_key: str,
++        default_reason: str,
++    ) -> dict[str, Any]:
++        worker_results = [
++            snapshot for snapshot in (snapshots or [])
++            if isinstance(snapshot, dict)
++        ]
++        total = len(worker_results)
++        successes = sum(
++            1
++            for snapshot in worker_results
++            if bool(snapshot.get(success_key))
++            or bool(snapshot.get("success"))
++            or bool(snapshot.get("ok"))
++        )
++        reasons = sorted(
++            {
++                str(snapshot.get("reason"))
++                for snapshot in worker_results
++                if snapshot.get("reason")
++            }
++        )
++        success = bool(total and successes == total)
++        return {
++            success_key: success,
++            "success": success,
++            "ok": success,
++            "reason": (
++                "runtime_expert_placement_hook_succeeded"
++                if success
++                else ",".join(reasons)
++                or default_reason
++            ),
++            "worker_count": total,
++            "worker_success_count": successes,
++            "physical_weight_migration": any(
++                bool(snapshot.get("physical_weight_migration"))
++                for snapshot in worker_results
++            ),
++            "worker_results": worker_results,
++        }
++
++    def apply_expert_placement_plan(
++        self,
++        expert_placement_plan: Mapping[str, Any] | None = None,
++    ) -> dict[str, Any]:
++        snapshots = self.model_executor.collective_rpc(
++            "apply_expert_placement_plan",
++            args=(dict(expert_placement_plan or {}),),
++        )
++        return self._aggregate_expert_placement_hook_results(
++            snapshots,
++            "applied",
++            "physical_expert_placement_migration_not_supported",
++        )
++
++    def verify_expert_placement_plan(
++        self,
++        expert_placement_plan: Mapping[str, Any] | None = None,
++    ) -> dict[str, Any]:
++        snapshots = self.model_executor.collective_rpc(
++            "verify_expert_placement_plan",
++            args=(dict(expert_placement_plan or {}),),
++        )
++        return self._aggregate_expert_placement_hook_results(
++            snapshots,
++            "verified",
++            "physical_expert_placement_verification_not_supported",
++        )
++
      def supports_state_restore(self) -> bool:
          connector = self.scheduler.get_kv_connector()
          if connector is None:
@@ -504,7 +697,7 @@ diff --git a/vllm/v1/worker/worker_base.py b/vllm/v1/worker/worker_base.py
 index 3fc13c233..46849bb1e 100644
 --- a/vllm/v1/worker/worker_base.py
 +++ b/vllm/v1/worker/worker_base.py
-@@ -109,6 +109,21 @@ class WorkerBase:
+@@ -109,6 +109,45 @@ class WorkerBase:
              ),
          }
  
@@ -522,6 +715,30 @@ index 3fc13c233..46849bb1e 100644
 +        from vllm.spotserve_moe import get_moe_runtime_metadata
 +
 +        return get_moe_runtime_metadata(worker_rank=self.rank)
++
++    def apply_expert_placement_plan(
++        self,
++        expert_placement_plan: dict[str, Any] | None = None,
++    ) -> dict[str, Any]:
++        """Accept a SpotServe placement contract without moving weights."""
++        from vllm.spotserve_moe import apply_expert_placement_plan
++
++        return apply_expert_placement_plan(
++            expert_placement_plan,
++            worker_rank=self.rank,
++        )
++
++    def verify_expert_placement_plan(
++        self,
++        expert_placement_plan: dict[str, Any] | None = None,
++    ) -> dict[str, Any]:
++        """Report whether a SpotServe placement contract is runtime-applied."""
++        from vllm.spotserve_moe import verify_expert_placement_plan
++
++        return verify_expert_placement_plan(
++            expert_placement_plan,
++            worker_rank=self.rank,
++        )
 +
      def compile_or_warm_up_model(self) -> None:
          """Prepare model for execution through compilation/warmup."""

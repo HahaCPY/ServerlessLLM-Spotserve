@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Mapping, Optional
 
+from .moe_placement import build_logical_expert_placement_plan
+
 
 READY = "ready"
 PREEMPTING = "preempting"
@@ -38,6 +40,8 @@ class ParallelPlan:
     enable_expert_parallel: bool = False
     num_gpus: int = 1
     target_nodes: List[str] = field(default_factory=list)
+    placement_epoch: int = 0
+    expert_placement_plan: Optional[Mapping[str, Any]] = None
     reason: str = "replan"
 
     def __init__(
@@ -51,6 +55,8 @@ class ParallelPlan:
         enable_expert_parallel: Optional[bool] = None,
         num_gpus: int = 1,
         target_nodes: Optional[List[str]] = None,
+        placement_epoch: int = 0,
+        expert_placement_plan: Optional[Mapping[str, Any]] = None,
         reason: str = "replan",
         num_replicas: Optional[int] = None,
         expert_parallel_size: Optional[int] = None,
@@ -90,6 +96,16 @@ class ParallelPlan:
             self,
             "target_nodes",
             [str(node) for node in (target_nodes or [])],
+        )
+        object.__setattr__(
+            self, "placement_epoch", max(0, int(placement_epoch or 0))
+        )
+        object.__setattr__(
+            self,
+            "expert_placement_plan",
+            dict(expert_placement_plan)
+            if isinstance(expert_placement_plan, Mapping)
+            else None,
         )
         object.__setattr__(self, "reason", str(reason))
 
@@ -162,10 +178,30 @@ class ParallelPlan:
             ),
             num_gpus=max(1, int(payload.get("num_gpus", 1) or 1)),
             target_nodes=[str(node) for node in payload.get("target_nodes", [])],
+            placement_epoch=max(
+                0,
+                int(
+                    payload.get(
+                        "placement_epoch",
+                        payload.get("expert_placement_epoch", 0),
+                    )
+                    or 0
+                ),
+            ),
+            expert_placement_plan=(
+                payload.get("expert_placement_plan")
+                if isinstance(payload.get("expert_placement_plan"), Mapping)
+                else None
+            ),
             reason=str(payload.get("reason", "replan")),
         )
 
     def to_dict(self) -> Dict[str, Any]:
+        expert_placement_plan = (
+            dict(self.expert_placement_plan)
+            if isinstance(self.expert_placement_plan, Mapping)
+            else None
+        )
         return {
             "model_name": self.model_name,
             "backend": self.backend,
@@ -194,6 +230,21 @@ class ParallelPlan:
             "num_replicas": self.num_replicas,
             "num_gpus": self.num_gpus,
             "target_nodes": list(self.target_nodes),
+            "placement_epoch": self.placement_epoch,
+            "placement_version": self.placement_epoch,
+            "expert_placement_epoch": self.placement_epoch,
+            "expert_placement_plan_available": bool(
+                expert_placement_plan
+                and expert_placement_plan.get("expert_placement_available")
+            ),
+            "expert_placement_fingerprint": (
+                str(
+                    expert_placement_plan.get("placement_fingerprint", "")
+                )
+                if expert_placement_plan
+                else ""
+            ),
+            "expert_placement_plan": expert_placement_plan,
             "reason": self.reason,
         }
 
@@ -217,6 +268,13 @@ class ParallelConfig:
     throughput_estimate_req_s: float = 0.0
     load_time_estimate_ms: float = 0.0
     migration_cost_estimate_ms: float = 0.0
+    expert_weight_movement_cost_estimate_ms: float = 0.0
+    expert_placement_movement_observation_available: bool = False
+    expert_placement_movement_source: str = "unavailable"
+    expert_placement_moved_expert_count: int = 0
+    expert_placement_stationary_expert_count: int = 0
+    expert_placement_unknown_movement_expert_count: int = 0
+    expert_placement_moved_weight_bytes: int = 0
     queue_penalty_ms: float = 0.0
     replan_window_cost_ms: float = 0.0
     score_components: Dict[str, float] = field(default_factory=dict)
@@ -272,6 +330,27 @@ class ParallelConfig:
             "load_time_estimate_ms": self.load_time_estimate_ms,
             "migration_cost_estimate_ms": (
                 self.migration_cost_estimate_ms
+            ),
+            "expert_weight_movement_cost_estimate_ms": (
+                self.expert_weight_movement_cost_estimate_ms
+            ),
+            "expert_placement_movement_observation_available": (
+                self.expert_placement_movement_observation_available
+            ),
+            "expert_placement_movement_source": (
+                self.expert_placement_movement_source
+            ),
+            "expert_placement_moved_expert_count": (
+                self.expert_placement_moved_expert_count
+            ),
+            "expert_placement_stationary_expert_count": (
+                self.expert_placement_stationary_expert_count
+            ),
+            "expert_placement_unknown_movement_expert_count": (
+                self.expert_placement_unknown_movement_expert_count
+            ),
+            "expert_placement_moved_weight_bytes": (
+                self.expert_placement_moved_weight_bytes
             ),
             "queue_penalty_ms": self.queue_penalty_ms,
             "replan_window_cost_ms": self.replan_window_cost_ms,
@@ -656,6 +735,14 @@ def _workload_cost_model_snapshot(
             ),
             1.0,
         ),
+        "expert_weight_movement_penalty_weight": _safe_float(
+            _planner_value(
+                planner_config,
+                "expert_weight_movement_penalty_weight",
+                1.0,
+            ),
+            1.0,
+        ),
         "queue_penalty_weight": _safe_float(
             _planner_value(planner_config, "queue_penalty_weight", 1.0),
             1.0,
@@ -714,9 +801,13 @@ def _score_parallel_candidates_for_workload(
             max(0.0, arrival_rate_req_s - throughput_estimate_req_s)
             * float(snapshot["queue_penalty_ms_per_req_s"])
         )
+        expert_weight_movement_cost_estimate_ms = (
+            candidate.expert_weight_movement_cost_estimate_ms
+        )
         replan_window_cost_ms = (
             load_time_estimate_ms
             + migration_cost_estimate_ms
+            + expert_weight_movement_cost_estimate_ms
             + queue_penalty_ms
         )
         score_components = {
@@ -737,6 +828,10 @@ def _score_parallel_candidates_for_workload(
                 migration_cost_estimate_ms
                 * float(snapshot["migration_cost_penalty_weight"])
             ),
+            "expert_weight_movement_penalty": (
+                expert_weight_movement_cost_estimate_ms
+                * float(snapshot["expert_weight_movement_penalty_weight"])
+            ),
             "queue_penalty": (
                 queue_penalty_ms * float(snapshot["queue_penalty_weight"])
             ),
@@ -751,6 +846,7 @@ def _score_parallel_candidates_for_workload(
             - score_components["latency_penalty"]
             - score_components["load_time_penalty"]
             - score_components["migration_cost_penalty"]
+            - score_components["expert_weight_movement_penalty"]
             - score_components["queue_penalty"]
             - score_components["replan_window_penalty"]
         )
@@ -769,6 +865,9 @@ def _score_parallel_candidates_for_workload(
                 load_time_estimate_ms=float(load_time_estimate_ms),
                 migration_cost_estimate_ms=(
                     float(migration_cost_estimate_ms)
+                ),
+                expert_weight_movement_cost_estimate_ms=(
+                    float(expert_weight_movement_cost_estimate_ms)
                 ),
                 queue_penalty_ms=float(queue_penalty_ms),
                 replan_window_cost_ms=float(replan_window_cost_ms),
@@ -858,6 +957,9 @@ def _supported_config_candidates(
             migration_cost_estimate_ms = _nonnegative_float(
                 plan.get("migration_cost_estimate_ms", 0.0)
             )
+            expert_weight_movement_cost_estimate_ms = _nonnegative_float(
+                plan.get("expert_weight_movement_cost_estimate_ms", 0.0)
+            )
         else:
             tensor_parallel_size = int(plan.tensor_parallel_size)
             pipeline_parallel_size = int(plan.pipeline_parallel_size)
@@ -881,6 +983,13 @@ def _supported_config_candidates(
             )
             migration_cost_estimate_ms = _nonnegative_float(
                 getattr(plan, "migration_cost_estimate_ms", 0.0)
+            )
+            expert_weight_movement_cost_estimate_ms = _nonnegative_float(
+                getattr(
+                    plan,
+                    "expert_weight_movement_cost_estimate_ms",
+                    0.0,
+                )
             )
 
         if tensor_parallel_size < min_tensor_parallel_size:
@@ -914,6 +1023,9 @@ def _supported_config_candidates(
                 throughput_estimate_req_s=throughput_estimate_req_s,
                 load_time_estimate_ms=load_time_estimate_ms,
                 migration_cost_estimate_ms=migration_cost_estimate_ms,
+                expert_weight_movement_cost_estimate_ms=(
+                    expert_weight_movement_cost_estimate_ms
+                ),
                 reason=reason,
             )
         )
@@ -962,6 +1074,8 @@ def build_parallel_plan(
     backend: str,
     parallel_config: ParallelConfig,
     worker_nodes: Mapping[str, Mapping[str, Any]],
+    placement_epoch: int = 0,
+    expert_placement_plan: Optional[Mapping[str, Any]] = None,
     reason: str = "replan",
 ) -> ParallelPlan:
     return ParallelPlan(
@@ -976,8 +1090,95 @@ def build_parallel_plan(
         target_nodes=select_target_nodes(
             worker_nodes, parallel_config.total_gpus
         ),
+        placement_epoch=placement_epoch,
+        expert_placement_plan=expert_placement_plan,
         reason=reason,
     )
+
+
+def _attach_expert_placement_movement_estimates(
+    candidates: List[ParallelConfig],
+    model_name: str,
+    backend: str,
+    worker_nodes: Mapping[str, Mapping[str, Any]],
+    model_config: Mapping[str, Any],
+    planner_config: Mapping[str, Any],
+    placement_epoch: int,
+    event: Optional[str],
+) -> List[ParallelConfig]:
+    if not candidates:
+        return candidates
+
+    enriched: List[ParallelConfig] = []
+    for candidate in candidates:
+        candidate_plan = build_parallel_plan(
+            model_name=model_name,
+            backend=backend,
+            parallel_config=candidate,
+            worker_nodes=worker_nodes,
+            placement_epoch=placement_epoch,
+            reason=f"{event or 'manual'}_replan",
+        )
+        expert_placement_plan = build_logical_expert_placement_plan(
+            model_name=model_name,
+            target_parallel_plan=candidate_plan.to_dict(),
+            model_config=model_config,
+            placement_epoch=placement_epoch,
+            planner_config=planner_config,
+        )
+        if expert_placement_plan is None:
+            enriched.append(candidate)
+            continue
+
+        plan_payload = expert_placement_plan.to_dict()
+        enriched.append(
+            replace(
+                candidate,
+                expert_weight_movement_cost_estimate_ms=(
+                    _nonnegative_float(
+                        plan_payload.get(
+                            "estimated_expert_weight_movement_cost_ms",
+                            0.0,
+                        )
+                    )
+                ),
+                expert_placement_movement_observation_available=bool(
+                    plan_payload.get("movement_observation_available", False)
+                ),
+                expert_placement_movement_source=str(
+                    plan_payload.get("movement_source", "unavailable")
+                ),
+                expert_placement_moved_expert_count=_safe_int(
+                    plan_payload.get("moved_expert_count"), 0
+                ),
+                expert_placement_stationary_expert_count=_safe_int(
+                    plan_payload.get("stationary_expert_count"), 0
+                ),
+                expert_placement_unknown_movement_expert_count=_safe_int(
+                    plan_payload.get("unknown_movement_expert_count"), 0
+                ),
+                expert_placement_moved_weight_bytes=_safe_int(
+                    plan_payload.get("moved_weight_bytes"), 0
+                ),
+            )
+        )
+    return enriched
+
+
+def _next_placement_epoch(
+    model_config: Mapping[str, Any],
+    planner_config: Mapping[str, Any],
+) -> int:
+    backend_config = model_config.get("backend_config", {})
+    if not isinstance(backend_config, Mapping):
+        backend_config = {}
+    current_epoch = max(
+        _safe_int(planner_config.get("placement_epoch"), 0),
+        _safe_int(planner_config.get("current_placement_epoch"), 0),
+        _safe_int(backend_config.get("placement_epoch"), 0),
+        _safe_int(model_config.get("placement_epoch"), 0),
+    )
+    return max(1, current_epoch + 1)
 
 
 def plan_dynamic_reparallelization(
@@ -1018,6 +1219,17 @@ def plan_dynamic_reparallelization(
         candidates = generate_parallel_candidates(
             availability.available_gpus, planner_config
         )
+    placement_epoch = _next_placement_epoch(model_config, planner_config)
+    candidates = _attach_expert_placement_movement_estimates(
+        candidates=candidates,
+        model_name=model_name,
+        backend=backend_name,
+        worker_nodes=worker_nodes,
+        model_config=model_config,
+        planner_config=planner_config,
+        placement_epoch=placement_epoch,
+        event=event,
+    )
     candidates, workload_cost_model = _score_parallel_candidates_for_workload(
         candidates,
         planner_config,
@@ -1030,11 +1242,31 @@ def plan_dynamic_reparallelization(
             backend=backend_name,
             parallel_config=selected,
             worker_nodes=worker_nodes,
+            placement_epoch=placement_epoch,
             reason=f"{event or 'manual'}_replan",
         )
         if selected
         else None
     )
+    expert_placement_plan = None
+    if parallel_plan is not None:
+        expert_placement_plan = build_logical_expert_placement_plan(
+            model_name=model_name,
+            target_parallel_plan=parallel_plan.to_dict(),
+            model_config=model_config,
+            placement_epoch=parallel_plan.placement_epoch,
+            planner_config=planner_config,
+        )
+        if expert_placement_plan is not None:
+            parallel_plan = build_parallel_plan(
+                model_name=model_name,
+                backend=backend_name,
+                parallel_config=selected,
+                worker_nodes=worker_nodes,
+                placement_epoch=parallel_plan.placement_epoch,
+                expert_placement_plan=expert_placement_plan.to_dict(),
+                reason=f"{event or 'manual'}_replan",
+            )
     action = "reparallelize" if selected is not None else "no_capacity"
     synthetic_worker_node_count = sum(
         1
@@ -1064,12 +1296,22 @@ def plan_dynamic_reparallelization(
         "physical_worker_node_count": runtime_worker_node_count,
         "workload_cost_model": workload_cost_model,
         "parallel_plan": parallel_plan.to_dict() if parallel_plan else None,
+        "expert_placement_plan": (
+            expert_placement_plan.to_dict()
+            if expert_placement_plan is not None
+            else None
+        ),
         "selected_config": selected.to_dict() if selected else None,
         "top_candidates": [
             candidate.to_dict() for candidate in candidates[:5]
         ],
     }
     if selected is not None:
+        expert_plan_payload = (
+            expert_placement_plan.to_dict()
+            if expert_placement_plan is not None
+            else {}
+        )
         decision.update(
             {
                 "selected_total_gpus": selected.total_gpus,
@@ -1128,9 +1370,87 @@ def plan_dynamic_reparallelization(
                 "selected_migration_cost_estimate_ms": (
                     selected.migration_cost_estimate_ms
                 ),
+                "selected_expert_weight_movement_cost_estimate_ms": (
+                    selected.expert_weight_movement_cost_estimate_ms
+                ),
+                "selected_expert_placement_movement_observation_available": (
+                    selected.expert_placement_movement_observation_available
+                ),
+                "selected_expert_placement_movement_source": (
+                    selected.expert_placement_movement_source
+                ),
+                "selected_expert_placement_moved_expert_count": (
+                    selected.expert_placement_moved_expert_count
+                ),
+                "selected_expert_placement_stationary_expert_count": (
+                    selected.expert_placement_stationary_expert_count
+                ),
+                "selected_expert_placement_unknown_movement_expert_count": (
+                    selected.expert_placement_unknown_movement_expert_count
+                ),
+                "selected_expert_placement_moved_weight_bytes": (
+                    selected.expert_placement_moved_weight_bytes
+                ),
                 "selected_queue_penalty_ms": selected.queue_penalty_ms,
                 "selected_replan_window_cost_ms": (
                     selected.replan_window_cost_ms
+                ),
+                "expert_placement_plan_available": bool(
+                    expert_plan_payload.get("expert_placement_available")
+                ),
+                "expert_placement_plan_epoch": (
+                    expert_plan_payload.get("placement_epoch", 0)
+                ),
+                "expert_placement_plan_fingerprint": (
+                    expert_plan_payload.get("placement_fingerprint", "")
+                ),
+                "expert_placement_plan_source": (
+                    expert_plan_payload.get("placement_source", "unavailable")
+                ),
+                "expert_placement_plan_required_experts": (
+                    expert_plan_payload.get("required_expert_count", 0)
+                ),
+                "expert_placement_plan_covered_experts": (
+                    expert_plan_payload.get("covered_expert_count", 0)
+                ),
+                "expert_placement_plan_shards": (
+                    expert_plan_payload.get("planned_shard_count", 0)
+                ),
+                "expert_placement_plan_target_ranks": (
+                    expert_plan_payload.get("target_rank_count", 0)
+                ),
+                "expert_placement_plan_physical_weight_migration": bool(
+                    expert_plan_payload.get("physical_weight_migration", False)
+                ),
+                "expert_placement_plan_movement_observation_available": bool(
+                    expert_plan_payload.get(
+                        "movement_observation_available", False
+                    )
+                ),
+                "expert_placement_plan_movement_source": (
+                    expert_plan_payload.get("movement_source", "unavailable")
+                ),
+                "expert_placement_plan_moved_experts": (
+                    expert_plan_payload.get("moved_expert_count", 0)
+                ),
+                "expert_placement_plan_stationary_experts": (
+                    expert_plan_payload.get("stationary_expert_count", 0)
+                ),
+                "expert_placement_plan_unknown_movement_experts": (
+                    expert_plan_payload.get(
+                        "unknown_movement_expert_count", 0
+                    )
+                ),
+                "expert_placement_plan_moved_weight_bytes": (
+                    expert_plan_payload.get("moved_weight_bytes", 0)
+                ),
+                "expert_placement_plan_estimated_weight_movement_cost_ms": (
+                    expert_plan_payload.get(
+                        "estimated_expert_weight_movement_cost_ms", 0.0
+                    )
+                ),
+                "expert_placement_plan_reason": (
+                    expert_plan_payload.get("reason", "unavailable")
                 ),
             }
         )
@@ -1159,8 +1479,34 @@ def plan_dynamic_reparallelization(
                 "selected_throughput_estimate_req_s": 0.0,
                 "selected_load_time_estimate_ms": 0.0,
                 "selected_migration_cost_estimate_ms": 0.0,
+                "selected_expert_weight_movement_cost_estimate_ms": 0.0,
+                "selected_expert_placement_movement_observation_available": (
+                    False
+                ),
+                "selected_expert_placement_movement_source": "unavailable",
+                "selected_expert_placement_moved_expert_count": 0,
+                "selected_expert_placement_stationary_expert_count": 0,
+                "selected_expert_placement_unknown_movement_expert_count": 0,
+                "selected_expert_placement_moved_weight_bytes": 0,
                 "selected_queue_penalty_ms": 0.0,
                 "selected_replan_window_cost_ms": 0.0,
+                "expert_placement_plan_available": False,
+                "expert_placement_plan_epoch": 0,
+                "expert_placement_plan_fingerprint": "",
+                "expert_placement_plan_source": "unavailable",
+                "expert_placement_plan_required_experts": 0,
+                "expert_placement_plan_covered_experts": 0,
+                "expert_placement_plan_shards": 0,
+                "expert_placement_plan_target_ranks": 0,
+                "expert_placement_plan_physical_weight_migration": False,
+                "expert_placement_plan_movement_observation_available": False,
+                "expert_placement_plan_movement_source": "unavailable",
+                "expert_placement_plan_moved_experts": 0,
+                "expert_placement_plan_stationary_experts": 0,
+                "expert_placement_plan_unknown_movement_experts": 0,
+                "expert_placement_plan_moved_weight_bytes": 0,
+                "expert_placement_plan_estimated_weight_movement_cost_ms": 0.0,
+                "expert_placement_plan_reason": "no_capacity",
             }
         )
     return decision

@@ -5,6 +5,7 @@ from sllm.spot.context_migration import (
     ContextMetadata,
     MigrationTarget,
     estimate_expert_dispatch_cost,
+    target_placement_marker,
 )
 
 
@@ -406,6 +407,52 @@ def _expert_recovery_locality(
             estimate.get("estimated_remote_routed_tokens", 0) or 0
         ),
         "expert_dispatch_cost": float(estimate.get("cost", 0.0) or 0.0),
+        "moe_dispatch_observation_available": bool(
+            estimate.get("dispatch_observation_available", False)
+        ),
+        "moe_routed_tokens": int(estimate.get("routed_tokens", 0) or 0),
+        "moe_local_routed_tokens": int(
+            estimate.get("local_routed_tokens", 0) or 0
+        ),
+        "moe_remote_routed_tokens": int(
+            estimate.get("remote_routed_tokens", 0) or 0
+        ),
+        "moe_local_routing_ratio": float(
+            estimate.get("local_routing_ratio", 0.0) or 0.0
+        ),
+        "moe_remote_routing_ratio": float(
+            estimate.get("remote_routing_ratio", 0.0) or 0.0
+        ),
+        "moe_local_routed_tokens_by_expert": dict(
+            estimate.get("local_routed_tokens_by_expert", {}) or {}
+        ),
+        "moe_remote_routed_tokens_by_expert": dict(
+            estimate.get("remote_routed_tokens_by_expert", {}) or {}
+        ),
+        "moe_local_routed_tokens_by_layer": dict(
+            estimate.get("local_routed_tokens_by_layer", {}) or {}
+        ),
+        "moe_remote_routed_tokens_by_layer": dict(
+            estimate.get("remote_routed_tokens_by_layer", {}) or {}
+        ),
+        "moe_locality_definition": str(
+            estimate.get("locality_definition", "unavailable")
+            or "unavailable"
+        ),
+        "moe_locality_granularity": str(
+            estimate.get("locality_granularity", "unavailable")
+            or "unavailable"
+        ),
+        "moe_remote_routing_definition": str(
+            estimate.get("remote_routing_definition", "unavailable")
+            or "unavailable"
+        ),
+        "moe_rank_locality_available": bool(
+            estimate.get("rank_locality_available", False)
+        ),
+        "moe_physical_dispatch_traffic_available": bool(
+            estimate.get("physical_dispatch_traffic_available", False)
+        ),
         "moe_route_histogram_source": str(
             estimate.get("route_histogram_source", "unavailable")
             or "unavailable"
@@ -415,6 +462,10 @@ def _expert_recovery_locality(
             or "unavailable"
         ),
     }
+
+
+def _candidate_placement_marker(candidate: Mapping[str, Any]) -> Dict[str, Any]:
+    return target_placement_marker(_candidate_migration_target(candidate))
 
 
 def _candidate_restore_score(
@@ -427,6 +478,7 @@ def _candidate_restore_score(
     kv_check = _kv_layout_compatible(state, candidate)
     ep_check = _ep_layout_compatible(state, candidate)
     locality = _expert_recovery_locality(state, candidate, planner_config)
+    placement_marker = _candidate_placement_marker(candidate)
     source_node = str(state.node_id or "")
     target_node = str(candidate.get("node_id", "") or "")
     same_node = bool(source_node and target_node and source_node == target_node)
@@ -469,6 +521,7 @@ def _candidate_restore_score(
         "warmup_cost": float(warmup_cost),
         "concurrency": concurrency,
         "total_estimated_cost": float(total_cost),
+        **placement_marker,
         **locality,
     }
 

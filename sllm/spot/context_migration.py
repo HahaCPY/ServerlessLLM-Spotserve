@@ -3,6 +3,11 @@ from functools import lru_cache
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 
+MOE_LOCALITY_DEFINITION = "target_placement_coverage"
+MOE_LOCALITY_GRANULARITY = "target_instance_or_deployment"
+MOE_REMOTE_ROUTING_DEFINITION = "missing_from_target_placement_snapshot"
+
+
 @dataclass(frozen=True)
 class ContextMetadata:
     request_id: Optional[str]
@@ -129,6 +134,48 @@ class MigrationPlan:
     estimated_remote_routing_ratio: float = 0.0
     estimated_remote_routed_tokens: int = 0
     expert_dispatch_cost: float = 0.0
+    moe_dispatch_observation_available: bool = False
+    moe_routed_tokens: int = 0
+    moe_local_routed_tokens: int = 0
+    moe_remote_routed_tokens: int = 0
+    moe_local_routing_ratio: float = 0.0
+    moe_remote_routing_ratio: float = 0.0
+    moe_local_routed_tokens_by_expert: Mapping[str, int] = field(
+        default_factory=dict
+    )
+    moe_remote_routed_tokens_by_expert: Mapping[str, int] = field(
+        default_factory=dict
+    )
+    moe_local_routed_tokens_by_layer: Mapping[str, int] = field(
+        default_factory=dict
+    )
+    moe_remote_routed_tokens_by_layer: Mapping[str, int] = field(
+        default_factory=dict
+    )
+    moe_locality_definition: str = "unavailable"
+    moe_locality_granularity: str = "unavailable"
+    moe_remote_routing_definition: str = "unavailable"
+    moe_rank_locality_available: bool = False
+    moe_physical_dispatch_traffic_available: bool = False
+    target_placement_epoch: Optional[int] = None
+    target_placement_version: Optional[int] = None
+    target_expert_placement_epoch: Optional[int] = None
+    target_expert_placement_fingerprint: str = ""
+    target_expert_placement_plan_fingerprint: str = ""
+    target_expert_placement_snapshot_fingerprint: str = ""
+    target_expert_placement_contract_available: bool = False
+    target_expert_placement_plan_applied: bool = False
+    target_expert_placement_plan_verified: bool = False
+    target_expert_placement_contract_reason: str = "unavailable"
+    target_expert_placement_apply_hook_available: bool = False
+    target_expert_placement_apply_attempted: bool = False
+    target_expert_placement_apply_success: bool = False
+    target_expert_placement_apply_reason: str = ""
+    target_expert_placement_verify_hook_available: bool = False
+    target_expert_placement_verify_attempted: bool = False
+    target_expert_placement_verify_success: bool = False
+    target_expert_placement_verify_reason: str = ""
+    target_placement_source: str = ""
     queue_depth: int = 0
     queue_pressure: float = 0.0
     queue_penalty_cost: float = 0.0
@@ -154,6 +201,86 @@ class MigrationPlan:
                 self.estimated_remote_routed_tokens
             ),
             "expert_dispatch_cost": self.expert_dispatch_cost,
+            "moe_dispatch_observation_available": (
+                self.moe_dispatch_observation_available
+            ),
+            "moe_routed_tokens": self.moe_routed_tokens,
+            "moe_local_routed_tokens": self.moe_local_routed_tokens,
+            "moe_remote_routed_tokens": self.moe_remote_routed_tokens,
+            "moe_local_routing_ratio": self.moe_local_routing_ratio,
+            "moe_remote_routing_ratio": self.moe_remote_routing_ratio,
+            "moe_local_routed_tokens_by_expert": dict(
+                self.moe_local_routed_tokens_by_expert
+            ),
+            "moe_remote_routed_tokens_by_expert": dict(
+                self.moe_remote_routed_tokens_by_expert
+            ),
+            "moe_local_routed_tokens_by_layer": dict(
+                self.moe_local_routed_tokens_by_layer
+            ),
+            "moe_remote_routed_tokens_by_layer": dict(
+                self.moe_remote_routed_tokens_by_layer
+            ),
+            "moe_locality_definition": self.moe_locality_definition,
+            "moe_locality_granularity": self.moe_locality_granularity,
+            "moe_remote_routing_definition": (
+                self.moe_remote_routing_definition
+            ),
+            "moe_rank_locality_available": self.moe_rank_locality_available,
+            "moe_physical_dispatch_traffic_available": (
+                self.moe_physical_dispatch_traffic_available
+            ),
+            "target_placement_epoch": self.target_placement_epoch,
+            "target_placement_version": self.target_placement_version,
+            "target_expert_placement_epoch": (
+                self.target_expert_placement_epoch
+            ),
+            "target_expert_placement_fingerprint": (
+                self.target_expert_placement_fingerprint
+            ),
+            "target_expert_placement_plan_fingerprint": (
+                self.target_expert_placement_plan_fingerprint
+            ),
+            "target_expert_placement_snapshot_fingerprint": (
+                self.target_expert_placement_snapshot_fingerprint
+            ),
+            "target_expert_placement_contract_available": (
+                self.target_expert_placement_contract_available
+            ),
+            "target_expert_placement_plan_applied": (
+                self.target_expert_placement_plan_applied
+            ),
+            "target_expert_placement_plan_verified": (
+                self.target_expert_placement_plan_verified
+            ),
+            "target_expert_placement_contract_reason": (
+                self.target_expert_placement_contract_reason
+            ),
+            "target_expert_placement_apply_hook_available": (
+                self.target_expert_placement_apply_hook_available
+            ),
+            "target_expert_placement_apply_attempted": (
+                self.target_expert_placement_apply_attempted
+            ),
+            "target_expert_placement_apply_success": (
+                self.target_expert_placement_apply_success
+            ),
+            "target_expert_placement_apply_reason": (
+                self.target_expert_placement_apply_reason
+            ),
+            "target_expert_placement_verify_hook_available": (
+                self.target_expert_placement_verify_hook_available
+            ),
+            "target_expert_placement_verify_attempted": (
+                self.target_expert_placement_verify_attempted
+            ),
+            "target_expert_placement_verify_success": (
+                self.target_expert_placement_verify_success
+            ),
+            "target_expert_placement_verify_reason": (
+                self.target_expert_placement_verify_reason
+            ),
+            "target_placement_source": self.target_placement_source,
             "queue_depth": self.queue_depth,
             "queue_pressure": self.queue_pressure,
             "queue_penalty_cost": self.queue_penalty_cost,
@@ -176,6 +303,16 @@ class MigrationDecision:
     moe_target_placement_available_count: int = 0
     total_estimated_remote_routed_tokens: int = 0
     total_expert_dispatch_cost: float = 0.0
+    moe_dispatch_observation_available_count: int = 0
+    total_moe_routed_tokens: int = 0
+    total_moe_local_routed_tokens: int = 0
+    total_moe_remote_routed_tokens: int = 0
+    avg_moe_remote_routing_ratio: float = 0.0
+    moe_locality_definition: str = "unavailable"
+    moe_locality_granularity: str = "unavailable"
+    moe_remote_routing_definition: str = "unavailable"
+    moe_rank_locality_available_count: int = 0
+    moe_physical_dispatch_traffic_available_count: int = 0
     total_queue_penalty_cost: float = 0.0
     avg_queue_pressure: float = 0.0
     max_queue_depth: int = 0
@@ -209,6 +346,30 @@ class MigrationDecision:
                 self.total_estimated_remote_routed_tokens
             ),
             "total_expert_dispatch_cost": self.total_expert_dispatch_cost,
+            "moe_dispatch_observation_available_count": (
+                self.moe_dispatch_observation_available_count
+            ),
+            "total_moe_routed_tokens": self.total_moe_routed_tokens,
+            "total_moe_local_routed_tokens": (
+                self.total_moe_local_routed_tokens
+            ),
+            "total_moe_remote_routed_tokens": (
+                self.total_moe_remote_routed_tokens
+            ),
+            "avg_moe_remote_routing_ratio": (
+                self.avg_moe_remote_routing_ratio
+            ),
+            "moe_locality_definition": self.moe_locality_definition,
+            "moe_locality_granularity": self.moe_locality_granularity,
+            "moe_remote_routing_definition": (
+                self.moe_remote_routing_definition
+            ),
+            "moe_rank_locality_available_count": (
+                self.moe_rank_locality_available_count
+            ),
+            "moe_physical_dispatch_traffic_available_count": (
+                self.moe_physical_dispatch_traffic_available_count
+            ),
             "total_queue_penalty_cost": self.total_queue_penalty_cost,
             "avg_queue_pressure": self.avg_queue_pressure,
             "max_queue_depth": self.max_queue_depth,
@@ -315,6 +476,23 @@ def _normalize_expert_key(value: Any) -> str:
     return text
 
 
+def _expert_layer_key(expert_key: str) -> str:
+    for part in str(expert_key).split("/"):
+        if part.startswith("layer:"):
+            return part
+    return "layer:unknown"
+
+
+def _routed_tokens_by_layer(histogram: Mapping[str, int]) -> Dict[str, int]:
+    tokens_by_layer: Dict[str, int] = {}
+    for expert_key, tokens in histogram.items():
+        layer_key = _expert_layer_key(expert_key)
+        tokens_by_layer[layer_key] = (
+            tokens_by_layer.get(layer_key, 0) + int(tokens)
+        )
+    return tokens_by_layer
+
+
 def _placement_expert_keys(value: Any) -> set[str]:
     keys: set[str] = set()
 
@@ -379,6 +557,93 @@ def target_expert_placement_keys(target: MigrationTarget) -> set[str]:
     return _placement_expert_keys(raw)
 
 
+def target_placement_marker(target: MigrationTarget) -> Dict[str, Any]:
+    placement_epoch = _as_non_negative_int(
+        _metadata_value(
+            target,
+            "placement_epoch",
+            "placement_version",
+            "expert_placement_epoch",
+        )
+    )
+    expert_placement_epoch = _as_non_negative_int(
+        _metadata_value(
+            target,
+            "expert_placement_epoch",
+            "placement_epoch",
+            "placement_version",
+        )
+    )
+    return {
+        "target_placement_epoch": placement_epoch,
+        "target_placement_version": placement_epoch,
+        "target_expert_placement_epoch": expert_placement_epoch,
+        "target_expert_placement_fingerprint": str(
+            _metadata_value(target, "expert_placement_fingerprint") or ""
+        ),
+        "target_expert_placement_plan_fingerprint": str(
+            _metadata_value(
+                target,
+                "expert_placement_plan_fingerprint",
+                "expert_placement_contract_fingerprint",
+            )
+            or ""
+        ),
+        "target_expert_placement_snapshot_fingerprint": str(
+            _metadata_value(target, "expert_placement_snapshot_fingerprint") or ""
+        ),
+        "target_expert_placement_contract_available": _to_bool(
+            _metadata_value(target, "expert_placement_contract_available"),
+            default=False,
+        ),
+        "target_expert_placement_plan_applied": _to_bool(
+            _metadata_value(target, "expert_placement_plan_applied"),
+            default=False,
+        ),
+        "target_expert_placement_plan_verified": _to_bool(
+            _metadata_value(target, "expert_placement_plan_verified"),
+            default=False,
+        ),
+        "target_expert_placement_contract_reason": str(
+            _metadata_value(target, "expert_placement_contract_reason")
+            or "unavailable"
+        ),
+        "target_expert_placement_apply_hook_available": _to_bool(
+            _metadata_value(target, "expert_placement_apply_hook_available"),
+            default=False,
+        ),
+        "target_expert_placement_apply_attempted": _to_bool(
+            _metadata_value(target, "expert_placement_apply_attempted"),
+            default=False,
+        ),
+        "target_expert_placement_apply_success": _to_bool(
+            _metadata_value(target, "expert_placement_apply_success"),
+            default=False,
+        ),
+        "target_expert_placement_apply_reason": str(
+            _metadata_value(target, "expert_placement_apply_reason") or ""
+        ),
+        "target_expert_placement_verify_hook_available": _to_bool(
+            _metadata_value(target, "expert_placement_verify_hook_available"),
+            default=False,
+        ),
+        "target_expert_placement_verify_attempted": _to_bool(
+            _metadata_value(target, "expert_placement_verify_attempted"),
+            default=False,
+        ),
+        "target_expert_placement_verify_success": _to_bool(
+            _metadata_value(target, "expert_placement_verify_success"),
+            default=False,
+        ),
+        "target_expert_placement_verify_reason": str(
+            _metadata_value(target, "expert_placement_verify_reason") or ""
+        ),
+        "target_placement_source": str(
+            _metadata_value(target, "placement_source") or ""
+        ),
+    }
+
+
 def estimate_expert_dispatch_cost(
     source: ContextMetadata,
     target: MigrationTarget,
@@ -415,6 +680,21 @@ def estimate_expert_dispatch_cost(
             "locality_ratio": 0.0,
             "estimated_remote_routing_ratio": 0.0,
             "estimated_remote_routed_tokens": 0,
+            "dispatch_observation_available": False,
+            "routed_tokens": 0,
+            "local_routed_tokens": 0,
+            "remote_routed_tokens": 0,
+            "local_routing_ratio": 0.0,
+            "remote_routing_ratio": 0.0,
+            "local_routed_tokens_by_expert": {},
+            "remote_routed_tokens_by_expert": {},
+            "local_routed_tokens_by_layer": {},
+            "remote_routed_tokens_by_layer": {},
+            "locality_definition": MOE_LOCALITY_DEFINITION,
+            "locality_granularity": MOE_LOCALITY_GRANULARITY,
+            "remote_routing_definition": MOE_REMOTE_ROUTING_DEFINITION,
+            "rank_locality_available": False,
+            "physical_dispatch_traffic_available": False,
             "cost": 0.0,
             "route_histogram_source": str(
                 _metadata_value(source, "moe_route_histogram_source")
@@ -427,13 +707,21 @@ def estimate_expert_dispatch_cost(
         }
 
     total_tokens = sum(histogram.values())
-    local_tokens = sum(
-        tokens
-        for expert_key, tokens in histogram.items()
-        if _normalize_expert_key(expert_key) in placement_keys
-    )
+    local_histogram: Dict[str, int] = {}
+    remote_histogram: Dict[str, int] = {}
+    for expert_key, tokens in histogram.items():
+        normalized_key = _normalize_expert_key(expert_key)
+        target_histogram = (
+            local_histogram
+            if normalized_key in placement_keys
+            else remote_histogram
+        )
+        target_histogram[normalized_key] = (
+            target_histogram.get(normalized_key, 0) + int(tokens)
+        )
+    local_tokens = sum(local_histogram.values())
     locality_ratio = local_tokens / total_tokens if total_tokens else 0.0
-    remote_tokens = max(total_tokens - local_tokens, 0)
+    remote_tokens = sum(remote_histogram.values())
     remote_ratio = 1.0 - locality_ratio if total_tokens else 0.0
     weight = _positive_float(planner_config, "expert_dispatch_weight", 1.0)
     cost = remote_ratio * weight
@@ -444,6 +732,25 @@ def estimate_expert_dispatch_cost(
         "locality_ratio": float(locality_ratio),
         "estimated_remote_routing_ratio": float(remote_ratio),
         "estimated_remote_routed_tokens": int(remote_tokens),
+        "dispatch_observation_available": True,
+        "routed_tokens": int(total_tokens),
+        "local_routed_tokens": int(local_tokens),
+        "remote_routed_tokens": int(remote_tokens),
+        "local_routing_ratio": float(locality_ratio),
+        "remote_routing_ratio": float(remote_ratio),
+        "local_routed_tokens_by_expert": dict(local_histogram),
+        "remote_routed_tokens_by_expert": dict(remote_histogram),
+        "local_routed_tokens_by_layer": _routed_tokens_by_layer(
+            local_histogram
+        ),
+        "remote_routed_tokens_by_layer": _routed_tokens_by_layer(
+            remote_histogram
+        ),
+        "locality_definition": MOE_LOCALITY_DEFINITION,
+        "locality_granularity": MOE_LOCALITY_GRANULARITY,
+        "remote_routing_definition": MOE_REMOTE_ROUTING_DEFINITION,
+        "rank_locality_available": False,
+        "physical_dispatch_traffic_available": False,
         "cost": float(cost),
         "route_histogram_source": str(
             _metadata_value(source, "moe_route_histogram_source")
@@ -692,6 +999,7 @@ def build_candidate_component_costs(
                 target,
                 planner_config,
             )
+            placement_marker = target_placement_marker(target)
             queue_penalty = estimate_queue_penalty_cost(
                 target,
                 planner_config,
@@ -729,6 +1037,50 @@ def build_candidate_component_costs(
                     )
                     or 0
                 ),
+                "moe_dispatch_observation_available": bool(
+                    expert_dispatch.get(
+                        "dispatch_observation_available", False
+                    )
+                ),
+                "moe_routed_tokens": int(
+                    expert_dispatch.get("routed_tokens", 0) or 0
+                ),
+                "moe_local_routed_tokens": int(
+                    expert_dispatch.get("local_routed_tokens", 0) or 0
+                ),
+                "moe_remote_routed_tokens": int(
+                    expert_dispatch.get("remote_routed_tokens", 0) or 0
+                ),
+                "moe_local_routing_ratio": float(
+                    expert_dispatch.get("local_routing_ratio", 0.0) or 0.0
+                ),
+                "moe_remote_routing_ratio": float(
+                    expert_dispatch.get("remote_routing_ratio", 0.0) or 0.0
+                ),
+                "moe_local_routed_tokens_by_expert": dict(
+                    expert_dispatch.get(
+                        "local_routed_tokens_by_expert", {}
+                    )
+                    or {}
+                ),
+                "moe_remote_routed_tokens_by_expert": dict(
+                    expert_dispatch.get(
+                        "remote_routed_tokens_by_expert", {}
+                    )
+                    or {}
+                ),
+                "moe_local_routed_tokens_by_layer": dict(
+                    expert_dispatch.get(
+                        "local_routed_tokens_by_layer", {}
+                    )
+                    or {}
+                ),
+                "moe_remote_routed_tokens_by_layer": dict(
+                    expert_dispatch.get(
+                        "remote_routed_tokens_by_layer", {}
+                    )
+                    or {}
+                ),
                 "queue_depth": int(queue_penalty.get("queue_depth", 0) or 0),
                 "queue_pressure": float(
                     queue_penalty.get("queue_pressure", 0.0) or 0.0
@@ -746,6 +1098,7 @@ def build_candidate_component_costs(
                         "route_histogram_kind", "unavailable"
                     )
                 ),
+                **placement_marker,
             }
     return rows
 
@@ -862,6 +1215,7 @@ def plan_low_cost_migration(
         expert_dispatch = estimate_expert_dispatch_cost(
             source, target, planner_config
         )
+        placement_marker = target_placement_marker(target)
         kv_migration = estimate_kv_migration_cost(
             source,
             target,
@@ -910,6 +1264,134 @@ def plan_low_cost_migration(
                 expert_dispatch_cost=float(
                     expert_dispatch.get("cost", 0.0) or 0.0
                 ),
+                moe_dispatch_observation_available=bool(
+                    expert_dispatch.get(
+                        "dispatch_observation_available", False
+                    )
+                ),
+                moe_routed_tokens=int(
+                    expert_dispatch.get("routed_tokens", 0) or 0
+                ),
+                moe_local_routed_tokens=int(
+                    expert_dispatch.get("local_routed_tokens", 0) or 0
+                ),
+                moe_remote_routed_tokens=int(
+                    expert_dispatch.get("remote_routed_tokens", 0) or 0
+                ),
+                moe_local_routing_ratio=float(
+                    expert_dispatch.get("local_routing_ratio", 0.0) or 0.0
+                ),
+                moe_remote_routing_ratio=float(
+                    expert_dispatch.get("remote_routing_ratio", 0.0) or 0.0
+                ),
+                moe_local_routed_tokens_by_expert=dict(
+                    expert_dispatch.get(
+                        "local_routed_tokens_by_expert", {}
+                    )
+                    or {}
+                ),
+                moe_remote_routed_tokens_by_expert=dict(
+                    expert_dispatch.get(
+                        "remote_routed_tokens_by_expert", {}
+                    )
+                    or {}
+                ),
+                moe_local_routed_tokens_by_layer=dict(
+                    expert_dispatch.get(
+                        "local_routed_tokens_by_layer", {}
+                    )
+                    or {}
+                ),
+                moe_remote_routed_tokens_by_layer=dict(
+                    expert_dispatch.get(
+                        "remote_routed_tokens_by_layer", {}
+                    )
+                    or {}
+                ),
+                moe_locality_definition=str(
+                    expert_dispatch.get(
+                        "locality_definition", MOE_LOCALITY_DEFINITION
+                    )
+                    or MOE_LOCALITY_DEFINITION
+                ),
+                moe_locality_granularity=str(
+                    expert_dispatch.get(
+                        "locality_granularity", MOE_LOCALITY_GRANULARITY
+                    )
+                    or MOE_LOCALITY_GRANULARITY
+                ),
+                moe_remote_routing_definition=str(
+                    expert_dispatch.get(
+                        "remote_routing_definition",
+                        MOE_REMOTE_ROUTING_DEFINITION,
+                    )
+                    or MOE_REMOTE_ROUTING_DEFINITION
+                ),
+                moe_rank_locality_available=bool(
+                    expert_dispatch.get("rank_locality_available", False)
+                ),
+                moe_physical_dispatch_traffic_available=bool(
+                    expert_dispatch.get(
+                        "physical_dispatch_traffic_available", False
+                    )
+                ),
+                target_placement_epoch=placement_marker[
+                    "target_placement_epoch"
+                ],
+                target_placement_version=placement_marker[
+                    "target_placement_version"
+                ],
+                target_expert_placement_epoch=placement_marker[
+                    "target_expert_placement_epoch"
+                ],
+                target_expert_placement_fingerprint=placement_marker[
+                    "target_expert_placement_fingerprint"
+                ],
+                target_expert_placement_plan_fingerprint=placement_marker[
+                    "target_expert_placement_plan_fingerprint"
+                ],
+                target_expert_placement_snapshot_fingerprint=placement_marker[
+                    "target_expert_placement_snapshot_fingerprint"
+                ],
+                target_expert_placement_contract_available=placement_marker[
+                    "target_expert_placement_contract_available"
+                ],
+                target_expert_placement_plan_applied=placement_marker[
+                    "target_expert_placement_plan_applied"
+                ],
+                target_expert_placement_plan_verified=placement_marker[
+                    "target_expert_placement_plan_verified"
+                ],
+                target_expert_placement_contract_reason=placement_marker[
+                    "target_expert_placement_contract_reason"
+                ],
+                target_expert_placement_apply_hook_available=placement_marker[
+                    "target_expert_placement_apply_hook_available"
+                ],
+                target_expert_placement_apply_attempted=placement_marker[
+                    "target_expert_placement_apply_attempted"
+                ],
+                target_expert_placement_apply_success=placement_marker[
+                    "target_expert_placement_apply_success"
+                ],
+                target_expert_placement_apply_reason=placement_marker[
+                    "target_expert_placement_apply_reason"
+                ],
+                target_expert_placement_verify_hook_available=placement_marker[
+                    "target_expert_placement_verify_hook_available"
+                ],
+                target_expert_placement_verify_attempted=placement_marker[
+                    "target_expert_placement_verify_attempted"
+                ],
+                target_expert_placement_verify_success=placement_marker[
+                    "target_expert_placement_verify_success"
+                ],
+                target_expert_placement_verify_reason=placement_marker[
+                    "target_expert_placement_verify_reason"
+                ],
+                target_placement_source=placement_marker[
+                    "target_placement_source"
+                ],
                 queue_depth=int(queue_penalty.get("queue_depth", 0) or 0),
                 queue_pressure=float(
                     queue_penalty.get("queue_pressure", 0.0) or 0.0
@@ -943,6 +1425,44 @@ def plan_low_cost_migration(
     )
     total_estimated_remote_routed_tokens = sum(
         plan.estimated_remote_routed_tokens for plan in plans
+    )
+    total_moe_routed_tokens = sum(
+        plan.moe_routed_tokens for plan in plans
+    )
+    total_moe_local_routed_tokens = sum(
+        plan.moe_local_routed_tokens for plan in plans
+    )
+    total_moe_remote_routed_tokens = sum(
+        plan.moe_remote_routed_tokens for plan in plans
+    )
+    moe_remote_ratios = [
+        plan.moe_remote_routing_ratio
+        for plan in plans
+        if plan.moe_dispatch_observation_available
+    ]
+    locality_definitions = sorted(
+        {
+            plan.moe_locality_definition
+            for plan in plans
+            if plan.moe_locality_definition
+            and plan.moe_locality_definition != "unavailable"
+        }
+    )
+    locality_granularities = sorted(
+        {
+            plan.moe_locality_granularity
+            for plan in plans
+            if plan.moe_locality_granularity
+            and plan.moe_locality_granularity != "unavailable"
+        }
+    )
+    remote_routing_definitions = sorted(
+        {
+            plan.moe_remote_routing_definition
+            for plan in plans
+            if plan.moe_remote_routing_definition
+            and plan.moe_remote_routing_definition != "unavailable"
+        }
     )
     locality_ratios = [
         plan.hot_expert_locality_ratio
@@ -1007,6 +1527,34 @@ def plan_low_cost_migration(
             total_estimated_remote_routed_tokens
         ),
         total_expert_dispatch_cost=float(total_expert_dispatch_cost),
+        moe_dispatch_observation_available_count=sum(
+            1 for plan in plans if plan.moe_dispatch_observation_available
+        ),
+        total_moe_routed_tokens=total_moe_routed_tokens,
+        total_moe_local_routed_tokens=total_moe_local_routed_tokens,
+        total_moe_remote_routed_tokens=total_moe_remote_routed_tokens,
+        avg_moe_remote_routing_ratio=(
+            sum(moe_remote_ratios) / len(moe_remote_ratios)
+            if moe_remote_ratios
+            else 0.0
+        ),
+        moe_locality_definition=(
+            ",".join(locality_definitions) or "unavailable"
+        ),
+        moe_locality_granularity=(
+            ",".join(locality_granularities) or "unavailable"
+        ),
+        moe_remote_routing_definition=(
+            ",".join(remote_routing_definitions) or "unavailable"
+        ),
+        moe_rank_locality_available_count=sum(
+            1 for plan in plans if plan.moe_rank_locality_available
+        ),
+        moe_physical_dispatch_traffic_available_count=sum(
+            1
+            for plan in plans
+            if plan.moe_physical_dispatch_traffic_available
+        ),
         total_queue_penalty_cost=float(total_queue_penalty_cost),
         avg_queue_pressure=(
             sum(queue_pressures) / len(queue_pressures)

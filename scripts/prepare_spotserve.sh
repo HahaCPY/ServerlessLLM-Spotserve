@@ -65,6 +65,9 @@ Environment overrides:
   SPOTSERVE_REQUIRE_MOE_ROUTE_INSTRUMENTATION
                             When set to 1, require patched vLLM MoE routing
                             hooks during vLLM deploy checks. Default: 0.
+  SPOTSERVE_REQUIRE_EXPERT_PLACEMENT_RUNTIME_HOOKS
+                            When set to 1, require patched vLLM expert
+                            placement apply/verify hooks. Default: 0.
   SPOTSERVE_REPARALLELIZATION_MODEL_PATH
                             vLLM model path/id used by V6 reparallelization.
                             Default: /models/vllm/vllm-dense-baseline
@@ -419,6 +422,7 @@ if [[ "$DEPLOY_SET" == "reparallelization" || "$DEPLOY_SET" == "reparallelizatio
   if ! podman exec -i "$WORKER_CONTAINER" "$WORKER_PYTHON" - \
       "$DEPLOY_SET" \
       "${SPOTSERVE_REQUIRE_MOE_ROUTE_INSTRUMENTATION:-0}" \
+      "${SPOTSERVE_REQUIRE_EXPERT_PLACEMENT_RUNTIME_HOOKS:-0}" \
       >"$VLLM_RUNTIME_LOG" 2>&1 <<'PY'
 import inspect
 import sys
@@ -428,6 +432,7 @@ from vllm import AsyncLLMEngine
 
 deploy_set = sys.argv[1]
 require_moe_route_instrumentation = sys.argv[2] == "1"
+require_expert_placement_hooks = sys.argv[3] == "1"
 required_hooks = ()
 if deploy_set == "context-migration-performance":
     required_hooks = (
@@ -450,6 +455,12 @@ if require_moe_route_instrumentation:
         "get_request_moe_metadata",
         "get_moe_runtime_metadata",
     )
+if require_expert_placement_hooks:
+    required_hooks = (
+        *required_hooks,
+        "apply_expert_placement_plan",
+        "verify_expert_placement_plan",
+    )
 missing = [name for name in required_hooks if not hasattr(AsyncLLMEngine, name)]
 try:
     nixl_version = version("nixl")
@@ -470,7 +481,8 @@ PY
     exit 1
   fi
   cat "$VLLM_RUNTIME_LOG"
-  if [[ "${SPOTSERVE_REQUIRE_MOE_ROUTE_INSTRUMENTATION:-0}" == "1" ]]; then
+  if [[ "${SPOTSERVE_REQUIRE_MOE_ROUTE_INSTRUMENTATION:-0}" == "1" ||
+        "${SPOTSERVE_REQUIRE_EXPERT_PLACEMENT_RUNTIME_HOOKS:-0}" == "1" ]]; then
     VLLM_PATH="$(
       podman exec "$WORKER_CONTAINER" "$WORKER_PYTHON" -c \
         'import os, vllm; print(os.path.dirname(os.path.abspath(vllm.__file__)))'
@@ -505,14 +517,30 @@ PY
       "worker_base.get_request_moe_metadata" \
       "$VLLM_PATH/v1/worker/worker_base.py" \
       "def get_request_moe_metadata"
+    check_moe_marker \
+      "async_llm.apply_expert_placement_plan" \
+      "$VLLM_PATH/v1/engine/async_llm.py" \
+      "def apply_expert_placement_plan"
+    check_moe_marker \
+      "async_llm.verify_expert_placement_plan" \
+      "$VLLM_PATH/v1/engine/async_llm.py" \
+      "def verify_expert_placement_plan"
+    check_moe_marker \
+      "worker_base.apply_expert_placement_plan" \
+      "$VLLM_PATH/v1/worker/worker_base.py" \
+      "def apply_expert_placement_plan"
+    check_moe_marker \
+      "worker_base.verify_expert_placement_plan" \
+      "$VLLM_PATH/v1/worker/worker_base.py" \
+      "def verify_expert_placement_plan"
     if ! podman exec "$WORKER_CONTAINER" "$WORKER_PYTHON" -m py_compile \
         "$VLLM_PATH/spotserve_moe.py"; then
       MISSING_MOE_MARKERS+=("vllm.spotserve_moe.py_compile")
     fi
-    printf 'MoE route instrumentation markers: missing=%s\n' \
+    printf 'MoE/placement runtime patch markers: missing=%s\n' \
       "${MISSING_MOE_MARKERS[*]:-none}"
     if [[ "${#MISSING_MOE_MARKERS[@]}" -gt 0 ]]; then
-      echo "Missing patched vLLM MoE route markers: ${MISSING_MOE_MARKERS[*]}" >&2
+      echo "Missing patched vLLM MoE/placement markers: ${MISSING_MOE_MARKERS[*]}" >&2
       exit 1
     fi
   fi
@@ -726,6 +754,7 @@ workdir = Path(sys.argv[1])
 model_path = sys.argv[2]
 load_format = sys.argv[3]
 for relative_path in (
+    "examples/spotserve/config-vllm-reparallelization-baseline-performance.json",
     "examples/spotserve/config-vllm-reparallelization-applied-performance.json",
     "examples/spotserve/config-vllm-reparallelization-applied-multi-worker-performance.json",
     "examples/spotserve/config-vllm-reparallelization-baseline-multi-worker-performance.json",
@@ -868,7 +897,7 @@ if [[ "$SKIP_DEPLOY" -eq 0 ]]; then
     "examples/spotserve/config-vllm-reparallelization-gpu-smoke.json"
   )
   REPARALLELIZATION_PERFORMANCE_CONFIGS=(
-    "examples/spotserve/config-vllm-reparallelization-baseline-gpu-smoke.json"
+    "examples/spotserve/config-vllm-reparallelization-baseline-performance.json"
     "examples/spotserve/config-vllm-reparallelization-applied-performance.json"
   )
   CONTEXT_MIGRATION_PERFORMANCE_CONFIGS=(
@@ -907,7 +936,7 @@ if [[ "$SKIP_DEPLOY" -eq 0 ]]; then
     DEPLOY_CONFIGS+=("${REPARALLELIZATION_CONFIGS[@]}")
   fi
   if [[ "$DEPLOY_SET" == "reparallelization-performance" || "$DEPLOY_SET" == "all" ]]; then
-    DEPLOY_CONFIGS+=("${REPARALLELIZATION_PERFORMANCE_CONFIGS[@]}")
+    log "Reparallelization performance configs will be deployed one run at a time by the benchmark runner"
   fi
   if [[ "$DEPLOY_SET" == "reparallelization-multi-worker-performance" || "$DEPLOY_SET" == "all" ]]; then
     log "Reparallelization multi-worker performance configs will be deployed one run at a time by the benchmark runner"

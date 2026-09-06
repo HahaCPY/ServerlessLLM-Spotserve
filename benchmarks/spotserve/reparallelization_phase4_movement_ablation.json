@@ -1,0 +1,144 @@
+{
+  "model": "reparallelization-phase4-movement-ablation",
+  "description": "Synthetic Phase 4F ablation for logical expert placement movement diff and expert movement penalty.",
+  "worker_nodes": {
+    "node-a": {
+      "ray_node_id": "node-a",
+      "address": "synthetic-node-a",
+      "free_gpu": 1,
+      "total_gpu": 1,
+      "state": "ready",
+      "_spotserve_synthetic": true
+    },
+    "node-b": {
+      "ray_node_id": "node-b",
+      "address": "synthetic-node-b",
+      "free_gpu": 1,
+      "total_gpu": 1,
+      "state": "ready",
+      "_spotserve_synthetic": true
+    }
+  },
+  "model_config": {
+    "model": "reparallelization-phase4-movement-ablation",
+    "backend": "vllm",
+    "num_gpus": 2,
+    "runtime_metadata": {
+      "placement_epoch": 1,
+      "placement_source": "phase4_synthetic_current_snapshot",
+      "expert_placement_snapshot": {
+        "layer:0/expert:0": {
+          "layer_id": 0,
+          "expert_id": 0,
+          "rank_id": "ep-rank-0",
+          "node_id": "node-a",
+          "gpu_id": "0",
+          "weight_size_bytes": 1048576
+        },
+        "layer:0/expert:1": {
+          "layer_id": 0,
+          "expert_id": 1,
+          "rank_id": "ep-rank-0",
+          "node_id": "node-a",
+          "gpu_id": "0",
+          "weight_size_bytes": 1048576
+        },
+        "layer:0/expert:2": {
+          "layer_id": 0,
+          "expert_id": 2,
+          "rank_id": "ep-rank-0",
+          "node_id": "node-a",
+          "gpu_id": "0",
+          "weight_size_bytes": 1048576
+        },
+        "layer:0/expert:3": {
+          "layer_id": 0,
+          "expert_id": 3,
+          "rank_id": "ep-rank-0",
+          "node_id": "node-a",
+          "gpu_id": "0",
+          "weight_size_bytes": 1048576
+        }
+      }
+    },
+    "backend_config": {
+      "enable_expert_parallel": true,
+      "model_config": {
+        "num_hidden_layers": 1,
+        "num_experts": 4
+      }
+    },
+    "backend_capability": {
+      "supported_configs": [
+        {
+          "tensor_parallel_size": 1,
+          "pipeline_parallel_size": 1,
+          "data_parallel_size": 1,
+          "replica_count": 1,
+          "enable_expert_parallel": false,
+          "num_gpus": 1,
+          "reason": "stationary_single_rank"
+        },
+        {
+          "tensor_parallel_size": 2,
+          "pipeline_parallel_size": 1,
+          "data_parallel_size": 1,
+          "replica_count": 1,
+          "enable_expert_parallel": true,
+          "num_gpus": 2,
+          "reason": "split_across_two_ep_ranks"
+        }
+      ]
+    }
+  },
+  "planner_config": {
+    "enable_workload_cost_model": true,
+    "target_replica_gpus": 2,
+    "throughput_score_weight": 0,
+    "latency_penalty_weight": 0,
+    "load_time_penalty_weight": 0,
+    "migration_cost_penalty_weight": 0,
+    "queue_penalty_weight": 0,
+    "replan_window_penalty_weight": 0,
+    "expert_weight_movement_cost_ms_per_expert": 10,
+    "latency_estimate_ms": 1000,
+    "batch_size": 1
+  },
+  "runs": [
+    {
+      "name": "phase4-movement-unpenalized",
+      "description": "Capacity/base score is active and expert movement penalty is disabled, so the planner should select the two-rank EP placement and report a non-zero movement diff.",
+      "planner_config": {
+        "base_score_weight": 1,
+        "expert_weight_movement_penalty_weight": 0
+      },
+      "expected_selected_reason": "split_across_two_ep_ranks",
+      "expected_selected_total_gpus": 2,
+      "expected_moved_experts": 2,
+      "expected_moved_weight_bytes": 2097152,
+      "expected_movement_cost_ms": 20,
+      "expected_movement_observation": true
+    },
+    {
+      "name": "phase4-movement-penalized",
+      "description": "Base score is disabled and expert movement penalty is active, so the planner should prefer the stationary one-rank placement.",
+      "planner_config": {
+        "base_score_weight": 0,
+        "expert_weight_movement_penalty_weight": 1
+      },
+      "expected_selected_reason": "stationary_single_rank",
+      "expected_selected_total_gpus": 1,
+      "expected_moved_experts": 0,
+      "expected_moved_weight_bytes": 0,
+      "expected_movement_cost_ms": 0,
+      "expected_movement_observation": true
+    }
+  ],
+  "comparisons": [
+    {
+      "name": "movement-penalty-vs-unpenalized",
+      "baseline": "phase4-movement-unpenalized",
+      "candidate": "phase4-movement-penalized"
+    }
+  ]
+}

@@ -211,6 +211,23 @@ def test_expert_locality_cost_prefers_target_with_hot_experts():
             "expert_placement_snapshot": {
                 "layer:0/expert:1": {"rank_id": "rank-1"}
             },
+            "placement_epoch": 7,
+            "expert_placement_fingerprint": "placement-a",
+            "expert_placement_plan_fingerprint": "plan-a",
+            "expert_placement_snapshot_fingerprint": "snapshot-a",
+            "expert_placement_contract_available": True,
+            "expert_placement_plan_applied": False,
+            "expert_placement_plan_verified": False,
+            "expert_placement_contract_reason": "runtime_not_applied",
+            "expert_placement_apply_hook_available": False,
+            "expert_placement_apply_attempted": False,
+            "expert_placement_apply_success": False,
+            "expert_placement_apply_reason": "runtime_apply_hook_unavailable",
+            "expert_placement_verify_hook_available": False,
+            "expert_placement_verify_attempted": False,
+            "expert_placement_verify_success": False,
+            "expert_placement_verify_reason": "runtime_verify_hook_unavailable",
+            "placement_source": "runtime_fixture",
         },
     )
 
@@ -232,6 +249,70 @@ def test_expert_locality_cost_prefers_target_with_hot_experts():
     assert decision.plans[0].hot_expert_locality_ratio == 1.0
     assert decision.plans[0].estimated_remote_routing_ratio == 0.0
     assert decision.plans[0].estimated_remote_routed_tokens == 0
+    assert decision.plans[0].moe_dispatch_observation_available is True
+    assert decision.plans[0].moe_routed_tokens == 10
+    assert decision.plans[0].moe_local_routed_tokens == 10
+    assert decision.plans[0].moe_remote_routed_tokens == 0
+    assert decision.plans[0].moe_remote_routing_ratio == 0.0
+    assert decision.plans[0].moe_locality_definition == (
+        "target_placement_coverage"
+    )
+    assert decision.plans[0].moe_locality_granularity == (
+        "target_instance_or_deployment"
+    )
+    assert decision.plans[0].moe_remote_routing_definition == (
+        "missing_from_target_placement_snapshot"
+    )
+    assert decision.plans[0].moe_rank_locality_available is False
+    assert decision.plans[0].moe_physical_dispatch_traffic_available is False
+    assert decision.plans[0].target_placement_epoch == 7
+    assert decision.plans[0].target_expert_placement_fingerprint == (
+        "placement-a"
+    )
+    assert decision.plans[0].target_expert_placement_plan_fingerprint == (
+        "plan-a"
+    )
+    assert decision.plans[0].target_expert_placement_snapshot_fingerprint == (
+        "snapshot-a"
+    )
+    assert (
+        decision.plans[0].target_expert_placement_contract_available is True
+    )
+    assert decision.plans[0].target_expert_placement_plan_applied is False
+    assert decision.plans[0].target_expert_placement_plan_verified is False
+    assert decision.plans[0].target_expert_placement_contract_reason == (
+        "runtime_not_applied"
+    )
+    assert (
+        decision.plans[0].target_expert_placement_apply_hook_available is False
+    )
+    assert decision.plans[0].target_expert_placement_apply_attempted is False
+    assert decision.plans[0].target_expert_placement_apply_success is False
+    assert decision.plans[0].target_expert_placement_apply_reason == (
+        "runtime_apply_hook_unavailable"
+    )
+    assert (
+        decision.plans[0].target_expert_placement_verify_hook_available is False
+    )
+    assert decision.plans[0].target_expert_placement_verify_attempted is False
+    assert decision.plans[0].target_expert_placement_verify_success is False
+    assert decision.plans[0].target_expert_placement_verify_reason == (
+        "runtime_verify_hook_unavailable"
+    )
+    assert decision.plans[0].target_placement_source == "runtime_fixture"
+    assert decision.total_moe_routed_tokens == 10
+    assert decision.total_moe_local_routed_tokens == 10
+    assert decision.total_moe_remote_routed_tokens == 0
+    assert decision.avg_moe_remote_routing_ratio == 0.0
+    assert decision.moe_locality_definition == "target_placement_coverage"
+    assert decision.moe_locality_granularity == (
+        "target_instance_or_deployment"
+    )
+    assert decision.moe_remote_routing_definition == (
+        "missing_from_target_placement_snapshot"
+    )
+    assert decision.moe_rank_locality_available_count == 0
+    assert decision.moe_physical_dispatch_traffic_available_count == 0
     assert decision.total_expert_dispatch_cost == 0.0
     assert decision.avg_hot_expert_locality_ratio == 1.0
     assert decision.avg_estimated_remote_routing_ratio == 0.0
@@ -301,12 +382,12 @@ def test_expert_dispatch_cost_uses_routing_weighted_locality():
             instance_id="old-a",
             node_id="node-0",
             metadata={
-            "moe_route_histogram_available": True,
-            "moe_route_histogram_source": "runtime_hook",
-            "moe_route_histogram_kind": "runtime_observed_topk",
-            "per_request_expert_route_histogram": {
-                "req-weighted": {
-                    "layer:0/expert:1": 6,
+                "moe_route_histogram_available": True,
+                "moe_route_histogram_source": "runtime_hook",
+                "moe_route_histogram_kind": "runtime_observed_topk",
+                "per_request_expert_route_histogram": {
+                    "req-weighted": {
+                        "layer:0/expert:1": 6,
                         "layer:0/expert:2": 4,
                     }
                 },
@@ -332,6 +413,20 @@ def test_expert_dispatch_cost_uses_routing_weighted_locality():
     assert result["locality_ratio"] == 0.6
     assert result["estimated_remote_routing_ratio"] == 0.4
     assert result["estimated_remote_routed_tokens"] == 4
+    assert result["dispatch_observation_available"] is True
+    assert result["routed_tokens"] == 10
+    assert result["local_routed_tokens"] == 6
+    assert result["remote_routed_tokens"] == 4
+    assert result["local_routing_ratio"] == 0.6
+    assert result["remote_routing_ratio"] == 0.4
+    assert result["local_routed_tokens_by_expert"] == {
+        "layer:0/expert:1": 6
+    }
+    assert result["remote_routed_tokens_by_expert"] == {
+        "layer:0/expert:2": 4
+    }
+    assert result["local_routed_tokens_by_layer"] == {"layer:0": 6}
+    assert result["remote_routed_tokens_by_layer"] == {"layer:0": 4}
     assert result["cost"] == 0.8
     assert result["route_histogram_source"] == "runtime_hook"
     assert result["route_histogram_kind"] == "runtime_observed_topk"
@@ -481,6 +576,77 @@ def test_context_migration_metric_contains_summary_fields():
     assert event["moe_estimated_remote_routing_ratio"] == 0.0
     assert event["moe_estimated_remote_routed_tokens"] == 0
     assert event["moe_estimated_dispatch_cost"] == 0.0
+    assert event["moe_dispatch_observation_available_count"] == 0
+    assert event["moe_routed_tokens"] == 0
+    assert event["moe_local_routed_tokens"] == 0
+    assert event["moe_remote_routed_tokens"] == 0
+    assert event["moe_remote_routing_ratio"] == 0.0
+    assert event["moe_locality_definition"] == "unavailable"
+    assert event["moe_locality_granularity"] == "unavailable"
+    assert event["moe_remote_routing_definition"] == "unavailable"
+    assert event["moe_rank_locality_available_count"] == 0
+    assert event["moe_physical_dispatch_traffic_available_count"] == 0
+    assert event["selected_plan_target_placement_epochs"] == []
+    assert event["selected_plan_target_expert_placement_fingerprints"] == []
+    assert event[
+        "selected_plan_target_expert_placement_plan_fingerprints"
+    ] == []
+    assert event[
+        "selected_plan_target_expert_placement_snapshot_fingerprints"
+    ] == []
+    assert (
+        event[
+            "selected_plan_target_expert_placement_contract_available_count"
+        ]
+        == 0
+    )
+    assert event[
+        "selected_plan_target_expert_placement_plan_applied_count"
+    ] == 0
+    assert event[
+        "selected_plan_target_expert_placement_plan_verified_count"
+    ] == 0
+    assert event[
+        "selected_plan_target_expert_placement_contract_reasons"
+    ] == []
+    assert (
+        event[
+            "selected_plan_target_expert_placement_apply_hook_available_count"
+        ]
+        == 0
+    )
+    assert event[
+        "selected_plan_target_expert_placement_apply_attempted_count"
+    ] == 0
+    assert event[
+        "selected_plan_target_expert_placement_apply_success_count"
+    ] == 0
+    assert event[
+        "selected_plan_target_expert_placement_apply_reasons"
+    ] == []
+    assert (
+        event[
+            "selected_plan_target_expert_placement_verify_hook_available_count"
+        ]
+        == 0
+    )
+    assert event[
+        "selected_plan_target_expert_placement_verify_attempted_count"
+    ] == 0
+    assert event[
+        "selected_plan_target_expert_placement_verify_success_count"
+    ] == 0
+    assert event[
+        "selected_plan_target_expert_placement_verify_reasons"
+    ] == []
+    assert event["placement_handshake_attempts"] == 0
+    assert event["placement_handshake_successes"] == 0
+    assert event["placement_handshake_failures"] == 0
+    assert event["placement_handshake_stale"] == 0
+    assert event["moe_local_routed_tokens_by_layer"] == {}
+    assert event["moe_remote_routed_tokens_by_layer"] == {}
+    assert event["moe_local_routed_tokens_by_expert"] == {}
+    assert event["moe_remote_routed_tokens_by_expert"] == {}
     assert event["context_source_count"] == 1
     assert event["context_target_count"] == 0
     assert event["candidate_component_costs_enabled"] is False

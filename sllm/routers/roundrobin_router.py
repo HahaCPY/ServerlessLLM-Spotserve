@@ -18,6 +18,7 @@
 import asyncio
 import copy
 import inspect
+import json
 import logging
 import os
 import time
@@ -47,6 +48,7 @@ from sllm.spot.context_migration import (
 )
 from sllm.spot.recovery_policy import RecoveryPolicy, normalize_policy
 from sllm.spot.reparallelization import (
+    PREEMPTING,
     READY,
     ParallelPlan,
     apply_spot_event_to_worker_nodes,
@@ -750,6 +752,51 @@ class RoundRobinRouter(SllmRouter):
                 node_info["state"] = instance.state.value
         return worker_nodes
 
+    async def _reparallelization_runtime_metadata_snapshot(
+        self,
+        matches: List[InstanceHandle],
+    ) -> Dict[str, Any]:
+        timeout_s = max(
+            0.1,
+            float(
+                self.reparallelization_config.get(
+                    "runtime_metadata_timeout_s", 5.0
+                )
+                or 5.0
+            ),
+        )
+        seen = set()
+        instances = list(matches)
+        async with self.instance_management_lock:
+            instances.extend(self.ready_inference_instances.values())
+            instances.extend(self.starting_inference_instances.values())
+        for instance in instances:
+            if instance.instance_id in seen:
+                continue
+            seen.add(instance.instance_id)
+            if instance.backend_instance is None:
+                continue
+            try:
+                metadata = await asyncio.wait_for(
+                    self._call_backend_method(
+                        instance.backend_instance,
+                        "get_runtime_metadata",
+                        instance_id=instance.instance_id,
+                        node_id=instance.node_id or "",
+                    ),
+                    timeout=timeout_s,
+                )
+            except Exception:
+                logger.info(
+                    "Could not collect runtime metadata for replan from %s",
+                    instance.instance_id,
+                    exc_info=True,
+                )
+                continue
+            if isinstance(metadata, Mapping) and metadata:
+                return dict(metadata)
+        return {}
+
     async def _replan_after_spot_event(
         self,
         event: str,
@@ -778,6 +825,30 @@ class RoundRobinRouter(SllmRouter):
                 target_node_id,
                 node_info=normalized_updates.get(target_node_id),
             )
+        if (
+            event == "preempt"
+            and bool(
+                self.reparallelization_config.get(
+                    "allow_preempting_target_recreate", False
+                )
+            )
+            and bool(
+                self.reparallelization_config.get(
+                    "allow_stop_before_recreate", False
+                )
+            )
+        ):
+            # Single-worker benchmarks cannot move to another failure domain.
+            # When explicitly requested, model this as stop-before-create on
+            # the same worker node so the executable vLLM adapter targets a
+            # real scheduler node instead of an unreachable synthetic target.
+            for target_node_id in target_node_ids:
+                node = worker_nodes.get(str(target_node_id))
+                if node is None or node.get("state") != PREEMPTING:
+                    continue
+                node["state"] = READY
+                node["preempting_target_recreate"] = True
+                node["preempting_target_recreate_original_state"] = PREEMPTING
         if event == "add" and node_id is not None and not target_node_ids:
             worker_nodes = apply_spot_event_to_worker_nodes(
                 worker_nodes,
@@ -786,6 +857,14 @@ class RoundRobinRouter(SllmRouter):
                 node_info=normalized_updates.get(node_id),
             )
         self.reparallelization_worker_nodes = worker_nodes
+        runtime_metadata = (
+            await self._reparallelization_runtime_metadata_snapshot(matches)
+        )
+        planner_backend_config = dict(self.backend_config)
+        if runtime_metadata:
+            planner_backend_config["runtime_metadata"] = dict(
+                runtime_metadata
+            )
 
         model_config = {
             "model": self.model_name,
@@ -796,7 +875,8 @@ class RoundRobinRouter(SllmRouter):
             # the runtime-neutral candidate generator, which intentionally
             # uses runtime DP=1 and EP disabled, so it cannot select an
             # expert-parallel shape for a MoE model.
-            "backend_config": dict(self.backend_config),
+            "backend_config": planner_backend_config,
+            "runtime_metadata": runtime_metadata,
         }
         decision = plan_dynamic_reparallelization(
             model_name=self.model_name,
@@ -839,10 +919,18 @@ class RoundRobinRouter(SllmRouter):
                     deployment = await self.reparallelization_executor.apply(
                         plan
                     )
+                    expert_placement_runtime = (
+                        await self._deployment_expert_placement_runtime_status(
+                            deployment
+                        )
+                    )
                     decision["execution"] = {
                         "status": "applied",
                         "instance_ids": sorted(deployment.instances),
                         "parallel_plan": plan.to_dict(),
+                        "expert_placement_runtime": (
+                            expert_placement_runtime
+                        ),
                         "request_migration": getattr(
                             self.vllm_deployment_adapter,
                             "last_request_migration",
@@ -885,10 +973,36 @@ class RoundRobinRouter(SllmRouter):
         return decision
 
     @staticmethod
+    def _parallel_plan_placement_fingerprint(plan: ParallelPlan) -> str:
+        expert_placement_plan = plan.expert_placement_plan
+        if not isinstance(expert_placement_plan, Mapping):
+            return ""
+        fingerprint = str(
+            expert_placement_plan.get("placement_fingerprint") or ""
+        )
+        if fingerprint:
+            return fingerprint
+        return "unfingerprinted:" + json.dumps(
+            expert_placement_plan,
+            sort_keys=True,
+            default=str,
+        )
+
+    @classmethod
     def _parallel_plans_match(
+        cls,
         left: ParallelPlan, right: ParallelPlan
     ) -> bool:
         """Compare deployment shape and placement, ignoring replan reason."""
+        left_placement_fingerprint = cls._parallel_plan_placement_fingerprint(
+            left
+        )
+        right_placement_fingerprint = cls._parallel_plan_placement_fingerprint(
+            right
+        )
+        if left_placement_fingerprint or right_placement_fingerprint:
+            if left_placement_fingerprint != right_placement_fingerprint:
+                return False
         return (
             left.model_name == right.model_name
             and left.backend == right.backend
@@ -1323,6 +1437,29 @@ class RoundRobinRouter(SllmRouter):
                 "placement_epoch",
                 "placement_version",
                 "placement_source",
+                "expert_placement_epoch",
+                "expert_placement_fingerprint",
+                "expert_placement_plan_fingerprint",
+                "expert_placement_snapshot_fingerprint",
+                "expert_placement_contract_available",
+                "expert_placement_contract_bound",
+                "expert_placement_contract_source",
+                "expert_placement_contract_epoch",
+                "expert_placement_contract_fingerprint",
+                "expert_placement_contract_snapshot_fingerprint",
+                "expert_placement_contract_snapshot_match",
+                "expert_placement_plan_applied",
+                "expert_placement_plan_verified",
+                "expert_placement_contract_reason",
+                "expert_placement_apply_hook_available",
+                "expert_placement_apply_attempted",
+                "expert_placement_apply_success",
+                "expert_placement_apply_duration_ms",
+                "expert_placement_apply_reason",
+                "expert_placement_verify_hook_available",
+                "expert_placement_verify_attempted",
+                "expert_placement_verify_success",
+                "expert_placement_verify_reason",
                 "moe_route_histogram_available",
                 "moe_route_histogram_source",
                 "moe_route_histogram_kind",
@@ -1334,6 +1471,199 @@ class RoundRobinRouter(SllmRouter):
                 "sllm_replica_count",
             }
         }
+
+    async def _deployment_expert_placement_runtime_status(
+        self,
+        deployment,
+    ) -> Dict[str, Any]:
+        metadata_rows: List[Dict[str, Any]] = []
+        for handle in getattr(deployment, "instances", {}).values():
+            metadata = await self._context_migration_target_metadata(handle)
+            if metadata:
+                metadata_rows.append(metadata)
+
+        def count_truthy(key: str) -> int:
+            return sum(1 for row in metadata_rows if row.get(key))
+
+        def compact_values(key: str) -> str:
+            values = sorted(
+                {
+                    str(row.get(key))
+                    for row in metadata_rows
+                    if row.get(key) not in (None, "")
+                }
+            )
+            return ",".join(values)
+
+        return {
+            "metadata_count": len(metadata_rows),
+            "apply_hook_available_count": count_truthy(
+                "expert_placement_apply_hook_available"
+            ),
+            "apply_attempted_count": count_truthy(
+                "expert_placement_apply_attempted"
+            ),
+            "apply_success_count": count_truthy(
+                "expert_placement_apply_success"
+            ),
+            "apply_reasons": compact_values(
+                "expert_placement_apply_reason"
+            ),
+            "verify_hook_available_count": count_truthy(
+                "expert_placement_verify_hook_available"
+            ),
+            "verify_attempted_count": count_truthy(
+                "expert_placement_verify_attempted"
+            ),
+            "verify_success_count": count_truthy(
+                "expert_placement_verify_success"
+            ),
+            "verify_reasons": compact_values(
+                "expert_placement_verify_reason"
+            ),
+            "plan_applied_count": count_truthy(
+                "expert_placement_plan_applied"
+            ),
+            "plan_verified_count": count_truthy(
+                "expert_placement_plan_verified"
+            ),
+            "contract_reasons": compact_values(
+                "expert_placement_contract_reason"
+            ),
+        }
+
+    @staticmethod
+    def _placement_marker_value(
+        payload: Mapping[str, Any],
+        *keys: str,
+    ) -> Optional[str]:
+        for key in keys:
+            value = payload.get(key)
+            if value is None:
+                continue
+            text = str(value)
+            if text:
+                return text
+        return None
+
+    @classmethod
+    def _placement_marker_from_payload(
+        cls,
+        payload: Optional[Mapping[str, Any]],
+    ) -> Dict[str, Optional[str]]:
+        payload = payload or {}
+        return {
+            "placement_epoch": cls._placement_marker_value(
+                payload,
+                "target_placement_epoch",
+                "placement_epoch",
+                "target_placement_version",
+                "placement_version",
+                "target_expert_placement_epoch",
+                "expert_placement_epoch",
+            ),
+            "expert_placement_fingerprint": cls._placement_marker_value(
+                payload,
+                "target_expert_placement_fingerprint",
+                "expert_placement_fingerprint",
+            ),
+            "placement_source": cls._placement_marker_value(
+                payload,
+                "target_placement_source",
+                "placement_source",
+            ),
+        }
+
+    @classmethod
+    def _compare_placement_markers(
+        cls,
+        expected_payload: Optional[Mapping[str, Any]],
+        current_payload: Optional[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        expected = cls._placement_marker_from_payload(expected_payload)
+        current = cls._placement_marker_from_payload(current_payload)
+        expected_epoch = expected.get("placement_epoch")
+        expected_fingerprint = expected.get("expert_placement_fingerprint")
+        if expected_epoch is None and expected_fingerprint is None:
+            return {
+                "attempted": False,
+                "verified": False,
+                "compatible": True,
+                "stale": False,
+                "reason": "expected_placement_marker_unavailable",
+                "mismatch_keys": [],
+                "expected": expected,
+                "current": current,
+            }
+
+        missing_keys = []
+        mismatch_keys = []
+        for key in ("placement_epoch", "expert_placement_fingerprint"):
+            expected_value = expected.get(key)
+            if expected_value is None:
+                continue
+            current_value = current.get(key)
+            if current_value is None:
+                missing_keys.append(key)
+            elif current_value != expected_value:
+                mismatch_keys.append(key)
+
+        if mismatch_keys or missing_keys:
+            return {
+                "attempted": True,
+                "verified": not missing_keys,
+                "compatible": False,
+                "stale": bool(mismatch_keys),
+                "reason": (
+                    "target_placement_changed"
+                    if mismatch_keys
+                    else "current_placement_marker_unavailable"
+                ),
+                "mismatch_keys": mismatch_keys,
+                "missing_keys": missing_keys,
+                "expected": expected,
+                "current": current,
+            }
+
+        return {
+            "attempted": True,
+            "verified": True,
+            "compatible": True,
+            "stale": False,
+            "reason": "stable_target_placement",
+            "mismatch_keys": [],
+            "expected": expected,
+            "current": current,
+        }
+
+    async def _verify_target_placement_handshake(
+        self,
+        expected_payload: Optional[Mapping[str, Any]],
+        target: InstanceHandle,
+        operation: str,
+    ) -> Dict[str, Any]:
+        expected = self._placement_marker_from_payload(expected_payload)
+        if (
+            expected.get("placement_epoch") is None
+            and expected.get("expert_placement_fingerprint") is None
+        ):
+            check = self._compare_placement_markers(expected_payload, {})
+        else:
+            current_metadata = await self._context_migration_target_metadata(
+                target
+            )
+            check = self._compare_placement_markers(
+                expected_payload,
+                current_metadata,
+            )
+        check.update(
+            {
+                "operation": operation,
+                "target_instance_id": target.instance_id,
+                "target_node_id": str(target.node_id or ""),
+            }
+        )
+        return check
 
     def _context_migration_planner_config(self) -> Dict[str, Any]:
         configured = self.context_migration_config.get(
@@ -1408,6 +1738,7 @@ class RoundRobinRouter(SllmRouter):
         succeeded = 0
         skipped = []
         failures = []
+        placement_handshake_checks = []
         total_tokens = 0
         for plan in decision.get("plans", []):
             source_id = plan.get("old_instance_id")
@@ -1429,6 +1760,25 @@ class RoundRobinRouter(SllmRouter):
                         "source_instance_id": source_id,
                         "target_instance_id": target_id,
                         "reason": "target_backend_unavailable",
+                    }
+                )
+                continue
+
+            placement_check = await self._verify_target_placement_handshake(
+                plan,
+                target,
+                operation="context_migration_prefix_warmup",
+            )
+            placement_handshake_checks.append(placement_check)
+            if not placement_check.get("compatible", True):
+                skipped.append(
+                    {
+                        "source_instance_id": source_id,
+                        "target_instance_id": target_id,
+                        "reason": placement_check.get(
+                            "reason", "target_placement_not_stable"
+                        ),
+                        "placement_handshake": placement_check,
                     }
                 )
                 continue
@@ -1486,6 +1836,27 @@ class RoundRobinRouter(SllmRouter):
             "succeeded": succeeded,
             "skipped": skipped,
             "failures": failures,
+            "placement_handshake_checks": placement_handshake_checks,
+            "placement_handshake_attempts": sum(
+                1
+                for check in placement_handshake_checks
+                if check.get("attempted")
+            ),
+            "placement_handshake_successes": sum(
+                1
+                for check in placement_handshake_checks
+                if check.get("attempted") and check.get("compatible")
+            ),
+            "placement_handshake_failures": sum(
+                1
+                for check in placement_handshake_checks
+                if check.get("attempted") and not check.get("compatible")
+            ),
+            "placement_handshake_stale": sum(
+                1
+                for check in placement_handshake_checks
+                if check.get("stale")
+            ),
             "warmed_tokens": total_tokens,
             "total_tokens": total_tokens,
             "reason": "resume_kv_cache_token_replay",
@@ -2034,6 +2405,60 @@ class RoundRobinRouter(SllmRouter):
             return None, None, counters, False
         counters["state_kind"] = state.state_kind
         counters["supports_state_restore"] = bool(state.supports_restore)
+
+        placement_handshake = None
+        if isinstance(target_selection, Mapping):
+            selected_candidate = target_selection.get("selected_candidate")
+            if isinstance(selected_candidate, Mapping):
+                placement_handshake = (
+                    await self._verify_target_placement_handshake(
+                        selected_candidate,
+                        target_instance,
+                        operation="stateful_recovery_restore",
+                    )
+                )
+                updated_selection = dict(target_selection)
+                updated_candidate = dict(selected_candidate)
+                updated_candidate.update(
+                    {
+                        "placement_handshake_attempted": (
+                            placement_handshake.get("attempted", False)
+                        ),
+                        "placement_handshake_verified": (
+                            placement_handshake.get("verified", False)
+                        ),
+                        "placement_handshake_compatible": (
+                            placement_handshake.get("compatible", True)
+                        ),
+                        "placement_handshake_stale": (
+                            placement_handshake.get("stale", False)
+                        ),
+                        "placement_handshake_reason": (
+                            placement_handshake.get("reason", "")
+                        ),
+                        "placement_handshake_mismatch_keys": (
+                            placement_handshake.get("mismatch_keys", [])
+                        ),
+                        "current_placement_epoch": (
+                            placement_handshake.get("current", {}).get(
+                                "placement_epoch"
+                            )
+                        ),
+                        "current_expert_placement_fingerprint": (
+                            placement_handshake.get("current", {}).get(
+                                "expert_placement_fingerprint"
+                            )
+                        ),
+                    }
+                )
+                updated_selection["selected_candidate"] = updated_candidate
+                updated_selection["placement_handshake"] = placement_handshake
+                if not placement_handshake.get("compatible", True):
+                    updated_selection["action"] = "fallback_token_replay"
+                    updated_selection["reason"] = placement_handshake.get(
+                        "reason", "target_placement_not_stable"
+                    )
+                target_selection = updated_selection
 
         planner_allows_restore = (
             target_selection is None

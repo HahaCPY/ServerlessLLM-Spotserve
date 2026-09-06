@@ -84,7 +84,23 @@ if ! grep -q "def get_request_moe_metadata" \
     "$VLLM_PATH/v1/worker/worker_base.py"; then
     MISSING_MOE_MARKERS+=("worker_base.get_request_moe_metadata")
 fi
+if ! grep -q "def apply_expert_placement_plan" \
+    "$VLLM_PATH/v1/engine/async_llm.py"; then
+    MISSING_MOE_MARKERS+=("async_llm.apply_expert_placement_plan")
+fi
+if ! grep -q "def verify_expert_placement_plan" \
+    "$VLLM_PATH/v1/engine/async_llm.py"; then
+    MISSING_MOE_MARKERS+=("async_llm.verify_expert_placement_plan")
+fi
+if ! grep -q "def apply_expert_placement_plan" \
+    "$VLLM_PATH/v1/worker/worker_base.py"; then
+    MISSING_MOE_MARKERS+=("worker_base.apply_expert_placement_plan")
+fi
+if ! grep -q "def verify_expert_placement_plan" \
+    "$VLLM_PATH/v1/worker/worker_base.py"; then
+    MISSING_MOE_MARKERS+=("worker_base.verify_expert_placement_plan")
+fi
 if [[ "${#MISSING_MOE_MARKERS[@]}" -gt 0 ]]; then
-    echo "Missing patched vLLM MoE route markers: ${MISSING_MOE_MARKERS[*]}" >&2
+    echo "Missing patched vLLM MoE/placement markers: ${MISSING_MOE_MARKERS[*]}" >&2
     exit 1
 fi

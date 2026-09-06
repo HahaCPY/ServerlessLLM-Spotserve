@@ -119,6 +119,10 @@ does not execute a selected `ParallelPlan`.
 For a V6 performance comparison, run the separate performance matrix:
 
 ```bash
+MODEL_FOLDER=/work/spotserve-models \
+SPOTSERVE_REPARALLELIZATION_MODEL_PATH=/models/Qwen2-MoE-Tiny \
+SPOTSERVE_REPARALLELIZATION_LOAD_FORMAT=auto \
+SPOTSERVE_REQUIRE_EXPERT_PLACEMENT_RUNTIME_HOOKS=1 \
 scripts/prepare_spotserve.sh --deploy-set reparallelization-performance
 
 podman exec sllm_head bash -lc '
@@ -126,7 +130,10 @@ cd /tmp/spotserve-work &&
 /opt/venvs/head/bin/python benchmarks/spotserve/run_benchmark.py \
   --config benchmarks/spotserve/benchmark_matrix_reparallelization_performance.yaml \
   --endpoint http://127.0.0.1:8343/v1/chat/completions \
-  --request-timeout 180
+  --request-timeout 180 \
+  --trace-event-timeout 600 \
+  --ray-address auto \
+  --ray-namespace sllm
 '
 ```
 
@@ -143,12 +150,27 @@ such as `phase_post_replan_latency_p95_ms`. It also writes
 `latest_comparisons.json` in the performance output directory.
 The V6 performance traces use `instance_selector=ready` so the preemption event
 targets a live router instance instead of a hardcoded synthetic node id.
+The performance matrices also set `trace_event_timeout_s=600`, and the command
+above passes the same value explicitly for manual runs. This timeout applies to
+the `/spot/event` request only. It is intentionally longer than the workload
+request timeout because a preemption event can synchronously wait for
+re-planning, actor recreation, model loading, and router metric emission. Treat
+a run as invalid for V6 re-plan claims if `trace_replay_success=0` or
+`replanning_events=0`.
 The V6 configs set `count_preempting_toward_capacity=true` so the generic
 autoscaler does not create an extra replacement actor while the preempting
 actor still owns its Ray/GPU resources; V6 replan logic owns actor recreate.
 Router shutdown also deallocates inference scheduler resources during benchmark
 cleanup, so a preempting baseline actor cannot leak GPU capacity into the next
 run.
+The single-worker applied config sets
+`allow_preempting_target_recreate=true` together with
+`allow_stop_before_recreate=true`. This is an explicit same-node recreate mode:
+the planner may select the preempted worker node as the target, the executor
+stops the old actor first, and the vLLM adapter recreates the actor on the same
+real scheduler node. This keeps the benchmark executable on a one-worker
+machine and validates the controller/apply/placement metric path, but it is not
+a cross-failure-domain relocation claim.
 The applied run enables the workload/cost-aware planner hook, so summaries also
 include `replanning_avg_execution_duration_ms`,
 `replanning_avg_selected_replan_window_cost_ms`,
@@ -156,6 +178,36 @@ include `replanning_avg_execution_duration_ms`,
 `replanning_avg_selected_migration_cost_estimate_ms`,
 `replanning_cross_node_targets`, `replanning_multi_worker_targets`, and
 `replanning_max_runtime_worker_node_count`.
+For MoE runs, V6 also emits the logical expert placement planning fields
+`replanning_expert_placement_plan_available_events`,
+`replanning_max_expert_placement_plan_shards`,
+`replanning_avg_expert_placement_plan_coverage_ratio`, and
+`replanning_expert_placement_plan_physical_migration_events`.  Phase 4E also
+adds logical movement-diff fields:
+`replanning_expert_placement_plan_movement_observation_events`,
+`replanning_max_expert_placement_plan_moved_experts`,
+`replanning_total_expert_placement_plan_moved_weight_bytes`, and
+`replanning_avg_expert_placement_plan_weight_movement_cost_ms`.  These fields
+confirm that re-parallelization produced a serializable placement plan and can
+estimate how that plan differs from the current runtime placement; they do not
+imply that expert weights were physically moved. If the head/router container
+cannot read the model `config.json`, the planner can still use active vLLM
+runtime metadata; an `expert_placement_snapshot` from the worker is enough to
+infer the logical layer/expert topology and compute movement diff.
+
+To validate non-zero movement diff without launching a GPU benchmark, run the
+Phase 4 movement ablation:
+
+```bash
+python scripts/run_reparallelization_phase4_movement_ablation.py \
+  --input benchmarks/spotserve/reparallelization_phase4_movement_ablation.json \
+  --output-dir results/spotserve_reparallelization_phase4_movement_ablation
+```
+
+The expected result is `passed=true`: the unpenalized run selects
+`split_across_two_ep_ranks` with `moved_experts=2`, while the penalized run
+selects `stationary_single_rank` with `moved_experts=0`. This validates logical
+movement accounting and the movement penalty, not physical expert migration.
 
 On the default root compose setup there is only one real worker id
 (`sllm_worker_0`). The performance matrix is therefore useful for measuring
@@ -177,6 +229,7 @@ cd /tmp/spotserve-work &&
   --config benchmarks/spotserve/benchmark_matrix_reparallelization_multi_worker_performance.yaml \
   --endpoint http://127.0.0.1:8343/v1/chat/completions \
   --request-timeout 240 \
+  --trace-event-timeout 600 \
   --ray-address auto \
   --ray-namespace sllm
 '
@@ -250,6 +303,60 @@ show `vllm_runtime_topk` and `runtime_observed_topk`; request fixtures show
 `request_instrumentation` / `request_fixture` and should be interpreted as
 deterministic planner validation.
 
+Phase 4 pre-work adds routing + placement-derived expert dispatch
+observability. For context migration, check
+`context_migration_moe_routed_tokens`,
+`context_migration_moe_local_routed_tokens`,
+`context_migration_moe_remote_routed_tokens`, and
+`context_migration_moe_avg_remote_routing_ratio`. Also check
+`context_migration_moe_locality_definitions`,
+`context_migration_moe_locality_granularities`,
+`context_migration_moe_rank_locality_available_count`, and
+`context_migration_moe_physical_dispatch_traffic_available_count`.
+These fields are not physical all-to-all traffic counters; they combine
+observed routing histograms with the target expert placement snapshot.  The
+current locality definition is `target_placement_coverage` at
+`target_instance_or_deployment` granularity, so `remote=0` means all observed
+expert keys were present in the target snapshot, not that per-rank remote
+dispatch traffic was measured as zero.
+
+The same pre-work also records a placement handshake. Check
+`context_migration_selected_target_placement_epochs`,
+`context_migration_placement_handshake_attempts`,
+`context_migration_placement_handshake_successes`, and
+`context_migration_placement_handshake_stale`. A stale count above zero means
+the target placement changed between planning and execution, so the locality
+claim for that attempted migration should be treated as invalid.
+
+Phase 4B additionally separates placement contract metadata from runtime
+application. Check
+`context_migration_selected_target_expert_placement_plan_fingerprints`,
+`context_migration_selected_target_expert_placement_snapshot_fingerprints`,
+`context_migration_selected_target_expert_placement_contracts`,
+`context_migration_selected_target_expert_placement_plan_applied`, and
+`context_migration_selected_target_expert_placement_plan_verified`. For
+stateful recovery, the matching fields are prefixed with
+`state_recovery_target_expert_placement_*`. In the current control-plane
+prototype, `*_plan_applied` and `*_plan_verified` should stay at `0`; non-zero
+values should only appear after the vLLM EP runtime explicitly applies and
+verifies the planned rank mapping / expert weight layout.
+
+Phase 4C exposes the optional runtime apply/verify hook boundary. The important
+fields are `*_expert_placement_apply_hook_available`,
+`*_expert_placement_apply_attempted`, `*_expert_placement_apply_success`,
+`*_expert_placement_verify_hook_available`,
+`*_expert_placement_verify_attempted`, and
+`*_expert_placement_verify_success`. With an old or unpatched image these are
+expected to be `0`/false with `runtime_apply_hook_unavailable` and
+`runtime_verify_hook_unavailable` reasons. After rebuilding with the
+observe-only SpotServe vLLM patch, hook availability and attempted counts may
+be non-zero, but `*_apply_success`, `*_verify_success`, `*_plan_applied`, and
+`*_plan_verified` should remain `0` with
+`physical_expert_placement_migration_not_supported` /
+`physical_expert_placement_verification_not_supported` reasons. They should
+only turn true after a patched vLLM EP runtime explicitly applies and verifies
+the planned rank mapping / expert weight layout.
+
 After rebuilding an image with `runtime_moe_metadata.patch`, the narrow smoke
 for true runtime top-k observability is:
 
@@ -294,9 +401,10 @@ phase2-kv-plus-expert-plus-queue  -> target-expert-idle
 ```
 
 The report includes candidate-level `kv_migration_cost`,
-`expert_dispatch_cost`, `queue_penalty_cost`, and `total_estimated_cost`, so
-the target change can be attributed to a specific Phase 2 cost component
-instead of only observing the final selected target.
+`expert_dispatch_cost`, `queue_penalty_cost`, `total_estimated_cost`,
+`moe_local_routed_tokens`, and `moe_remote_routed_tokens`, so the target change
+can be attributed to a specific Phase 2/4 signal instead of only observing the
+final selected target.
 
 For vLLM stateful-recovery performance, deploy the V8 live restore pair and run
 the dedicated matrix:

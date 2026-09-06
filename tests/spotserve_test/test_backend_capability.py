@@ -127,30 +127,30 @@ def test_backend_capability_serializes_supported_configs():
         }
     )
 
-    assert capability.to_dict() == {
-        "backend": "vllm",
-        "model_name": "qwen3",
-        "supports_tp": True,
-        "supports_dp": True,
-        "supports_ep": False,
-        "supports_state_export": False,
-        "supports_state_restore": False,
-        "max_num_gpus": 1,
-        "supported_configs": [
-            {
-                "model_name": "qwen3",
-                "backend": "vllm",
-                "tensor_parallel_size": 1,
-                "data_parallel_size": 1,
-                "pipeline_parallel_size": 1,
-                "replica_count": 1,
-                "enable_expert_parallel": False,
-                "effective_expert_parallel_size": 1,
-                "expert_parallel_size": 1,
-                "num_replicas": 1,
-                "num_gpus": 1,
-                "target_nodes": [],
-                "reason": "current_vllm_config",
-            }
-        ],
-    }
+    payload = capability.to_dict()
+
+    assert payload["backend"] == "vllm"
+    assert payload["model_name"] == "qwen3"
+    assert payload["supports_tp"] is True
+    assert payload["supports_dp"] is True
+    assert payload["supports_ep"] is False
+    assert payload["supports_state_export"] is False
+    assert payload["supports_state_restore"] is False
+    assert payload["max_num_gpus"] == 1
+    assert len(payload["supported_configs"]) == 1
+
+    plan = payload["supported_configs"][0]
+    assert plan["model_name"] == "qwen3"
+    assert plan["backend"] == "vllm"
+    assert plan["tensor_parallel_size"] == 1
+    assert plan["data_parallel_size"] == 1
+    assert plan["pipeline_parallel_size"] == 1
+    assert plan["replica_count"] == 1
+    assert plan["enable_expert_parallel"] is False
+    assert plan["effective_expert_parallel_size"] == 1
+    assert plan["expert_parallel_size"] == 1
+    assert plan["num_replicas"] == 1
+    assert plan["num_gpus"] == 1
+    assert plan["target_nodes"] == []
+    assert plan["expert_placement_plan"] is None
+    assert plan["reason"] == "current_vllm_config"

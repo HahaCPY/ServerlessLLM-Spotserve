@@ -9,11 +9,15 @@ from .context_migration import (
     estimate_queue_penalty_cost,
     plan_low_cost_migration,
     plan_low_cost_migration_from_dict,
+    target_placement_marker,
 )
 from .moe_placement import (
     ExpertPlacementPlan,
     ExpertPlacementState,
     ExpertShard,
+    build_logical_expert_placement_plan,
+    infer_moe_topology,
+    looks_like_moe_model,
 )
 from .recovery_policy import RecoveryPolicy, normalize_policy
 from .reparallelization import ParallelPlan, plan_dynamic_reparallelization
@@ -62,10 +66,13 @@ __all__ = [
     "StateRecoveryDecision",
     "StateRecoveryPlan",
     "build_candidate_component_costs",
+    "build_logical_expert_placement_plan",
     "estimate_expert_dispatch_cost",
     "estimate_kv_migration_cost",
     "estimate_queue_penalty_cost",
+    "infer_moe_topology",
     "load_spot_trace",
+    "looks_like_moe_model",
     "normalize_policy",
     "plan_low_cost_migration",
     "plan_low_cost_migration_from_dict",
@@ -73,6 +80,7 @@ __all__ = [
     "plan_risk_aware_scheduling",
     "plan_stateful_recovery",
     "rank_nodes_by_spot_risk",
+    "target_placement_marker",
     "build_risk_metadata_provider",
     "normalize_risk_metadata",
 ]

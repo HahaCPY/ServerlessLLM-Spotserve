@@ -130,6 +130,112 @@ def test_vllm_model_resource_profile_prefers_runtime_effective_ep():
     assert profile["moe_route_histogram_kind"] == "instrumentation_derived"
 
 
+def test_vllm_model_resource_profile_reports_placement_contract():
+    profile = get_vllm_model_resource_profile(
+        model_name="vllm-moe",
+        backend_config={
+            "tensor_parallel_size": 2,
+            "data_parallel_size": 1,
+            "enable_expert_parallel": True,
+            "expert_placement_plan": {
+                "placement_epoch": 8,
+                "placement_source": "logical_reparallelization_planner",
+                "placement_fingerprint": "plan-fp",
+            },
+        },
+        runtime_metadata={
+            "expert_placement_snapshot": {
+                "layer:0/expert:1": {"rank_id": "rank-1"}
+            },
+            "expert_placement_snapshot_fingerprint": "snapshot-fp",
+            "expert_placement_contract_snapshot_fingerprint": "snapshot-fp",
+            "expert_placement_plan_applied": True,
+            "expert_placement_apply_hook_available": True,
+            "expert_placement_apply_attempted": True,
+            "expert_placement_apply_success": True,
+            "expert_placement_apply_duration_ms": 3.5,
+            "expert_placement_apply_reason": "runtime_apply_succeeded",
+            "expert_placement_verify_hook_available": True,
+            "expert_placement_verify_attempted": True,
+            "expert_placement_verify_success": True,
+            "expert_placement_verify_reason": "runtime_verify_succeeded",
+        },
+    )
+
+    assert profile["expert_placement_available"] is True
+    assert profile["expert_placement_fingerprint"] == "plan-fp"
+    assert profile["expert_placement_plan_fingerprint"] == "plan-fp"
+    assert profile["expert_placement_snapshot_fingerprint"] == "snapshot-fp"
+    assert profile["expert_placement_contract_available"] is True
+    assert profile["expert_placement_contract_bound"] is True
+    assert profile["expert_placement_contract_source"] == (
+        "logical_reparallelization_planner"
+    )
+    assert profile["expert_placement_contract_epoch"] == 8
+    assert profile["expert_placement_contract_fingerprint"] == "plan-fp"
+    assert profile["expert_placement_contract_snapshot_match"] is True
+    assert profile["expert_placement_plan_applied"] is True
+    assert profile["expert_placement_plan_verified"] is True
+    assert profile["expert_placement_contract_reason"] == "verified_runtime_plan"
+    assert profile["expert_placement_apply_hook_available"] is True
+    assert profile["expert_placement_apply_attempted"] is True
+    assert profile["expert_placement_apply_success"] is True
+    assert profile["expert_placement_apply_duration_ms"] == 3.5
+    assert profile["expert_placement_apply_reason"] == "runtime_apply_succeeded"
+    assert profile["expert_placement_verify_hook_available"] is True
+    assert profile["expert_placement_verify_attempted"] is True
+    assert profile["expert_placement_verify_success"] is True
+    assert profile["expert_placement_verify_reason"] == "runtime_verify_succeeded"
+
+
+def test_vllm_runtime_metadata_exposes_placement_contract():
+    metadata = get_vllm_runtime_metadata(
+        model_name="vllm-moe",
+        backend_config={
+            "expert_placement_plan": {
+                "placement_epoch": 9,
+                "placement_source": "logical_reparallelization_planner",
+                "placement_fingerprint": "plan-9",
+            },
+        },
+        runtime_metadata={
+            "expert_placement_snapshot": {
+                "layer:0/expert:1": {"rank_id": "rank-1"}
+            },
+            "expert_placement_snapshot_fingerprint": "snap-9",
+            "expert_placement_contract_snapshot_fingerprint": "snap-9",
+            "expert_placement_plan_applied": True,
+            "expert_placement_apply_hook_available": True,
+            "expert_placement_apply_attempted": True,
+            "expert_placement_apply_success": True,
+            "expert_placement_apply_reason": "runtime_apply_succeeded",
+            "expert_placement_verify_hook_available": True,
+            "expert_placement_verify_attempted": True,
+            "expert_placement_verify_success": True,
+            "expert_placement_verify_reason": "runtime_verify_succeeded",
+        },
+    )
+
+    assert metadata["expert_placement_fingerprint"] == "plan-9"
+    assert metadata["expert_placement_plan_fingerprint"] == "plan-9"
+    assert metadata["expert_placement_snapshot_fingerprint"] == "snap-9"
+    assert metadata["expert_placement_snapshot"] == {
+        "layer:0/expert:1": {"rank_id": "rank-1"}
+    }
+    assert metadata["expert_placement_contract_available"] is True
+    assert metadata["expert_placement_contract_bound"] is True
+    assert metadata["expert_placement_plan_applied"] is True
+    assert metadata["expert_placement_plan_verified"] is True
+    assert metadata["expert_placement_apply_hook_available"] is True
+    assert metadata["expert_placement_apply_attempted"] is True
+    assert metadata["expert_placement_apply_success"] is True
+    assert metadata["expert_placement_apply_reason"] == "runtime_apply_succeeded"
+    assert metadata["expert_placement_verify_hook_available"] is True
+    assert metadata["expert_placement_verify_attempted"] is True
+    assert metadata["expert_placement_verify_success"] is True
+    assert metadata["expert_placement_verify_reason"] == "runtime_verify_succeeded"
+
+
 def test_vllm_model_resource_profile_requires_canonical_route_histogram():
     profile = get_vllm_model_resource_profile(
         model_name="vllm-moe",
@@ -175,6 +281,15 @@ def test_vllm_runtime_metadata_can_feed_risk_score():
     assert metadata["expert_placement_available"] is False
     assert metadata["moe_route_histogram_available"] is False
     assert metadata["moe_route_histogram_kind"] == "unavailable"
+    assert metadata["expert_placement_contract_available"] is False
+    assert metadata["expert_placement_plan_applied"] is False
+    assert metadata["expert_placement_plan_verified"] is False
+    assert metadata["expert_placement_apply_hook_available"] is False
+    assert metadata["expert_placement_apply_attempted"] is False
+    assert metadata["expert_placement_apply_success"] is False
+    assert metadata["expert_placement_verify_hook_available"] is False
+    assert metadata["expert_placement_verify_attempted"] is False
+    assert metadata["expert_placement_verify_success"] is False
 
     score = node_risk_score(
         node_id=metadata["node_id"],

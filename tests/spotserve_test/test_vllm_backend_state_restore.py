@@ -99,6 +99,20 @@ class FakeMoeMetadataEngine(FakeMetadataEngine):
         }
 
 
+class FakeExpertPlacementRuntime:
+    def __init__(self):
+        self.applied_plan = None
+        self.verified_plan = None
+
+    async def apply_expert_placement_plan(self, expert_placement_plan):
+        self.applied_plan = dict(expert_placement_plan)
+        return {"applied": True, "reason": "runtime_apply_succeeded"}
+
+    def verify_expert_placement_plan(self, expert_placement_plan):
+        self.verified_plan = dict(expert_placement_plan)
+        return {"verified": True, "reason": "runtime_verify_succeeded"}
+
+
 class FakeEmptyRestoreEngine(FakeStatefulEngine):
     def restore_inference_state(self, state, request_id, **kwargs):
         return {"restored": True, "restored_blocks": 0}
@@ -123,6 +137,7 @@ def make_backend(engine=None, **backend_config):
     backend.engine = engine
     backend.request_trace = LLMEngineStatusDict()
     backend.pending_kv_restores = {}
+    backend.expert_placement_runtime_status = {}
     backend.request_expert_route_histograms = {}
     backend.request_expert_route_histogram_sources = {}
     backend.request_expert_route_histogram_kinds = {}
@@ -467,6 +482,185 @@ def test_engine_parallel_metadata_derives_moe_placement_from_model_config(
     assert metadata["expert_placement_snapshot"]["layer:0/expert:2"][
         "rank_id"
     ] == "ep-rank-0"
+
+
+def test_engine_parallel_metadata_separates_plan_contract_from_snapshot():
+    snapshot = {
+        "layer:0/expert:1": {
+            "layer_id": 0,
+            "expert_id": 1,
+            "rank_id": "replica:0/ep-rank:1",
+            "node_id": "node-0",
+        }
+    }
+    backend = make_backend(
+        object(),
+        enable_expert_parallel=True,
+        tensor_parallel_size=2,
+        placement_epoch=8,
+        expert_placement_plan={
+            "expert_placement_available": True,
+            "placement_epoch": 8,
+            "placement_source": "logical_reparallelization_planner",
+            "placement_fingerprint": "plan-fp",
+            "expert_placement_snapshot": snapshot,
+        },
+        expert_placement_snapshot=snapshot,
+    )
+
+    metadata = backend._engine_parallel_metadata(
+        instance_id="instance-0",
+        node_id="node-0",
+    )
+
+    assert metadata["expert_placement_available"] is True
+    assert metadata["expert_placement_contract_available"] is True
+    assert metadata["expert_placement_contract_bound"] is True
+    assert metadata["expert_placement_fingerprint"] == "plan-fp"
+    assert metadata["expert_placement_plan_fingerprint"] == "plan-fp"
+    assert metadata["expert_placement_snapshot_fingerprint"]
+    assert metadata["expert_placement_contract_snapshot_fingerprint"]
+    assert metadata["expert_placement_contract_snapshot_match"] is True
+    assert metadata["expert_placement_plan_applied"] is False
+    assert metadata["expert_placement_plan_verified"] is False
+    assert metadata["expert_placement_contract_reason"] == "runtime_not_applied"
+
+
+def test_engine_parallel_metadata_can_report_runtime_verified_plan():
+    snapshot = {
+        "layer:0/expert:1": {
+            "layer_id": 0,
+            "expert_id": 1,
+            "rank_id": "replica:0/ep-rank:1",
+            "node_id": "node-0",
+        }
+    }
+    backend = make_backend(
+        object(),
+        enable_expert_parallel=True,
+        tensor_parallel_size=2,
+        placement_epoch=8,
+        expert_placement_plan={
+            "expert_placement_available": True,
+            "placement_epoch": 8,
+            "placement_source": "logical_reparallelization_planner",
+            "placement_fingerprint": "plan-fp",
+            "expert_placement_snapshot": snapshot,
+        },
+        expert_placement_snapshot=snapshot,
+        expert_placement_plan_applied=True,
+        expert_placement_plan_verified=True,
+    )
+
+    metadata = backend._engine_parallel_metadata(
+        instance_id="instance-0",
+        node_id="node-0",
+    )
+
+    assert metadata["expert_placement_plan_applied"] is True
+    assert metadata["expert_placement_plan_verified"] is True
+    assert metadata["expert_placement_contract_reason"] == "verified_runtime_plan"
+
+
+@pytest.mark.asyncio
+async def test_backend_calls_runtime_expert_placement_apply_and_verify_hooks():
+    snapshot = {
+        "layer:0/expert:1": {
+            "layer_id": 0,
+            "expert_id": 1,
+            "rank_id": "replica:0/ep-rank:1",
+            "node_id": "node-0",
+        }
+    }
+    runtime = FakeExpertPlacementRuntime()
+    backend = make_backend(
+        runtime,
+        enable_expert_parallel=True,
+        tensor_parallel_size=2,
+        placement_epoch=8,
+        expert_placement_plan={
+            "expert_placement_available": True,
+            "placement_epoch": 8,
+            "placement_source": "logical_reparallelization_planner",
+            "placement_fingerprint": "plan-fp",
+            "expert_placement_snapshot": snapshot,
+        },
+        expert_placement_snapshot=snapshot,
+    )
+
+    await backend._apply_configured_expert_placement_plan()
+    metadata = backend._engine_parallel_metadata(
+        instance_id="instance-0",
+        node_id="node-0",
+    )
+
+    assert runtime.applied_plan["placement_fingerprint"] == "plan-fp"
+    assert runtime.verified_plan["placement_fingerprint"] == "plan-fp"
+    assert metadata["expert_placement_apply_hook_available"] is True
+    assert metadata["expert_placement_apply_attempted"] is True
+    assert metadata["expert_placement_apply_success"] is True
+    assert metadata["expert_placement_apply_reason"] == (
+        "runtime_apply_succeeded"
+    )
+    assert metadata["expert_placement_verify_hook_available"] is True
+    assert metadata["expert_placement_verify_attempted"] is True
+    assert metadata["expert_placement_verify_success"] is True
+    assert metadata["expert_placement_verify_reason"] == (
+        "runtime_verify_succeeded"
+    )
+    assert metadata["expert_placement_plan_applied"] is True
+    assert metadata["expert_placement_plan_verified"] is True
+    assert metadata["expert_placement_contract_reason"] == "verified_runtime_plan"
+
+
+@pytest.mark.asyncio
+async def test_backend_reports_missing_runtime_expert_placement_apply_hook():
+    snapshot = {
+        "layer:0/expert:1": {
+            "layer_id": 0,
+            "expert_id": 1,
+            "rank_id": "replica:0/ep-rank:1",
+            "node_id": "node-0",
+        }
+    }
+    backend = make_backend(
+        object(),
+        enable_expert_parallel=True,
+        tensor_parallel_size=2,
+        placement_epoch=8,
+        expert_placement_plan={
+            "expert_placement_available": True,
+            "placement_epoch": 8,
+            "placement_source": "logical_reparallelization_planner",
+            "placement_fingerprint": "plan-fp",
+            "expert_placement_snapshot": snapshot,
+        },
+        expert_placement_snapshot=snapshot,
+    )
+
+    await backend._apply_configured_expert_placement_plan()
+    metadata = backend._engine_parallel_metadata(
+        instance_id="instance-0",
+        node_id="node-0",
+    )
+
+    assert metadata["expert_placement_apply_hook_available"] is False
+    assert metadata["expert_placement_apply_attempted"] is False
+    assert metadata["expert_placement_apply_success"] is False
+    assert metadata["expert_placement_apply_reason"] == (
+        "runtime_apply_hook_unavailable"
+    )
+    assert metadata["expert_placement_verify_hook_available"] is False
+    assert metadata["expert_placement_verify_attempted"] is False
+    assert metadata["expert_placement_verify_success"] is False
+    assert metadata["expert_placement_verify_reason"] == (
+        "runtime_verify_hook_unavailable"
+    )
+    assert metadata["expert_placement_plan_applied"] is False
+    assert metadata["expert_placement_plan_verified"] is False
+    assert metadata["expert_placement_contract_reason"] == (
+        "runtime_apply_hook_unavailable"
+    )
 
 
 @pytest.mark.asyncio

@@ -187,6 +187,9 @@ def build_comparisons(
         "fallback_rate",
         "router_clean_success_rate",
         "router_fallback_rate",
+        "trace_replay_started",
+        "trace_replay_success",
+        "trace_replay_failed",
         "latency_p95_ms",
         "throughput_req_s",
         "replanning_events",
@@ -197,8 +200,17 @@ def build_comparisons(
         "replanning_avg_selected_replan_window_cost_ms",
         "replanning_avg_selected_load_time_estimate_ms",
         "replanning_avg_selected_migration_cost_estimate_ms",
+        "replanning_avg_selected_expert_weight_movement_cost_estimate_ms",
         "replanning_cross_node_targets",
         "replanning_multi_worker_targets",
+        "replanning_expert_placement_plan_available_events",
+        "replanning_max_expert_placement_plan_shards",
+        "replanning_avg_expert_placement_plan_coverage_ratio",
+        "replanning_expert_placement_plan_physical_migration_events",
+        "replanning_expert_placement_plan_movement_observation_events",
+        "replanning_max_expert_placement_plan_moved_experts",
+        "replanning_total_expert_placement_plan_moved_weight_bytes",
+        "replanning_avg_expert_placement_plan_weight_movement_cost_ms",
         "replanning_max_ready_worker_node_count",
         "replanning_max_runtime_worker_node_count",
         "replanning_max_physical_worker_node_count",
@@ -757,7 +769,8 @@ async def replay_trace_over_http(
     with log_path.open("w", encoding="utf-8") as log_file:
         log_file.write(
             "HTTP trace replay started: "
-            f"trace={trace_path}, events={len(events)}, endpoint={spot_endpoint}\n"
+            f"trace={trace_path}, events={len(events)}, "
+            f"endpoint={spot_endpoint}, event_timeout_s={timeout_s}\n"
         )
         log_file.flush()
         for event in events:
@@ -821,34 +834,80 @@ def start_http_trace_replayer(
     return TraceTask(task=task, log_path=log_path)
 
 
-async def wait_trace_replayer(trace_replayer) -> None:
+async def wait_trace_replayer(trace_replayer) -> Dict[str, Any]:
+    base_status = {
+        "trace_replay_started": False,
+        "trace_replay_success": True,
+        "trace_replay_failed": False,
+        "trace_replay_error": "",
+        "trace_replay_exit_code": 0,
+        "trace_replay_log_path": "",
+    }
     if trace_replayer is None:
-        return
+        return base_status
+
+    status = {
+        **base_status,
+        "trace_replay_started": True,
+        "trace_replay_success": False,
+        "trace_replay_failed": True,
+        "trace_replay_log_path": str(trace_replayer.log_path),
+    }
     if isinstance(trace_replayer, TraceProcess):
+        terminated = False
         try:
             trace_replayer.process.wait(timeout=5)
         except subprocess.TimeoutExpired:
+            terminated = True
             trace_replayer.process.terminate()
             trace_replayer.process.wait(timeout=5)
         finally:
             trace_replayer.log_file.close()
-        if trace_replayer.process.returncode not in (0, None):
+
+        returncode = trace_replayer.process.returncode
+        success = returncode == 0 and not terminated
+        status.update(
+            {
+                "trace_replay_success": success,
+                "trace_replay_failed": not success,
+                "trace_replay_exit_code": returncode or 0,
+                "trace_replay_error": (
+                    ""
+                    if success
+                    else (
+                        "trace_replayer_still_running_after_workload"
+                        if terminated
+                        else f"trace_replayer_exit_code_{returncode}"
+                    )
+                ),
+            }
+        )
+        if not success:
             print(
                 "[benchmark trace warning] Trace replayer exited with "
                 f"code {trace_replayer.process.returncode}; see "
                 f"{trace_replayer.log_path}",
                 file=sys.stderr,
             )
-        return
+        return status
 
     try:
         await trace_replayer.task
+        status.update(
+            {
+                "trace_replay_success": True,
+                "trace_replay_failed": False,
+                "trace_replay_error": "",
+            }
+        )
     except Exception as exc:
+        status["trace_replay_error"] = str(exc)
         print(
             "[benchmark trace warning] HTTP trace replayer failed: "
             f"{exc}; see {trace_replayer.log_path}",
             file=sys.stderr,
         )
+    return status
 
 
 def write_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
@@ -863,6 +922,7 @@ async def run_one(
     output_root: Path,
     speedup: float,
     request_timeout_s: float,
+    trace_event_timeout_s: Optional[float] = None,
     skip_trace: bool = False,
     ray_address: str = "auto",
     ray_namespace: str = "sllm",
@@ -879,12 +939,22 @@ async def run_one(
         run_config.get("request_timeout_s", request_timeout_s)
         or request_timeout_s
     )
+    run_trace_event_timeout_s = float(
+        run_config.get(
+            "trace_event_timeout_s",
+            trace_event_timeout_s
+            if trace_event_timeout_s is not None
+            else run_request_timeout_s,
+        )
+        or run_request_timeout_s
+    )
 
     metadata = {
         "git_commit": git_commit(),
         "started_at": datetime.now().isoformat(),
         "endpoint": endpoint,
         "effective_request_timeout_s": run_request_timeout_s,
+        "effective_trace_event_timeout_s": run_trace_event_timeout_s,
         **run_config,
     }
     (run_dir / "run_metadata.json").write_text(
@@ -952,7 +1022,7 @@ async def run_one(
                     speedup,
                     endpoint,
                     run_dir / "trace_replayer.log",
-                    run_request_timeout_s,
+                    run_trace_event_timeout_s,
                     ray_address,
                     ray_namespace,
                     model_name=run_config["model"],
@@ -961,7 +1031,16 @@ async def run_one(
             endpoint, run_config["model"], workload, run_request_timeout_s
         )
     finally:
-        await wait_trace_replayer(trace_replayer)
+        trace_status = await wait_trace_replayer(trace_replayer)
+        (run_dir / "trace_status.json").write_text(
+            json.dumps(trace_status, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        metadata.update(trace_status)
+        (run_dir / "run_metadata.json").write_text(
+            json.dumps(metadata, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
         if run_config.get("delete_after_run"):
             delete_model_over_http(
                 endpoint, run_config["model"], run_request_timeout_s
@@ -998,6 +1077,7 @@ async def main_async(args):
                 output_root,
                 args.speedup,
                 args.request_timeout,
+                trace_event_timeout_s=args.trace_event_timeout,
                 skip_trace=args.skip_trace,
                 ray_address=args.ray_address,
                 ray_namespace=args.ray_namespace,
@@ -1040,6 +1120,14 @@ async def main_async(args):
         print("\nBenchmark summary:")
         for summary in summaries:
             recovery_suffix = ""
+            trace_suffix = ""
+            if int(summary.get("trace_replay_status_available", 0) or 0) > 0:
+                trace_suffix = (
+                    f", trace_success="
+                    f"{summary.get('trace_replay_success', 0)}, "
+                    f"trace_failed="
+                    f"{summary.get('trace_replay_failed', 0)}"
+                )
             if int(summary.get("router_metrics_rows", 0) or 0) > 0:
                 recovery_suffix = (
                     f", failed_attempts="
@@ -1079,7 +1167,25 @@ async def main_async(args):
                     f"cross_node="
                     f"{summary.get('replanning_cross_node_targets', 0)}, "
                     f"runtime_workers="
-                    f"{summary.get('replanning_max_runtime_worker_node_count', 0)}"
+                    f"{summary.get('replanning_max_runtime_worker_node_count', 0)}, "
+                    f"expert_plan="
+                    f"{summary.get('replanning_expert_placement_plan_available_events', 0)}, "
+                    f"expert_plan_shards="
+                    f"{summary.get('replanning_max_expert_placement_plan_shards', 0)}, "
+                    f"expert_plan_moved="
+                    f"{summary.get('replanning_max_expert_placement_plan_moved_experts', 0)}, "
+                    f"expert_plan_moved_mb="
+                    f"{summary.get('replanning_total_expert_placement_plan_moved_weight_bytes', 0) / (1024 * 1024):.2f}, "
+                    f"expert_move_ms="
+                    f"{summary.get('replanning_avg_expert_placement_plan_weight_movement_cost_ms', 0.0):.2f}, "
+                    f"runtime_apply_hooks="
+                    f"{summary.get('replanning_expert_placement_runtime_apply_hook_available', 0)}, "
+                    f"runtime_apply_success="
+                    f"{summary.get('replanning_expert_placement_runtime_apply_success', 0)}, "
+                    f"runtime_verify_hooks="
+                    f"{summary.get('replanning_expert_placement_runtime_verify_hook_available', 0)}, "
+                    f"runtime_verify_success="
+                    f"{summary.get('replanning_expert_placement_runtime_verify_success', 0)}"
                 )
             context_migration_suffix = ""
             if int(summary.get("context_migration_events", 0) or 0) > 0:
@@ -1101,6 +1207,12 @@ async def main_async(args):
                     f"{summary.get('context_migration_selected_plan_expert_dispatch_cost', 0.0):.2f}, "
                     f"queue_cost="
                     f"{summary.get('context_migration_selected_plan_queue_penalty_cost', 0.0):.2f}, "
+                    f"remote_dispatch_tokens="
+                    f"{summary.get('context_migration_moe_remote_routed_tokens', 0)}, "
+                    f"remote_dispatch_ratio="
+                    f"{summary.get('context_migration_moe_avg_remote_routing_ratio', 0.0):.2f}, "
+                    f"placement_stale="
+                    f"{summary.get('context_migration_placement_handshake_stale', 0)}, "
                     f"route_source="
                     f"{summary.get('context_migration_moe_route_histogram_sources', 'unavailable') or 'unavailable'}, "
                     f"route_kind="
@@ -1148,6 +1260,12 @@ async def main_async(args):
                     f"{summary.get('state_recovery_avg_hot_expert_locality_ratio', 0.0):.2f}, "
                     f"recovery_remote_tokens="
                     f"{summary.get('state_recovery_estimated_remote_routed_tokens', 0)}, "
+                    f"recovery_remote_dispatch_tokens="
+                    f"{summary.get('state_recovery_moe_remote_routed_tokens', 0)}, "
+                    f"recovery_remote_dispatch_ratio="
+                    f"{summary.get('state_recovery_moe_avg_remote_routing_ratio', 0.0):.2f}, "
+                    f"recovery_placement_stale="
+                    f"{summary.get('state_recovery_placement_handshake_stale', 0)}, "
                     f"recovery_expert_cost="
                     f"{summary.get('state_recovery_estimated_dispatch_cost', 0.0):.2f}"
                 )
@@ -1157,6 +1275,7 @@ async def main_async(args):
                 f"successes={summary['successes']}/{summary['requests']}, "
                 f"success_rate={summary['success_rate']:.2%}, "
                 f"p95={summary['latency_p95_ms']:.2f}ms"
+                f"{trace_suffix}"
                 f"{recovery_suffix}"
                 f"{instance_suffix}"
                 f"{replanning_suffix}"
@@ -1199,6 +1318,16 @@ def main():
     parser.add_argument("--endpoint", default=None)
     parser.add_argument("--speedup", type=float, default=1.0)
     parser.add_argument("--request-timeout", type=float, default=15.0)
+    parser.add_argument(
+        "--trace-event-timeout",
+        type=float,
+        default=None,
+        help=(
+            "HTTP timeout for each /spot/event request. Defaults to the "
+            "effective workload request timeout unless the benchmark run "
+            "sets trace_event_timeout_s."
+        ),
+    )
     parser.add_argument(
         "--skip-trace",
         action="store_true",

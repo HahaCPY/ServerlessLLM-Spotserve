@@ -18,6 +18,53 @@ def read_jsonl(path: Path) -> List[Dict[str, Any]]:
     return rows
 
 
+def read_json(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def summarize_trace_replay(
+    run_dir: Path,
+    metadata: Dict[str, Any],
+) -> Dict[str, Any]:
+    trace_status = read_json(run_dir / "trace_status.json")
+    if not trace_status:
+        trace_status = {
+            key: metadata[key]
+            for key in (
+                "trace_replay_started",
+                "trace_replay_success",
+                "trace_replay_failed",
+                "trace_replay_error",
+                "trace_replay_exit_code",
+                "trace_replay_log_path",
+            )
+            if key in metadata
+        }
+    return {
+        "trace_replay_status_available": 1 if trace_status else 0,
+        "trace_replay_started": int(
+            bool(trace_status.get("trace_replay_started", False))
+        ),
+        "trace_replay_success": int(
+            bool(trace_status.get("trace_replay_success", False))
+        ),
+        "trace_replay_failed": int(
+            bool(trace_status.get("trace_replay_failed", False))
+        ),
+        "trace_replay_exit_code": safe_int(
+            trace_status.get("trace_replay_exit_code"), 0
+        ),
+        "trace_replay_error": str(
+            trace_status.get("trace_replay_error", "") or ""
+        ),
+        "trace_replay_log_path": str(
+            trace_status.get("trace_replay_log_path", "") or ""
+        ),
+    }
+
+
 def percentile(values: List[float], pct: float) -> float:
     if not values:
         return 0.0
@@ -83,6 +130,18 @@ def safe_float(value: Any, default: float = 0.0) -> float:
 def compact_values(values: List[str]) -> str:
     unique = sorted({value for value in values if value})
     return ",".join(unique)
+
+
+def merge_int_maps(values: List[Any]) -> Dict[str, int]:
+    merged: Dict[str, int] = {}
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        for key, count in value.items():
+            merged[str(key)] = (
+                merged.get(str(key), 0) + safe_int(count, 0)
+            )
+    return merged
 
 
 def summarize_phase_requests(
@@ -574,6 +633,9 @@ def summarize_replanning_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     migration_costs = numeric_values(
         "selected_migration_cost_estimate_ms"
     )
+    selected_expert_weight_movement_costs = numeric_values(
+        "selected_expert_weight_movement_cost_estimate_ms"
+    )
     queue_penalties = numeric_values("selected_queue_penalty_ms")
     throughput_estimates = numeric_values(
         "selected_throughput_estimate_req_s"
@@ -626,6 +688,47 @@ def summarize_replanning_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         )
         for row in replanning_rows
     ]
+    expert_plan_shards = [
+        safe_int(row.get("expert_placement_plan_shards"), 0)
+        for row in replanning_rows
+    ]
+    expert_plan_required = [
+        safe_int(row.get("expert_placement_plan_required_experts"), 0)
+        for row in replanning_rows
+    ]
+    expert_plan_covered = [
+        safe_int(row.get("expert_placement_plan_covered_experts"), 0)
+        for row in replanning_rows
+    ]
+    expert_plan_moved = [
+        safe_int(row.get("expert_placement_plan_moved_experts"), 0)
+        for row in replanning_rows
+    ]
+    expert_plan_stationary = [
+        safe_int(row.get("expert_placement_plan_stationary_experts"), 0)
+        for row in replanning_rows
+    ]
+    expert_plan_unknown_movement = [
+        safe_int(
+            row.get("expert_placement_plan_unknown_movement_experts"),
+            0,
+        )
+        for row in replanning_rows
+    ]
+    expert_plan_moved_weight_bytes = [
+        safe_int(row.get("expert_placement_plan_moved_weight_bytes"), 0)
+        for row in replanning_rows
+    ]
+    expert_plan_weight_movement_costs = numeric_values(
+        "expert_placement_plan_estimated_weight_movement_cost_ms"
+    )
+    expert_plan_coverage_ratios = [
+        covered / required
+        for covered, required in zip(
+            expert_plan_covered, expert_plan_required
+        )
+        if required > 0
+    ]
     return {
         "replanning_events": len(replanning_rows),
         "replanning_no_capacity_events": no_capacity_count,
@@ -664,6 +767,9 @@ def summarize_replanning_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         ),
         "replanning_avg_selected_migration_cost_estimate_ms": average(
             migration_costs
+        ),
+        "replanning_avg_selected_expert_weight_movement_cost_estimate_ms": (
+            average(selected_expert_weight_movement_costs)
         ),
         "replanning_avg_selected_queue_penalty_ms": average(
             queue_penalties
@@ -735,6 +841,167 @@ def summarize_replanning_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
                 str(row.get("moe_expert_parallel_size_source", ""))
                 for row in replanning_rows
             ]
+        ),
+        "replanning_expert_placement_plan_available_events": sum(
+            1
+            for row in replanning_rows
+            if row.get("expert_placement_plan_available")
+        ),
+        "replanning_expert_placement_plan_epochs": compact_values(
+            [
+                str(row.get("expert_placement_plan_epoch", ""))
+                for row in replanning_rows
+                if row.get("expert_placement_plan_epoch") not in (None, "")
+            ]
+        ),
+        "replanning_expert_placement_plan_fingerprints": compact_values(
+            [
+                str(row.get("expert_placement_plan_fingerprint", ""))
+                for row in replanning_rows
+            ]
+        ),
+        "replanning_expert_placement_plan_sources": compact_values(
+            [
+                str(row.get("expert_placement_plan_source", ""))
+                for row in replanning_rows
+            ]
+        ),
+        "replanning_expert_placement_plan_reasons": compact_values(
+            [
+                str(row.get("expert_placement_plan_reason", ""))
+                for row in replanning_rows
+            ]
+        ),
+        "replanning_expert_placement_plan_physical_migration_events": sum(
+            1
+            for row in replanning_rows
+            if row.get("expert_placement_plan_physical_weight_migration")
+        ),
+        "replanning_expert_placement_plan_movement_observation_events": sum(
+            1
+            for row in replanning_rows
+            if row.get("expert_placement_plan_movement_observation_available")
+        ),
+        "replanning_expert_placement_plan_movement_sources": compact_values(
+            [
+                str(row.get("expert_placement_plan_movement_source", ""))
+                for row in replanning_rows
+            ]
+        ),
+        "replanning_total_expert_placement_plan_moved_experts": sum(
+            expert_plan_moved
+        ),
+        "replanning_max_expert_placement_plan_moved_experts": (
+            max(expert_plan_moved) if expert_plan_moved else 0
+        ),
+        "replanning_total_expert_placement_plan_stationary_experts": sum(
+            expert_plan_stationary
+        ),
+        "replanning_total_expert_placement_plan_unknown_movement_experts": (
+            sum(expert_plan_unknown_movement)
+        ),
+        "replanning_total_expert_placement_plan_moved_weight_bytes": sum(
+            expert_plan_moved_weight_bytes
+        ),
+        "replanning_avg_expert_placement_plan_weight_movement_cost_ms": (
+            average(expert_plan_weight_movement_costs)
+        ),
+        "replanning_expert_placement_runtime_metadata_count": sum(
+            safe_int(
+                row.get("expert_placement_runtime_metadata_count"),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_expert_placement_runtime_apply_hook_available": sum(
+            safe_int(
+                row.get(
+                    "expert_placement_runtime_apply_hook_available_count"
+                ),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_expert_placement_runtime_apply_attempted": sum(
+            safe_int(
+                row.get("expert_placement_runtime_apply_attempted_count"),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_expert_placement_runtime_apply_success": sum(
+            safe_int(
+                row.get("expert_placement_runtime_apply_success_count"),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_expert_placement_runtime_apply_reasons": compact_values(
+            [
+                str(row.get("expert_placement_runtime_apply_reasons", ""))
+                for row in replanning_rows
+            ]
+        ),
+        "replanning_expert_placement_runtime_verify_hook_available": sum(
+            safe_int(
+                row.get(
+                    "expert_placement_runtime_verify_hook_available_count"
+                ),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_expert_placement_runtime_verify_attempted": sum(
+            safe_int(
+                row.get("expert_placement_runtime_verify_attempted_count"),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_expert_placement_runtime_verify_success": sum(
+            safe_int(
+                row.get("expert_placement_runtime_verify_success_count"),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_expert_placement_runtime_verify_reasons": compact_values(
+            [
+                str(row.get("expert_placement_runtime_verify_reasons", ""))
+                for row in replanning_rows
+            ]
+        ),
+        "replanning_expert_placement_runtime_plan_applied": sum(
+            safe_int(
+                row.get("expert_placement_runtime_plan_applied_count"),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_expert_placement_runtime_plan_verified": sum(
+            safe_int(
+                row.get("expert_placement_runtime_plan_verified_count"),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_expert_placement_runtime_contract_reasons": compact_values(
+            [
+                str(row.get("expert_placement_runtime_contract_reasons", ""))
+                for row in replanning_rows
+            ]
+        ),
+        "replanning_max_expert_placement_plan_required_experts": (
+            max(expert_plan_required) if expert_plan_required else 0
+        ),
+        "replanning_max_expert_placement_plan_covered_experts": (
+            max(expert_plan_covered) if expert_plan_covered else 0
+        ),
+        "replanning_max_expert_placement_plan_shards": (
+            max(expert_plan_shards) if expert_plan_shards else 0
+        ),
+        "replanning_avg_expert_placement_plan_coverage_ratio": average(
+            expert_plan_coverage_ratios
         ),
         "replanning_max_synthetic_worker_node_count": max(
             (
@@ -824,6 +1091,31 @@ def summarize_context_migration_metrics(
             for plan in latest_plans
             if isinstance(plan, dict) and plan.get("request_id")
         ]
+    latest_target_placement_epochs = latest_event.get(
+        "selected_plan_target_placement_epochs", []
+    )
+    if not isinstance(latest_target_placement_epochs, list):
+        latest_target_placement_epochs = []
+    latest_target_placement_fingerprints = latest_event.get(
+        "selected_plan_target_expert_placement_fingerprints", []
+    )
+    if not isinstance(latest_target_placement_fingerprints, list):
+        latest_target_placement_fingerprints = []
+    latest_target_plan_fingerprints = latest_event.get(
+        "selected_plan_target_expert_placement_plan_fingerprints", []
+    )
+    if not isinstance(latest_target_plan_fingerprints, list):
+        latest_target_plan_fingerprints = []
+    latest_target_snapshot_fingerprints = latest_event.get(
+        "selected_plan_target_expert_placement_snapshot_fingerprints", []
+    )
+    if not isinstance(latest_target_snapshot_fingerprints, list):
+        latest_target_snapshot_fingerprints = []
+    latest_target_placement_sources = latest_event.get(
+        "selected_plan_target_placement_sources", []
+    )
+    if not isinstance(latest_target_placement_sources, list):
+        latest_target_placement_sources = []
     kv_rows = [
         row.get("kv_cache_migration") or {}
         for row in migration_rows
@@ -848,6 +1140,32 @@ def summarize_context_migration_metrics(
         for row in migration_rows
         if row.get("moe_estimated_remote_routing_ratio") is not None
     ]
+    moe_dispatch_rows = [
+        row
+        for row in migration_rows
+        if safe_int(row.get("moe_dispatch_observation_available_count"), 0)
+        > 0
+    ]
+    moe_remote_dispatch_ratios = [
+        safe_float(row.get("moe_remote_routing_ratio"), 0.0)
+        for row in moe_dispatch_rows
+    ]
+    moe_local_by_layer = merge_int_maps([
+        row.get("moe_local_routed_tokens_by_layer", {})
+        for row in moe_dispatch_rows
+    ])
+    moe_remote_by_layer = merge_int_maps([
+        row.get("moe_remote_routed_tokens_by_layer", {})
+        for row in moe_dispatch_rows
+    ])
+    moe_local_by_expert = merge_int_maps([
+        row.get("moe_local_routed_tokens_by_expert", {})
+        for row in moe_dispatch_rows
+    ])
+    moe_remote_by_expert = merge_int_maps([
+        row.get("moe_remote_routed_tokens_by_expert", {})
+        for row in moe_dispatch_rows
+    ])
     queue_pressures = [
         safe_float(row.get("avg_queue_pressure"), 0.0)
         for row in migration_rows
@@ -932,6 +1250,242 @@ def summarize_context_migration_metrics(
             )
             for row in migration_rows
         ),
+        "context_migration_selected_target_placement_epochs": compact_values(
+            [str(value) for value in latest_target_placement_epochs]
+        ),
+        "context_migration_selected_target_expert_placement_fingerprints": (
+            compact_values([
+                str(value)
+                for value in latest_target_placement_fingerprints
+            ])
+        ),
+        "context_migration_selected_target_expert_placement_plan_fingerprints": (
+            compact_values([
+                str(value) for value in latest_target_plan_fingerprints
+            ])
+        ),
+        "context_migration_selected_target_expert_placement_snapshot_fingerprints": (
+            compact_values([
+                str(value) for value in latest_target_snapshot_fingerprints
+            ])
+        ),
+        "context_migration_selected_target_expert_placement_contracts": sum(
+            safe_int(
+                row.get(
+                    "selected_plan_target_expert_placement_contract_available_count"
+                ),
+                0,
+            )
+            for row in migration_rows
+        ),
+        "context_migration_selected_target_expert_placement_plan_applied": sum(
+            safe_int(
+                row.get(
+                    "selected_plan_target_expert_placement_plan_applied_count"
+                ),
+                0,
+            )
+            for row in migration_rows
+        ),
+        "context_migration_selected_target_expert_placement_plan_verified": sum(
+            safe_int(
+                row.get(
+                    "selected_plan_target_expert_placement_plan_verified_count"
+                ),
+                0,
+            )
+            for row in migration_rows
+        ),
+        "context_migration_selected_target_expert_placement_contract_reasons": (
+            compact_values([
+                str(reason)
+                for row in migration_rows
+                for reason in (
+                    row.get(
+                        "selected_plan_target_expert_placement_contract_reasons",
+                        [],
+                    )
+                    or []
+                )
+            ])
+        ),
+        "context_migration_selected_target_expert_placement_apply_hook_available": sum(
+            safe_int(
+                row.get(
+                    "selected_plan_target_expert_placement_apply_hook_available_count"
+                ),
+                0,
+            )
+            for row in migration_rows
+        ),
+        "context_migration_selected_target_expert_placement_apply_attempted": sum(
+            safe_int(
+                row.get(
+                    "selected_plan_target_expert_placement_apply_attempted_count"
+                ),
+                0,
+            )
+            for row in migration_rows
+        ),
+        "context_migration_selected_target_expert_placement_apply_success": sum(
+            safe_int(
+                row.get(
+                    "selected_plan_target_expert_placement_apply_success_count"
+                ),
+                0,
+            )
+            for row in migration_rows
+        ),
+        "context_migration_selected_target_expert_placement_apply_reasons": (
+            compact_values([
+                str(reason)
+                for row in migration_rows
+                for reason in (
+                    row.get(
+                        "selected_plan_target_expert_placement_apply_reasons",
+                        [],
+                    )
+                    or []
+                )
+            ])
+        ),
+        "context_migration_selected_target_expert_placement_verify_hook_available": sum(
+            safe_int(
+                row.get(
+                    "selected_plan_target_expert_placement_verify_hook_available_count"
+                ),
+                0,
+            )
+            for row in migration_rows
+        ),
+        "context_migration_selected_target_expert_placement_verify_attempted": sum(
+            safe_int(
+                row.get(
+                    "selected_plan_target_expert_placement_verify_attempted_count"
+                ),
+                0,
+            )
+            for row in migration_rows
+        ),
+        "context_migration_selected_target_expert_placement_verify_success": sum(
+            safe_int(
+                row.get(
+                    "selected_plan_target_expert_placement_verify_success_count"
+                ),
+                0,
+            )
+            for row in migration_rows
+        ),
+        "context_migration_selected_target_expert_placement_verify_reasons": (
+            compact_values([
+                str(reason)
+                for row in migration_rows
+                for reason in (
+                    row.get(
+                        "selected_plan_target_expert_placement_verify_reasons",
+                        [],
+                    )
+                    or []
+                )
+            ])
+        ),
+        "context_migration_selected_target_placement_sources": compact_values(
+            [str(value) for value in latest_target_placement_sources]
+        ),
+        "context_migration_placement_handshake_attempts": sum(
+            safe_int(row.get("placement_handshake_attempts"), 0)
+            for row in migration_rows
+        ),
+        "context_migration_placement_handshake_successes": sum(
+            safe_int(row.get("placement_handshake_successes"), 0)
+            for row in migration_rows
+        ),
+        "context_migration_placement_handshake_failures": sum(
+            safe_int(row.get("placement_handshake_failures"), 0)
+            for row in migration_rows
+        ),
+        "context_migration_placement_handshake_stale": sum(
+            safe_int(row.get("placement_handshake_stale"), 0)
+            for row in migration_rows
+        ),
+        "context_migration_placement_handshake_reasons": compact_values([
+            str(reason)
+            for row in migration_rows
+            for reason in (
+                row.get("placement_handshake_reasons", [])
+                if isinstance(row.get("placement_handshake_reasons"), list)
+                else []
+            )
+        ]),
+        "context_migration_selected_plan_moe_routed_tokens": sum(
+            safe_int(row.get("selected_plan_moe_routed_tokens"), 0)
+            for row in migration_rows
+        ),
+        "context_migration_selected_plan_moe_local_routed_tokens": sum(
+            safe_int(row.get("selected_plan_moe_local_routed_tokens"), 0)
+            for row in migration_rows
+        ),
+        "context_migration_selected_plan_moe_remote_routed_tokens": sum(
+            safe_int(row.get("selected_plan_moe_remote_routed_tokens"), 0)
+            for row in migration_rows
+        ),
+        "context_migration_selected_plan_moe_avg_remote_routing_ratio": (
+            mean([
+                safe_float(
+                    row.get(
+                        "selected_plan_moe_avg_remote_routing_ratio"
+                    ),
+                    0.0,
+                )
+                for row in moe_dispatch_rows
+            ])
+            if moe_dispatch_rows
+            else 0.0
+        ),
+        "context_migration_selected_plan_moe_locality_definitions": (
+            compact_values([
+                str(value)
+                for row in migration_rows
+                for value in (
+                    row.get("selected_plan_moe_locality_definitions", [])
+                    if isinstance(
+                        row.get("selected_plan_moe_locality_definitions"),
+                        list,
+                    )
+                    else []
+                )
+            ])
+        ),
+        "context_migration_selected_plan_moe_locality_granularities": (
+            compact_values([
+                str(value)
+                for row in migration_rows
+                for value in (
+                    row.get("selected_plan_moe_locality_granularities", [])
+                    if isinstance(
+                        row.get("selected_plan_moe_locality_granularities"),
+                        list,
+                    )
+                    else []
+                )
+            ])
+        ),
+        "context_migration_selected_plan_moe_remote_routing_definitions": (
+            compact_values([
+                str(value)
+                for row in migration_rows
+                for value in (
+                    row.get("selected_plan_moe_remote_routing_definitions", [])
+                    if isinstance(
+                        row.get(
+                            "selected_plan_moe_remote_routing_definitions"
+                        ),
+                        list,
+                    )
+                    else []
+                )
+            ])
+        ),
         "context_migration_context_source_count": max(
             (
                 safe_int(row.get("context_source_count"), 0)
@@ -1009,6 +1563,76 @@ def summarize_context_migration_metrics(
         "context_migration_moe_estimated_dispatch_cost": sum(
             moe_dispatch_costs
         ),
+        "context_migration_moe_dispatch_observation_available_count": sum(
+            safe_int(row.get("moe_dispatch_observation_available_count"), 0)
+            for row in migration_rows
+        ),
+        "context_migration_moe_routed_tokens": sum(
+            safe_int(row.get("moe_routed_tokens"), 0)
+            for row in migration_rows
+        ),
+        "context_migration_moe_local_routed_tokens": sum(
+            safe_int(row.get("moe_local_routed_tokens"), 0)
+            for row in migration_rows
+        ),
+        "context_migration_moe_remote_routed_tokens": sum(
+            safe_int(row.get("moe_remote_routed_tokens"), 0)
+            for row in migration_rows
+        ),
+        "context_migration_moe_avg_remote_routing_ratio": (
+            mean(moe_remote_dispatch_ratios)
+            if moe_remote_dispatch_ratios
+            else 0.0
+        ),
+        "context_migration_moe_locality_definitions": compact_values(
+            [
+                str(row.get("moe_locality_definition", ""))
+                for row in migration_rows
+            ]
+        ),
+        "context_migration_moe_locality_granularities": compact_values(
+            [
+                str(row.get("moe_locality_granularity", ""))
+                for row in migration_rows
+            ]
+        ),
+        "context_migration_moe_remote_routing_definitions": compact_values(
+            [
+                str(row.get("moe_remote_routing_definition", ""))
+                for row in migration_rows
+            ]
+        ),
+        "context_migration_moe_rank_locality_available_count": sum(
+            safe_int(row.get("moe_rank_locality_available_count"), 0)
+            for row in migration_rows
+        ),
+        "context_migration_moe_physical_dispatch_traffic_available_count": sum(
+            safe_int(
+                row.get("moe_physical_dispatch_traffic_available_count"),
+                0,
+            )
+            for row in migration_rows
+        ),
+        "context_migration_moe_local_routed_tokens_by_layer": (
+            json.dumps(moe_local_by_layer, sort_keys=True)
+            if moe_local_by_layer
+            else ""
+        ),
+        "context_migration_moe_remote_routed_tokens_by_layer": (
+            json.dumps(moe_remote_by_layer, sort_keys=True)
+            if moe_remote_by_layer
+            else ""
+        ),
+        "context_migration_moe_local_routed_tokens_by_expert": (
+            json.dumps(moe_local_by_expert, sort_keys=True)
+            if moe_local_by_expert
+            else ""
+        ),
+        "context_migration_moe_remote_routed_tokens_by_expert": (
+            json.dumps(moe_remote_by_expert, sort_keys=True)
+            if moe_remote_by_expert
+            else ""
+        ),
         "context_migration_latest_plans": (
             json.dumps(latest_plans, sort_keys=True) if latest_plans else ""
         ),
@@ -1035,6 +1659,11 @@ def summarize_state_recovery_metrics(
     locality_rows = [
         row for row in state_rows if row.get("expert_locality_available")
     ]
+    moe_dispatch_rows = [
+        row
+        for row in locality_rows
+        if row.get("moe_dispatch_observation_available")
+    ]
     locality_ratios = [
         safe_float(row.get("hot_expert_locality_ratio"), 0.0)
         for row in locality_rows
@@ -1043,9 +1672,32 @@ def summarize_state_recovery_metrics(
         safe_float(row.get("estimated_remote_routing_ratio"), 0.0)
         for row in locality_rows
     ]
+    moe_remote_dispatch_ratios = [
+        safe_float(row.get("moe_remote_routing_ratio"), 0.0)
+        for row in moe_dispatch_rows
+    ]
+    moe_local_by_layer = merge_int_maps([
+        row.get("moe_local_routed_tokens_by_layer", {})
+        for row in moe_dispatch_rows
+    ])
+    moe_remote_by_layer = merge_int_maps([
+        row.get("moe_remote_routed_tokens_by_layer", {})
+        for row in moe_dispatch_rows
+    ])
+    moe_local_by_expert = merge_int_maps([
+        row.get("moe_local_routed_tokens_by_expert", {})
+        for row in moe_dispatch_rows
+    ])
+    moe_remote_by_expert = merge_int_maps([
+        row.get("moe_remote_routed_tokens_by_expert", {})
+        for row in moe_dispatch_rows
+    ])
     expert_dispatch_costs = [
         safe_float(row.get("expert_dispatch_cost"), 0.0)
         for row in locality_rows
+    ]
+    placement_handshake_rows = [
+        row for row in state_rows if row.get("placement_handshake_attempted")
     ]
     latest_plan = state_rows[-1].get("plan") if state_rows else None
     return {
@@ -1077,6 +1729,9 @@ def summarize_state_recovery_metrics(
             1 for row in state_rows if row.get("expert_placement_mismatch")
         ),
         "state_recovery_expert_locality_available_count": len(locality_rows),
+        "state_recovery_moe_dispatch_observation_available_count": sum(
+            1 for row in moe_dispatch_rows
+        ),
         "state_recovery_avg_hot_expert_locality_ratio": (
             mean(locality_ratios) if locality_ratios else 0.0
         ),
@@ -1089,6 +1744,193 @@ def summarize_state_recovery_metrics(
         ),
         "state_recovery_estimated_dispatch_cost": sum(
             expert_dispatch_costs
+        ),
+        "state_recovery_target_placement_epochs": compact_values([
+            str(row.get("target_placement_epoch"))
+            for row in state_rows
+            if row.get("target_placement_epoch") is not None
+        ]),
+        "state_recovery_current_placement_epochs": compact_values([
+            str(row.get("current_placement_epoch"))
+            for row in state_rows
+            if row.get("current_placement_epoch") is not None
+        ]),
+        "state_recovery_target_expert_placement_fingerprints": compact_values([
+            str(row.get("target_expert_placement_fingerprint"))
+            for row in state_rows
+            if row.get("target_expert_placement_fingerprint")
+        ]),
+        "state_recovery_target_expert_placement_plan_fingerprints": (
+            compact_values([
+                str(row.get("target_expert_placement_plan_fingerprint"))
+                for row in state_rows
+                if row.get("target_expert_placement_plan_fingerprint")
+            ])
+        ),
+        "state_recovery_target_expert_placement_snapshot_fingerprints": (
+            compact_values([
+                str(row.get("target_expert_placement_snapshot_fingerprint"))
+                for row in state_rows
+                if row.get("target_expert_placement_snapshot_fingerprint")
+            ])
+        ),
+        "state_recovery_target_expert_placement_contracts": sum(
+            1
+            for row in state_rows
+            if row.get("target_expert_placement_contract_available")
+        ),
+        "state_recovery_target_expert_placement_plan_applied": sum(
+            1
+            for row in state_rows
+            if row.get("target_expert_placement_plan_applied")
+        ),
+        "state_recovery_target_expert_placement_plan_verified": sum(
+            1
+            for row in state_rows
+            if row.get("target_expert_placement_plan_verified")
+        ),
+        "state_recovery_target_expert_placement_contract_reasons": (
+            compact_values([
+                str(row.get("target_expert_placement_contract_reason"))
+                for row in state_rows
+                if row.get("target_expert_placement_contract_reason")
+            ])
+        ),
+        "state_recovery_target_expert_placement_apply_hook_available": sum(
+            1
+            for row in state_rows
+            if row.get("target_expert_placement_apply_hook_available")
+        ),
+        "state_recovery_target_expert_placement_apply_attempted": sum(
+            1
+            for row in state_rows
+            if row.get("target_expert_placement_apply_attempted")
+        ),
+        "state_recovery_target_expert_placement_apply_success": sum(
+            1
+            for row in state_rows
+            if row.get("target_expert_placement_apply_success")
+        ),
+        "state_recovery_target_expert_placement_apply_reasons": (
+            compact_values([
+                str(row.get("target_expert_placement_apply_reason"))
+                for row in state_rows
+                if row.get("target_expert_placement_apply_reason")
+            ])
+        ),
+        "state_recovery_target_expert_placement_verify_hook_available": sum(
+            1
+            for row in state_rows
+            if row.get("target_expert_placement_verify_hook_available")
+        ),
+        "state_recovery_target_expert_placement_verify_attempted": sum(
+            1
+            for row in state_rows
+            if row.get("target_expert_placement_verify_attempted")
+        ),
+        "state_recovery_target_expert_placement_verify_success": sum(
+            1
+            for row in state_rows
+            if row.get("target_expert_placement_verify_success")
+        ),
+        "state_recovery_target_expert_placement_verify_reasons": (
+            compact_values([
+                str(row.get("target_expert_placement_verify_reason"))
+                for row in state_rows
+                if row.get("target_expert_placement_verify_reason")
+            ])
+        ),
+        "state_recovery_current_expert_placement_fingerprints": (
+            compact_values([
+                str(row.get("current_expert_placement_fingerprint"))
+                for row in state_rows
+                if row.get("current_expert_placement_fingerprint")
+            ])
+        ),
+        "state_recovery_placement_handshake_attempts": len(
+            placement_handshake_rows
+        ),
+        "state_recovery_placement_handshake_successes": sum(
+            1
+            for row in placement_handshake_rows
+            if row.get("placement_handshake_compatible")
+        ),
+        "state_recovery_placement_handshake_failures": sum(
+            1
+            for row in placement_handshake_rows
+            if not row.get("placement_handshake_compatible")
+        ),
+        "state_recovery_placement_handshake_stale": sum(
+            1
+            for row in placement_handshake_rows
+            if row.get("placement_handshake_stale")
+        ),
+        "state_recovery_placement_handshake_reasons": compact_values([
+            str(row.get("placement_handshake_reason", ""))
+            for row in placement_handshake_rows
+        ]),
+        "state_recovery_moe_routed_tokens": sum(
+            safe_int(row.get("moe_routed_tokens"), 0)
+            for row in moe_dispatch_rows
+        ),
+        "state_recovery_moe_local_routed_tokens": sum(
+            safe_int(row.get("moe_local_routed_tokens"), 0)
+            for row in moe_dispatch_rows
+        ),
+        "state_recovery_moe_remote_routed_tokens": sum(
+            safe_int(row.get("moe_remote_routed_tokens"), 0)
+            for row in moe_dispatch_rows
+        ),
+        "state_recovery_moe_avg_remote_routing_ratio": (
+            mean(moe_remote_dispatch_ratios)
+            if moe_remote_dispatch_ratios
+            else 0.0
+        ),
+        "state_recovery_moe_locality_definitions": compact_values(
+            [
+                str(row.get("moe_locality_definition", ""))
+                for row in state_rows
+            ]
+        ),
+        "state_recovery_moe_locality_granularities": compact_values(
+            [
+                str(row.get("moe_locality_granularity", ""))
+                for row in state_rows
+            ]
+        ),
+        "state_recovery_moe_remote_routing_definitions": compact_values(
+            [
+                str(row.get("moe_remote_routing_definition", ""))
+                for row in state_rows
+            ]
+        ),
+        "state_recovery_moe_rank_locality_available_count": sum(
+            1 for row in state_rows if row.get("moe_rank_locality_available")
+        ),
+        "state_recovery_moe_physical_dispatch_traffic_available_count": sum(
+            1
+            for row in state_rows
+            if row.get("moe_physical_dispatch_traffic_available")
+        ),
+        "state_recovery_moe_local_routed_tokens_by_layer": (
+            json.dumps(moe_local_by_layer, sort_keys=True)
+            if moe_local_by_layer
+            else ""
+        ),
+        "state_recovery_moe_remote_routed_tokens_by_layer": (
+            json.dumps(moe_remote_by_layer, sort_keys=True)
+            if moe_remote_by_layer
+            else ""
+        ),
+        "state_recovery_moe_local_routed_tokens_by_expert": (
+            json.dumps(moe_local_by_expert, sort_keys=True)
+            if moe_local_by_expert
+            else ""
+        ),
+        "state_recovery_moe_remote_routed_tokens_by_expert": (
+            json.dumps(moe_remote_by_expert, sort_keys=True)
+            if moe_remote_by_expert
+            else ""
         ),
         "state_recovery_moe_route_histogram_sources": compact_values(
             [
@@ -1237,6 +2079,7 @@ def analyze_run(run_dir: Path) -> Dict[str, Any]:
         "router_metrics_path": (
             str(router_metrics_path) if router_metrics_path is not None else ""
         ),
+        **summarize_trace_replay(run_dir, metadata),
         **request_summary,
         **phase_summary,
         **response_kv_summary,

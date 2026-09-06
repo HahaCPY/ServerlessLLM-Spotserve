@@ -181,6 +181,36 @@ def _as_bool(value: Any, default: bool = False) -> bool:
     return bool(value)
 
 
+def _json_fingerprint(value: Any) -> str:
+    if not value:
+        return ""
+    blob = json.dumps(value, sort_keys=True, default=str).encode("utf-8")
+    return format(zlib.crc32(blob) & 0xFFFFFFFF, "08x")
+
+
+def _runtime_hook_bool(
+    result: Any,
+    *keys: str,
+    default: bool = False,
+) -> bool:
+    if isinstance(result, bool):
+        return result
+    if isinstance(result, Mapping):
+        for key in keys:
+            if key in result:
+                return _as_bool(result.get(key), default)
+    return default
+
+
+def _runtime_hook_reason(result: Any, default: str) -> str:
+    if isinstance(result, Mapping):
+        for key in ("reason", "status", "error"):
+            value = result.get(key)
+            if value:
+                return str(value)
+    return default
+
+
 def _expert_key_from_parts(parts: Sequence[Any]) -> str:
     cleaned = [str(part) for part in parts if str(part) not in {"", "None"}]
     if not cleaned:
@@ -305,6 +335,7 @@ class VllmBackend(SllmBackend):
         self.backend_config = backend_config
         self.request_trace = LLMEngineStatusDict()
         self.pending_kv_restores: Dict[str, int] = {}
+        self.expert_placement_runtime_status: Dict[str, Any] = {}
         self.request_expert_route_histograms: Dict[str, Dict[str, int]] = (
             _normalize_per_request_expert_route_histogram(
                 backend_config.get("per_request_expert_route_histogram")
@@ -513,6 +544,147 @@ class VllmBackend(SllmBackend):
                     "placement_source": "derived_from_model_config",
                 }
         return placement
+
+    def _configured_expert_placement_plan(
+        self,
+        instance_id: str = "",
+        node_id: str = "",
+    ) -> Dict[str, Any]:
+        configured = self._config_value_for_runtime(
+            "expert_placement_plan",
+            instance_id=instance_id,
+            node_id=node_id,
+        )
+        return dict(configured) if isinstance(configured, Mapping) else {}
+
+    def _expert_placement_contract_metadata(
+        self,
+        placement_snapshot: Optional[Mapping[str, Any]],
+        instance_id: str = "",
+        node_id: str = "",
+    ) -> Dict[str, Any]:
+        plan = self._configured_expert_placement_plan(
+            instance_id=instance_id,
+            node_id=node_id,
+        )
+        plan_available = bool(plan)
+        plan_fingerprint = str(plan.get("placement_fingerprint") or "")
+        contract_snapshot = plan.get("expert_placement_snapshot")
+        if not isinstance(contract_snapshot, Mapping):
+            contract_snapshot = None
+        snapshot_fingerprint = _json_fingerprint(placement_snapshot)
+        contract_snapshot_fingerprint = _json_fingerprint(contract_snapshot)
+        snapshot_match = bool(
+            snapshot_fingerprint
+            and contract_snapshot_fingerprint
+            and snapshot_fingerprint == contract_snapshot_fingerprint
+        )
+        runtime_status = dict(
+            getattr(self, "expert_placement_runtime_status", {}) or {}
+        )
+        runtime_applied_value = runtime_status.get(
+            "expert_placement_plan_applied"
+        )
+        runtime_verified_value = runtime_status.get(
+            "expert_placement_plan_verified"
+        )
+        configured_plan_applied = self._config_value_for_runtime(
+            "expert_placement_plan_applied",
+            instance_id=instance_id,
+            node_id=node_id,
+        )
+        configured_plan_verified = self._config_value_for_runtime(
+            "expert_placement_plan_verified",
+            instance_id=instance_id,
+            node_id=node_id,
+        )
+        plan_applied = bool(
+            plan_available
+            and _as_bool(
+                runtime_applied_value
+                if runtime_applied_value is not None
+                else configured_plan_applied,
+                default=False,
+            )
+        )
+        explicit_plan_verified = _as_bool(
+            runtime_verified_value
+            if runtime_verified_value is not None
+            else configured_plan_verified,
+            default=False,
+        )
+        plan_verified = bool(
+            plan_available
+            and plan_applied
+            and explicit_plan_verified
+        )
+        contract_bound = bool(plan_available and placement_snapshot)
+        if not plan_available:
+            reason = "no_expert_placement_contract"
+        elif not contract_bound:
+            reason = "contract_without_runtime_snapshot"
+        elif not snapshot_match:
+            reason = "contract_snapshot_mismatch"
+        elif not plan_applied:
+            reason = str(
+                runtime_status.get("expert_placement_apply_reason")
+                or "runtime_not_applied"
+            )
+        elif plan_verified:
+            reason = "verified_runtime_plan"
+        else:
+            reason = "runtime_applied_unverified"
+
+        return {
+            "expert_placement_contract_available": plan_available,
+            "expert_placement_contract_bound": contract_bound,
+            "expert_placement_contract_source": str(
+                plan.get("placement_source", "unavailable") or "unavailable"
+            ),
+            "expert_placement_contract_epoch": (
+                _as_non_negative_int(plan.get("placement_epoch"))
+            ),
+            "expert_placement_contract_fingerprint": plan_fingerprint,
+            "expert_placement_plan_fingerprint": plan_fingerprint,
+            "expert_placement_snapshot_fingerprint": snapshot_fingerprint,
+            "expert_placement_contract_snapshot_fingerprint": (
+                contract_snapshot_fingerprint
+            ),
+            "expert_placement_contract_snapshot_match": snapshot_match,
+            "expert_placement_plan_applied": plan_applied,
+            "expert_placement_plan_verified": plan_verified,
+            "expert_placement_contract_reason": reason,
+            "expert_placement_apply_hook_available": bool(
+                runtime_status.get("expert_placement_apply_hook_available", False)
+            ),
+            "expert_placement_apply_attempted": bool(
+                runtime_status.get("expert_placement_apply_attempted", False)
+            ),
+            "expert_placement_apply_success": bool(
+                runtime_status.get("expert_placement_apply_success", False)
+            ),
+            "expert_placement_apply_duration_ms": float(
+                runtime_status.get("expert_placement_apply_duration_ms", 0.0)
+                or 0.0
+            ),
+            "expert_placement_apply_reason": str(
+                runtime_status.get("expert_placement_apply_reason", "")
+                or ""
+            ),
+            "expert_placement_verify_hook_available": bool(
+                runtime_status.get("expert_placement_verify_hook_available", False)
+            ),
+            "expert_placement_verify_attempted": bool(
+                runtime_status.get("expert_placement_verify_attempted", False)
+            ),
+            "expert_placement_verify_success": bool(
+                runtime_status.get("expert_placement_verify_success", False)
+            ),
+            "expert_placement_verify_reason": str(
+                runtime_status.get("expert_placement_verify_reason", "")
+                or ""
+            ),
+        }
 
     def _record_request_expert_route_histogram(
         self,
@@ -750,6 +922,11 @@ class VllmBackend(SllmBackend):
             default_placement_source = "instrumentation"
         elif placement_snapshot:
             default_placement_source = "derived_from_model_config"
+        placement_contract = self._expert_placement_contract_metadata(
+            placement_snapshot,
+            instance_id=instance_id,
+            node_id=node_id,
+        )
         metadata["expert_placement_available"] = bool(placement_snapshot)
         metadata["placement_epoch"] = (
             _as_non_negative_int(
@@ -769,15 +946,14 @@ class VllmBackend(SllmBackend):
         )
         if placement_snapshot:
             metadata["expert_placement_snapshot"] = placement_snapshot
-            placement_blob = json.dumps(
-                placement_snapshot,
-                sort_keys=True,
-                default=str,
-            ).encode("utf-8")
-            metadata["expert_placement_fingerprint"] = format(
-                zlib.crc32(placement_blob) & 0xFFFFFFFF,
-                "08x",
+        metadata.update(placement_contract)
+        metadata["expert_placement_fingerprint"] = (
+            placement_contract["expert_placement_plan_fingerprint"]
+            or placement_contract["expert_placement_snapshot_fingerprint"]
+            or str(
+                self.backend_config.get("expert_placement_fingerprint", "") or ""
             )
+        )
         metadata["expert_placement_epoch"] = metadata["placement_epoch"]
         request_histograms = getattr(
             self, "request_expert_route_histograms", {}
@@ -881,6 +1057,124 @@ class VllmBackend(SllmBackend):
             )
         return await _maybe_await(hook(**call_kwargs))
 
+    async def _apply_configured_expert_placement_plan(self) -> None:
+        plan = self._configured_expert_placement_plan()
+        if not plan:
+            self.expert_placement_runtime_status = {}
+            return
+
+        status: Dict[str, Any] = {
+            "expert_placement_apply_hook_available": False,
+            "expert_placement_apply_attempted": False,
+            "expert_placement_apply_success": False,
+            "expert_placement_apply_duration_ms": 0.0,
+            "expert_placement_apply_reason": "",
+            "expert_placement_verify_hook_available": False,
+            "expert_placement_verify_attempted": False,
+            "expert_placement_verify_success": False,
+            "expert_placement_verify_reason": "",
+            "expert_placement_plan_applied": False,
+            "expert_placement_plan_verified": False,
+        }
+
+        apply_names = (
+            "apply_expert_placement_plan",
+            "apply_moe_expert_placement_plan",
+            "apply_spotserve_expert_placement_plan",
+        )
+        apply_hook = self._runtime_hook(*apply_names)
+        status["expert_placement_apply_hook_available"] = apply_hook is not None
+        if apply_hook is None:
+            status["expert_placement_apply_reason"] = (
+                "runtime_apply_hook_unavailable"
+            )
+        else:
+            status["expert_placement_apply_attempted"] = True
+            started_at = time.monotonic()
+            try:
+                apply_result = await self._call_runtime_hook(
+                    apply_names,
+                    expert_placement_plan=plan,
+                    placement_plan=plan,
+                    plan=plan,
+                    backend_config=self.backend_config,
+                )
+            except Exception as exc:
+                logger.exception("vLLM expert placement plan apply failed")
+                status["expert_placement_apply_reason"] = repr(exc)
+            else:
+                status["expert_placement_apply_success"] = _runtime_hook_bool(
+                    apply_result,
+                    "applied",
+                    "success",
+                    "ok",
+                    "expert_placement_plan_applied",
+                )
+                status["expert_placement_apply_reason"] = (
+                    _runtime_hook_reason(
+                        apply_result,
+                        "runtime_apply_succeeded"
+                        if status["expert_placement_apply_success"]
+                        else "runtime_apply_returned_false",
+                    )
+                )
+            finally:
+                status["expert_placement_apply_duration_ms"] = (
+                    time.monotonic() - started_at
+                ) * 1000.0
+
+        verify_names = (
+            "verify_expert_placement_plan",
+            "verify_moe_expert_placement_plan",
+            "verify_spotserve_expert_placement_plan",
+        )
+        verify_hook = self._runtime_hook(*verify_names)
+        status["expert_placement_verify_hook_available"] = (
+            verify_hook is not None
+        )
+        if verify_hook is None:
+            status["expert_placement_verify_reason"] = (
+                "runtime_verify_hook_unavailable"
+            )
+        else:
+            status["expert_placement_verify_attempted"] = True
+            try:
+                verify_result = await self._call_runtime_hook(
+                    verify_names,
+                    expert_placement_plan=plan,
+                    placement_plan=plan,
+                    plan=plan,
+                    backend_config=self.backend_config,
+                )
+            except Exception as exc:
+                logger.exception("vLLM expert placement plan verify failed")
+                status["expert_placement_verify_reason"] = repr(exc)
+            else:
+                status["expert_placement_verify_success"] = _runtime_hook_bool(
+                    verify_result,
+                    "verified",
+                    "success",
+                    "ok",
+                    "expert_placement_plan_verified",
+                )
+                status["expert_placement_verify_reason"] = (
+                    _runtime_hook_reason(
+                        verify_result,
+                        "runtime_verify_succeeded"
+                        if status["expert_placement_verify_success"]
+                        else "runtime_verify_returned_false",
+                    )
+                )
+
+        status["expert_placement_plan_applied"] = bool(
+            status["expert_placement_apply_success"]
+            or status["expert_placement_verify_success"]
+        )
+        status["expert_placement_plan_verified"] = bool(
+            status["expert_placement_verify_success"]
+        )
+        self.expert_placement_runtime_status = status
+
     async def _request_runtime_moe_metadata(
         self,
         request_id: str,
@@ -942,6 +1236,7 @@ class VllmBackend(SllmBackend):
             self._configure_spotserve_moe_route_tracing()
             self.engine = AsyncLLMEngine.from_engine_args(self.engine_args)
             self.model_load_time_s = time.monotonic() - started_at
+            await self._apply_configured_expert_placement_plan()
             self.status = BackendStatus.RUNNING
 
     def _spotserve_runtime_identity(self) -> str:
@@ -1734,6 +2029,71 @@ class VllmBackend(SllmBackend):
             "placement_source": parallel_metadata.get("placement_source"),
             "expert_placement_fingerprint": parallel_metadata.get(
                 "expert_placement_fingerprint"
+            ),
+            "expert_placement_plan_fingerprint": parallel_metadata.get(
+                "expert_placement_plan_fingerprint"
+            ),
+            "expert_placement_snapshot_fingerprint": parallel_metadata.get(
+                "expert_placement_snapshot_fingerprint"
+            ),
+            "expert_placement_contract_available": parallel_metadata.get(
+                "expert_placement_contract_available"
+            ),
+            "expert_placement_contract_bound": parallel_metadata.get(
+                "expert_placement_contract_bound"
+            ),
+            "expert_placement_contract_source": parallel_metadata.get(
+                "expert_placement_contract_source"
+            ),
+            "expert_placement_contract_epoch": parallel_metadata.get(
+                "expert_placement_contract_epoch"
+            ),
+            "expert_placement_contract_fingerprint": parallel_metadata.get(
+                "expert_placement_contract_fingerprint"
+            ),
+            "expert_placement_contract_snapshot_fingerprint": (
+                parallel_metadata.get(
+                    "expert_placement_contract_snapshot_fingerprint"
+                )
+            ),
+            "expert_placement_contract_snapshot_match": parallel_metadata.get(
+                "expert_placement_contract_snapshot_match"
+            ),
+            "expert_placement_plan_applied": parallel_metadata.get(
+                "expert_placement_plan_applied"
+            ),
+            "expert_placement_plan_verified": parallel_metadata.get(
+                "expert_placement_plan_verified"
+            ),
+            "expert_placement_contract_reason": parallel_metadata.get(
+                "expert_placement_contract_reason"
+            ),
+            "expert_placement_apply_hook_available": parallel_metadata.get(
+                "expert_placement_apply_hook_available"
+            ),
+            "expert_placement_apply_attempted": parallel_metadata.get(
+                "expert_placement_apply_attempted"
+            ),
+            "expert_placement_apply_success": parallel_metadata.get(
+                "expert_placement_apply_success"
+            ),
+            "expert_placement_apply_duration_ms": parallel_metadata.get(
+                "expert_placement_apply_duration_ms"
+            ),
+            "expert_placement_apply_reason": parallel_metadata.get(
+                "expert_placement_apply_reason"
+            ),
+            "expert_placement_verify_hook_available": parallel_metadata.get(
+                "expert_placement_verify_hook_available"
+            ),
+            "expert_placement_verify_attempted": parallel_metadata.get(
+                "expert_placement_verify_attempted"
+            ),
+            "expert_placement_verify_success": parallel_metadata.get(
+                "expert_placement_verify_success"
+            ),
+            "expert_placement_verify_reason": parallel_metadata.get(
+                "expert_placement_verify_reason"
             ),
             "moe_route_histogram_available": parallel_metadata.get(
                 "moe_route_histogram_available"

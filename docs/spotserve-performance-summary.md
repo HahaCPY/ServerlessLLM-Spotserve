@@ -1,6 +1,6 @@
 # SpotServe Performance Summary
 
-Last updated: 2026-08-30
+Last updated: 2026-09-06
 
 This page is intentionally short. It keeps only the commands needed to rerun
 each version's benchmark path and a compact performance summary. V6, V7, V8,
@@ -134,6 +134,7 @@ V6 dynamic reparallelization performance:
 MODEL_FOLDER=/work/spotserve-models \
 SPOTSERVE_REPARALLELIZATION_MODEL_PATH=/models/Qwen2-MoE-Tiny \
 SPOTSERVE_REPARALLELIZATION_LOAD_FORMAT=auto \
+SPOTSERVE_REQUIRE_EXPERT_PLACEMENT_RUNTIME_HOOKS=1 \
 scripts/prepare_spotserve.sh --skip-build --deploy-set reparallelization-performance
 
 podman exec sllm_head bash -lc '
@@ -142,9 +143,36 @@ cd /tmp/spotserve-work &&
   --config benchmarks/spotserve/benchmark_matrix_reparallelization_performance.yaml \
   --endpoint http://127.0.0.1:8343/v1/chat/completions \
   --request-timeout 180 \
+  --trace-event-timeout 600 \
   --ray-address auto \
   --ray-namespace sllm
 '
+```
+
+For V6, `--request-timeout` controls normal chat completion requests, while
+`--trace-event-timeout` controls each `/spot/event` replay request. Keep the
+trace timeout longer than the request timeout because the preemption event may
+wait for re-planning, actor recreation, model loading, and metric emission.
+Do not claim a valid V6 re-plan result unless `trace_replay_success=1` and
+`replanning_events > 0`.
+
+The single-worker V6 performance config uses explicit same-node recreate mode:
+`allow_preempting_target_recreate=true` plus
+`allow_stop_before_recreate=true`. It validates the controller/apply/logical
+placement metric path on one real worker node, but it is not a cross-failure
+domain relocation experiment. Use the multi-worker performance matrix for
+multi-worker relocation validation.
+
+After changing `runtime_moe_metadata.patch`, rebuild the image once by omitting
+`--skip-build`. With the observe-only vLLM placement hook patch present, the
+applied V6 summary should show runtime hook availability/attempts but still no
+physical apply/verify success:
+
+```text
+runtime_apply_hooks=1
+runtime_apply_success=0
+runtime_verify_hooks=1
+runtime_verify_success=0
 ```
 
 V7 context migration performance:
@@ -300,7 +328,7 @@ cd /tmp/spotserve-work &&
 | V3 | `benchmark_matrix_recovery_correctness.yaml` | Recovery policies turn forced failures into successes; latency is not the main metric. | Stable correctness check. |
 | V4 | `benchmark_matrix_vllm_dense.yaml` | Dense vLLM compatibility milestone; black-box recovery smoke only. | Rerun if backend image/model changed. |
 | V5 | `benchmark_matrix_vllm_moe.yaml`, `benchmark_matrix_vllm_dense_vs_moe.yaml` | MoE compatibility milestone; no MoE-specific speedup claim. | Rerun after backend/model changes. |
-| V6 | `benchmark_matrix_reparallelization_performance.yaml` | Shared Qwen2 run keeps both versions at 100% success; reparallelization executes once, succeeds, and lowers overall p95. Post-replan p95 stays near parity. | Refreshed 2026-07-27. |
+| V6 | `benchmark_matrix_reparallelization_performance.yaml` | Shared Qwen2 MoE single-worker same-node recreate run improves success from 37.50% to 100.00%; trace replay succeeds, one replan is applied, the logical expert placement plan is emitted with 8 shards/full coverage, movement diff is observed, and observe-only vLLM placement hooks are available/attempted. This validates the control-plane/logical placement/runtime-hook plumbing path, not physical expert weight movement. | Phase 4E movement-diff run refreshed 2026-09-06. |
 | V7 | `benchmark_matrix_context_migration_performance.yaml` | Shared Qwen2 MoE run keeps both versions at 100% success; preemption is injected, one context-migration plan executes, selected-plan KV/expert/queue costs are reported, and route metadata is consumed from patched vLLM runtime top-k instrumentation. V7 verifies low-cost target selection and prefix warmup/context planning, not physical expert migration or true remote expert-dispatch traffic. | Runtime top-k MoE run refreshed 2026-08-30. |
 | V8 | `benchmark_matrix_stateful_recovery_performance.yaml` | Shared Qwen2 MoE run keeps both versions at 100% success; stateful recovery restores once, restores 16 tokens and 6 KV blocks, has no fallback, and reports separated KV compatibility vs EP/locality signals. | Phase 3 MoE-aware recovery run refreshed 2026-08-30. |
 | V9 | `risk_aware_scheduling_synthetic.json` | Placement-quality improvement: lower-risk / longer-lived node selection. | Synthetic result; live latency/SLO impact still requires a real workload. |
@@ -309,11 +337,16 @@ cd /tmp/spotserve-work &&
 
 | Metric | Baseline | Applied | Result | Status |
 |---|---|---|---|---|
-| V6 success rate | Reparallelization disabled | Reparallelization applied | `100.00% -> 100.00%` | New backend, `8/8 -> 8/8`. |
-| V6 overall p95 | Reparallelization disabled | Reparallelization applied | `53261.47ms -> 13095.55ms` | Applied reduces overall p95 by `40165.93ms`. |
-| V6 replan-window p95 | Reparallelization disabled | Reparallelization applied | `14226.90ms -> 13095.55ms` | Replan window improved. |
-| V6 post-replan p95 | Reparallelization disabled | Reparallelization applied | `1048.39ms -> 1094.16ms` | Near parity after replan. |
-| V6 replan execution | Reparallelization disabled | Reparallelization applied | `0 replans -> 1 replan, 1 applied, 0 failed` | Lifecycle verified. |
+| V6 success rate | Reparallelization disabled | Reparallelization applied | `37.50% -> 100.00%` | `3/8 -> 8/8`; clean success also improves from `37.50%` to `100.00%`, with `0` fallbacks. |
+| V6 trace replay | Reparallelization disabled | Reparallelization applied | `1 success, 0 failed -> 1 success, 0 failed` | The preemption event replay completed on both runs, so the replan metrics are valid. |
+| V6 overall p95 | Reparallelization disabled | Reparallelization applied | `180084.27ms -> 14123.75ms` | Applied reduces overall p95 by `165960.52ms`. |
+| V6 replan-window p95 | Reparallelization disabled | Reparallelization applied | `180084.27ms -> 14123.75ms` | Replan-window success improves from `0.00%` to `100.00%`. |
+| V6 post-replan p95 | Reparallelization disabled | Reparallelization applied | `180045.72ms -> 1062.94ms` | Post-replan success improves from `0.00%` to `100.00%`. |
+| V6 replan execution | Reparallelization disabled | Reparallelization applied | `0 replans -> 1 replan, 1 applied, 0 failed` | Lifecycle verified; average execution duration was `15530.65ms`. |
+| V6 workload-aware cost model | Reparallelization disabled | Reparallelization applied | `0 -> 1 cost-model event` | Selected estimates: replan window `5800.00ms`, model load `5500.00ms`, migration `300.00ms`. |
+| V6 logical expert placement | Reparallelization disabled | Reparallelization applied | `0 -> 1 plan, 8 shards, coverage=1.00` | Phase 4 logical placement was emitted; physical expert migration remains `0`. |
+| V6 expert movement diff | Reparallelization disabled | Reparallelization applied | `0 -> 1 movement observation, moved=0, moved_bytes=0, move_cost=0.00ms` | Phase 4E compared selected placement against the current runtime snapshot. `moved=0` is expected for this single-worker same-node recreate run. |
+| V6 runtime placement hooks | Reparallelization disabled | Reparallelization applied | `0 -> apply_hooks=1, apply_attempted=1, verify_hooks=1, verify_attempted=1` | Observe-only hook plumbing verified; apply/verify success and plan applied/verified remain `0`. |
 | V7 MoE success rate | Context migration disabled | Context migration applied | `100.00% -> 100.00%` | New backend, `8/8 -> 8/8`. |
 | V7 MoE overall p95 | Context migration disabled | Context migration applied | `48238.92ms -> 4010.09ms` | Applied reduces overall p95 by `44228.82ms`. |
 | V7 MoE migration-window p95 | Context migration disabled | Context migration applied | `37079.91ms -> 1030.30ms` | Migration window improved by `36049.61ms`. |
@@ -325,7 +358,6 @@ cd /tmp/spotserve-work &&
 | V8 MoE post-recovery p95 | Token replay | Stateful recovery | `1082.20ms -> 1070.37ms` | Post-recovery latency stays near parity. |
 | V8 MoE restore signals | Token replay | Stateful recovery | `0 -> 1 restore, 16 restored tokens, 6 restored blocks, 0 fallback, true_kv_rate=100.00%` | True KV restore path verified for this run. |
 | V8 MoE recovery compatibility | Token replay | Stateful recovery | `0 -> 1 KV-compatible, 0 EP-required, 1 EP mismatch, locality=1.00, remote_tokens=0, expert_cost=0.00` | Confirms EP mismatch was reported as topology/locality information, not used as a hard KV restore rejection. |
-| V7-V9 live combined success rate | Token replay + no context migration + health-only scheduling | Stateful recovery + context/KV migration + risk-aware scheduling | `100.00% -> 100.00%` | New live combined run, `8/8 -> 8/8`. |
 | V7-V9 live combined overall p95 | Token replay + no context migration + health-only scheduling | Stateful recovery + context/KV migration + risk-aware scheduling | `48965.38ms -> 2656.23ms` | Overall p95 improves by `46309.15ms`, about `18.43x` faster. |
 | V7-V9 live migration-window p95 | Context migration disabled | Context/KV migration applied | `37195.15ms -> 1026.63ms` | Migration window improves by `36168.52ms`. |
 | V7-V9 live failure-window p95 | Token replay | Stateful recovery | `2226.07ms -> 2429.70ms` | In this combined timing, stateful failure window is slower by `203.62ms`; standalone V8 remains the cleaner stateful-recovery speedup result. |
@@ -352,8 +384,24 @@ Notes:
   `state_recovery_ep_layout_required_count`,
   `state_recovery_expert_placement_mismatch_count`, and recovery locality
   fields.
-- The 2026-07-27 V6 table uses shared `Qwen2-MoE-Tiny` with
-  `SPOTSERVE_REPARALLELIZATION_LOAD_FORMAT=auto`.
+- The 2026-09-06 V6 table uses shared `Qwen2-MoE-Tiny` with
+  `SPOTSERVE_REPARALLELIZATION_LOAD_FORMAT=auto`. The applied run reported
+  `trace_success=1`, `replans=1`, `applied=1`, `cost_model=1`,
+  `expert_plan=1`, `expert_plan_shards=8`, and
+  `replanning_avg_expert_placement_plan_coverage_ratio=1.0`. After Phase 4E,
+  it also reported
+  `replanning_expert_placement_plan_movement_observation_events=1`,
+  `replanning_max_expert_placement_plan_moved_experts=0`,
+  `replanning_total_expert_placement_plan_moved_weight_bytes=0`, and
+  `replanning_avg_expert_placement_plan_weight_movement_cost_ms=0.0`.
+  After Phase 4D observe-only hook plumbing, it reported
+  `runtime_apply_hooks=1`, `runtime_apply_success=0`,
+  `runtime_verify_hooks=1`, and `runtime_verify_success=0`.
+  `runtime_workers=0` is expected for this single-worker same-node recreate
+  matrix because the extra capacity is represented through the planner's
+  same-node recreate path, not through a multi-worker runtime relocation.
+  `replanning_expert_placement_plan_physical_migration_events=0`, so this row
+  must not be used as evidence of physical expert weight movement.
 - A 2026-07-28 V7 dense-side run used `/models/vllm/vllm-dense-baseline`;
   do not use it as the V7 MoE result.
 - The 2026-08-30 V7 MoE table uses shared `Qwen2-MoE-Tiny` with
@@ -371,6 +419,65 @@ Notes:
   `context_migration_events > 0`, `state_restore_successes_total > 0`, and
   `risk_scheduling_events > 0` before claiming that all three core paths ran
   together.
+- For Phase 4 pre-work, use `context_migration_moe_routed_tokens`,
+  `context_migration_moe_local_routed_tokens`,
+  `context_migration_moe_remote_routed_tokens`,
+  `context_migration_moe_avg_remote_routing_ratio`,
+  `state_recovery_moe_routed_tokens`,
+  `state_recovery_moe_local_routed_tokens`,
+  `state_recovery_moe_remote_routed_tokens`, and
+  `state_recovery_moe_avg_remote_routing_ratio` as routing + placement-derived
+  expert dispatch observability. These fields are not physical network traffic
+  counters. Require `context_migration_moe_locality_definitions` and
+  `state_recovery_moe_locality_definitions` to show
+  `target_placement_coverage`; require the corresponding
+  `*_moe_rank_locality_available_count` and
+  `*_moe_physical_dispatch_traffic_available_count` to remain `0` until
+  per-rank locality or real dispatch traffic instrumentation exists.
+- For the Phase 4 logical re-parallelization planner, require
+  `replanning_expert_placement_plan_available_events > 0`,
+  `replanning_max_expert_placement_plan_shards > 0`, and
+  `replanning_avg_expert_placement_plan_coverage_ratio = 1.0` on MoE runs.
+  After Phase 4E, also check
+  `replanning_expert_placement_plan_movement_observation_events`,
+  `replanning_max_expert_placement_plan_moved_experts`,
+  `replanning_total_expert_placement_plan_moved_weight_bytes`, and
+  `replanning_avg_expert_placement_plan_weight_movement_cost_ms` to confirm
+  that the planner compared the selected placement against the current runtime
+  placement snapshot. Use
+  `scripts/run_reparallelization_phase4_movement_ablation.py` for a controlled
+  Phase 4F non-zero movement check: the unpenalized synthetic run should report
+  `moved_experts=2`, `moved_weight_bytes=2097152`, and `movement_cost=20ms`,
+  while the penalized run should select the stationary placement with
+  `moved_experts=0`.
+  `replanning_expert_placement_plan_physical_migration_events` should remain
+  `0` until physical expert weight movement is implemented.
+  Replan comparison must treat a changed `ExpertPlacementPlan` fingerprint as
+  a changed deployment plan even when TP/DP/PP/replica shape is unchanged.
+- For the Phase 4 runtime placement contract pre-work, require
+  `context_migration_selected_target_expert_placement_contracts > 0` or
+  `state_recovery_target_expert_placement_contracts > 0` only when a target was
+  created from a logical `ExpertPlacementPlan`. The corresponding
+  `*_expert_placement_plan_applied` and
+  `*_expert_placement_plan_verified` values should remain `0` until vLLM EP
+  rank mapping / weight loading can explicitly apply and verify the plan.
+  The hook-level fields
+  `*_expert_placement_apply_hook_available`,
+  `*_expert_placement_apply_attempted`,
+  `*_expert_placement_apply_success`,
+  `*_expert_placement_verify_hook_available`,
+  `*_expert_placement_verify_attempted`, and
+  `*_expert_placement_verify_success` show whether the backend actually found
+  and called a patched vLLM runtime hook. After the observe-only vLLM hook
+  patch is rebuilt into the image, availability/attempt counts may be non-zero,
+  but apply/verify success and plan applied/verified counts should still remain
+  `0` with physical expert migration unsupported reasons.
+- For the placement ordering guard, require
+  `context_migration_placement_handshake_stale = 0` and
+  `state_recovery_placement_handshake_stale = 0` before claiming that migration
+  or recovery used a stable target placement view. The corresponding
+  `*_placement_handshake_attempts` and `*_placement_handshake_successes` fields
+  show whether the runtime could verify the target epoch/fingerprint.
 - The 2026-08-30 V7-V9 core table uses shared `Qwen2-MoE-Tiny` with
   `SPOTSERVE_CORE_LOAD_FORMAT=auto`. The applied run reported
   `context_migrations=1`, `route_source=vllm_runtime_topk`,
