@@ -202,10 +202,12 @@ class RoundRobinRouter(SllmRouter):
         self.deleting_inference_instances: Dict[str, InstanceHandle] = {}  # type:ignore
         self.ready_inference_instances: Dict[str, InstanceHandle] = {}  # type:ignore
         self.failed_inference_instances: Dict[str, InstanceHandle] = {}  # type:ignore
+        self.instance_start_tasks: Dict[str, asyncio.Task] = {}
         # Fine-tuning instance pools
         self.starting_ft_instances: Dict[str, InstanceHandle] = {}  # type:ignore
         self.deleting_ft_instances: Dict[str, InstanceHandle] = {}  # type:ignore
         self.ready_ft_instances: Dict[str, InstanceHandle] = {}  # type:ignore
+        self.ft_start_tasks: Dict[str, asyncio.Task] = {}
         self.instance_management_lock = asyncio.Lock()
 
         self.auto_scaling_config = {}
@@ -252,10 +254,188 @@ class RoundRobinRouter(SllmRouter):
 
     async def _stop_backend(self, backend_instance: Any, method_name: str):
         try:
-            await self._call_backend_method(backend_instance, method_name)
+            timeout_s = float(
+                self.router_config.get("backend_shutdown_timeout_s", 30.0)
+            )
+        except (TypeError, ValueError):
+            timeout_s = 30.0
+        if timeout_s <= 0:
+            timeout_s = 30.0
+        try:
+            await asyncio.wait_for(
+                self._call_backend_method(backend_instance, method_name),
+                timeout=timeout_s,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Timed out waiting %.3fs for backend actor %s during %s; "
+                "killing actor",
+                timeout_s,
+                backend_instance,
+                method_name,
+            )
         finally:
             if hasattr(backend_instance, "_ray_actor_id"):
                 ray.kill(backend_instance)
+
+    async def _clear_scheduler_model_state(self) -> None:
+        if self.backend == "dummy":
+            return
+        clear_model = getattr(self.model_loading_scheduler, "clear_model", None)
+        if clear_model is None:
+            return
+        try:
+            remote = getattr(clear_model, "remote", None)
+            if remote is not None:
+                await remote(self.model_name)
+            else:
+                result = clear_model(self.model_name)
+                if inspect.isawaitable(result):
+                    await result
+        except Exception:
+            logger.exception(
+                "Failed to clear scheduler state for model %s",
+                self.model_name,
+            )
+
+    async def _cancel_start_tasks(self) -> None:
+        task_items = [
+            (instance_id, task)
+            for instance_id, task in list(self.instance_start_tasks.items())
+            if not task.done()
+        ]
+        task_items.extend(
+            (instance_id, task)
+            for instance_id, task in list(self.ft_start_tasks.items())
+            if not task.done()
+        )
+        tasks = [task for _, task in task_items]
+        if not tasks:
+            return
+        for task in tasks:
+            task.cancel()
+        try:
+            timeout_s = float(
+                self.router_config.get("startup_task_cancel_timeout_s", 5.0)
+            )
+        except (TypeError, ValueError):
+            timeout_s = 5.0
+        if timeout_s <= 0:
+            timeout_s = 5.0
+        done, pending = await asyncio.wait(tasks, timeout=timeout_s)
+        for task in done:
+            try:
+                task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception(
+                    "Startup task failed while shutting down model %s",
+                    self.model_name,
+                )
+        if pending:
+            logger.warning(
+                "Timed out waiting %.3fs for %d startup tasks while "
+                "shutting down model %s",
+                timeout_s,
+                len(pending),
+                self.model_name,
+            )
+            pending_task_ids = {
+                task: instance_id for instance_id, task in task_items
+            }
+            await asyncio.gather(
+                *(
+                    self._kill_detached_backend_actor_by_name(
+                        pending_task_ids[task]
+                    )
+                    for task in pending
+                ),
+                return_exceptions=True,
+            )
+        self.instance_start_tasks.clear()
+        self.ft_start_tasks.clear()
+
+    async def _kill_detached_backend_actor_by_name(
+        self, actor_name: str
+    ) -> bool:
+        try:
+            timeout_s = float(
+                self.router_config.get(
+                    "startup_actor_cleanup_timeout_s", 60.0
+                )
+            )
+        except (TypeError, ValueError):
+            timeout_s = 60.0
+        try:
+            quiet_s = float(
+                self.router_config.get("startup_actor_cleanup_quiet_s", 15.0)
+            )
+        except (TypeError, ValueError):
+            quiet_s = 15.0
+        try:
+            interval_s = float(
+                self.router_config.get(
+                    "startup_actor_cleanup_interval_s", 0.5
+                )
+            )
+        except (TypeError, ValueError):
+            interval_s = 0.5
+        timeout_s = max(timeout_s, 0.0)
+        quiet_s = max(quiet_s, 0.0)
+        interval_s = max(interval_s, 0.05)
+        deadline = time.monotonic() + timeout_s
+        quiet_deadline = time.monotonic() + quiet_s
+        namespaces = (None, "sllm", "models")
+
+        while True:
+            actor_handle = None
+            for namespace in namespaces:
+                try:
+                    if namespace is None:
+                        actor_handle = ray.get_actor(actor_name)
+                    else:
+                        actor_handle = ray.get_actor(
+                            actor_name, namespace=namespace
+                        )
+                    break
+                except Exception:
+                    continue
+            if actor_handle is not None:
+                try:
+                    ray.kill(actor_handle, no_restart=True)
+                except TypeError:
+                    ray.kill(actor_handle)
+                logger.info(
+                    "Killed detached backend actor %s while shutting down "
+                    "model %s",
+                    actor_name,
+                    self.model_name,
+                )
+                return True
+            now = time.monotonic()
+            if now >= quiet_deadline or now >= deadline:
+                logger.info(
+                    "No detached backend actor %s appeared while shutting "
+                    "down model %s",
+                    actor_name,
+                    self.model_name,
+                )
+                return False
+            await asyncio.sleep(interval_s)
+
+    def _track_start_task(
+        self,
+        instance_id: str,
+        task: asyncio.Task,
+        task_map: Dict[str, asyncio.Task],
+    ) -> None:
+        task_map[instance_id] = task
+
+        def _forget_task(_task: asyncio.Task) -> None:
+            task_map.pop(instance_id, None)
+
+        task.add_done_callback(_forget_task)
 
     async def _track_inflight_request(
         self,
@@ -3383,6 +3563,7 @@ class RoundRobinRouter(SllmRouter):
     async def shutdown(self):
         async with self.running_lock:
             self.running = False
+        await self._cancel_start_tasks()
         # stop all inference instances
         # return all unfinished requests
         while not self.request_queue.empty():
@@ -3417,6 +3598,7 @@ class RoundRobinRouter(SllmRouter):
             for instance_id, instance in ft_instances.items()
         )
         await asyncio.gather(*delete_tasks)
+        await self._clear_scheduler_model_state()
 
         return deleted_instance_id
 
@@ -3530,7 +3712,10 @@ class RoundRobinRouter(SllmRouter):
         )
         async with self.instance_management_lock:
             self.starting_inference_instances[instance_id] = instance
-        self.loop.create_task(self._start_instance(instance_id))
+        task = self.loop.create_task(self._start_instance(instance_id))
+        self._track_start_task(
+            instance_id, task, self.instance_start_tasks
+        )
 
         return instance_id
 
@@ -3547,7 +3732,8 @@ class RoundRobinRouter(SllmRouter):
         )
         async with self.instance_management_lock:
             self.starting_ft_instances[instance_id] = instance
-        self.loop.create_task(self._start_ft_instance(instance_id))
+        task = self.loop.create_task(self._start_ft_instance(instance_id))
+        self._track_start_task(instance_id, task, self.ft_start_tasks)
         logger.info(f"Created task for starting FT instance {instance_id}")
         return instance_id
 
@@ -3637,6 +3823,42 @@ class RoundRobinRouter(SllmRouter):
                 )
                 return
             return instance_id
+        except asyncio.CancelledError:
+            logger.info(
+                "Cancelled startup for instance %s of model %s",
+                instance_id,
+                self.model_name,
+            )
+            if instance is not None:
+                async with self.instance_management_lock:
+                    self.starting_inference_instances.pop(instance_id, None)
+                if instance.backend_instance is not None:
+                    try:
+                        await self._stop_backend(
+                            instance.backend_instance, "shutdown"
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to shutdown cancelled backend actor %s "
+                            "for model %s",
+                            instance_id,
+                            self.model_name,
+                        )
+                if resources_allocated and self.backend != "dummy":
+                    try:
+                        await self.model_loading_scheduler.deallocate_resource.remote(
+                            self.model_name,
+                            instance_id,
+                            self.resource_requirements,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to deallocate resources for cancelled "
+                            "instance %s of model %s",
+                            instance_id,
+                            self.model_name,
+                        )
+            raise
         except Exception as exc:
             logger.exception(
                 "Failed to start instance %s for model %s",

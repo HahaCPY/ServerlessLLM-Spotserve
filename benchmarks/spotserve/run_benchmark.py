@@ -481,6 +481,171 @@ def delete_model_over_http(
         )
 
 
+def alive_model_actor_names_from_actor_table(
+    actor_table: Mapping[str, Mapping[str, Any]],
+    model_name: str,
+) -> List[str]:
+    prefix = f"{model_name}_"
+    actor_names: List[str] = []
+    for actor in actor_table.values():
+        actor_name = str(actor.get("Name") or actor.get("name") or "")
+        actor_state = str(
+            actor.get("State") or actor.get("state") or ""
+        ).upper()
+        if actor_state != "ALIVE":
+            continue
+        if actor_name == model_name or actor_name.startswith(prefix):
+            actor_names.append(actor_name)
+    return sorted(actor_names)
+
+
+def _dedupe_namespaces(
+    ray_namespace: str,
+) -> List[Optional[str]]:
+    namespaces: List[Optional[str]] = [None]
+    for namespace in (ray_namespace, "sllm", "models"):
+        if namespace and namespace not in namespaces:
+            namespaces.append(namespace)
+    return namespaces
+
+
+def _resolve_ray_actor_by_name(
+    ray_module: Any,
+    actor_name: str,
+    namespaces: List[Optional[str]],
+) -> Optional[Any]:
+    for namespace in namespaces:
+        try:
+            if namespace is None:
+                return ray_module.get_actor(actor_name)
+            return ray_module.get_actor(actor_name, namespace=namespace)
+        except Exception:
+            continue
+    return None
+
+
+async def cleanup_detached_model_actors_after_delete(
+    model_name: str,
+    ray_address: str,
+    ray_namespace: str,
+    timeout_s: float,
+    quiet_s: float,
+    interval_s: float,
+) -> Dict[str, Any]:
+    started_at = time.monotonic()
+    cleanup: Dict[str, Any] = {
+        "model_name": model_name,
+        "timeout_s": timeout_s,
+        "quiet_s": quiet_s,
+        "interval_s": interval_s,
+        "observed_actor_names": [],
+        "killed_actor_names": [],
+        "remaining_actor_names": [],
+        "skipped": False,
+    }
+    try:
+        import ray
+        import ray._private.state as ray_state
+    except ModuleNotFoundError as exc:
+        cleanup["skipped"] = True
+        cleanup["skipped_reason"] = str(exc)
+        return cleanup
+
+    if not ray.is_initialized():
+        ray.init(
+            address=ray_address,
+            namespace=ray_namespace,
+            ignore_reinit_error=True,
+        )
+
+    timeout_s = max(float(timeout_s or 0.0), 0.0)
+    quiet_s = max(float(quiet_s or 0.0), 0.0)
+    interval_s = max(float(interval_s or 0.0), 0.05)
+    deadline = time.monotonic() + timeout_s
+    quiet_deadline = time.monotonic() + quiet_s
+    namespaces = _dedupe_namespaces(ray_namespace)
+    observed_actor_names = set()
+    killed_actor_names = set()
+
+    while True:
+        actor_names = alive_model_actor_names_from_actor_table(
+            ray_state.actors(),
+            model_name,
+        )
+        observed_actor_names.update(actor_names)
+        now = time.monotonic()
+        if not actor_names:
+            if now >= quiet_deadline or now >= deadline:
+                cleanup["elapsed_s"] = time.monotonic() - started_at
+                cleanup["observed_actor_names"] = sorted(observed_actor_names)
+                cleanup["killed_actor_names"] = sorted(killed_actor_names)
+                return cleanup
+            await asyncio.sleep(interval_s)
+            continue
+
+        quiet_deadline = now + quiet_s
+        for actor_name in actor_names:
+            actor_handle = _resolve_ray_actor_by_name(
+                ray,
+                actor_name,
+                namespaces,
+            )
+            if actor_handle is None:
+                continue
+            try:
+                ray.kill(actor_handle, no_restart=True)
+            except TypeError:
+                ray.kill(actor_handle)
+            killed_actor_names.add(actor_name)
+
+        if now >= deadline:
+            cleanup["elapsed_s"] = time.monotonic() - started_at
+            cleanup["observed_actor_names"] = sorted(observed_actor_names)
+            cleanup["killed_actor_names"] = sorted(killed_actor_names)
+            cleanup["remaining_actor_names"] = actor_names
+            return cleanup
+        await asyncio.sleep(interval_s)
+
+
+async def record_actor_cleanup_after_delete(
+    run_dir: Path,
+    records: List[Dict[str, Any]],
+    phase: str,
+    model_name: str,
+    run_config: Mapping[str, Any],
+    ray_address: str,
+    ray_namespace: str,
+) -> None:
+    cleanup = await cleanup_detached_model_actors_after_delete(
+        model_name,
+        ray_address,
+        ray_namespace,
+        float(run_config.get("delete_actor_cleanup_timeout_s", 60.0) or 60.0),
+        float(run_config.get("delete_actor_cleanup_quiet_s", 5.0) or 5.0),
+        float(run_config.get("delete_actor_cleanup_interval_s", 0.5) or 0.5),
+    )
+    cleanup["phase"] = phase
+    records.append(cleanup)
+    (run_dir / "actor_cleanup.json").write_text(
+        json.dumps(records, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    remaining = cleanup.get("remaining_actor_names") or []
+    if not remaining:
+        return
+    print(
+        "[benchmark cleanup warning] Stale Ray actors remained after "
+        f"deleting {model_name}: {remaining}",
+        file=sys.stderr,
+    )
+    if run_config.get("fail_on_stale_actor_cleanup"):
+        raise RuntimeError(
+            f"Stale Ray actors remained after deleting {model_name}: "
+            f"{remaining}"
+        )
+
+
 def get_json(endpoint: str, timeout_s: float) -> Dict[str, Any]:
     with request.urlopen(endpoint, timeout=timeout_s) as response:
         return json.loads(response.read().decode("utf-8"))
@@ -625,16 +790,24 @@ async def resolve_trace_instance_id(
         event.model_name, ray_address, ray_namespace
     )
     if selector in ("active", "active_context", "busy"):
-        ready_instances = [
+        all_ready_instances = [
             (instance_id, state)
             for instance_id, state in states.items()
             if is_ready_instance_state(state)
         ]
         ready_instances = [
             (instance_id, state)
-            for instance_id, state in ready_instances
+            for instance_id, state in all_ready_instances
             if instance_concurrency(state) > 0
         ]
+        if not ready_instances and all_ready_instances:
+            print(
+                f"Trace selector={selector} found no busy instances for "
+                f"{event.model_name}; falling back to ready instance "
+                "selection",
+                flush=True,
+            )
+            ready_instances = all_ready_instances
         ready_instances = sorted(
             ready_instances,
             key=lambda item: (-instance_concurrency(item[1]), item[0]),
@@ -983,9 +1156,19 @@ async def run_one(
             encoding="utf-8",
         )
 
+    actor_cleanup_records: List[Dict[str, Any]] = []
     deleted_before_run = False
     for model_name in run_config.get("delete_models_before_run", []):
         delete_model_over_http(endpoint, model_name, run_request_timeout_s)
+        await record_actor_cleanup_after_delete(
+            run_dir,
+            actor_cleanup_records,
+            "before_run",
+            model_name,
+            run_config,
+            ray_address,
+            ray_namespace,
+        )
         deleted_before_run = True
     if deleted_before_run:
         await asyncio.sleep(float(run_config.get("delete_settle_s", 0.0) or 0.0))
@@ -1000,6 +1183,7 @@ async def run_one(
         )
 
     trace_replayer = None
+    rows: List[Dict[str, Any]] = []
     try:
         await wait_for_ready_instances(
             run_config["model"],
@@ -1049,6 +1233,15 @@ async def run_one(
         if run_config.get("delete_after_run"):
             delete_model_over_http(
                 endpoint, run_config["model"], run_request_timeout_s
+            )
+            await record_actor_cleanup_after_delete(
+                run_dir,
+                actor_cleanup_records,
+                "after_run",
+                run_config["model"],
+                run_config,
+                ray_address,
+                ray_namespace,
             )
 
     for row in rows:

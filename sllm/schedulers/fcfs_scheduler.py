@@ -61,6 +61,7 @@ class FcfsScheduler(SllmScheduler):
         self.metadata_lock = asyncio.Lock()
         self.worker_nodes = {}
         self.model_instance = {}
+        self.model_instance_resources = {}
 
         self.loop = asyncio.get_running_loop()
 
@@ -161,6 +162,95 @@ class FcfsScheduler(SllmScheduler):
                 updated_node_info[key] = previous_node_info[key]
         updated_node_info.update(self._configured_node_risk(str(node_id)))
         return updated_node_info
+
+    @staticmethod
+    def _optional_float_value(
+        payload: Mapping[str, Any], key: str
+    ) -> Optional[float]:
+        try:
+            value = payload.get(key)
+            if value is None:
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _apply_scheduler_capacity(
+        self,
+        updated_node_info: dict,
+        allocated_gpu: float,
+    ) -> dict:
+        live_total_gpu = self._optional_float_value(
+            updated_node_info, "total_gpu"
+        )
+        live_free_gpu = self._optional_float_value(
+            updated_node_info, "free_gpu"
+        )
+        if live_total_gpu is None and live_free_gpu is None:
+            return updated_node_info
+        total_gpu = live_total_gpu if live_total_gpu is not None else live_free_gpu
+        if total_gpu is None:
+            return updated_node_info
+        updated_node_info["total_gpu"] = total_gpu
+        updated_node_info["free_gpu"] = max(
+            0.0,
+            min(
+                total_gpu,
+                (live_free_gpu if live_free_gpu is not None else total_gpu),
+                total_gpu - allocated_gpu,
+            ),
+        )
+        return updated_node_info
+
+    def _apply_ray_available_capacity(
+        self,
+        updated_node_info: dict,
+        node_id: str,
+        available_resources: Mapping[str, Any],
+    ) -> dict:
+        """Conservatively reconcile scheduler state with live Ray resources.
+
+        ``ray.nodes()`` reports static node resources, not currently available
+        capacity.  The per-worker custom resource is consumed together with a
+        vLLM backend actor, so on single-GPU worker containers it is a reliable
+        guard against assigning a second actor to a GPU already held by a stale
+        or pending Ray actor that the scheduler does not own.
+        """
+        total_gpu = self._optional_float_value(updated_node_info, "total_gpu")
+        if total_gpu is None or total_gpu > 1.0:
+            return updated_node_info
+
+        worker_resource_key = f"worker_id_{node_id}"
+        try:
+            available_worker_resource = float(
+                available_resources.get(worker_resource_key, 0.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            return updated_node_info
+
+        updated_node_info["ray_available_worker_resource"] = (
+            available_worker_resource
+        )
+        if available_worker_resource < 0.999:
+            updated_node_info["free_gpu"] = 0.0
+        return updated_node_info
+
+    def _allocated_gpu_by_node_unlocked(self) -> Dict[str, float]:
+        allocated: Dict[str, float] = {}
+        for model_name, instances in self.model_instance.items():
+            resource_entries = self.model_instance_resources.get(
+                model_name, {}
+            )
+            for instance_id, node_id in instances.items():
+                resource_entry = resource_entries.get(instance_id, {})
+                try:
+                    num_gpus = float(resource_entry.get("num_gpus", 1.0))
+                except (TypeError, ValueError):
+                    num_gpus = 1.0
+                allocated[str(node_id)] = (
+                    allocated.get(str(node_id), 0.0) + max(0.0, num_gpus)
+                )
+        return allocated
 
     async def _collect_provider_risk_metadata(
         self, worker_nodes: Mapping[str, Mapping[str, Any]]
@@ -599,7 +689,13 @@ class FcfsScheduler(SllmScheduler):
                 self.model_loading_queues[model_name] = []
             allocation_result = self.loop.create_future()
             self.model_loading_queues[model_name].append(
-                (time.time(), num_gpus, allocation_result, target_node_id)
+                (
+                    time.time(),
+                    instance_id,
+                    num_gpus,
+                    allocation_result,
+                    target_node_id,
+                )
             )
         logger.info(
             f"Model {model_name} added to the loading queue"
@@ -614,6 +710,12 @@ class FcfsScheduler(SllmScheduler):
             if model_name not in self.model_instance:
                 self.model_instance[model_name] = {}
             self.model_instance[model_name][instance_id] = node_id
+            if model_name not in self.model_instance_resources:
+                self.model_instance_resources[model_name] = {}
+            self.model_instance_resources[model_name][instance_id] = {
+                "node_id": node_id,
+                "num_gpus": num_gpus,
+            }
         return node_id
 
     async def deallocate_resource(
@@ -630,12 +732,73 @@ class FcfsScheduler(SllmScheduler):
                 logger.error(f"Instance {instance_id} not found")
                 return
             node_id = self.model_instance[model_name].pop(instance_id)
+            resource_entry = self.model_instance_resources.get(
+                model_name, {}
+            ).pop(instance_id, {})
+            if not self.model_instance[model_name]:
+                self.model_instance.pop(model_name, None)
+            if not self.model_instance_resources.get(model_name):
+                self.model_instance_resources.pop(model_name, None)
+            try:
+                num_gpus = float(resource_entry.get("num_gpus", num_gpus))
+            except (TypeError, ValueError):
+                pass
             logger.info(f"Node {node_id} deallocated {num_gpus} GPUs")
             if node_id not in self.worker_nodes:
                 logger.error(f"Node {node_id} not found")
                 return
             self.worker_nodes[node_id]["free_gpu"] += num_gpus
         logger.info(f"Model {model_name} instance {instance_id} deallocated")
+
+    async def clear_model(self, model_name: str):
+        logger.info(f"Clearing scheduler state for model {model_name}")
+        cleared_pending = 0
+        released_allocations = 0
+        async with self.queue_lock:
+            pending = self.model_loading_queues.pop(model_name, [])
+            for entry in pending:
+                try:
+                    allocation_result = entry[3]
+                except IndexError:
+                    continue
+                if allocation_result.done():
+                    continue
+                allocation_result.set_exception(
+                    RuntimeError(
+                        f"Allocation cancelled for deleted model {model_name}"
+                    )
+                )
+                cleared_pending += 1
+
+        async with self.metadata_lock:
+            instances = self.model_instance.pop(model_name, {})
+            resource_entries = self.model_instance_resources.pop(
+                model_name, {}
+            )
+            for instance_id, node_id in instances.items():
+                resource_entry = resource_entries.get(instance_id, {})
+                try:
+                    num_gpus = float(resource_entry.get("num_gpus", 1.0))
+                except (TypeError, ValueError):
+                    num_gpus = 1.0
+                if node_id in self.worker_nodes:
+                    self.worker_nodes[node_id]["free_gpu"] = min(
+                        float(
+                            self.worker_nodes[node_id].get("total_gpu", 0)
+                            or 0
+                        ),
+                        float(
+                            self.worker_nodes[node_id].get("free_gpu", 0)
+                            or 0
+                        )
+                        + num_gpus,
+                    )
+                released_allocations += 1
+        return {
+            "model_name": model_name,
+            "cleared_pending": cleared_pending,
+            "released_allocations": released_allocations,
+        }
 
     async def _control_loop(self):
         logger.info("Starting control loop")
@@ -648,6 +811,7 @@ class FcfsScheduler(SllmScheduler):
                 ) in self.model_loading_queues.items():
                     for idx, (
                         request_time,
+                        instance_id,
                         num_gpus,
                         allocation_result,
                         target_node_id,
@@ -657,6 +821,7 @@ class FcfsScheduler(SllmScheduler):
                                 model_name,
                                 idx,
                                 request_time,
+                                instance_id,
                                 num_gpus,
                                 allocation_result,
                                 target_node_id,
@@ -672,6 +837,7 @@ class FcfsScheduler(SllmScheduler):
                     model_name,
                     idx,
                     request_time,
+                    instance_id,
                     num_gpus,
                     allocation_result,
                     target_node_id,
@@ -706,6 +872,7 @@ class FcfsScheduler(SllmScheduler):
                                     ].remove(
                                         (
                                             request_time,
+                                            instance_id,
                                             num_gpus,
                                             allocation_result,
                                             target_node_id,
@@ -728,6 +895,10 @@ class FcfsScheduler(SllmScheduler):
 
     async def _get_worker_nodes(self):
         worker_nodes = get_worker_nodes()
+        try:
+            available_resources = ray.available_resources()
+        except Exception:
+            available_resources = {}
         provider_metadata = await self._collect_provider_risk_metadata(
             worker_nodes
         )
@@ -736,23 +907,49 @@ class FcfsScheduler(SllmScheduler):
                 worker_nodes[node_id].update(metadata)
         async with self.metadata_lock:
             updated_worker_nodes = copy.deepcopy(self.worker_nodes)
+            allocated_gpu_by_node = self._allocated_gpu_by_node_unlocked()
         for node_id, node_info in worker_nodes.items():
             if node_id not in updated_worker_nodes:
                 updated_worker_nodes[node_id] = self._ensure_node_metadata(
                     copy.deepcopy(node_info),
                     node_id=node_id,
                 )
+                updated_worker_nodes[node_id] = (
+                    self._apply_scheduler_capacity(
+                        updated_worker_nodes[node_id],
+                        allocated_gpu_by_node.get(str(node_id), 0.0),
+                    )
+                )
             else:
                 current_state = updated_worker_nodes[node_id].get(
                     "state", NodeState.READY.value
                 )
                 updated_worker_nodes[node_id].update(copy.deepcopy(node_info))
+                updated_worker_nodes[node_id] = (
+                    self._apply_scheduler_capacity(
+                        updated_worker_nodes[node_id],
+                        allocated_gpu_by_node.get(str(node_id), 0.0),
+                    )
+                )
                 updated_worker_nodes[node_id]["state"] = current_state
                 updated_worker_nodes[node_id] = self._preserve_spot_metadata(
                     updated_worker_nodes[node_id],
                     self.worker_nodes[node_id],
                     node_id,
                 )
+            updated_worker_nodes[node_id] = self._apply_ray_available_capacity(
+                updated_worker_nodes[node_id],
+                str(node_id),
+                available_resources,
+            )
+
+        for node_id, node_info in updated_worker_nodes.items():
+            if node_id in worker_nodes:
+                continue
+            updated_worker_nodes[node_id] = self._apply_scheduler_capacity(
+                node_info,
+                allocated_gpu_by_node.get(str(node_id), 0.0),
+            )
 
         runtime_metadata_rows = await self._collect_backend_runtime_metadata()
         updated_worker_nodes = self._merge_backend_runtime_metadata(

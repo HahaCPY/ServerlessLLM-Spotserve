@@ -319,6 +319,13 @@ cd /tmp/spotserve-work &&
 '
 ```
 
+`spotserve-core-performance` now starts both `sllm_worker_0` and
+`sllm_worker_1` by default because the core matrices deploy two ready vLLM
+instances (`min_instances=2`, `min_ready_instances=2`). If only
+`sllm_worker_0` is running, the second model instance can remain in `starting`
+and the sweep will fail during setup with a Ray scheduling warning for
+`worker_id_0`.
+
 ## Performance Summary
 
 | Version | Benchmark | Current claim | Refresh status |
@@ -511,7 +518,10 @@ Notes:
   `recovery_ep_mismatch=1`, and `risk_scheduling_events=3`.
 - For the V7-V9 trace sweep, baseline and applied use the same trace file
   inside each scenario. The benchmark runner fills in each run's model name at
-  replay time. After the sweep, compare scenarios in
+  replay time. This sweep expects two ready vLLM instances, so rerun
+  `prepare_spotserve.sh --skip-build --deploy-set spotserve-core-performance`
+  after pulling this change and confirm that both `sllm_worker_0` and
+  `sllm_worker_1` are active. After the sweep, compare scenarios in
   `results/spotserve_core_trace_sweep/latest_comparisons.json`.
 - V9 scheduling affects model placement/loading, not per-token decoding. On a
   single worker node it can emit the scheduling decision but may not improve

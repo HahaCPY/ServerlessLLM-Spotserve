@@ -211,3 +211,150 @@ async def test_scheduler_preserves_node_state_during_worker_update():
         scheduler.worker_nodes["node-0"]["state"]
         == NodeState.PREEMPTING.value
     )
+
+
+@pytest.mark.asyncio
+async def test_scheduler_preserves_allocated_capacity_during_worker_refresh(
+    monkeypatch,
+):
+    scheduler = FcfsScheduler({})
+    scheduler.model_instance = {
+        "test-model": {
+            "instance-0": "0",
+        }
+    }
+    scheduler.model_instance_resources = {
+        "test-model": {
+            "instance-0": {
+                "node_id": "0",
+                "num_gpus": 1,
+            }
+        }
+    }
+    scheduler.worker_nodes = {
+        "0": {
+            "ray_node_id": "ray-node-0",
+            "address": "10.0.0.1",
+            "free_gpu": 0,
+            "total_gpu": 1,
+            "state": NodeState.READY.value,
+        },
+        "1": {
+            "ray_node_id": "ray-node-1",
+            "address": "10.0.0.2",
+            "free_gpu": 1,
+            "total_gpu": 1,
+            "state": NodeState.READY.value,
+        },
+    }
+
+    monkeypatch.setattr(
+        fcfs_scheduler_module,
+        "get_worker_nodes",
+        lambda: {
+            "0": {
+                "ray_node_id": "ray-node-0-new",
+                "address": "10.0.0.1",
+                "free_gpu": 1,
+                "total_gpu": 1,
+            },
+            "1": {
+                "ray_node_id": "ray-node-1-new",
+                "address": "10.0.0.2",
+                "free_gpu": 1,
+                "total_gpu": 1,
+            },
+        },
+    )
+
+    refreshed = await scheduler._get_worker_nodes()
+
+    assert refreshed["0"]["ray_node_id"] == "ray-node-0-new"
+    assert refreshed["0"]["free_gpu"] == 0
+    assert refreshed["1"]["free_gpu"] == 1
+
+
+@pytest.mark.asyncio
+async def test_scheduler_reconciles_single_gpu_worker_with_ray_available_resources(
+    monkeypatch,
+):
+    scheduler = FcfsScheduler({})
+
+    monkeypatch.setattr(
+        fcfs_scheduler_module,
+        "get_worker_nodes",
+        lambda: {
+            "0": {
+                "ray_node_id": "ray-node-0",
+                "address": "10.0.0.1",
+                "free_gpu": 1,
+                "total_gpu": 1,
+            },
+            "1": {
+                "ray_node_id": "ray-node-1",
+                "address": "10.0.0.2",
+                "free_gpu": 1,
+                "total_gpu": 1,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        fcfs_scheduler_module.ray,
+        "available_resources",
+        lambda: {
+            "GPU": 1.0,
+            "worker_id_0": 1.0,
+            "worker_id_1": 0.9,
+        },
+    )
+
+    refreshed = await scheduler._get_worker_nodes()
+
+    assert refreshed["0"]["free_gpu"] == 1
+    assert refreshed["1"]["free_gpu"] == 0
+    assert refreshed["1"]["ray_available_worker_resource"] == 0.9
+
+
+@pytest.mark.asyncio
+async def test_scheduler_clear_model_cancels_pending_and_releases_allocations():
+    scheduler = FcfsScheduler({})
+    pending = scheduler.loop.create_future()
+    scheduler.model_loading_queues = {
+        "test-model": [
+            (0.0, "instance-pending", 1, pending, None),
+        ]
+    }
+    scheduler.model_instance = {
+        "test-model": {
+            "instance-ready": "0",
+        }
+    }
+    scheduler.model_instance_resources = {
+        "test-model": {
+            "instance-ready": {
+                "node_id": "0",
+                "num_gpus": 1,
+            }
+        }
+    }
+    scheduler.worker_nodes = {
+        "0": {
+            "ray_node_id": "ray-node-0",
+            "address": "10.0.0.1",
+            "free_gpu": 0,
+            "total_gpu": 1,
+            "state": NodeState.READY.value,
+        }
+    }
+
+    result = await scheduler.clear_model("test-model")
+
+    assert result["cleared_pending"] == 1
+    assert result["released_allocations"] == 1
+    assert scheduler.model_loading_queues == {}
+    assert scheduler.model_instance == {}
+    assert scheduler.model_instance_resources == {}
+    assert scheduler.worker_nodes["0"]["free_gpu"] == 1
+    assert pending.done()
+    with pytest.raises(RuntimeError):
+        pending.result()

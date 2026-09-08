@@ -47,16 +47,24 @@ async def _resolve_instance_id(event: SpotEvent):
     router = ray.get_actor(event.model_name, namespace="models")
     states = await router.get_instance_states.remote()
     if event.instance_selector in ("active", "active_context", "busy"):
-        ready_instances = [
+        all_ready_instances = [
             (instance_id, state)
             for instance_id, state in states.items()
             if _is_ready_instance_state(state)
         ]
         ready_instances = [
             (instance_id, state)
-            for instance_id, state in ready_instances
+            for instance_id, state in all_ready_instances
             if _instance_concurrency(state) > 0
         ]
+        if not ready_instances and all_ready_instances:
+            logger.info(
+                "Trace selector=%s found no busy instances for %s; "
+                "falling back to ready instance selection",
+                event.instance_selector,
+                event.model_name,
+            )
+            ready_instances = all_ready_instances
         ready_instances = sorted(
             ready_instances,
             key=lambda item: (-_instance_concurrency(item[1]), item[0]),

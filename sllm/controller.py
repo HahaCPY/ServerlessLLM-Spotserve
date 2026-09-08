@@ -18,6 +18,7 @@
 import asyncio
 import datetime
 import os
+import time
 import uuid
 from typing import List, Mapping, Optional
 
@@ -469,21 +470,160 @@ class SllmController:
         async with self.metadata_lock:
             return model_name in self.registered_models
 
+    async def _clear_scheduler_model_state(self, model_name: str) -> None:
+        scheduler = getattr(self, "scheduler", None)
+        if scheduler is None:
+            return
+        clear_model = getattr(scheduler, "clear_model", None)
+        if clear_model is None:
+            return
+        try:
+            await clear_model.remote(model_name)
+        except Exception:
+            logger.exception(
+                "Failed to clear scheduler state for model %s", model_name
+            )
+
+    def _alive_actor_names_for_model(self, model_name: str) -> List[str]:
+        try:
+            import ray._private.state as ray_state
+
+            actors = ray_state.actors()
+        except Exception:
+            logger.exception(
+                "Failed to inspect Ray actors while deleting model %s",
+                model_name,
+            )
+            return []
+
+        prefix = f"{model_name}_"
+        actor_names: List[str] = []
+        for actor in actors.values():
+            actor_name = str(actor.get("Name") or actor.get("name") or "")
+            actor_state = str(
+                actor.get("State") or actor.get("state") or ""
+            ).upper()
+            if actor_state != "ALIVE":
+                continue
+            if actor_name == model_name or actor_name.startswith(prefix):
+                actor_names.append(actor_name)
+        return actor_names
+
+    async def _kill_detached_model_actors(self, model_name: str) -> None:
+        namespaces = (None, "sllm", "models")
+        config = dict(getattr(self, "config", {}) or {})
+        try:
+            timeout_s = float(
+                config.get("stale_actor_cleanup_timeout_s", 10.0)
+            )
+        except (TypeError, ValueError):
+            timeout_s = 10.0
+        try:
+            interval_s = float(
+                config.get("stale_actor_cleanup_interval_s", 0.5)
+            )
+        except (TypeError, ValueError):
+            interval_s = 0.5
+        try:
+            quiet_s = float(config.get("stale_actor_cleanup_quiet_s", 2.0))
+        except (TypeError, ValueError):
+            quiet_s = 2.0
+        timeout_s = max(timeout_s, 0.0)
+        interval_s = max(interval_s, 0.05)
+        quiet_s = max(quiet_s, 0.0)
+        deadline = time.monotonic() + timeout_s
+        quiet_deadline = time.monotonic() + quiet_s
+        killed_actor_names = set()
+
+        while True:
+            alive_actor_names = self._alive_actor_names_for_model(model_name)
+            actor_names = [
+                actor_name
+                for actor_name in alive_actor_names
+                if actor_name not in killed_actor_names
+            ]
+            if not actor_names:
+                now = time.monotonic()
+                if now >= quiet_deadline or now >= deadline:
+                    return
+                await asyncio.sleep(interval_s)
+                continue
+            for actor_name in actor_names:
+                actor_handle = None
+                for namespace in namespaces:
+                    try:
+                        if namespace is None:
+                            actor_handle = ray.get_actor(actor_name)
+                        else:
+                            actor_handle = ray.get_actor(
+                                actor_name, namespace=namespace
+                            )
+                        break
+                    except Exception:
+                        continue
+                if actor_handle is None:
+                    logger.warning(
+                        "Could not resolve stale Ray actor %s while deleting %s",
+                        actor_name,
+                        model_name,
+                    )
+                    killed_actor_names.add(actor_name)
+                    continue
+                try:
+                    ray.kill(actor_handle, no_restart=True)
+                    killed_actor_names.add(actor_name)
+                    logger.info(
+                        "Killed stale Ray actor %s while deleting model %s",
+                        actor_name,
+                        model_name,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to kill stale Ray actor %s while deleting %s",
+                        actor_name,
+                        model_name,
+                    )
+            if time.monotonic() >= deadline:
+                remaining = [
+                    actor_name
+                    for actor_name in self._alive_actor_names_for_model(
+                        model_name
+                    )
+                    if actor_name not in killed_actor_names
+                ]
+                if remaining:
+                    logger.warning(
+                        "Timed out waiting for stale Ray actors for model %s: %s",
+                        model_name,
+                        remaining,
+                    )
+                return
+            quiet_deadline = time.monotonic() + quiet_s
+            await asyncio.sleep(interval_s)
+
     async def delete(
         self, model_name: str, lora_adapters: Optional[List[str]] = None
     ):
         router = None
+        missing_model = False
         async with self.metadata_lock:
             if model_name not in self.request_routers:
                 logger.error(f"Model {model_name} not found")
-                return
-            if lora_adapters is not None:
+                self.registered_models.pop(model_name, None)
+                missing_model = True
+            elif lora_adapters is not None:
                 await self.request_routers[model_name].delete_adapters.remote(
                     lora_adapters
                 )
                 return
-            router = self.request_routers.pop(model_name)
-            self.registered_models.pop(model_name)
+            else:
+                router = self.request_routers.pop(model_name)
+                self.registered_models.pop(model_name)
+
+        if missing_model:
+            await self._clear_scheduler_model_state(model_name)
+            await self._kill_detached_model_actors(model_name)
+            return
 
         # Stop the router's workers before dropping the controller reference.
         # Merely removing the router from the registry leaks its vLLM actors
@@ -491,6 +631,8 @@ class SllmController:
         # target deployment from applying a newly selected ParallelPlan.
         if router is not None:
             await router.shutdown.remote()
+            await self._clear_scheduler_model_state(model_name)
+            await self._kill_detached_model_actors(model_name)
         del router
 
     async def get_models(self):

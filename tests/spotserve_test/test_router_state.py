@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 import pytest
@@ -398,6 +399,13 @@ class FakeFailingShutdownRayBackend:
 
     async def shutdown(self):
         raise RuntimeError("shutdown failed")
+
+
+class FakeHangingShutdownRayBackend:
+    _ray_actor_id = "fake-ray-actor"
+
+    async def shutdown(self):
+        await asyncio.Event().wait()
 
 
 class FakeStartInstanceRemote:
@@ -844,6 +852,55 @@ async def test_stop_backend_kills_ray_actor_when_shutdown_fails(monkeypatch):
         await router._stop_backend(backend, "shutdown")
 
     assert killed == [backend]
+
+
+@pytest.mark.asyncio
+async def test_stop_backend_kills_ray_actor_when_shutdown_times_out(monkeypatch):
+    router = RoundRobinRouter(
+        model_name="test-model",
+        resource_requirements={"num_cpus": 1, "num_gpus": 1},
+        backend="vllm",
+        backend_config={},
+        router_config={"backend_shutdown_timeout_s": 0.01},
+    )
+    backend = FakeHangingShutdownRayBackend()
+    killed = []
+
+    monkeypatch.setattr(
+        "sllm.routers.roundrobin_router.ray.kill",
+        lambda actor: killed.append(actor),
+    )
+
+    await router._stop_backend(backend, "shutdown")
+
+    assert killed == [backend]
+
+
+@pytest.mark.asyncio
+async def test_create_instance_tracks_and_cancels_start_task(monkeypatch):
+    router = RoundRobinRouter(
+        model_name="test-model",
+        resource_requirements={"num_cpus": 1, "num_gpus": 1},
+        backend="dummy",
+        backend_config={},
+        router_config={"startup_task_cancel_timeout_s": 0.1},
+    )
+    started = asyncio.Event()
+
+    async def pending_start(instance_id):
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(router, "_start_instance", pending_start)
+
+    instance_id = await router._create_instance()
+    await started.wait()
+
+    assert instance_id in router.instance_start_tasks
+
+    await router._cancel_start_tasks()
+
+    assert router.instance_start_tasks == {}
 
 
 @pytest.mark.asyncio

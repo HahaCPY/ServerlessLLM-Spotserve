@@ -43,7 +43,8 @@ Environment overrides:
   SPOTSERVE_EXPECTED_WORKER_NODES
                             Minimum Ray worker_node resources required before
                             deploying. Default: 2 for
-                            reparallelization-multi-worker-performance,
+                            reparallelization-multi-worker-performance and
+                            spotserve-core-performance,
                             otherwise 1.
   SPOTSERVE_REPARALLELIZATION_MULTI_WORKER
                             When set to 1, include sllm_worker_1 in the
@@ -177,7 +178,7 @@ CONTAINER="${SPOTSERVE_CONTAINER:-sllm_head}"
 COMPOSE_SERVICE="${SPOTSERVE_COMPOSE_SERVICE:-sllm_head}"
 WORKER_CONTAINER="${SPOTSERVE_WORKER_CONTAINER:-sllm_worker_0}"
 REPARALLELIZATION_MULTI_WORKER="${SPOTSERVE_REPARALLELIZATION_MULTI_WORKER:-0}"
-if [[ "$DEPLOY_SET" == "reparallelization-multi-worker-performance" ]]; then
+if [[ "$DEPLOY_SET" == "reparallelization-multi-worker-performance" || "$DEPLOY_SET" == "spotserve-core-performance" ]]; then
   EXPECTED_WORKER_NODES="${SPOTSERVE_EXPECTED_WORKER_NODES:-2}"
 else
   EXPECTED_WORKER_NODES="${SPOTSERVE_EXPECTED_WORKER_NODES:-1}"
@@ -252,7 +253,7 @@ fi
 
 if [[ -n "${SPOTSERVE_COMPOSE_SERVICES:-}" ]]; then
   read -r -a COMPOSE_SERVICES <<<"$SPOTSERVE_COMPOSE_SERVICES"
-elif [[ "$DEPLOY_SET" == "reparallelization-multi-worker-performance" ]]; then
+elif [[ "$DEPLOY_SET" == "reparallelization-multi-worker-performance" || "$DEPLOY_SET" == "spotserve-core-performance" ]]; then
   COMPOSE_SERVICES=("$COMPOSE_SERVICE" "sllm_worker_0" "sllm_worker_1")
 elif [[ "$DEPLOY_SET" == "reparallelization" || "$DEPLOY_SET" == "reparallelization-performance" || "$DEPLOY_SET" == "context-migration-performance" || "$DEPLOY_SET" == "stateful-recovery-performance" || "$DEPLOY_SET" == "spotserve-core-performance" || "$DEPLOY_SET" == "vllm-dense" || "$DEPLOY_SET" == "vllm-moe" || "$DEPLOY_SET" == "vllm-blackbox" || "$DEPLOY_SET" == "all" ]]; then
   COMPOSE_SERVICES=("$COMPOSE_SERVICE" "sllm_worker_0")
