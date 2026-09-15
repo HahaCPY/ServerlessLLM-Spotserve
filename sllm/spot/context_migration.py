@@ -166,6 +166,8 @@ class MigrationPlan:
     target_expert_placement_contract_available: bool = False
     target_expert_placement_plan_applied: bool = False
     target_expert_placement_plan_verified: bool = False
+    target_expert_placement_contract_seen_by_runtime: bool = False
+    target_expert_placement_contract_seen_by_all_workers: bool = False
     target_expert_placement_contract_reason: str = "unavailable"
     target_expert_placement_apply_hook_available: bool = False
     target_expert_placement_apply_attempted: bool = False
@@ -252,6 +254,12 @@ class MigrationPlan:
             ),
             "target_expert_placement_plan_verified": (
                 self.target_expert_placement_plan_verified
+            ),
+            "target_expert_placement_contract_seen_by_runtime": (
+                self.target_expert_placement_contract_seen_by_runtime
+            ),
+            "target_expert_placement_contract_seen_by_all_workers": (
+                self.target_expert_placement_contract_seen_by_all_workers
             ),
             "target_expert_placement_contract_reason": (
                 self.target_expert_placement_contract_reason
@@ -602,6 +610,20 @@ def target_placement_marker(target: MigrationTarget) -> Dict[str, Any]:
         ),
         "target_expert_placement_plan_verified": _to_bool(
             _metadata_value(target, "expert_placement_plan_verified"),
+            default=False,
+        ),
+        "target_expert_placement_contract_seen_by_runtime": _to_bool(
+            _metadata_value(
+                target,
+                "expert_placement_contract_seen_by_runtime",
+            ),
+            default=False,
+        ),
+        "target_expert_placement_contract_seen_by_all_workers": _to_bool(
+            _metadata_value(
+                target,
+                "expert_placement_contract_seen_by_all_workers",
+            ),
             default=False,
         ),
         "target_expert_placement_contract_reason": str(
@@ -1362,6 +1384,16 @@ def plan_low_cost_migration(
                 target_expert_placement_plan_verified=placement_marker[
                     "target_expert_placement_plan_verified"
                 ],
+                target_expert_placement_contract_seen_by_runtime=(
+                    placement_marker[
+                        "target_expert_placement_contract_seen_by_runtime"
+                    ]
+                ),
+                target_expert_placement_contract_seen_by_all_workers=(
+                    placement_marker[
+                        "target_expert_placement_contract_seen_by_all_workers"
+                    ]
+                ),
                 target_expert_placement_contract_reason=placement_marker[
                     "target_expert_placement_contract_reason"
                 ],

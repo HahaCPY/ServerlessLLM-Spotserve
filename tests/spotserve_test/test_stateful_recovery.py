@@ -311,6 +311,12 @@ def test_planner_ranks_compatible_targets_by_expert_locality():
     assert selected["target_expert_placement_contract_available"] is True
     assert selected["target_expert_placement_plan_applied"] is False
     assert selected["target_expert_placement_plan_verified"] is False
+    assert (
+        selected["target_expert_placement_contract_seen_by_runtime"] is False
+    )
+    assert (
+        selected["target_expert_placement_contract_seen_by_all_workers"] is False
+    )
     assert selected["target_expert_placement_contract_reason"] == (
         "runtime_not_applied"
     )

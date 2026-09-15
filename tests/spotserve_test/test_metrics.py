@@ -57,6 +57,11 @@ def test_replanning_event_exposes_runtime_expert_placement_hook_status():
                     "verify_reasons": (
                         "physical_expert_placement_verification_not_supported"
                     ),
+                    "contract_seen_count": 1,
+                    "contract_seen_all_workers_count": 1,
+                    "contract_seen_worker_count": 2,
+                    "contract_seen_worker_total": 2,
+                    "physical_weight_migration_count": 0,
                     "plan_applied_count": 0,
                     "plan_verified_count": 0,
                     "contract_reasons": (
@@ -93,6 +98,13 @@ def test_replanning_event_exposes_runtime_expert_placement_hook_status():
     assert event["expert_placement_runtime_verify_hook_available_count"] == 1
     assert event["expert_placement_runtime_verify_attempted_count"] == 1
     assert event["expert_placement_runtime_verify_success_count"] == 0
+    assert event["expert_placement_runtime_contract_seen_count"] == 1
+    assert (
+        event["expert_placement_runtime_contract_seen_all_workers_count"] == 1
+    )
+    assert event["expert_placement_runtime_contract_seen_worker_count"] == 2
+    assert event["expert_placement_runtime_contract_seen_worker_total"] == 2
+    assert event["expert_placement_runtime_physical_weight_migration_count"] == 0
     assert event["expert_placement_runtime_plan_applied_count"] == 0
     assert event["expert_placement_runtime_plan_verified_count"] == 0
     assert event["reparallelization_execution_model"] == "actor_recreate"

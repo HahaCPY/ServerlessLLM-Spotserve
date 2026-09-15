@@ -327,6 +327,21 @@ def make_replanning_event(
         "expert_placement_runtime_verify_reasons": (
             expert_placement_runtime.get("verify_reasons", "")
         ),
+        "expert_placement_runtime_contract_seen_count": (
+            expert_placement_runtime.get("contract_seen_count", 0)
+        ),
+        "expert_placement_runtime_contract_seen_all_workers_count": (
+            expert_placement_runtime.get("contract_seen_all_workers_count", 0)
+        ),
+        "expert_placement_runtime_contract_seen_worker_count": (
+            expert_placement_runtime.get("contract_seen_worker_count", 0)
+        ),
+        "expert_placement_runtime_contract_seen_worker_total": (
+            expert_placement_runtime.get("contract_seen_worker_total", 0)
+        ),
+        "expert_placement_runtime_physical_weight_migration_count": (
+            expert_placement_runtime.get("physical_weight_migration_count", 0)
+        ),
         "expert_placement_runtime_plan_applied_count": (
             expert_placement_runtime.get("plan_applied_count", 0)
         ),
@@ -744,6 +759,24 @@ def make_context_migration_event(
                 if plan.get("target_expert_placement_plan_verified")
             )
         ),
+        "selected_plan_target_expert_placement_contract_seen_count": (
+            sum(
+                1
+                for plan in plans
+                if plan.get(
+                    "target_expert_placement_contract_seen_by_runtime"
+                )
+            )
+        ),
+        "selected_plan_target_expert_placement_contract_seen_all_workers_count": (
+            sum(
+                1
+                for plan in plans
+                if plan.get(
+                    "target_expert_placement_contract_seen_by_all_workers"
+                )
+            )
+        ),
         "selected_plan_target_expert_placement_contract_reasons": (
             selected_target_contract_reasons
         ),
@@ -1082,6 +1115,16 @@ def make_state_recovery_event(
         ),
         "target_expert_placement_plan_verified": selected_candidate.get(
             "target_expert_placement_plan_verified", False
+        ),
+        "target_expert_placement_contract_seen_by_runtime": (
+            selected_candidate.get(
+                "target_expert_placement_contract_seen_by_runtime", False
+            )
+        ),
+        "target_expert_placement_contract_seen_by_all_workers": (
+            selected_candidate.get(
+                "target_expert_placement_contract_seen_by_all_workers", False
+            )
         ),
         "target_expert_placement_contract_reason": selected_candidate.get(
             "target_expert_placement_contract_reason", "unavailable"

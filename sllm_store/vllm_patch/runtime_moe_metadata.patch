@@ -3,7 +3,7 @@ new file mode 100644
 index 000000000..5b1bb3f55
 --- /dev/null
 +++ b/vllm/spotserve_moe.py
-@@ -0,0 +1,340 @@
+@@ -0,0 +1,356 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Lightweight SpotServe MoE routing instrumentation.
@@ -305,6 +305,11 @@ index 000000000..5b1bb3f55
 +        "physical_weight_migration": False,
 +        "expert_placement_plan_available": bool(payload),
 +        "placement_fingerprint": _placement_plan_fingerprint(payload),
++        "last_seen_placement_fingerprint": _placement_plan_fingerprint(payload),
++        "contract_seen_by_runtime": bool(payload),
++        "contract_seen_by_all_workers": bool(payload),
++        "contract_seen_worker_count": int(bool(payload)),
++        "contract_seen_worker_total": 1,
 +        "worker_rank": worker_rank,
 +    }
 +
@@ -342,6 +347,17 @@ index 000000000..5b1bb3f55
 +            requested_fingerprint
 +            and requested_fingerprint == seen_fingerprint
 +        ),
++        "contract_seen_by_all_workers": bool(
++            requested_fingerprint
++            and requested_fingerprint == seen_fingerprint
++        ),
++        "contract_seen_worker_count": int(
++            bool(
++                requested_fingerprint
++                and requested_fingerprint == seen_fingerprint
++            )
++        ),
++        "contract_seen_worker_total": 1,
 +        "worker_rank": worker_rank,
 +    }
 diff --git a/vllm/model_executor/layers/fused_moe/fused_moe_modular_method.py b/vllm/model_executor/layers/fused_moe/fused_moe_modular_method.py
@@ -476,7 +492,7 @@ index 5bc564f36..7fbdc4101 100644
  
  import msgspec
  import zmq
-@@ -654,6 +654,186 @@ class EngineCore:
+@@ -654,6 +654,204 @@ class EngineCore:
              for request_id in list(requests)
          ]
  
@@ -613,6 +629,11 @@ index 5bc564f36..7fbdc4101 100644
 +            }
 +        )
 +        success = bool(total and successes == total)
++        contract_seen_count = sum(
++            1
++            for snapshot in worker_results
++            if bool(snapshot.get("contract_seen_by_runtime"))
++        )
 +        return {
 +            success_key: success,
 +            "success": success,
@@ -625,6 +646,19 @@ index 5bc564f36..7fbdc4101 100644
 +            ),
 +            "worker_count": total,
 +            "worker_success_count": successes,
++            "contract_seen_count": contract_seen_count,
++            "contract_seen_by_runtime": bool(contract_seen_count),
++            "contract_seen_by_all_workers": bool(
++                total and contract_seen_count == total
++            ),
++            "contract_seen_worker_count": sum(
++                int(snapshot.get("contract_seen_worker_count", 0) or 0)
++                for snapshot in worker_results
++            ),
++            "contract_seen_worker_total": sum(
++                int(snapshot.get("contract_seen_worker_total", 0) or 0)
++                for snapshot in worker_results
++            ),
 +            "physical_weight_migration": any(
 +                bool(snapshot.get("physical_weight_migration"))
 +                for snapshot in worker_results

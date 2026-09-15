@@ -481,8 +481,9 @@ Notes:
   `*_expert_placement_verify_success` show whether the backend actually found
   and called a patched vLLM runtime hook. After the observe-only vLLM hook
   patch is rebuilt into the image, availability/attempt counts may be non-zero,
-  but apply/verify success and plan applied/verified counts should still remain
-  `0` with physical expert migration unsupported reasons.
+  and `*_contract_seen*` counts can become non-zero, but apply/verify success
+  and plan applied/verified counts should still remain `0` with physical expert
+  migration unsupported reasons.
 - For Phase 5A, run `python -m sllm.spot.vllm_ep_runtime_audit` inside the
   worker runtime. The current expected gate is
   `observe_only_expert_placement_contract` with

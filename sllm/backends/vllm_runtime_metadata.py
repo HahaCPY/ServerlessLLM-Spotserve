@@ -340,6 +340,22 @@ def get_vllm_model_resource_profile(
         )
         or ""
     )
+    apply_worker_count = _optional_non_negative_int(
+        _first_present(
+            runtime_metadata.get("expert_placement_apply_worker_count"),
+            backend_config.get("expert_placement_apply_worker_count"),
+        )
+    ) or 0
+    apply_worker_success_count = _optional_non_negative_int(
+        _first_present(
+            runtime_metadata.get(
+                "expert_placement_apply_worker_success_count"
+            ),
+            backend_config.get(
+                "expert_placement_apply_worker_success_count"
+            ),
+        )
+    ) or 0
     verify_hook_available = _to_bool(
         _first_present(
             runtime_metadata.get("expert_placement_verify_hook_available"),
@@ -367,6 +383,65 @@ def get_vllm_model_resource_profile(
             "",
         )
         or ""
+    )
+    verify_worker_count = _optional_non_negative_int(
+        _first_present(
+            runtime_metadata.get("expert_placement_verify_worker_count"),
+            backend_config.get("expert_placement_verify_worker_count"),
+        )
+    ) or 0
+    verify_worker_success_count = _optional_non_negative_int(
+        _first_present(
+            runtime_metadata.get(
+                "expert_placement_verify_worker_success_count"
+            ),
+            backend_config.get(
+                "expert_placement_verify_worker_success_count"
+            ),
+        )
+    ) or 0
+    contract_seen_by_runtime = _to_bool(
+        _first_present(
+            runtime_metadata.get("expert_placement_contract_seen_by_runtime"),
+            backend_config.get("expert_placement_contract_seen_by_runtime"),
+        ),
+        default=False,
+    )
+    contract_seen_by_all_workers = _to_bool(
+        _first_present(
+            runtime_metadata.get(
+                "expert_placement_contract_seen_by_all_workers"
+            ),
+            backend_config.get(
+                "expert_placement_contract_seen_by_all_workers"
+            ),
+        ),
+        default=False,
+    )
+    contract_seen_worker_count = _optional_non_negative_int(
+        _first_present(
+            runtime_metadata.get(
+                "expert_placement_contract_seen_worker_count"
+            ),
+            backend_config.get("expert_placement_contract_seen_worker_count"),
+        )
+    ) or 0
+    contract_seen_worker_total = _optional_non_negative_int(
+        _first_present(
+            runtime_metadata.get(
+                "expert_placement_contract_seen_worker_total"
+            ),
+            backend_config.get("expert_placement_contract_seen_worker_total"),
+        )
+    ) or 0
+    physical_weight_migration = _to_bool(
+        _first_present(
+            runtime_metadata.get(
+                "expert_placement_physical_weight_migration"
+            ),
+            backend_config.get("expert_placement_physical_weight_migration"),
+        ),
+        default=False,
     )
     if not contract_available:
         contract_reason = "no_expert_placement_contract"
@@ -532,12 +607,35 @@ def get_vllm_model_resource_profile(
         "expert_placement_apply_hook_available": apply_hook_available,
         "expert_placement_apply_attempted": apply_attempted,
         "expert_placement_apply_success": apply_success,
+        "expert_placement_apply_worker_count": apply_worker_count,
+        "expert_placement_apply_worker_success_count": (
+            apply_worker_success_count
+        ),
         "expert_placement_apply_duration_ms": apply_duration_ms,
         "expert_placement_apply_reason": apply_reason,
         "expert_placement_verify_hook_available": verify_hook_available,
         "expert_placement_verify_attempted": verify_attempted,
         "expert_placement_verify_success": verify_success,
+        "expert_placement_verify_worker_count": verify_worker_count,
+        "expert_placement_verify_worker_success_count": (
+            verify_worker_success_count
+        ),
         "expert_placement_verify_reason": verify_reason,
+        "expert_placement_contract_seen_by_runtime": (
+            contract_seen_by_runtime
+        ),
+        "expert_placement_contract_seen_by_all_workers": (
+            contract_seen_by_all_workers
+        ),
+        "expert_placement_contract_seen_worker_count": (
+            contract_seen_worker_count
+        ),
+        "expert_placement_contract_seen_worker_total": (
+            contract_seen_worker_total
+        ),
+        "expert_placement_physical_weight_migration": (
+            physical_weight_migration
+        ),
         "moe_route_histogram_available": route_histogram_available,
         "moe_route_histogram_source": route_histogram_source,
         "moe_route_histogram_kind": route_histogram_kind,
@@ -686,6 +784,12 @@ def get_vllm_runtime_metadata(
         "expert_placement_apply_success": (
             profile["expert_placement_apply_success"]
         ),
+        "expert_placement_apply_worker_count": (
+            profile["expert_placement_apply_worker_count"]
+        ),
+        "expert_placement_apply_worker_success_count": (
+            profile["expert_placement_apply_worker_success_count"]
+        ),
         "expert_placement_apply_duration_ms": (
             profile["expert_placement_apply_duration_ms"]
         ),
@@ -701,8 +805,29 @@ def get_vllm_runtime_metadata(
         "expert_placement_verify_success": (
             profile["expert_placement_verify_success"]
         ),
+        "expert_placement_verify_worker_count": (
+            profile["expert_placement_verify_worker_count"]
+        ),
+        "expert_placement_verify_worker_success_count": (
+            profile["expert_placement_verify_worker_success_count"]
+        ),
         "expert_placement_verify_reason": (
             profile["expert_placement_verify_reason"]
+        ),
+        "expert_placement_contract_seen_by_runtime": (
+            profile["expert_placement_contract_seen_by_runtime"]
+        ),
+        "expert_placement_contract_seen_by_all_workers": (
+            profile["expert_placement_contract_seen_by_all_workers"]
+        ),
+        "expert_placement_contract_seen_worker_count": (
+            profile["expert_placement_contract_seen_worker_count"]
+        ),
+        "expert_placement_contract_seen_worker_total": (
+            profile["expert_placement_contract_seen_worker_total"]
+        ),
+        "expert_placement_physical_weight_migration": (
+            profile["expert_placement_physical_weight_migration"]
         ),
         "moe_route_histogram_available": (
             profile["moe_route_histogram_available"]

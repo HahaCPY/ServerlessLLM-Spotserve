@@ -153,12 +153,21 @@ def test_vllm_model_resource_profile_reports_placement_contract():
             "expert_placement_apply_hook_available": True,
             "expert_placement_apply_attempted": True,
             "expert_placement_apply_success": True,
+            "expert_placement_apply_worker_count": 2,
+            "expert_placement_apply_worker_success_count": 2,
             "expert_placement_apply_duration_ms": 3.5,
             "expert_placement_apply_reason": "runtime_apply_succeeded",
             "expert_placement_verify_hook_available": True,
             "expert_placement_verify_attempted": True,
             "expert_placement_verify_success": True,
+            "expert_placement_verify_worker_count": 2,
+            "expert_placement_verify_worker_success_count": 2,
             "expert_placement_verify_reason": "runtime_verify_succeeded",
+            "expert_placement_contract_seen_by_runtime": True,
+            "expert_placement_contract_seen_by_all_workers": True,
+            "expert_placement_contract_seen_worker_count": 2,
+            "expert_placement_contract_seen_worker_total": 2,
+            "expert_placement_physical_weight_migration": True,
         },
     )
 
@@ -189,12 +198,21 @@ def test_vllm_model_resource_profile_reports_placement_contract():
     assert profile["expert_placement_apply_hook_available"] is True
     assert profile["expert_placement_apply_attempted"] is True
     assert profile["expert_placement_apply_success"] is True
+    assert profile["expert_placement_apply_worker_count"] == 2
+    assert profile["expert_placement_apply_worker_success_count"] == 2
     assert profile["expert_placement_apply_duration_ms"] == 3.5
     assert profile["expert_placement_apply_reason"] == "runtime_apply_succeeded"
     assert profile["expert_placement_verify_hook_available"] is True
     assert profile["expert_placement_verify_attempted"] is True
     assert profile["expert_placement_verify_success"] is True
+    assert profile["expert_placement_verify_worker_count"] == 2
+    assert profile["expert_placement_verify_worker_success_count"] == 2
     assert profile["expert_placement_verify_reason"] == "runtime_verify_succeeded"
+    assert profile["expert_placement_contract_seen_by_runtime"] is True
+    assert profile["expert_placement_contract_seen_by_all_workers"] is True
+    assert profile["expert_placement_contract_seen_worker_count"] == 2
+    assert profile["expert_placement_contract_seen_worker_total"] == 2
+    assert profile["expert_placement_physical_weight_migration"] is True
 
 
 def test_vllm_runtime_metadata_exposes_placement_contract():
@@ -222,6 +240,7 @@ def test_vllm_runtime_metadata_exposes_placement_contract():
             "expert_placement_verify_attempted": True,
             "expert_placement_verify_success": True,
             "expert_placement_verify_reason": "runtime_verify_succeeded",
+            "expert_placement_contract_seen_by_runtime": True,
         },
     )
 
@@ -252,6 +271,8 @@ def test_vllm_runtime_metadata_exposes_placement_contract():
     assert metadata["expert_placement_verify_attempted"] is True
     assert metadata["expert_placement_verify_success"] is True
     assert metadata["expert_placement_verify_reason"] == "runtime_verify_succeeded"
+    assert metadata["expert_placement_contract_seen_by_runtime"] is True
+    assert metadata["expert_placement_physical_weight_migration"] is False
 
 
 def test_vllm_model_resource_profile_requires_canonical_route_histogram():

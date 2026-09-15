@@ -1712,12 +1712,21 @@ class RoundRobinRouter(SllmRouter):
                 "expert_placement_apply_hook_available",
                 "expert_placement_apply_attempted",
                 "expert_placement_apply_success",
+                "expert_placement_apply_worker_count",
+                "expert_placement_apply_worker_success_count",
                 "expert_placement_apply_duration_ms",
                 "expert_placement_apply_reason",
                 "expert_placement_verify_hook_available",
                 "expert_placement_verify_attempted",
                 "expert_placement_verify_success",
+                "expert_placement_verify_worker_count",
+                "expert_placement_verify_worker_success_count",
                 "expert_placement_verify_reason",
+                "expert_placement_contract_seen_by_runtime",
+                "expert_placement_contract_seen_by_all_workers",
+                "expert_placement_contract_seen_worker_count",
+                "expert_placement_contract_seen_worker_total",
+                "expert_placement_physical_weight_migration",
                 "reparallelization_execution_model",
                 "reparallelization_execution_model_reason",
                 "expert_placement_execution_model",
@@ -1785,6 +1794,23 @@ class RoundRobinRouter(SllmRouter):
             ),
             "verify_reasons": compact_values(
                 "expert_placement_verify_reason"
+            ),
+            "contract_seen_count": count_truthy(
+                "expert_placement_contract_seen_by_runtime"
+            ),
+            "contract_seen_all_workers_count": count_truthy(
+                "expert_placement_contract_seen_by_all_workers"
+            ),
+            "contract_seen_worker_count": sum(
+                int(row.get("expert_placement_contract_seen_worker_count", 0) or 0)
+                for row in metadata_rows
+            ),
+            "contract_seen_worker_total": sum(
+                int(row.get("expert_placement_contract_seen_worker_total", 0) or 0)
+                for row in metadata_rows
+            ),
+            "physical_weight_migration_count": count_truthy(
+                "expert_placement_physical_weight_migration"
             ),
             "plan_applied_count": count_truthy(
                 "expert_placement_plan_applied"

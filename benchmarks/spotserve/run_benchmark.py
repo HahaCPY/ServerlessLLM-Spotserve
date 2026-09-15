@@ -214,6 +214,9 @@ def build_comparisons(
         "replanning_max_expert_placement_plan_moved_experts",
         "replanning_total_expert_placement_plan_moved_weight_bytes",
         "replanning_avg_expert_placement_plan_weight_movement_cost_ms",
+        "replanning_expert_placement_runtime_contract_seen",
+        "replanning_expert_placement_runtime_contract_seen_all_workers",
+        "replanning_expert_placement_runtime_physical_weight_migration",
         "replanning_expert_placement_runtime_live_migration",
         "replanning_expert_placement_runtime_physical_migration_required",
         "replanning_max_ready_worker_node_count",
@@ -1389,7 +1392,11 @@ async def main_async(args):
                     f"runtime_verify_hooks="
                     f"{summary.get('replanning_expert_placement_runtime_verify_hook_available', 0)}, "
                     f"runtime_verify_success="
-                    f"{summary.get('replanning_expert_placement_runtime_verify_success', 0)}"
+                    f"{summary.get('replanning_expert_placement_runtime_verify_success', 0)}, "
+                    f"runtime_contract_seen="
+                    f"{summary.get('replanning_expert_placement_runtime_contract_seen', 0)}, "
+                    f"runtime_physical_migration="
+                    f"{summary.get('replanning_expert_placement_runtime_physical_weight_migration', 0)}"
                 )
             context_migration_suffix = ""
             if int(summary.get("context_migration_events", 0) or 0) > 0:

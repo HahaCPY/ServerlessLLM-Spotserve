@@ -1456,6 +1456,20 @@ phase5_gate:
 能作為 placement contract / observability boundary，不能把它寫成 live
 physical expert migration。
 
+Phase 5A 後續補強的 runtime observability 會把這個邊界拆得更清楚：
+
+```text
+expert_placement_contract_seen_by_runtime = true
+expert_placement_contract_seen_by_all_workers = true
+expert_placement_plan_applied = false
+expert_placement_plan_verified = false
+expert_placement_physical_weight_migration = false
+```
+
+這代表每個 vLLM worker hook 已經看過同一份 placement contract，但 runtime
+仍沒有證明 expert tensor 被 live remap 或搬移。因此它只能證明 control-plane
+到 runtime hook 的 handshake 成功，不能宣稱 physical expert migration。
+
 ### Phase 5B: Expert-aware Actor Recreate Execution Model
 
 Phase 5B 先把目前能安全宣稱的 execution model 固定下來：
@@ -1488,6 +1502,8 @@ expert_placement_physical_migration_required = false
 replanning_expert_placement_actor_recreate_events > 0
 replanning_expert_placement_live_migration_events = 0
 replanning_expert_placement_physical_migration_required_events = 0
+replanning_expert_placement_runtime_contract_seen > 0
+replanning_expert_placement_runtime_physical_weight_migration = 0
 ```
 
 如果未來真的完成 physical expert migration，這些欄位才應該轉成：

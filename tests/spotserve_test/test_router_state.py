@@ -87,6 +87,11 @@ class FakeMoeRuntimeTargetBackend:
         expert_placement_contract_available=False,
         expert_placement_plan_applied=False,
         expert_placement_plan_verified=False,
+        expert_placement_contract_seen_by_runtime=False,
+        expert_placement_contract_seen_by_all_workers=False,
+        expert_placement_contract_seen_worker_count=0,
+        expert_placement_contract_seen_worker_total=0,
+        expert_placement_physical_weight_migration=False,
         expert_placement_contract_reason="no_expert_placement_contract",
     ):
         self.expert_ids = tuple(expert_ids)
@@ -103,6 +108,21 @@ class FakeMoeRuntimeTargetBackend:
         )
         self.expert_placement_plan_applied = expert_placement_plan_applied
         self.expert_placement_plan_verified = expert_placement_plan_verified
+        self.expert_placement_contract_seen_by_runtime = (
+            expert_placement_contract_seen_by_runtime
+        )
+        self.expert_placement_contract_seen_by_all_workers = (
+            expert_placement_contract_seen_by_all_workers
+        )
+        self.expert_placement_contract_seen_worker_count = (
+            expert_placement_contract_seen_worker_count
+        )
+        self.expert_placement_contract_seen_worker_total = (
+            expert_placement_contract_seen_worker_total
+        )
+        self.expert_placement_physical_weight_migration = (
+            expert_placement_physical_weight_migration
+        )
         self.expert_placement_contract_reason = (
             expert_placement_contract_reason
         )
@@ -155,6 +175,21 @@ class FakeMoeRuntimeTargetBackend:
                     ),
                     "expert_placement_plan_verified": (
                         self.expert_placement_plan_verified
+                    ),
+                    "expert_placement_contract_seen_by_runtime": (
+                        self.expert_placement_contract_seen_by_runtime
+                    ),
+                    "expert_placement_contract_seen_by_all_workers": (
+                        self.expert_placement_contract_seen_by_all_workers
+                    ),
+                    "expert_placement_contract_seen_worker_count": (
+                        self.expert_placement_contract_seen_worker_count
+                    ),
+                    "expert_placement_contract_seen_worker_total": (
+                        self.expert_placement_contract_seen_worker_total
+                    ),
+                    "expert_placement_physical_weight_migration": (
+                        self.expert_placement_physical_weight_migration
                     ),
                     "expert_placement_contract_reason": (
                         self.expert_placement_contract_reason
@@ -1382,6 +1417,10 @@ async def test_router_uses_runtime_moe_metadata_for_context_migration(tmp_path):
     assert plan["target_expert_placement_contract_available"] is True
     assert plan["target_expert_placement_plan_applied"] is False
     assert plan["target_expert_placement_plan_verified"] is False
+    assert plan["target_expert_placement_contract_seen_by_runtime"] is False
+    assert (
+        plan["target_expert_placement_contract_seen_by_all_workers"] is False
+    )
     assert plan["target_expert_placement_contract_reason"] == (
         "runtime_not_applied"
     )
@@ -1444,6 +1483,53 @@ async def test_router_uses_runtime_moe_metadata_for_context_migration(tmp_path):
     assert context_rows[-1][
         "selected_plan_target_expert_placement_contract_reasons"
     ] == ["runtime_not_applied"]
+
+
+@pytest.mark.asyncio
+async def test_router_runtime_status_keeps_expert_contract_seen_fields():
+    router = RoundRobinRouter(
+        model_name="test-model",
+        resource_requirements={"num_cpus": 1, "num_gpus": 0},
+        backend="vllm",
+        backend_config={},
+        router_config={},
+    )
+    target = InstanceHandle(
+        instance_id="instance-runtime-target",
+        max_queue_length=1,
+        num_gpu=0,
+        backend_instance=FakeMoeRuntimeTargetBackend(
+            expert_ids=[1],
+            expert_placement_contract_available=True,
+            expert_placement_contract_seen_by_runtime=True,
+            expert_placement_contract_seen_by_all_workers=True,
+            expert_placement_contract_seen_worker_count=1,
+            expert_placement_contract_seen_worker_total=1,
+            expert_placement_contract_reason=(
+                "physical_expert_placement_migration_not_supported"
+            ),
+        ),
+    )
+    deployment = VllmDeployment(
+        plan=ParallelPlan(
+            model_name="test-model",
+            backend="vllm",
+            tensor_parallel_size=1,
+            data_parallel_size=1,
+        ),
+        instances={target.instance_id: target},
+    )
+
+    status = await router._deployment_expert_placement_runtime_status(
+        deployment
+    )
+
+    assert status["metadata_count"] == 1
+    assert status["contract_seen_count"] == 1
+    assert status["contract_seen_all_workers_count"] == 1
+    assert status["contract_seen_worker_count"] == 1
+    assert status["contract_seen_worker_total"] == 1
+    assert status["physical_weight_migration_count"] == 0
 
 
 @pytest.mark.asyncio

@@ -321,6 +321,12 @@ def classify_audit_report(report: Mapping[str, Any]) -> Dict[str, Any]:
             or verify_result.get("reason")
             == "physical_expert_placement_verification_not_supported"
         )
+    contract_seen = False
+    if isinstance(verify_result, Mapping):
+        contract_seen = bool(
+            verify_result.get("contract_seen_by_runtime")
+            or verify_result.get("contract_seen_by_all_workers")
+        )
 
     physical_supported = bool(
         apply_success and verify_success and physical_flag
@@ -361,6 +367,8 @@ def classify_audit_report(report: Mapping[str, Any]) -> Dict[str, Any]:
     return {
         "classification": classification,
         "can_claim_physical_expert_migration": physical_supported,
+        "runtime_contract_seen_by_runtime": contract_seen,
+        "runtime_physical_weight_migration": physical_flag,
         "recommended_execution_model": recommended_execution_model,
         "blocking_gaps": blocking_gaps,
     }

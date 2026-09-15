@@ -76,6 +76,8 @@
         "context_migration_selected_target_expert_placement_contracts",
         "context_migration_selected_target_expert_placement_plan_applied",
         "context_migration_selected_target_expert_placement_plan_verified",
+        "context_migration_selected_target_expert_placement_contract_seen",
+        "context_migration_selected_target_expert_placement_contract_seen_all_workers",
         "context_migration_selected_target_expert_placement_contract_reasons",
         "context_migration_selected_target_expert_placement_apply_hook_available",
         "context_migration_selected_target_expert_placement_apply_attempted",

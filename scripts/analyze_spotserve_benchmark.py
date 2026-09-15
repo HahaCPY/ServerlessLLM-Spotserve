@@ -1012,6 +1012,45 @@ def summarize_replanning_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
                 for row in replanning_rows
             ]
         ),
+        "replanning_expert_placement_runtime_contract_seen": sum(
+            safe_int(
+                row.get("expert_placement_runtime_contract_seen_count"),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_expert_placement_runtime_contract_seen_all_workers": sum(
+            safe_int(
+                row.get(
+                    "expert_placement_runtime_contract_seen_all_workers_count"
+                ),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_expert_placement_runtime_contract_seen_worker_count": sum(
+            safe_int(
+                row.get("expert_placement_runtime_contract_seen_worker_count"),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_expert_placement_runtime_contract_seen_worker_total": sum(
+            safe_int(
+                row.get("expert_placement_runtime_contract_seen_worker_total"),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_expert_placement_runtime_physical_weight_migration": sum(
+            safe_int(
+                row.get(
+                    "expert_placement_runtime_physical_weight_migration_count"
+                ),
+                0,
+            )
+            for row in replanning_rows
+        ),
         "replanning_expert_placement_runtime_plan_applied": sum(
             safe_int(
                 row.get("expert_placement_runtime_plan_applied_count"),
@@ -1366,6 +1405,24 @@ def summarize_context_migration_metrics(
             safe_int(
                 row.get(
                     "selected_plan_target_expert_placement_plan_verified_count"
+                ),
+                0,
+            )
+            for row in migration_rows
+        ),
+        "context_migration_selected_target_expert_placement_contract_seen": sum(
+            safe_int(
+                row.get(
+                    "selected_plan_target_expert_placement_contract_seen_count"
+                ),
+                0,
+            )
+            for row in migration_rows
+        ),
+        "context_migration_selected_target_expert_placement_contract_seen_all_workers": sum(
+            safe_int(
+                row.get(
+                    "selected_plan_target_expert_placement_contract_seen_all_workers_count"
                 ),
                 0,
             )
@@ -1863,6 +1920,20 @@ def summarize_state_recovery_metrics(
             1
             for row in state_rows
             if row.get("target_expert_placement_plan_verified")
+        ),
+        "state_recovery_target_expert_placement_contract_seen": sum(
+            1
+            for row in state_rows
+            if row.get("target_expert_placement_contract_seen_by_runtime")
+        ),
+        "state_recovery_target_expert_placement_contract_seen_all_workers": (
+            sum(
+                1
+                for row in state_rows
+                if row.get(
+                    "target_expert_placement_contract_seen_by_all_workers"
+                )
+            )
         ),
         "state_recovery_target_expert_placement_contract_reasons": (
             compact_values([

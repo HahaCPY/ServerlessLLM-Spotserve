@@ -280,6 +280,18 @@ def test_expert_locality_cost_prefers_target_with_hot_experts():
     )
     assert decision.plans[0].target_expert_placement_plan_applied is False
     assert decision.plans[0].target_expert_placement_plan_verified is False
+    assert (
+        decision.plans[
+            0
+        ].target_expert_placement_contract_seen_by_runtime
+        is False
+    )
+    assert (
+        decision.plans[
+            0
+        ].target_expert_placement_contract_seen_by_all_workers
+        is False
+    )
     assert decision.plans[0].target_expert_placement_contract_reason == (
         "runtime_not_applied"
     )
@@ -605,6 +617,12 @@ def test_context_migration_metric_contains_summary_fields():
     ] == 0
     assert event[
         "selected_plan_target_expert_placement_plan_verified_count"
+    ] == 0
+    assert event[
+        "selected_plan_target_expert_placement_contract_seen_count"
+    ] == 0
+    assert event[
+        "selected_plan_target_expert_placement_contract_seen_all_workers_count"
     ] == 0
     assert event[
         "selected_plan_target_expert_placement_contract_reasons"

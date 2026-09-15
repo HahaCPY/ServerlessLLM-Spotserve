@@ -211,6 +211,86 @@ def _runtime_hook_reason(result: Any, default: str) -> str:
     return default
 
 
+def _runtime_hook_int(result: Any, key: str, default: int = 0) -> int:
+    if isinstance(result, Mapping) and key in result:
+        parsed = _as_non_negative_int(result.get(key))
+        if parsed is not None:
+            return parsed
+    return default
+
+
+def _runtime_hook_worker_results(result: Any) -> List[Mapping[str, Any]]:
+    if not isinstance(result, Mapping):
+        return []
+    worker_results = result.get("worker_results")
+    if not isinstance(worker_results, Sequence) or isinstance(
+        worker_results, (str, bytes)
+    ):
+        return []
+    return [
+        cast(Mapping[str, Any], row)
+        for row in worker_results
+        if isinstance(row, Mapping)
+    ]
+
+
+def _runtime_hook_worker_truthy_count(
+    result: Any,
+    key: str,
+    *,
+    fallback_key: Optional[str] = None,
+) -> int:
+    rows = _runtime_hook_worker_results(result)
+    if not rows:
+        return 1 if _runtime_hook_bool(result, key, default=False) else 0
+    return sum(
+        1
+        for row in rows
+        if _runtime_hook_bool(row, key, default=False)
+        or (
+            fallback_key is not None
+            and _runtime_hook_bool(row, fallback_key, default=False)
+        )
+    )
+
+
+def _runtime_hook_worker_count(result: Any) -> int:
+    rows = _runtime_hook_worker_results(result)
+    return _runtime_hook_int(
+        result,
+        "worker_count",
+        len(rows) if rows else (1 if isinstance(result, Mapping) else 0),
+    )
+
+
+def _runtime_hook_contract_seen_by_runtime(
+    result: Any,
+    plan_fingerprint: str,
+) -> bool:
+    if not isinstance(result, Mapping):
+        return False
+    if _runtime_hook_bool(result, "contract_seen_by_runtime", default=False):
+        return True
+    requested = str(result.get("placement_fingerprint") or "")
+    seen = str(result.get("last_seen_placement_fingerprint") or "")
+    if plan_fingerprint and requested == plan_fingerprint and seen == plan_fingerprint:
+        return True
+    rows = _runtime_hook_worker_results(result)
+    return bool(
+        rows
+        and all(
+            _runtime_hook_bool(row, "contract_seen_by_runtime", default=False)
+            or (
+                plan_fingerprint
+                and str(row.get("placement_fingerprint") or "") == plan_fingerprint
+                and str(row.get("last_seen_placement_fingerprint") or "")
+                == plan_fingerprint
+            )
+            for row in rows
+        )
+    )
+
+
 def _expert_key_from_parts(parts: Sequence[Any]) -> str:
     cleaned = [str(part) for part in parts if str(part) not in {"", "None"}]
     if not cleaned:
@@ -746,6 +826,16 @@ class VllmBackend(SllmBackend):
             "expert_placement_apply_success": bool(
                 runtime_status.get("expert_placement_apply_success", False)
             ),
+            "expert_placement_apply_worker_count": int(
+                runtime_status.get("expert_placement_apply_worker_count", 0)
+                or 0
+            ),
+            "expert_placement_apply_worker_success_count": int(
+                runtime_status.get(
+                    "expert_placement_apply_worker_success_count", 0
+                )
+                or 0
+            ),
             "expert_placement_apply_duration_ms": float(
                 runtime_status.get("expert_placement_apply_duration_ms", 0.0)
                 or 0.0
@@ -763,9 +853,46 @@ class VllmBackend(SllmBackend):
             "expert_placement_verify_success": bool(
                 runtime_status.get("expert_placement_verify_success", False)
             ),
+            "expert_placement_verify_worker_count": int(
+                runtime_status.get("expert_placement_verify_worker_count", 0)
+                or 0
+            ),
+            "expert_placement_verify_worker_success_count": int(
+                runtime_status.get(
+                    "expert_placement_verify_worker_success_count", 0
+                )
+                or 0
+            ),
             "expert_placement_verify_reason": str(
                 runtime_status.get("expert_placement_verify_reason", "")
                 or ""
+            ),
+            "expert_placement_contract_seen_by_runtime": bool(
+                runtime_status.get(
+                    "expert_placement_contract_seen_by_runtime", False
+                )
+            ),
+            "expert_placement_contract_seen_by_all_workers": bool(
+                runtime_status.get(
+                    "expert_placement_contract_seen_by_all_workers", False
+                )
+            ),
+            "expert_placement_contract_seen_worker_count": int(
+                runtime_status.get(
+                    "expert_placement_contract_seen_worker_count", 0
+                )
+                or 0
+            ),
+            "expert_placement_contract_seen_worker_total": int(
+                runtime_status.get(
+                    "expert_placement_contract_seen_worker_total", 0
+                )
+                or 0
+            ),
+            "expert_placement_physical_weight_migration": bool(
+                runtime_status.get(
+                    "expert_placement_physical_weight_migration", False
+                )
             ),
             "reparallelization_execution_model": replanning_execution_model,
             "reparallelization_execution_model_reason": (
@@ -1167,13 +1294,37 @@ class VllmBackend(SllmBackend):
             "expert_placement_apply_success": False,
             "expert_placement_apply_duration_ms": 0.0,
             "expert_placement_apply_reason": "",
+            "expert_placement_apply_worker_count": 0,
+            "expert_placement_apply_worker_success_count": 0,
             "expert_placement_verify_hook_available": False,
             "expert_placement_verify_attempted": False,
             "expert_placement_verify_success": False,
             "expert_placement_verify_reason": "",
+            "expert_placement_verify_worker_count": 0,
+            "expert_placement_verify_worker_success_count": 0,
+            "expert_placement_contract_seen_by_runtime": False,
+            "expert_placement_contract_seen_by_all_workers": False,
+            "expert_placement_contract_seen_worker_count": 0,
+            "expert_placement_contract_seen_worker_total": 0,
+            "expert_placement_physical_weight_migration": False,
+            "expert_placement_physical_migration_required": False,
             "expert_placement_plan_applied": False,
             "expert_placement_plan_verified": False,
         }
+        plan_fingerprint = str(plan.get("placement_fingerprint") or "")
+        status["expert_placement_physical_migration_required"] = bool(
+            _as_bool(plan.get("physical_weight_migration"), default=False)
+            or _as_bool(
+                plan.get("expert_placement_physical_migration_required"),
+                default=False,
+            )
+            or _as_bool(
+                self._config_value_for_runtime(
+                    "expert_placement_physical_migration_required"
+                ),
+                default=False,
+            )
+        )
 
         apply_names = (
             "apply_expert_placement_plan",
@@ -1214,6 +1365,72 @@ class VllmBackend(SllmBackend):
                         "runtime_apply_succeeded"
                         if status["expert_placement_apply_success"]
                         else "runtime_apply_returned_false",
+                    )
+                )
+                apply_worker_count = _runtime_hook_worker_count(apply_result)
+                status["expert_placement_apply_worker_count"] = (
+                    apply_worker_count
+                )
+                status["expert_placement_apply_worker_success_count"] = (
+                    _runtime_hook_int(
+                        apply_result,
+                        "worker_success_count",
+                        _runtime_hook_worker_truthy_count(
+                            apply_result,
+                            "applied",
+                            fallback_key="success",
+                        ),
+                    )
+                )
+                apply_contract_seen_count = _runtime_hook_int(
+                    apply_result,
+                    "contract_seen_count",
+                    _runtime_hook_worker_truthy_count(
+                        apply_result,
+                        "contract_seen_by_runtime",
+                    ),
+                )
+                apply_contract_seen_by_runtime = (
+                    _runtime_hook_contract_seen_by_runtime(
+                        apply_result,
+                        plan_fingerprint,
+                    )
+                )
+                if (
+                    apply_contract_seen_by_runtime
+                    and apply_contract_seen_count == 0
+                ):
+                    apply_contract_seen_count = apply_worker_count or 1
+                apply_contract_seen_worker_count = _runtime_hook_int(
+                    apply_result,
+                    "contract_seen_worker_count",
+                    apply_contract_seen_count,
+                )
+                apply_contract_seen_worker_total = _runtime_hook_int(
+                    apply_result,
+                    "contract_seen_worker_total",
+                    apply_worker_count,
+                )
+                status["expert_placement_contract_seen_by_runtime"] = (
+                    apply_contract_seen_by_runtime
+                )
+                status["expert_placement_contract_seen_worker_count"] = (
+                    apply_contract_seen_worker_count
+                )
+                status["expert_placement_contract_seen_worker_total"] = (
+                    apply_contract_seen_worker_total
+                )
+                status["expert_placement_contract_seen_by_all_workers"] = bool(
+                    apply_contract_seen_worker_total > 0
+                    and apply_contract_seen_worker_count
+                    == apply_contract_seen_worker_total
+                )
+                status["expert_placement_physical_weight_migration"] = (
+                    bool(status["expert_placement_physical_weight_migration"])
+                    or _runtime_hook_bool(
+                        apply_result,
+                        "physical_weight_migration",
+                        default=False,
                     )
                 )
             finally:
@@ -1263,6 +1480,96 @@ class VllmBackend(SllmBackend):
                         else "runtime_verify_returned_false",
                     )
                 )
+                verify_worker_count = _runtime_hook_worker_count(verify_result)
+                contract_seen_count = _runtime_hook_int(
+                    verify_result,
+                    "contract_seen_count",
+                    _runtime_hook_worker_truthy_count(
+                        verify_result,
+                        "contract_seen_by_runtime",
+                    ),
+                )
+                contract_seen_by_runtime = (
+                    _runtime_hook_contract_seen_by_runtime(
+                        verify_result,
+                        plan_fingerprint,
+                    )
+                )
+                if contract_seen_by_runtime and contract_seen_count == 0:
+                    contract_seen_count = verify_worker_count or 1
+                contract_seen_worker_count = _runtime_hook_int(
+                    verify_result,
+                    "contract_seen_worker_count",
+                    contract_seen_count,
+                )
+                contract_seen_worker_total = _runtime_hook_int(
+                    verify_result,
+                    "contract_seen_worker_total",
+                    verify_worker_count,
+                )
+                status["expert_placement_verify_worker_count"] = (
+                    verify_worker_count
+                )
+                status["expert_placement_verify_worker_success_count"] = (
+                    _runtime_hook_int(
+                        verify_result,
+                        "worker_success_count",
+                        _runtime_hook_worker_truthy_count(
+                            verify_result,
+                            "verified",
+                            fallback_key="success",
+                        ),
+                    )
+                )
+                status["expert_placement_contract_seen_by_runtime"] = bool(
+                    status["expert_placement_contract_seen_by_runtime"]
+                    or contract_seen_by_runtime
+                )
+                status["expert_placement_contract_seen_worker_count"] = (
+                    max(
+                        int(
+                            status[
+                                "expert_placement_contract_seen_worker_count"
+                            ]
+                            or 0
+                        ),
+                        contract_seen_worker_count,
+                    )
+                )
+                status["expert_placement_contract_seen_worker_total"] = (
+                    max(
+                        int(
+                            status[
+                                "expert_placement_contract_seen_worker_total"
+                            ]
+                            or 0
+                        ),
+                        contract_seen_worker_total,
+                    )
+                )
+                status["expert_placement_contract_seen_by_all_workers"] = bool(
+                    status["expert_placement_contract_seen_by_all_workers"]
+                    or (
+                        status[
+                            "expert_placement_contract_seen_worker_total"
+                        ]
+                        > 0
+                        and status[
+                            "expert_placement_contract_seen_worker_count"
+                        ]
+                        == status[
+                            "expert_placement_contract_seen_worker_total"
+                        ]
+                    )
+                )
+                status["expert_placement_physical_weight_migration"] = (
+                    bool(status["expert_placement_physical_weight_migration"])
+                    or _runtime_hook_bool(
+                        verify_result,
+                        "physical_weight_migration",
+                        default=False,
+                    )
+                )
 
         status["expert_placement_plan_applied"] = bool(
             status["expert_placement_apply_success"]
@@ -1272,6 +1579,13 @@ class VllmBackend(SllmBackend):
             status["expert_placement_verify_success"]
         )
         self.expert_placement_runtime_status = status
+        if (
+            status["expert_placement_physical_migration_required"]
+            and not status["expert_placement_physical_weight_migration"]
+        ):
+            raise RuntimeError(
+                "required_physical_expert_placement_migration_not_supported"
+            )
 
     async def _request_runtime_moe_metadata(
         self,

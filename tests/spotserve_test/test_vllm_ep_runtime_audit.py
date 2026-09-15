@@ -102,12 +102,15 @@ def test_vllm_ep_runtime_audit_classifies_observe_only_contract():
                     "physical_expert_placement_verification_not_supported"
                 ),
                 "hook_kind": "spotserve_observation_only",
+                "contract_seen_by_runtime": True,
             },
         },
     })
 
     assert gate["classification"] == "observe_only_expert_placement_contract"
     assert gate["can_claim_physical_expert_migration"] is False
+    assert gate["runtime_contract_seen_by_runtime"] is True
+    assert gate["runtime_physical_weight_migration"] is False
     assert gate["recommended_execution_model"] == "expert_aware_actor_recreate"
 
 
@@ -133,4 +136,6 @@ def test_vllm_ep_runtime_audit_classifies_physical_migration_support():
 
     assert gate["classification"] == "physical_expert_migration_supported"
     assert gate["can_claim_physical_expert_migration"] is True
+    assert gate["runtime_contract_seen_by_runtime"] is False
+    assert gate["runtime_physical_weight_migration"] is True
     assert gate["recommended_execution_model"] == "live_expert_weight_migration"

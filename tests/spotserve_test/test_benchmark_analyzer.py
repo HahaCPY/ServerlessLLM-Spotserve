@@ -81,6 +81,8 @@ def test_state_recovery_summary_exposes_phase3_moe_metrics():
                 "target_expert_placement_contract_available": True,
                 "target_expert_placement_plan_applied": False,
                 "target_expert_placement_plan_verified": False,
+                "target_expert_placement_contract_seen_by_runtime": True,
+                "target_expert_placement_contract_seen_by_all_workers": True,
                 "target_expert_placement_contract_reason": (
                     "runtime_not_applied"
                 ),
@@ -159,6 +161,13 @@ def test_state_recovery_summary_exposes_phase3_moe_metrics():
     assert summary["state_recovery_target_expert_placement_contracts"] == 1
     assert summary["state_recovery_target_expert_placement_plan_applied"] == 0
     assert summary["state_recovery_target_expert_placement_plan_verified"] == 0
+    assert summary["state_recovery_target_expert_placement_contract_seen"] == 1
+    assert (
+        summary[
+            "state_recovery_target_expert_placement_contract_seen_all_workers"
+        ]
+        == 1
+    )
     assert (
         summary["state_recovery_target_expert_placement_contract_reasons"]
         == "runtime_not_applied"
@@ -448,6 +457,11 @@ def test_replanning_summary_exposes_workload_cost_metrics():
                 "expert_placement_runtime_verify_reasons": (
                     "physical_expert_placement_verification_not_supported"
                 ),
+                "expert_placement_runtime_contract_seen_count": 1,
+                "expert_placement_runtime_contract_seen_all_workers_count": 1,
+                "expert_placement_runtime_contract_seen_worker_count": 2,
+                "expert_placement_runtime_contract_seen_worker_total": 2,
+                "expert_placement_runtime_physical_weight_migration_count": 0,
                 "expert_placement_runtime_plan_applied_count": 0,
                 "expert_placement_runtime_plan_verified_count": 0,
                 "expert_placement_runtime_contract_reasons": (
@@ -578,6 +592,31 @@ def test_replanning_summary_exposes_workload_cost_metrics():
     assert summary["replanning_expert_placement_runtime_verify_reasons"] == (
         "physical_expert_placement_verification_not_supported"
     )
+    assert summary["replanning_expert_placement_runtime_contract_seen"] == 1
+    assert (
+        summary[
+            "replanning_expert_placement_runtime_contract_seen_all_workers"
+        ]
+        == 1
+    )
+    assert (
+        summary[
+            "replanning_expert_placement_runtime_contract_seen_worker_count"
+        ]
+        == 2
+    )
+    assert (
+        summary[
+            "replanning_expert_placement_runtime_contract_seen_worker_total"
+        ]
+        == 2
+    )
+    assert (
+        summary[
+            "replanning_expert_placement_runtime_physical_weight_migration"
+        ]
+        == 0
+    )
     assert summary["replanning_expert_placement_runtime_plan_applied"] == 0
     assert summary["replanning_expert_placement_runtime_plan_verified"] == 0
     assert summary["replanning_expert_placement_runtime_contract_reasons"] == (
@@ -639,6 +678,8 @@ def test_context_migration_summary_exposes_moe_locality_metrics():
                 "selected_plan_target_expert_placement_contract_available_count": 1,
                 "selected_plan_target_expert_placement_plan_applied_count": 0,
                 "selected_plan_target_expert_placement_plan_verified_count": 0,
+                "selected_plan_target_expert_placement_contract_seen_count": 1,
+                "selected_plan_target_expert_placement_contract_seen_all_workers_count": 1,
                 "selected_plan_target_expert_placement_contract_reasons": [
                     "runtime_not_applied"
                 ],
@@ -781,6 +822,18 @@ def test_context_migration_summary_exposes_moe_locality_metrics():
             "context_migration_selected_target_expert_placement_plan_verified"
         ]
         == 0
+    )
+    assert (
+        summary[
+            "context_migration_selected_target_expert_placement_contract_seen"
+        ]
+        == 1
+    )
+    assert (
+        summary[
+            "context_migration_selected_target_expert_placement_contract_seen_all_workers"
+        ]
+        == 1
     )
     assert (
         summary[
