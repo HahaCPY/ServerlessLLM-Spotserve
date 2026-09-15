@@ -3,7 +3,7 @@ new file mode 100644
 index 000000000..5b1bb3f55
 --- /dev/null
 +++ b/vllm/spotserve_moe.py
-@@ -0,0 +1,356 @@
+@@ -0,0 +1,368 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Lightweight SpotServe MoE routing instrumentation.
@@ -303,6 +303,12 @@ index 000000000..5b1bb3f55
 +        "reason": "physical_expert_placement_migration_not_supported",
 +        "hook_kind": "spotserve_observation_only",
 +        "physical_weight_migration": False,
++        "runtime_verified_placement": False,
++        "verification_level": "contract_seen_only",
++        "can_verify_physical_placement": False,
++        "can_remap_live_ep_rank": False,
++        "can_measure_all_to_all": False,
++        "capability_reason": "vllm_live_ep_rank_remap_not_supported",
 +        "expert_placement_plan_available": bool(payload),
 +        "placement_fingerprint": _placement_plan_fingerprint(payload),
 +        "last_seen_placement_fingerprint": _placement_plan_fingerprint(payload),
@@ -340,6 +346,12 @@ index 000000000..5b1bb3f55
 +        "reason": "physical_expert_placement_verification_not_supported",
 +        "hook_kind": "spotserve_observation_only",
 +        "physical_weight_migration": False,
++        "runtime_verified_placement": False,
++        "verification_level": "contract_seen_only",
++        "can_verify_physical_placement": False,
++        "can_remap_live_ep_rank": False,
++        "can_measure_all_to_all": False,
++        "capability_reason": "vllm_live_ep_rank_remap_not_supported",
 +        "expert_placement_plan_available": bool(payload),
 +        "placement_fingerprint": requested_fingerprint,
 +        "last_seen_placement_fingerprint": seen_fingerprint,
@@ -492,7 +504,7 @@ index 5bc564f36..7fbdc4101 100644
  
  import msgspec
  import zmq
-@@ -654,6 +654,204 @@ class EngineCore:
+@@ -654,6 +654,246 @@ class EngineCore:
              for request_id in list(requests)
          ]
  
@@ -662,6 +674,48 @@ index 5bc564f36..7fbdc4101 100644
 +            "physical_weight_migration": any(
 +                bool(snapshot.get("physical_weight_migration"))
 +                for snapshot in worker_results
++            ),
++            "runtime_verified_placement": bool(
++                total
++                and all(
++                    bool(snapshot.get("runtime_verified_placement"))
++                    for snapshot in worker_results
++                )
++            ),
++            "verification_levels": ",".join(
++                sorted(
++                    {
++                        str(snapshot.get("verification_level"))
++                        for snapshot in worker_results
++                        if snapshot.get("verification_level")
++                    }
++                )
++            ),
++            "verified_placement_count": sum(
++                1
++                for snapshot in worker_results
++                if bool(snapshot.get("runtime_verified_placement"))
++            ),
++            "can_verify_physical_placement": any(
++                bool(snapshot.get("can_verify_physical_placement"))
++                for snapshot in worker_results
++            ),
++            "can_remap_live_ep_rank": any(
++                bool(snapshot.get("can_remap_live_ep_rank"))
++                for snapshot in worker_results
++            ),
++            "can_measure_all_to_all": any(
++                bool(snapshot.get("can_measure_all_to_all"))
++                for snapshot in worker_results
++            ),
++            "capability_reasons": ",".join(
++                sorted(
++                    {
++                        str(snapshot.get("capability_reason"))
++                        for snapshot in worker_results
++                        if snapshot.get("capability_reason")
++                    }
++                )
 +            ),
 +            "worker_results": worker_results,
 +        }

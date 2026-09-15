@@ -1727,6 +1727,12 @@ class RoundRobinRouter(SllmRouter):
                 "expert_placement_contract_seen_worker_count",
                 "expert_placement_contract_seen_worker_total",
                 "expert_placement_physical_weight_migration",
+                "expert_placement_runtime_verification_level",
+                "expert_placement_runtime_verified_placement",
+                "expert_placement_runtime_can_verify_physical_placement",
+                "expert_placement_runtime_can_remap_live_ep_rank",
+                "expert_placement_runtime_can_measure_all_to_all",
+                "expert_placement_runtime_capability_reason",
                 "reparallelization_execution_model",
                 "reparallelization_execution_model_reason",
                 "expert_placement_execution_model",
@@ -1811,6 +1817,24 @@ class RoundRobinRouter(SllmRouter):
             ),
             "physical_weight_migration_count": count_truthy(
                 "expert_placement_physical_weight_migration"
+            ),
+            "verification_levels": compact_values(
+                "expert_placement_runtime_verification_level"
+            ),
+            "verified_placement_count": count_truthy(
+                "expert_placement_runtime_verified_placement"
+            ),
+            "can_verify_physical_placement_count": count_truthy(
+                "expert_placement_runtime_can_verify_physical_placement"
+            ),
+            "can_remap_live_ep_rank_count": count_truthy(
+                "expert_placement_runtime_can_remap_live_ep_rank"
+            ),
+            "can_measure_all_to_all_count": count_truthy(
+                "expert_placement_runtime_can_measure_all_to_all"
+            ),
+            "capability_reasons": compact_values(
+                "expert_placement_runtime_capability_reason"
             ),
             "plan_applied_count": count_truthy(
                 "expert_placement_plan_applied"

@@ -726,6 +726,18 @@ async def test_backend_reports_observe_only_contract_seen_without_plan_verify():
     assert metadata["expert_placement_contract_seen_worker_total"] == 1
     assert metadata["expert_placement_contract_seen_by_all_workers"] is True
     assert metadata["expert_placement_physical_weight_migration"] is False
+    assert metadata["expert_placement_runtime_verification_level"] == (
+        "contract_seen_only"
+    )
+    assert metadata["expert_placement_runtime_verified_placement"] is False
+    assert (
+        metadata[
+            "expert_placement_runtime_can_verify_physical_placement"
+        ]
+        is False
+    )
+    assert metadata["expert_placement_runtime_can_remap_live_ep_rank"] is False
+    assert metadata["expert_placement_runtime_can_measure_all_to_all"] is False
     assert metadata["expert_placement_plan_applied"] is False
     assert metadata["expert_placement_plan_verified"] is False
     assert metadata["expert_placement_contract_reason"] == (
@@ -773,6 +785,10 @@ async def test_backend_keeps_contract_seen_from_apply_when_verify_is_observe_onl
     assert metadata["expert_placement_contract_seen_worker_count"] == 1
     assert metadata["expert_placement_contract_seen_worker_total"] == 1
     assert metadata["expert_placement_contract_seen_by_all_workers"] is True
+    assert metadata["expert_placement_runtime_verification_level"] == (
+        "contract_seen_only"
+    )
+    assert metadata["expert_placement_runtime_verified_placement"] is False
     assert metadata["expert_placement_plan_applied"] is False
     assert metadata["expert_placement_plan_verified"] is False
 
@@ -818,6 +834,12 @@ async def test_backend_fails_closed_when_physical_migration_is_required():
     ] is True
     assert backend.expert_placement_runtime_status[
         "expert_placement_physical_weight_migration"
+    ] is False
+    assert backend.expert_placement_runtime_status[
+        "expert_placement_runtime_verification_level"
+    ] == "contract_seen_only"
+    assert backend.expert_placement_runtime_status[
+        "expert_placement_runtime_verified_placement"
     ] is False
 
 

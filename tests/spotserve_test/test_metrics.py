@@ -62,6 +62,14 @@ def test_replanning_event_exposes_runtime_expert_placement_hook_status():
                     "contract_seen_worker_count": 2,
                     "contract_seen_worker_total": 2,
                     "physical_weight_migration_count": 0,
+                    "verification_levels": "contract_seen_only",
+                    "verified_placement_count": 0,
+                    "can_verify_physical_placement_count": 0,
+                    "can_remap_live_ep_rank_count": 0,
+                    "can_measure_all_to_all_count": 0,
+                    "capability_reasons": (
+                        "vllm_live_ep_rank_remap_not_supported"
+                    ),
                     "plan_applied_count": 0,
                     "plan_verified_count": 0,
                     "contract_reasons": (
@@ -105,6 +113,21 @@ def test_replanning_event_exposes_runtime_expert_placement_hook_status():
     assert event["expert_placement_runtime_contract_seen_worker_count"] == 2
     assert event["expert_placement_runtime_contract_seen_worker_total"] == 2
     assert event["expert_placement_runtime_physical_weight_migration_count"] == 0
+    assert event["expert_placement_runtime_verification_levels"] == (
+        "contract_seen_only"
+    )
+    assert event["expert_placement_runtime_verified_placement_count"] == 0
+    assert (
+        event[
+            "expert_placement_runtime_can_verify_physical_placement_count"
+        ]
+        == 0
+    )
+    assert event["expert_placement_runtime_can_remap_live_ep_rank_count"] == 0
+    assert event["expert_placement_runtime_can_measure_all_to_all_count"] == 0
+    assert event["expert_placement_runtime_capability_reasons"] == (
+        "vllm_live_ep_rank_remap_not_supported"
+    )
     assert event["expert_placement_runtime_plan_applied_count"] == 0
     assert event["expert_placement_runtime_plan_verified_count"] == 0
     assert event["reparallelization_execution_model"] == "actor_recreate"

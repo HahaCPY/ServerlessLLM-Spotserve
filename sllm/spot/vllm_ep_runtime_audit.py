@@ -322,14 +322,72 @@ def classify_audit_report(report: Mapping[str, Any]) -> Dict[str, Any]:
             == "physical_expert_placement_verification_not_supported"
         )
     contract_seen = False
-    if isinstance(verify_result, Mapping):
-        contract_seen = bool(
-            verify_result.get("contract_seen_by_runtime")
-            or verify_result.get("contract_seen_by_all_workers")
-        )
+    for result in (apply_result, verify_result):
+        if isinstance(result, Mapping):
+            contract_seen = bool(
+                contract_seen
+                or result.get("contract_seen_by_runtime")
+                or result.get("contract_seen_by_all_workers")
+            )
 
     physical_supported = bool(
         apply_success and verify_success and physical_flag
+    )
+    runtime_verified_placement = bool(
+        verify_success
+        or _truthy_result(
+            verify_result,
+            "runtime_verified_placement",
+            "verified_placement",
+            "expert_placement_runtime_verified_placement",
+        )
+    )
+    can_verify_physical_placement = bool(
+        _truthy_result(
+            apply_result,
+            "can_verify_physical_placement",
+            "physical_placement_verification_supported",
+            "expert_placement_runtime_can_verify_physical_placement",
+        )
+        or _truthy_result(
+            verify_result,
+            "can_verify_physical_placement",
+            "physical_placement_verification_supported",
+            "expert_placement_runtime_can_verify_physical_placement",
+        )
+    )
+    can_verify_physical_placement = bool(
+        can_verify_physical_placement or physical_supported
+    )
+    can_remap_live_ep_rank = bool(
+        _truthy_result(
+            apply_result,
+            "can_remap_live_ep_rank",
+            "live_ep_rank_remap_supported",
+            "expert_placement_runtime_can_remap_live_ep_rank",
+        )
+        or _truthy_result(
+            verify_result,
+            "can_remap_live_ep_rank",
+            "live_ep_rank_remap_supported",
+            "expert_placement_runtime_can_remap_live_ep_rank",
+        )
+    )
+    can_measure_all_to_all = bool(
+        _truthy_result(
+            apply_result,
+            "can_measure_all_to_all",
+            "all_to_all_traffic_available",
+            "real_all_to_all_traffic_available",
+            "expert_placement_runtime_can_measure_all_to_all",
+        )
+        or _truthy_result(
+            verify_result,
+            "can_measure_all_to_all",
+            "all_to_all_traffic_available",
+            "real_all_to_all_traffic_available",
+            "expert_placement_runtime_can_measure_all_to_all",
+        )
     )
     boundary_present = bool(
         source_checks.get("apply_verify_boundary_present")
@@ -340,10 +398,16 @@ def classify_audit_report(report: Mapping[str, Any]) -> Dict[str, Any]:
     )
     if physical_supported:
         classification = "physical_expert_migration_supported"
+        verification_level = "physical_migration_verified"
         recommended_execution_model = "live_expert_weight_migration"
         blocking_gaps: list[str] = []
     elif source_observe_only or runtime_observe_only:
         classification = "observe_only_expert_placement_contract"
+        verification_level = (
+            "contract_seen_only"
+            if contract_seen
+            else "runtime_boundary_observe_only"
+        )
         recommended_execution_model = "expert_aware_actor_recreate"
         blocking_gaps = [
             "apply_expert_placement_plan returns applied=false",
@@ -352,6 +416,11 @@ def classify_audit_report(report: Mapping[str, Any]) -> Dict[str, Any]:
         ]
     elif boundary_present:
         classification = "runtime_boundary_present_but_not_verified"
+        verification_level = (
+            "runtime_placement_verified"
+            if runtime_verified_placement
+            else "runtime_boundary_observe_only"
+        )
         recommended_execution_model = "expert_aware_actor_recreate"
         blocking_gaps = [
             "runtime apply/verify hooks are present but do not prove physical "
@@ -359,6 +428,7 @@ def classify_audit_report(report: Mapping[str, Any]) -> Dict[str, Any]:
         ]
     else:
         classification = "runtime_boundary_unavailable"
+        verification_level = "unavailable"
         recommended_execution_model = "actor_recreate_only"
         blocking_gaps = [
             "patched vLLM apply/verify expert placement hooks are unavailable",
@@ -366,7 +436,14 @@ def classify_audit_report(report: Mapping[str, Any]) -> Dict[str, Any]:
 
     return {
         "classification": classification,
+        "runtime_verification_level": verification_level,
         "can_claim_physical_expert_migration": physical_supported,
+        "runtime_verified_placement": runtime_verified_placement,
+        "runtime_can_verify_physical_placement": (
+            can_verify_physical_placement
+        ),
+        "runtime_can_remap_live_ep_rank": can_remap_live_ep_rank,
+        "runtime_can_measure_all_to_all": can_measure_all_to_all,
         "runtime_contract_seen_by_runtime": contract_seen,
         "runtime_physical_weight_migration": physical_flag,
         "recommended_execution_model": recommended_execution_model,

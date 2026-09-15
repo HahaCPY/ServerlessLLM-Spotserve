@@ -342,6 +342,26 @@ def make_replanning_event(
         "expert_placement_runtime_physical_weight_migration_count": (
             expert_placement_runtime.get("physical_weight_migration_count", 0)
         ),
+        "expert_placement_runtime_verification_levels": (
+            expert_placement_runtime.get("verification_levels", "")
+        ),
+        "expert_placement_runtime_verified_placement_count": (
+            expert_placement_runtime.get("verified_placement_count", 0)
+        ),
+        "expert_placement_runtime_can_verify_physical_placement_count": (
+            expert_placement_runtime.get(
+                "can_verify_physical_placement_count", 0
+            )
+        ),
+        "expert_placement_runtime_can_remap_live_ep_rank_count": (
+            expert_placement_runtime.get("can_remap_live_ep_rank_count", 0)
+        ),
+        "expert_placement_runtime_can_measure_all_to_all_count": (
+            expert_placement_runtime.get("can_measure_all_to_all_count", 0)
+        ),
+        "expert_placement_runtime_capability_reasons": (
+            expert_placement_runtime.get("capability_reasons", "")
+        ),
         "expert_placement_runtime_plan_applied_count": (
             expert_placement_runtime.get("plan_applied_count", 0)
         ),
@@ -572,6 +592,26 @@ def make_context_migration_event(
             if plan.get("target_expert_placement_verify_reason")
         }
     )
+    selected_target_runtime_verification_levels = sorted(
+        {
+            str(plan.get("target_expert_placement_runtime_verification_level"))
+            for plan in plans
+            if plan.get(
+                "target_expert_placement_runtime_verification_level"
+            )
+            and plan.get(
+                "target_expert_placement_runtime_verification_level"
+            )
+            != "unavailable"
+        }
+    )
+    selected_target_runtime_capability_reasons = sorted(
+        {
+            str(plan.get("target_expert_placement_runtime_capability_reason"))
+            for plan in plans
+            if plan.get("target_expert_placement_runtime_capability_reason")
+        }
+    )
     selected_target_placement_sources = [
         str(plan.get("target_placement_source"))
         for plan in plans
@@ -779,6 +819,48 @@ def make_context_migration_event(
         ),
         "selected_plan_target_expert_placement_contract_reasons": (
             selected_target_contract_reasons
+        ),
+        "selected_plan_target_expert_placement_runtime_verification_levels": (
+            selected_target_runtime_verification_levels
+        ),
+        "selected_plan_target_expert_placement_runtime_verified_count": (
+            sum(
+                1
+                for plan in plans
+                if plan.get(
+                    "target_expert_placement_runtime_verified_placement"
+                )
+            )
+        ),
+        "selected_plan_target_expert_placement_runtime_can_verify_physical_count": (
+            sum(
+                1
+                for plan in plans
+                if plan.get(
+                    "target_expert_placement_runtime_can_verify_physical_placement"
+                )
+            )
+        ),
+        "selected_plan_target_expert_placement_runtime_can_remap_ep_count": (
+            sum(
+                1
+                for plan in plans
+                if plan.get(
+                    "target_expert_placement_runtime_can_remap_live_ep_rank"
+                )
+            )
+        ),
+        "selected_plan_target_expert_placement_runtime_can_measure_a2a_count": (
+            sum(
+                1
+                for plan in plans
+                if plan.get(
+                    "target_expert_placement_runtime_can_measure_all_to_all"
+                )
+            )
+        ),
+        "selected_plan_target_expert_placement_runtime_capability_reasons": (
+            selected_target_runtime_capability_reasons
         ),
         "selected_plan_target_expert_placement_apply_hook_available_count": (
             sum(
@@ -1128,6 +1210,40 @@ def make_state_recovery_event(
         ),
         "target_expert_placement_contract_reason": selected_candidate.get(
             "target_expert_placement_contract_reason", "unavailable"
+        ),
+        "target_expert_placement_runtime_verification_level": (
+            selected_candidate.get(
+                "target_expert_placement_runtime_verification_level",
+                "unavailable",
+            )
+        ),
+        "target_expert_placement_runtime_verified_placement": (
+            selected_candidate.get(
+                "target_expert_placement_runtime_verified_placement", False
+            )
+        ),
+        "target_expert_placement_runtime_can_verify_physical_placement": (
+            selected_candidate.get(
+                "target_expert_placement_runtime_can_verify_physical_placement",
+                False,
+            )
+        ),
+        "target_expert_placement_runtime_can_remap_live_ep_rank": (
+            selected_candidate.get(
+                "target_expert_placement_runtime_can_remap_live_ep_rank",
+                False,
+            )
+        ),
+        "target_expert_placement_runtime_can_measure_all_to_all": (
+            selected_candidate.get(
+                "target_expert_placement_runtime_can_measure_all_to_all",
+                False,
+            )
+        ),
+        "target_expert_placement_runtime_capability_reason": (
+            selected_candidate.get(
+                "target_expert_placement_runtime_capability_reason", ""
+            )
         ),
         "target_expert_placement_apply_hook_available": (
             selected_candidate.get(

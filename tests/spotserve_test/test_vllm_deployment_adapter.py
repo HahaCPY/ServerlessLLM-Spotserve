@@ -132,6 +132,36 @@ async def test_vllm_adapter_creates_real_shape_and_honors_target_node(monkeypatc
         ]
         is False
     )
+    assert deployment.backend_config[
+        "expert_placement_runtime_verification_level"
+    ] == "unavailable"
+    assert (
+        deployment.backend_config[
+            "expert_placement_runtime_verified_placement"
+        ]
+        is False
+    )
+    assert (
+        deployment.backend_config[
+            "expert_placement_runtime_can_verify_physical_placement"
+        ]
+        is False
+    )
+    assert (
+        deployment.backend_config[
+            "expert_placement_runtime_can_remap_live_ep_rank"
+        ]
+        is False
+    )
+    assert (
+        deployment.backend_config[
+            "expert_placement_runtime_can_measure_all_to_all"
+        ]
+        is False
+    )
+    assert deployment.backend_config[
+        "expert_placement_runtime_capability_reason"
+    ] == "awaiting_runtime_expert_placement_hook"
     assert deployment.backend_config["placement_source"] == (
         "logical_reparallelization_planner"
     )

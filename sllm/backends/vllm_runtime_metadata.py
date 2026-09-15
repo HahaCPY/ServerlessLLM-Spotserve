@@ -86,6 +86,24 @@ def _has_payload(value: Any) -> bool:
     return True
 
 
+def _expert_placement_runtime_verification_level(
+    *,
+    contract_seen_by_runtime: bool,
+    hook_available: bool,
+    physical_weight_migration: bool,
+    runtime_verified_placement: bool,
+) -> str:
+    if physical_weight_migration and runtime_verified_placement:
+        return "physical_migration_verified"
+    if runtime_verified_placement:
+        return "runtime_placement_verified"
+    if contract_seen_by_runtime:
+        return "contract_seen_only"
+    if hook_available:
+        return "runtime_boundary_observe_only"
+    return "unavailable"
+
+
 def get_vllm_model_resource_profile(
     model_name: str,
     backend_config: Optional[Mapping[str, Any]] = None,
@@ -443,6 +461,73 @@ def get_vllm_model_resource_profile(
         ),
         default=False,
     )
+    runtime_verified_placement = _to_bool(
+        _first_present(
+            runtime_metadata.get("expert_placement_runtime_verified_placement"),
+            backend_config.get("expert_placement_runtime_verified_placement"),
+        ),
+        default=plan_verified,
+    )
+    can_verify_physical_placement = _to_bool(
+        _first_present(
+            runtime_metadata.get(
+                "expert_placement_runtime_can_verify_physical_placement"
+            ),
+            backend_config.get(
+                "expert_placement_runtime_can_verify_physical_placement"
+            ),
+        ),
+        default=physical_weight_migration and plan_verified,
+    )
+    can_remap_live_ep_rank = _to_bool(
+        _first_present(
+            runtime_metadata.get(
+                "expert_placement_runtime_can_remap_live_ep_rank"
+            ),
+            backend_config.get("expert_placement_runtime_can_remap_live_ep_rank"),
+        ),
+        default=False,
+    )
+    can_measure_all_to_all = _to_bool(
+        _first_present(
+            runtime_metadata.get(
+                "expert_placement_runtime_can_measure_all_to_all"
+            ),
+            backend_config.get("expert_placement_runtime_can_measure_all_to_all"),
+        ),
+        default=False,
+    )
+    derived_runtime_verification_level = (
+        _expert_placement_runtime_verification_level(
+            contract_seen_by_runtime=contract_seen_by_runtime,
+            hook_available=(
+                apply_hook_available
+                or verify_hook_available
+                or apply_attempted
+                or verify_attempted
+            ),
+            physical_weight_migration=physical_weight_migration,
+            runtime_verified_placement=runtime_verified_placement,
+        )
+    )
+    runtime_verification_level = str(
+        _first_present(
+            runtime_metadata.get(
+                "expert_placement_runtime_verification_level"
+            ),
+            backend_config.get("expert_placement_runtime_verification_level"),
+            derived_runtime_verification_level,
+        )
+        or derived_runtime_verification_level
+    )
+    runtime_capability_reason = str(
+        _first_present(
+            runtime_metadata.get("expert_placement_runtime_capability_reason"),
+            backend_config.get("expert_placement_runtime_capability_reason"),
+            "",
+        )
+        or ""
+    )
     if not contract_available:
         contract_reason = "no_expert_placement_contract"
     elif not contract_bound:
@@ -636,6 +721,24 @@ def get_vllm_model_resource_profile(
         "expert_placement_physical_weight_migration": (
             physical_weight_migration
         ),
+        "expert_placement_runtime_verification_level": (
+            runtime_verification_level
+        ),
+        "expert_placement_runtime_verified_placement": (
+            runtime_verified_placement
+        ),
+        "expert_placement_runtime_can_verify_physical_placement": (
+            can_verify_physical_placement
+        ),
+        "expert_placement_runtime_can_remap_live_ep_rank": (
+            can_remap_live_ep_rank
+        ),
+        "expert_placement_runtime_can_measure_all_to_all": (
+            can_measure_all_to_all
+        ),
+        "expert_placement_runtime_capability_reason": (
+            runtime_capability_reason
+        ),
         "moe_route_histogram_available": route_histogram_available,
         "moe_route_histogram_source": route_histogram_source,
         "moe_route_histogram_kind": route_histogram_kind,
@@ -828,6 +931,26 @@ def get_vllm_runtime_metadata(
         ),
         "expert_placement_physical_weight_migration": (
             profile["expert_placement_physical_weight_migration"]
+        ),
+        "expert_placement_runtime_verification_level": (
+            profile["expert_placement_runtime_verification_level"]
+        ),
+        "expert_placement_runtime_verified_placement": (
+            profile["expert_placement_runtime_verified_placement"]
+        ),
+        "expert_placement_runtime_can_verify_physical_placement": (
+            profile[
+                "expert_placement_runtime_can_verify_physical_placement"
+            ]
+        ),
+        "expert_placement_runtime_can_remap_live_ep_rank": (
+            profile["expert_placement_runtime_can_remap_live_ep_rank"]
+        ),
+        "expert_placement_runtime_can_measure_all_to_all": (
+            profile["expert_placement_runtime_can_measure_all_to_all"]
+        ),
+        "expert_placement_runtime_capability_reason": (
+            profile["expert_placement_runtime_capability_reason"]
         ),
         "moe_route_histogram_available": (
             profile["moe_route_histogram_available"]

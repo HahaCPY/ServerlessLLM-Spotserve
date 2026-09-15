@@ -1504,6 +1504,11 @@ replanning_expert_placement_live_migration_events = 0
 replanning_expert_placement_physical_migration_required_events = 0
 replanning_expert_placement_runtime_contract_seen > 0
 replanning_expert_placement_runtime_physical_weight_migration = 0
+replanning_expert_placement_runtime_verification_levels = contract_seen_only
+replanning_expert_placement_runtime_verified_placement = 0
+replanning_expert_placement_runtime_can_verify_physical_placement = 0
+replanning_expert_placement_runtime_can_remap_live_ep_rank = 0
+replanning_expert_placement_runtime_can_measure_all_to_all = 0
 ```
 
 如果未來真的完成 physical expert migration，這些欄位才應該轉成：
@@ -1512,6 +1517,10 @@ replanning_expert_placement_runtime_physical_weight_migration = 0
 expert_placement_execution_model = live_expert_weight_migration
 expert_placement_live_migration_enabled = true
 expert_placement_physical_migration_required = true
+replanning_expert_placement_runtime_verification_levels = physical_migration_verified
+replanning_expert_placement_runtime_verified_placement > 0
+replanning_expert_placement_runtime_physical_weight_migration > 0
+replanning_expert_placement_runtime_can_verify_physical_placement > 0
 ```
 
 所以目前 Phase 5B 的 claim 是：
@@ -1520,6 +1529,22 @@ expert_placement_physical_migration_required = true
 Current implementation executes expert-aware re-parallelization by recreating
 vLLM actors with a logical expert placement contract.
 It does not execute live physical expert weight migration.
+```
+
+也就是：
+
+```text
+contract_seen_only
+-> runtime 已收到 / 看過 ExpertPlacementPlan contract
+-> 不代表 expert tensor 已搬動
+-> 不代表 live EP rank mapping 已更新
+-> 不代表 all-to-all dispatch traffic 已下降
+
+physical_migration_verified
+-> runtime apply 成功
+-> runtime verify 成功
+-> physical_weight_migration=true
+-> 才能宣稱真正 physical expert weight migration
 ```
 
 ### Milestone E: Physical Cross-node Validation

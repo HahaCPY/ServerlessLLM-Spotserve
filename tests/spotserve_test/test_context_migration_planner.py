@@ -627,6 +627,24 @@ def test_context_migration_metric_contains_summary_fields():
     assert event[
         "selected_plan_target_expert_placement_contract_reasons"
     ] == []
+    assert event[
+        "selected_plan_target_expert_placement_runtime_verification_levels"
+    ] == []
+    assert event[
+        "selected_plan_target_expert_placement_runtime_verified_count"
+    ] == 0
+    assert event[
+        "selected_plan_target_expert_placement_runtime_can_verify_physical_count"
+    ] == 0
+    assert event[
+        "selected_plan_target_expert_placement_runtime_can_remap_ep_count"
+    ] == 0
+    assert event[
+        "selected_plan_target_expert_placement_runtime_can_measure_a2a_count"
+    ] == 0
+    assert event[
+        "selected_plan_target_expert_placement_runtime_capability_reasons"
+    ] == []
     assert (
         event[
             "selected_plan_target_expert_placement_apply_hook_available_count"

@@ -405,6 +405,10 @@ Notes:
   After Phase 4D observe-only hook plumbing, it reported
   `runtime_apply_hooks=1`, `runtime_apply_success=0`,
   `runtime_verify_hooks=1`, and `runtime_verify_success=0`.
+  After the runtime capability split, a correct observe-only run should also
+  report `runtime_level=contract_seen_only`,
+  `runtime_verified_placement=0`, `runtime_physical_migration=0`,
+  `runtime_remap_ep=0`, and `runtime_a2a_counters=0`.
   After Phase 5B, the single-worker same-node recreate capacity entry is marked
   `_spotserve_counts_as_runtime_worker=true`, so the expected summary is
   `runtime_workers=1`, `exec_model=expert_aware_actor_recreate`,
@@ -482,15 +486,22 @@ Notes:
   and called a patched vLLM runtime hook. After the observe-only vLLM hook
   patch is rebuilt into the image, availability/attempt counts may be non-zero,
   and `*_contract_seen*` counts can become non-zero, but apply/verify success
-  and plan applied/verified counts should still remain `0` with physical expert
-  migration unsupported reasons.
+  and plan applied/verified counts should still remain `0`. Also require the
+  target/runtime capability fields to show `*_runtime_verified=0`,
+  `*_runtime_can_verify_physical=0`, `*_runtime_can_remap_ep=0`, and
+  `*_runtime_can_measure_a2a=0` with physical expert migration unsupported
+  reasons.
 - For Phase 5A, run `python -m sllm.spot.vllm_ep_runtime_audit` inside the
   worker runtime. The current expected gate is
   `observe_only_expert_placement_contract` with
-  `can_claim_physical_expert_migration=false`. Only treat Phase 5 as physical
-  migration when `apply` returns `applied=true`,
-  `verify` returns `verified=true`, and both report
-  `physical_weight_migration=true`. If the running container cannot import the
+  `runtime_verification_level=contract_seen_only`,
+  `can_claim_physical_expert_migration=false`,
+  `runtime_verified_placement=false`,
+  `runtime_can_remap_live_ep_rank=false`, and
+  `runtime_can_measure_all_to_all=false`. Only treat Phase 5 as physical
+  migration when `apply` returns `applied=true`, `verify` returns
+  `verified=true`, both report `physical_weight_migration=true`, and the audit
+  reports `runtime_verification_level=physical_migration_verified`. If the running container cannot import the
   audit module, sync local source with `SPOTSERVE_SYNC_SOURCE=1` or rebuild
   before running the audit. The 2026-09-06 `sllm_worker_0` audit reported vLLM
   `0.11.2`, source markers present, `contract_seen_by_runtime=true`, but

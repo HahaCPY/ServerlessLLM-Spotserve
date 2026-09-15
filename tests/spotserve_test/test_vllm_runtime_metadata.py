@@ -213,6 +213,18 @@ def test_vllm_model_resource_profile_reports_placement_contract():
     assert profile["expert_placement_contract_seen_worker_count"] == 2
     assert profile["expert_placement_contract_seen_worker_total"] == 2
     assert profile["expert_placement_physical_weight_migration"] is True
+    assert profile["expert_placement_runtime_verification_level"] == (
+        "physical_migration_verified"
+    )
+    assert profile["expert_placement_runtime_verified_placement"] is True
+    assert (
+        profile[
+            "expert_placement_runtime_can_verify_physical_placement"
+        ]
+        is True
+    )
+    assert profile["expert_placement_runtime_can_remap_live_ep_rank"] is False
+    assert profile["expert_placement_runtime_can_measure_all_to_all"] is False
 
 
 def test_vllm_runtime_metadata_exposes_placement_contract():
@@ -273,6 +285,18 @@ def test_vllm_runtime_metadata_exposes_placement_contract():
     assert metadata["expert_placement_verify_reason"] == "runtime_verify_succeeded"
     assert metadata["expert_placement_contract_seen_by_runtime"] is True
     assert metadata["expert_placement_physical_weight_migration"] is False
+    assert metadata["expert_placement_runtime_verification_level"] == (
+        "runtime_placement_verified"
+    )
+    assert metadata["expert_placement_runtime_verified_placement"] is True
+    assert (
+        metadata[
+            "expert_placement_runtime_can_verify_physical_placement"
+        ]
+        is False
+    )
+    assert metadata["expert_placement_runtime_can_remap_live_ep_rank"] is False
+    assert metadata["expert_placement_runtime_can_measure_all_to_all"] is False
 
 
 def test_vllm_model_resource_profile_requires_canonical_route_histogram():
@@ -334,6 +358,18 @@ def test_vllm_runtime_metadata_can_feed_risk_score():
     assert metadata["expert_placement_runtime_contract_mode"] == "unavailable"
     assert metadata["expert_placement_live_migration_enabled"] is False
     assert metadata["expert_placement_physical_migration_required"] is False
+    assert metadata["expert_placement_runtime_verification_level"] == (
+        "unavailable"
+    )
+    assert metadata["expert_placement_runtime_verified_placement"] is False
+    assert (
+        metadata[
+            "expert_placement_runtime_can_verify_physical_placement"
+        ]
+        is False
+    )
+    assert metadata["expert_placement_runtime_can_remap_live_ep_rank"] is False
+    assert metadata["expert_placement_runtime_can_measure_all_to_all"] is False
 
     score = node_risk_score(
         node_id=metadata["node_id"],

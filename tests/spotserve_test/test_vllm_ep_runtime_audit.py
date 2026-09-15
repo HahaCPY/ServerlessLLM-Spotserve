@@ -108,7 +108,12 @@ def test_vllm_ep_runtime_audit_classifies_observe_only_contract():
     })
 
     assert gate["classification"] == "observe_only_expert_placement_contract"
+    assert gate["runtime_verification_level"] == "contract_seen_only"
     assert gate["can_claim_physical_expert_migration"] is False
+    assert gate["runtime_verified_placement"] is False
+    assert gate["runtime_can_verify_physical_placement"] is False
+    assert gate["runtime_can_remap_live_ep_rank"] is False
+    assert gate["runtime_can_measure_all_to_all"] is False
     assert gate["runtime_contract_seen_by_runtime"] is True
     assert gate["runtime_physical_weight_migration"] is False
     assert gate["recommended_execution_model"] == "expert_aware_actor_recreate"
@@ -135,7 +140,12 @@ def test_vllm_ep_runtime_audit_classifies_physical_migration_support():
     })
 
     assert gate["classification"] == "physical_expert_migration_supported"
+    assert gate["runtime_verification_level"] == "physical_migration_verified"
     assert gate["can_claim_physical_expert_migration"] is True
+    assert gate["runtime_verified_placement"] is True
+    assert gate["runtime_can_verify_physical_placement"] is True
+    assert gate["runtime_can_remap_live_ep_rank"] is False
+    assert gate["runtime_can_measure_all_to_all"] is False
     assert gate["runtime_contract_seen_by_runtime"] is False
     assert gate["runtime_physical_weight_migration"] is True
     assert gate["recommended_execution_model"] == "live_expert_weight_migration"

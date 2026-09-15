@@ -1051,6 +1051,70 @@ def summarize_replanning_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             )
             for row in replanning_rows
         ),
+        "replanning_expert_placement_runtime_verification_levels": (
+            compact_values(
+                [
+                    str(
+                        row.get(
+                            "expert_placement_runtime_verification_levels",
+                            "",
+                        )
+                    )
+                    for row in replanning_rows
+                ]
+            )
+        ),
+        "replanning_expert_placement_runtime_verified_placement": sum(
+            safe_int(
+                row.get(
+                    "expert_placement_runtime_verified_placement_count"
+                ),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_expert_placement_runtime_can_verify_physical_placement": (
+            sum(
+                safe_int(
+                    row.get(
+                        "expert_placement_runtime_can_verify_physical_placement_count"
+                    ),
+                    0,
+                )
+                for row in replanning_rows
+            )
+        ),
+        "replanning_expert_placement_runtime_can_remap_live_ep_rank": sum(
+            safe_int(
+                row.get(
+                    "expert_placement_runtime_can_remap_live_ep_rank_count"
+                ),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_expert_placement_runtime_can_measure_all_to_all": sum(
+            safe_int(
+                row.get(
+                    "expert_placement_runtime_can_measure_all_to_all_count"
+                ),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_expert_placement_runtime_capability_reasons": (
+            compact_values(
+                [
+                    str(
+                        row.get(
+                            "expert_placement_runtime_capability_reasons",
+                            "",
+                        )
+                    )
+                    for row in replanning_rows
+                ]
+            )
+        ),
         "replanning_expert_placement_runtime_plan_applied": sum(
             safe_int(
                 row.get("expert_placement_runtime_plan_applied_count"),
@@ -1435,6 +1499,68 @@ def summarize_context_migration_metrics(
                 for reason in (
                     row.get(
                         "selected_plan_target_expert_placement_contract_reasons",
+                        [],
+                    )
+                    or []
+                )
+            ])
+        ),
+        "context_migration_selected_target_expert_placement_runtime_levels": (
+            compact_values([
+                str(level)
+                for row in migration_rows
+                for level in (
+                    row.get(
+                        "selected_plan_target_expert_placement_runtime_verification_levels",
+                        [],
+                    )
+                    or []
+                )
+            ])
+        ),
+        "context_migration_selected_target_expert_placement_runtime_verified": sum(
+            safe_int(
+                row.get(
+                    "selected_plan_target_expert_placement_runtime_verified_count"
+                ),
+                0,
+            )
+            for row in migration_rows
+        ),
+        "context_migration_selected_target_expert_placement_runtime_can_verify_physical": sum(
+            safe_int(
+                row.get(
+                    "selected_plan_target_expert_placement_runtime_can_verify_physical_count"
+                ),
+                0,
+            )
+            for row in migration_rows
+        ),
+        "context_migration_selected_target_expert_placement_runtime_can_remap_ep": sum(
+            safe_int(
+                row.get(
+                    "selected_plan_target_expert_placement_runtime_can_remap_ep_count"
+                ),
+                0,
+            )
+            for row in migration_rows
+        ),
+        "context_migration_selected_target_expert_placement_runtime_can_measure_a2a": sum(
+            safe_int(
+                row.get(
+                    "selected_plan_target_expert_placement_runtime_can_measure_a2a_count"
+                ),
+                0,
+            )
+            for row in migration_rows
+        ),
+        "context_migration_selected_target_expert_placement_runtime_capability_reasons": (
+            compact_values([
+                str(reason)
+                for row in migration_rows
+                for reason in (
+                    row.get(
+                        "selected_plan_target_expert_placement_runtime_capability_reasons",
                         [],
                     )
                     or []
@@ -1940,6 +2066,48 @@ def summarize_state_recovery_metrics(
                 str(row.get("target_expert_placement_contract_reason"))
                 for row in state_rows
                 if row.get("target_expert_placement_contract_reason")
+            ])
+        ),
+        "state_recovery_target_expert_placement_runtime_levels": (
+            compact_values([
+                str(row.get("target_expert_placement_runtime_verification_level"))
+                for row in state_rows
+                if row.get("target_expert_placement_runtime_verification_level")
+            ])
+        ),
+        "state_recovery_target_expert_placement_runtime_verified": sum(
+            1
+            for row in state_rows
+            if row.get("target_expert_placement_runtime_verified_placement")
+        ),
+        "state_recovery_target_expert_placement_runtime_can_verify_physical": (
+            sum(
+                1
+                for row in state_rows
+                if row.get(
+                    "target_expert_placement_runtime_can_verify_physical_placement"
+                )
+            )
+        ),
+        "state_recovery_target_expert_placement_runtime_can_remap_ep": sum(
+            1
+            for row in state_rows
+            if row.get(
+                "target_expert_placement_runtime_can_remap_live_ep_rank"
+            )
+        ),
+        "state_recovery_target_expert_placement_runtime_can_measure_a2a": sum(
+            1
+            for row in state_rows
+            if row.get(
+                "target_expert_placement_runtime_can_measure_all_to_all"
+            )
+        ),
+        "state_recovery_target_expert_placement_runtime_capability_reasons": (
+            compact_values([
+                str(row.get("target_expert_placement_runtime_capability_reason"))
+                for row in state_rows
+                if row.get("target_expert_placement_runtime_capability_reason")
             ])
         ),
         "state_recovery_target_expert_placement_apply_hook_available": sum(

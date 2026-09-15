@@ -122,6 +122,18 @@ class VllmDeploymentAdapter:
             )
             config["expert_placement_live_migration_enabled"] = False
             config["expert_placement_physical_migration_required"] = False
+            config["expert_placement_runtime_verification_level"] = (
+                "unavailable"
+            )
+            config["expert_placement_runtime_verified_placement"] = False
+            config[
+                "expert_placement_runtime_can_verify_physical_placement"
+            ] = False
+            config["expert_placement_runtime_can_remap_live_ep_rank"] = False
+            config["expert_placement_runtime_can_measure_all_to_all"] = False
+            config["expert_placement_runtime_capability_reason"] = (
+                "awaiting_runtime_expert_placement_hook"
+            )
             config["placement_source"] = str(
                 expert_placement_plan.get(
                     "placement_source",

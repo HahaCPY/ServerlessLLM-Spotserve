@@ -217,6 +217,10 @@ def build_comparisons(
         "replanning_expert_placement_runtime_contract_seen",
         "replanning_expert_placement_runtime_contract_seen_all_workers",
         "replanning_expert_placement_runtime_physical_weight_migration",
+        "replanning_expert_placement_runtime_verified_placement",
+        "replanning_expert_placement_runtime_can_verify_physical_placement",
+        "replanning_expert_placement_runtime_can_remap_live_ep_rank",
+        "replanning_expert_placement_runtime_can_measure_all_to_all",
         "replanning_expert_placement_runtime_live_migration",
         "replanning_expert_placement_runtime_physical_migration_required",
         "replanning_max_ready_worker_node_count",
@@ -1395,8 +1399,16 @@ async def main_async(args):
                     f"{summary.get('replanning_expert_placement_runtime_verify_success', 0)}, "
                     f"runtime_contract_seen="
                     f"{summary.get('replanning_expert_placement_runtime_contract_seen', 0)}, "
+                    f"runtime_level="
+                    f"{summary.get('replanning_expert_placement_runtime_verification_levels', '') or 'unavailable'}, "
+                    f"runtime_verified_placement="
+                    f"{summary.get('replanning_expert_placement_runtime_verified_placement', 0)}, "
                     f"runtime_physical_migration="
-                    f"{summary.get('replanning_expert_placement_runtime_physical_weight_migration', 0)}"
+                    f"{summary.get('replanning_expert_placement_runtime_physical_weight_migration', 0)}, "
+                    f"runtime_remap_ep="
+                    f"{summary.get('replanning_expert_placement_runtime_can_remap_live_ep_rank', 0)}, "
+                    f"runtime_a2a_counters="
+                    f"{summary.get('replanning_expert_placement_runtime_can_measure_all_to_all', 0)}"
                 )
             context_migration_suffix = ""
             if int(summary.get("context_migration_events", 0) or 0) > 0:

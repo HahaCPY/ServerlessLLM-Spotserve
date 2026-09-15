@@ -92,6 +92,12 @@ class FakeMoeRuntimeTargetBackend:
         expert_placement_contract_seen_worker_count=0,
         expert_placement_contract_seen_worker_total=0,
         expert_placement_physical_weight_migration=False,
+        expert_placement_runtime_verification_level="unavailable",
+        expert_placement_runtime_verified_placement=False,
+        expert_placement_runtime_can_verify_physical_placement=False,
+        expert_placement_runtime_can_remap_live_ep_rank=False,
+        expert_placement_runtime_can_measure_all_to_all=False,
+        expert_placement_runtime_capability_reason="",
         expert_placement_contract_reason="no_expert_placement_contract",
     ):
         self.expert_ids = tuple(expert_ids)
@@ -122,6 +128,24 @@ class FakeMoeRuntimeTargetBackend:
         )
         self.expert_placement_physical_weight_migration = (
             expert_placement_physical_weight_migration
+        )
+        self.expert_placement_runtime_verification_level = (
+            expert_placement_runtime_verification_level
+        )
+        self.expert_placement_runtime_verified_placement = (
+            expert_placement_runtime_verified_placement
+        )
+        self.expert_placement_runtime_can_verify_physical_placement = (
+            expert_placement_runtime_can_verify_physical_placement
+        )
+        self.expert_placement_runtime_can_remap_live_ep_rank = (
+            expert_placement_runtime_can_remap_live_ep_rank
+        )
+        self.expert_placement_runtime_can_measure_all_to_all = (
+            expert_placement_runtime_can_measure_all_to_all
+        )
+        self.expert_placement_runtime_capability_reason = (
+            expert_placement_runtime_capability_reason
         )
         self.expert_placement_contract_reason = (
             expert_placement_contract_reason
@@ -190,6 +214,25 @@ class FakeMoeRuntimeTargetBackend:
                     ),
                     "expert_placement_physical_weight_migration": (
                         self.expert_placement_physical_weight_migration
+                    ),
+                    "expert_placement_runtime_verification_level": (
+                        self.expert_placement_runtime_verification_level
+                    ),
+                    "expert_placement_runtime_verified_placement": (
+                        self.expert_placement_runtime_verified_placement
+                    ),
+                    "expert_placement_runtime_can_verify_physical_placement": (
+                        self
+                        .expert_placement_runtime_can_verify_physical_placement
+                    ),
+                    "expert_placement_runtime_can_remap_live_ep_rank": (
+                        self.expert_placement_runtime_can_remap_live_ep_rank
+                    ),
+                    "expert_placement_runtime_can_measure_all_to_all": (
+                        self.expert_placement_runtime_can_measure_all_to_all
+                    ),
+                    "expert_placement_runtime_capability_reason": (
+                        self.expert_placement_runtime_capability_reason
                     ),
                     "expert_placement_contract_reason": (
                         self.expert_placement_contract_reason
@@ -1505,6 +1548,12 @@ async def test_router_runtime_status_keeps_expert_contract_seen_fields():
             expert_placement_contract_seen_by_all_workers=True,
             expert_placement_contract_seen_worker_count=1,
             expert_placement_contract_seen_worker_total=1,
+            expert_placement_runtime_verification_level=(
+                "contract_seen_only"
+            ),
+            expert_placement_runtime_capability_reason=(
+                "vllm_live_ep_rank_remap_not_supported"
+            ),
             expert_placement_contract_reason=(
                 "physical_expert_placement_migration_not_supported"
             ),
@@ -1530,6 +1579,14 @@ async def test_router_runtime_status_keeps_expert_contract_seen_fields():
     assert status["contract_seen_worker_count"] == 1
     assert status["contract_seen_worker_total"] == 1
     assert status["physical_weight_migration_count"] == 0
+    assert status["verification_levels"] == "contract_seen_only"
+    assert status["verified_placement_count"] == 0
+    assert status["can_verify_physical_placement_count"] == 0
+    assert status["can_remap_live_ep_rank_count"] == 0
+    assert status["can_measure_all_to_all_count"] == 0
+    assert status["capability_reasons"] == (
+        "vllm_live_ep_rank_remap_not_supported"
+    )
 
 
 @pytest.mark.asyncio

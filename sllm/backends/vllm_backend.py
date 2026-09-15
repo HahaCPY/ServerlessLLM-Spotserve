@@ -211,6 +211,24 @@ def _runtime_hook_reason(result: Any, default: str) -> str:
     return default
 
 
+def _runtime_hook_str(result: Any, *keys: str, default: str = "") -> str:
+    if isinstance(result, Mapping):
+        for key in keys:
+            value = result.get(key)
+            if value not in (None, ""):
+                return str(value)
+    return default
+
+
+def _runtime_hook_any_truthy(result: Any, *keys: str) -> bool:
+    if any(_runtime_hook_bool(result, key, default=False) for key in keys):
+        return True
+    return any(
+        any(_runtime_hook_bool(row, key, default=False) for key in keys)
+        for row in _runtime_hook_worker_results(result)
+    )
+
+
 def _runtime_hook_int(result: Any, key: str, default: int = 0) -> int:
     if isinstance(result, Mapping) and key in result:
         parsed = _as_non_negative_int(result.get(key))
@@ -289,6 +307,78 @@ def _runtime_hook_contract_seen_by_runtime(
             for row in rows
         )
     )
+
+
+def _expert_placement_runtime_verification_level(
+    *,
+    contract_seen_by_runtime: bool,
+    hook_available: bool,
+    physical_weight_migration: bool,
+    plan_verified: bool,
+) -> str:
+    if physical_weight_migration and plan_verified:
+        return "physical_migration_verified"
+    if plan_verified:
+        return "runtime_placement_verified"
+    if contract_seen_by_runtime:
+        return "contract_seen_only"
+    if hook_available:
+        return "runtime_boundary_observe_only"
+    return "unavailable"
+
+
+def _merge_expert_placement_runtime_capabilities(
+    status: Dict[str, Any],
+    result: Any,
+) -> None:
+    status["expert_placement_runtime_verified_placement"] = bool(
+        status["expert_placement_runtime_verified_placement"]
+        or _runtime_hook_any_truthy(
+            result,
+            "runtime_verified_placement",
+            "verified_placement",
+            "expert_placement_runtime_verified_placement",
+        )
+    )
+    status["expert_placement_runtime_can_verify_physical_placement"] = bool(
+        status["expert_placement_runtime_can_verify_physical_placement"]
+        or _runtime_hook_any_truthy(
+            result,
+            "can_verify_physical_placement",
+            "physical_placement_verification_supported",
+            "expert_placement_runtime_can_verify_physical_placement",
+        )
+    )
+    status["expert_placement_runtime_can_remap_live_ep_rank"] = bool(
+        status["expert_placement_runtime_can_remap_live_ep_rank"]
+        or _runtime_hook_any_truthy(
+            result,
+            "can_remap_live_ep_rank",
+            "live_ep_rank_remap_supported",
+            "expert_placement_runtime_can_remap_live_ep_rank",
+        )
+    )
+    status["expert_placement_runtime_can_measure_all_to_all"] = bool(
+        status["expert_placement_runtime_can_measure_all_to_all"]
+        or _runtime_hook_any_truthy(
+            result,
+            "can_measure_all_to_all",
+            "all_to_all_traffic_available",
+            "real_all_to_all_traffic_available",
+            "expert_placement_runtime_can_measure_all_to_all",
+        )
+    )
+    capability_reason = _runtime_hook_str(
+        result,
+        "capability_reason",
+        "capability_reasons",
+        "expert_placement_runtime_capability_reason",
+        default="",
+    )
+    if capability_reason:
+        status["expert_placement_runtime_capability_reason"] = (
+            capability_reason
+        )
 
 
 def _expert_key_from_parts(parts: Sequence[Any]) -> str:
@@ -894,6 +984,63 @@ class VllmBackend(SllmBackend):
                     "expert_placement_physical_weight_migration", False
                 )
             ),
+            "expert_placement_runtime_verification_level": str(
+                runtime_status.get(
+                    "expert_placement_runtime_verification_level",
+                    _expert_placement_runtime_verification_level(
+                        contract_seen_by_runtime=bool(
+                            runtime_status.get(
+                                "expert_placement_contract_seen_by_runtime",
+                                False,
+                            )
+                        ),
+                        hook_available=bool(
+                            runtime_status.get(
+                                "expert_placement_apply_hook_available", False
+                            )
+                            or runtime_status.get(
+                                "expert_placement_verify_hook_available", False
+                            )
+                        ),
+                        physical_weight_migration=bool(
+                            runtime_status.get(
+                                "expert_placement_physical_weight_migration",
+                                False,
+                            )
+                        ),
+                        plan_verified=plan_verified,
+                    ),
+                )
+            ),
+            "expert_placement_runtime_verified_placement": bool(
+                runtime_status.get(
+                    "expert_placement_runtime_verified_placement",
+                    plan_verified,
+                )
+            ),
+            "expert_placement_runtime_can_verify_physical_placement": bool(
+                runtime_status.get(
+                    "expert_placement_runtime_can_verify_physical_placement",
+                    False,
+                )
+            ),
+            "expert_placement_runtime_can_remap_live_ep_rank": bool(
+                runtime_status.get(
+                    "expert_placement_runtime_can_remap_live_ep_rank", False
+                )
+            ),
+            "expert_placement_runtime_can_measure_all_to_all": bool(
+                runtime_status.get(
+                    "expert_placement_runtime_can_measure_all_to_all", False
+                )
+            ),
+            "expert_placement_runtime_capability_reason": str(
+                runtime_status.get(
+                    "expert_placement_runtime_capability_reason",
+                    reason,
+                )
+                or ""
+            ),
             "reparallelization_execution_model": replanning_execution_model,
             "reparallelization_execution_model_reason": (
                 replanning_execution_model_reason
@@ -1307,6 +1454,12 @@ class VllmBackend(SllmBackend):
             "expert_placement_contract_seen_worker_count": 0,
             "expert_placement_contract_seen_worker_total": 0,
             "expert_placement_physical_weight_migration": False,
+            "expert_placement_runtime_verification_level": "unavailable",
+            "expert_placement_runtime_verified_placement": False,
+            "expert_placement_runtime_can_verify_physical_placement": False,
+            "expert_placement_runtime_can_remap_live_ep_rank": False,
+            "expert_placement_runtime_can_measure_all_to_all": False,
+            "expert_placement_runtime_capability_reason": "",
             "expert_placement_physical_migration_required": False,
             "expert_placement_plan_applied": False,
             "expert_placement_plan_verified": False,
@@ -1432,6 +1585,9 @@ class VllmBackend(SllmBackend):
                         "physical_weight_migration",
                         default=False,
                     )
+                )
+                _merge_expert_placement_runtime_capabilities(
+                    status, apply_result
                 )
             finally:
                 status["expert_placement_apply_duration_ms"] = (
@@ -1570,6 +1726,9 @@ class VllmBackend(SllmBackend):
                         default=False,
                     )
                 )
+                _merge_expert_placement_runtime_capabilities(
+                    status, verify_result
+                )
 
         status["expert_placement_plan_applied"] = bool(
             status["expert_placement_apply_success"]
@@ -1578,6 +1737,40 @@ class VllmBackend(SllmBackend):
         status["expert_placement_plan_verified"] = bool(
             status["expert_placement_verify_success"]
         )
+        status["expert_placement_runtime_verified_placement"] = bool(
+            status["expert_placement_runtime_verified_placement"]
+            or status["expert_placement_plan_verified"]
+        )
+        if (
+            status["expert_placement_physical_weight_migration"]
+            and status["expert_placement_runtime_verified_placement"]
+        ):
+            status[
+                "expert_placement_runtime_can_verify_physical_placement"
+            ] = True
+        status["expert_placement_runtime_verification_level"] = (
+            _expert_placement_runtime_verification_level(
+                contract_seen_by_runtime=bool(
+                    status["expert_placement_contract_seen_by_runtime"]
+                ),
+                hook_available=bool(
+                    status["expert_placement_apply_hook_available"]
+                    or status["expert_placement_verify_hook_available"]
+                ),
+                physical_weight_migration=bool(
+                    status["expert_placement_physical_weight_migration"]
+                ),
+                plan_verified=bool(
+                    status["expert_placement_runtime_verified_placement"]
+                ),
+            )
+        )
+        if not status["expert_placement_runtime_capability_reason"]:
+            status["expert_placement_runtime_capability_reason"] = str(
+                status.get("expert_placement_verify_reason")
+                or status.get("expert_placement_apply_reason")
+                or status["expert_placement_runtime_verification_level"]
+            )
         self.expert_placement_runtime_status = status
         if (
             status["expert_placement_physical_migration_required"]
@@ -2506,6 +2699,36 @@ class VllmBackend(SllmBackend):
             ),
             "expert_placement_verify_reason": parallel_metadata.get(
                 "expert_placement_verify_reason"
+            ),
+            "expert_placement_runtime_verification_level": (
+                parallel_metadata.get(
+                    "expert_placement_runtime_verification_level"
+                )
+            ),
+            "expert_placement_runtime_verified_placement": (
+                parallel_metadata.get(
+                    "expert_placement_runtime_verified_placement"
+                )
+            ),
+            "expert_placement_runtime_can_verify_physical_placement": (
+                parallel_metadata.get(
+                    "expert_placement_runtime_can_verify_physical_placement"
+                )
+            ),
+            "expert_placement_runtime_can_remap_live_ep_rank": (
+                parallel_metadata.get(
+                    "expert_placement_runtime_can_remap_live_ep_rank"
+                )
+            ),
+            "expert_placement_runtime_can_measure_all_to_all": (
+                parallel_metadata.get(
+                    "expert_placement_runtime_can_measure_all_to_all"
+                )
+            ),
+            "expert_placement_runtime_capability_reason": (
+                parallel_metadata.get(
+                    "expert_placement_runtime_capability_reason"
+                )
             ),
             "moe_route_histogram_available": parallel_metadata.get(
                 "moe_route_histogram_available"

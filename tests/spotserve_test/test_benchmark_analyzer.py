@@ -86,6 +86,16 @@ def test_state_recovery_summary_exposes_phase3_moe_metrics():
                 "target_expert_placement_contract_reason": (
                     "runtime_not_applied"
                 ),
+                "target_expert_placement_runtime_verification_level": (
+                    "contract_seen_only"
+                ),
+                "target_expert_placement_runtime_verified_placement": False,
+                "target_expert_placement_runtime_can_verify_physical_placement": False,
+                "target_expert_placement_runtime_can_remap_live_ep_rank": False,
+                "target_expert_placement_runtime_can_measure_all_to_all": False,
+                "target_expert_placement_runtime_capability_reason": (
+                    "vllm_live_ep_rank_remap_not_supported"
+                ),
                 "target_expert_placement_apply_hook_available": False,
                 "target_expert_placement_apply_attempted": False,
                 "target_expert_placement_apply_success": False,
@@ -171,6 +181,34 @@ def test_state_recovery_summary_exposes_phase3_moe_metrics():
     assert (
         summary["state_recovery_target_expert_placement_contract_reasons"]
         == "runtime_not_applied"
+    )
+    assert (
+        summary["state_recovery_target_expert_placement_runtime_levels"]
+        == "contract_seen_only"
+    )
+    assert (
+        summary["state_recovery_target_expert_placement_runtime_verified"]
+        == 0
+    )
+    assert (
+        summary[
+            "state_recovery_target_expert_placement_runtime_can_verify_physical"
+        ]
+        == 0
+    )
+    assert (
+        summary["state_recovery_target_expert_placement_runtime_can_remap_ep"]
+        == 0
+    )
+    assert (
+        summary["state_recovery_target_expert_placement_runtime_can_measure_a2a"]
+        == 0
+    )
+    assert (
+        summary[
+            "state_recovery_target_expert_placement_runtime_capability_reasons"
+        ]
+        == "vllm_live_ep_rank_remap_not_supported"
     )
     assert (
         summary[
@@ -462,6 +500,16 @@ def test_replanning_summary_exposes_workload_cost_metrics():
                 "expert_placement_runtime_contract_seen_worker_count": 2,
                 "expert_placement_runtime_contract_seen_worker_total": 2,
                 "expert_placement_runtime_physical_weight_migration_count": 0,
+                "expert_placement_runtime_verification_levels": (
+                    "contract_seen_only"
+                ),
+                "expert_placement_runtime_verified_placement_count": 0,
+                "expert_placement_runtime_can_verify_physical_placement_count": 0,
+                "expert_placement_runtime_can_remap_live_ep_rank_count": 0,
+                "expert_placement_runtime_can_measure_all_to_all_count": 0,
+                "expert_placement_runtime_capability_reasons": (
+                    "vllm_live_ep_rank_remap_not_supported"
+                ),
                 "expert_placement_runtime_plan_applied_count": 0,
                 "expert_placement_runtime_plan_verified_count": 0,
                 "expert_placement_runtime_contract_reasons": (
@@ -617,6 +665,42 @@ def test_replanning_summary_exposes_workload_cost_metrics():
         ]
         == 0
     )
+    assert (
+        summary[
+            "replanning_expert_placement_runtime_verification_levels"
+        ]
+        == "contract_seen_only"
+    )
+    assert (
+        summary[
+            "replanning_expert_placement_runtime_verified_placement"
+        ]
+        == 0
+    )
+    assert (
+        summary[
+            "replanning_expert_placement_runtime_can_verify_physical_placement"
+        ]
+        == 0
+    )
+    assert (
+        summary[
+            "replanning_expert_placement_runtime_can_remap_live_ep_rank"
+        ]
+        == 0
+    )
+    assert (
+        summary[
+            "replanning_expert_placement_runtime_can_measure_all_to_all"
+        ]
+        == 0
+    )
+    assert (
+        summary[
+            "replanning_expert_placement_runtime_capability_reasons"
+        ]
+        == "vllm_live_ep_rank_remap_not_supported"
+    )
     assert summary["replanning_expert_placement_runtime_plan_applied"] == 0
     assert summary["replanning_expert_placement_runtime_plan_verified"] == 0
     assert summary["replanning_expert_placement_runtime_contract_reasons"] == (
@@ -682,6 +766,16 @@ def test_context_migration_summary_exposes_moe_locality_metrics():
                 "selected_plan_target_expert_placement_contract_seen_all_workers_count": 1,
                 "selected_plan_target_expert_placement_contract_reasons": [
                     "runtime_not_applied"
+                ],
+                "selected_plan_target_expert_placement_runtime_verification_levels": [
+                    "contract_seen_only"
+                ],
+                "selected_plan_target_expert_placement_runtime_verified_count": 0,
+                "selected_plan_target_expert_placement_runtime_can_verify_physical_count": 0,
+                "selected_plan_target_expert_placement_runtime_can_remap_ep_count": 0,
+                "selected_plan_target_expert_placement_runtime_can_measure_a2a_count": 0,
+                "selected_plan_target_expert_placement_runtime_capability_reasons": [
+                    "vllm_live_ep_rank_remap_not_supported"
                 ],
                 "selected_plan_target_expert_placement_apply_hook_available_count": 0,
                 "selected_plan_target_expert_placement_apply_attempted_count": 0,
@@ -840,6 +934,42 @@ def test_context_migration_summary_exposes_moe_locality_metrics():
             "context_migration_selected_target_expert_placement_contract_reasons"
         ]
         == "runtime_not_applied"
+    )
+    assert (
+        summary[
+            "context_migration_selected_target_expert_placement_runtime_levels"
+        ]
+        == "contract_seen_only"
+    )
+    assert (
+        summary[
+            "context_migration_selected_target_expert_placement_runtime_verified"
+        ]
+        == 0
+    )
+    assert (
+        summary[
+            "context_migration_selected_target_expert_placement_runtime_can_verify_physical"
+        ]
+        == 0
+    )
+    assert (
+        summary[
+            "context_migration_selected_target_expert_placement_runtime_can_remap_ep"
+        ]
+        == 0
+    )
+    assert (
+        summary[
+            "context_migration_selected_target_expert_placement_runtime_can_measure_a2a"
+        ]
+        == 0
+    )
+    assert (
+        summary[
+            "context_migration_selected_target_expert_placement_runtime_capability_reasons"
+        ]
+        == "vllm_live_ep_rank_remap_not_supported"
     )
     assert (
         summary[
