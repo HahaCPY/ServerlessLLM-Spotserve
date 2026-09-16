@@ -12,17 +12,20 @@ preemption-aware flow 裡。
 
 ```text
 已完成：SpotServe-style control-plane prototype + vLLM MoE compatibility
-部分完成：vLLM patched runtime/NIXL 的 stateful KV restore smoke
-尚未完成：MoE-aware expert placement / expert migration / expert recovery
+已完成：patched vLLM/NIXL true KV stateful restore benchmark
+部分完成：MoE-aware target selection、logical expert placement planning、
+          runtime placement contract observability
+尚未完成：live physical expert weight migration / live EP rank remapping /
+          real all-to-all traffic reduction
 ```
 
 ## 三大核心對應架構
 
 | SpotServe 核心 | 專案主要位置 | 目前狀態 |
 |---|---|---|
-| Dynamic re-parallelization | `sllm/spot/reparallelization.py`, `sllm/spot/reparallelization_executor.py`, `sllm/spot/vllm_deployment_adapter.py`, `sllm/routers/roundrobin_router.py` | 控制平面與 vLLM actor 重建/切流有做，但不是論文完整 optimizer，也不是 in-place MoE expert repartition |
+| Dynamic re-parallelization | `sllm/spot/reparallelization.py`, `sllm/spot/reparallelization_executor.py`, `sllm/spot/vllm_deployment_adapter.py`, `sllm/routers/roundrobin_router.py` | 控制平面、workload/cost-aware plan、vLLM actor recreate/切流、logical ExpertPlacementPlan 與 observe-only runtime contract 已做；不是 in-place MoE expert weight migration |
 | Low-cost context migration | `sllm/spot/context_migration.py`, `sllm/backends/vllm_context_metadata.py`, `sllm/routers/roundrobin_router.py` | 有 context metadata 與低成本 mapping planner；但 V7 本身多數是 planning / prefix warmup，不等於 true KV block migration |
-| Stateful recovery | `sllm/spot/stateful_recovery.py`, `sllm/backends/vllm_state_metadata.py`, `sllm/backends/vllm_backend.py`, `sllm/routers/roundrobin_router.py` | recovery decision、fallback、patched vLLM/NIXL hooks 有接；真 KV restore 依賴 patched runtime，未 patch 時是 token replay fallback |
+| Stateful recovery | `sllm/spot/stateful_recovery.py`, `sllm/backends/vllm_state_metadata.py`, `sllm/backends/vllm_backend.py`, `sllm/routers/roundrobin_router.py` | recovery decision、fallback、patched vLLM/NIXL hooks 有接；standalone V8 benchmark 已驗證 true KV restore，未 patch 或 core matrix capability 不足時仍會 token replay fallback |
 | Preemptible simulation | `sllm/spot/trace_reader.py`, `sllm/spot/preemption_simulator.py`, `sllm/app_lib.py`, `sllm/controller.py` | JSONL trace replay 模擬 `add/remove/preempt/recover/dead`，不是真 cloud spot provider integration |
 
 ## 主要問題
@@ -254,7 +257,41 @@ response_kv_restore_successes > 0
 response_kv_restore_restored_blocks > 0
 ```
 
-### 4. Re-parallelization 是 heuristic + actor recreate，不是論文完整 controller（部分修正）
+最新驗證：
+
+2026-09-16 的 `benchmark_matrix_stateful_recovery_performance.yaml`
+使用 `/models/Qwen2-MoE-Tiny` 跑通 standalone V8：
+
+```text
+vllm-stateful-recovery-token-replay:
+  successes=3/3
+  p95=48739.13ms
+
+vllm-stateful-recovery-applied:
+  successes=3/3
+  p95=5157.64ms
+  state_restores=1/1
+  state_tokens=16
+  state_fallbacks=0
+  state_blocks=6
+  response_blocks=6
+  true_kv_restores=1
+  true_kv_rate=100.00%
+  true_kv_blocks=6
+  supports_state_restore=1
+  recovery_kv_compatible=1
+  recovery_ep_required=0
+  recovery_ep_mismatch=1
+  recovery_locality=1.00
+```
+
+因此 V8 true KV restore 的獨立 benchmark 已成功。若
+`benchmark_matrix_spotserve_core_performance.yaml` 顯示
+`state_fallbacks=1` 或 `supports_state_restore=0`，那只能代表 core matrix 的
+整合 control flow 成功，不能拿來當 true KV restore 證據；true KV restore
+claim 應以 standalone V8 matrix 為準。
+
+### 4. Re-parallelization 是 workload-aware planner + actor recreate，不是 live expert migration（部分修正）
 
 `sllm/spot/reparallelization.py` 的 candidate selection 主要依照：
 
@@ -265,10 +302,10 @@ target replica GPU shape distance
 unused GPU count
 ```
 
-這是合理的 control-plane prototype，但 SpotServe 論文中的 parallelization
-controller 會考慮 throughput、latency、monetary cost、batch size `B`、workload
-變化等 trade-off。現有版本也主要透過 `VllmDeploymentAdapter` 建新 vLLM actors、
-ready 後切流、drain 舊 actors，不是 runtime 內部原地重分片。
+這已經從早期 capacity-only heuristic 推進成 workload/cost-aware control-plane
+planner，但現有版本仍主要透過 `VllmDeploymentAdapter` 建新 vLLM actors、ready
+後切流、drain 舊 actors，不是 runtime 內部原地重分片，也不是 live expert
+weight migration。
 
 影響：
 
@@ -337,13 +374,60 @@ ready 後切流、drain 舊 actors，不是 runtime 內部原地重分片。
 仍未完成：
 
 - 這不是完整 SpotServe optimizer，也還沒有 monetary cost model。
-- 目前是 actor recreate / ready 後切流，不是 runtime 內部 in-place repartition。
+- 目前是 expert-aware actor recreate / ready 後切流，不是 runtime 內部
+  in-place repartition。
+- `ExpertPlacementPlan` 目前可以被 runtime hook 看到，但 vLLM hook 回報的是
+  `contract_seen_only` / observe-only，不是
+  `physical_migration_verified`。
+- `runtime_verified_placement=0`、`runtime_physical_migration=0`、
+  `runtime_remap_ep=0`、`runtime_a2a_counters=0` 是目前正確結果。
 
 實驗邊界：
 
 - 新增的 multi-worker matrix 可以驗證多個 runtime worker container。若兩個
   worker 都在同一台 host 上，結果應標示為 same-host / same-machine validation；
   本階段不 claim physical cross-node validation。
+
+2026-09-15 的 standalone V6 re-parallelization performance run 已驗證最新
+Phase 4/5 邊界：
+
+```text
+vllm-reparallelization-disabled:
+  successes=3/8
+  success_rate=37.50%
+  p95=180102.20ms
+
+vllm-reparallelization-applied:
+  successes=8/8
+  success_rate=100.00%
+  p95=14069.87ms
+  trace_success=1
+  replans=1
+  applied=1
+  failed=0
+  exec_ms=16340.36
+  cost_model=1
+  expert_plan=1
+  expert_plan_shards=8
+  actor_recreate=1
+  live_migration=0
+  runtime_workers=1
+```
+
+這可以 claim：
+
+```text
+preemption event -> replan -> actor recreate -> logical ExpertPlacementPlan
+```
+
+但仍不能 claim：
+
+```text
+physical expert weight migration
+live EP rank remapping
+runtime-verified physical placement
+real all-to-all traffic reduction
+```
 
 這三件事的意思如下。
 

@@ -921,8 +921,8 @@ Applied:
   placement metadata 估計，不是真實 vLLM all-to-all / remote dispatch traffic
   counter。真實 traffic counter 仍屬後續工作。
 
-2026-08-30 的 V8 stateful recovery performance run 已驗證 Phase 3 的主要
-control-plane path：
+2026-09-16 的 V8 stateful recovery performance run 已驗證 Phase 3 的主要
+runtime restore path：
 
 ```text
 Benchmark:
@@ -931,16 +931,19 @@ Model:
   /models/Qwen2-MoE-Tiny
 Token replay:
   successes=3/3
-  p95=49201.94ms
+  p95=48739.13ms
 Stateful recovery:
   successes=3/3
-  p95=2374.77ms
+  p95=5157.64ms
   state_restores=1/1
   state_tokens=16
   state_blocks=6
+  response_blocks=6
   state_fallbacks=0
   true_kv_restores=1
   true_kv_rate=100.00%
+  true_kv_blocks=6
+  supports_state_restore=1
   recovery_kv_compatible=1
   recovery_ep_required=0
   recovery_ep_mismatch=1
@@ -952,32 +955,33 @@ Stateful recovery:
 這個結果的重點不是 `EP mismatch=1` 有問題，而是相反：planner/runtime
 正確把它視為 topology/locality signal。因為 `recovery_ep_required=0`，
 EP mismatch 不會硬擋 KV restore；同一個 run 同時有
-`recovery_kv_compatible=1`、`state_blocks=6`、`true_kv_restores=1`，代表
-KV restore correctness 與 expert locality 已經被分開報告。
+`recovery_kv_compatible=1`、`state_blocks=6`、`response_blocks=6`、
+`true_kv_restores=1`，代表 KV restore correctness 與 expert locality 已經
+被分開報告。
 
 仍不能宣稱已量測真實 remote expert dispatch traffic；這次
 `recovery_remote_tokens=0` / `recovery_expert_cost=0.00` 是根據 route histogram
 與 target placement metadata 的估計結果。
 
-2026-08-30 的 V7-V9 core combined run 也確認三個核心可以在同一個 applied
-benchmark 中一起運作：
+2026-09-16 的 V7-V9 core combined run 也確認三個核心可以在同一個 applied
+benchmark 中一起運作，但這個 matrix 不應取代 standalone V8 true-KV-restore
+證據：
 
 ```text
 Benchmark:
   benchmark_matrix_spotserve_core_performance.yaml
 Baseline:
   successes=8/8
-  p95=48965.38ms
 Applied:
   successes=8/8
-  p95=2656.23ms
   context_migrations=1
   route_source=vllm_runtime_topk
   route_kind=runtime_observed_topk
   kv_successes=1
-  state_restores=1/1
-  true_kv_restores=1
-  true_kv_blocks=3
+  state_events=1
+  state_fallbacks=1
+  true_kv_restores=0
+  supports_state_restore=0
   recovery_kv_compatible=1
   recovery_ep_required=0
   recovery_ep_mismatch=1
@@ -987,8 +991,9 @@ Applied:
 
 這組結果可以用來 claim「V7 context planning、V8 stateful recovery、V9
 risk-aware scheduling 的 code paths 可以合在同一個 live benchmark 內執行」。
-但它仍不應被寫成 physical expert migration 或真實 remote expert dispatch traffic
-已完成。
+但它仍不應被寫成 physical expert migration、真實 remote expert dispatch traffic
+已完成，或 true KV restore 已在 core matrix 中完成。true KV restore 的主要
+證據應使用 standalone `benchmark_matrix_stateful_recovery_performance.yaml`。
 
 ### Phase 4 前置小步：Expert Dispatch Observability
 
@@ -1284,7 +1289,7 @@ phase4-movement-penalized:
 4 claim 從「logical/control-plane placement」推進到「runtime-applied
 placement」。
 
-2026-09-06 的 V6 re-parallelization performance benchmark 已驗證目前
+2026-09-15 的 V6 re-parallelization performance benchmark 已驗證目前
 logical/control-plane placement、movement diff 與 observe-only runtime hook
 plumbing path：
 
@@ -1295,13 +1300,13 @@ model = /models/Qwen2-MoE-Tiny
 Disabled:
   successes=3/8
   success_rate=37.50%
-  p95=180041.97ms
+  p95=180102.20ms
   trace_success=1
 
 Applied:
   successes=8/8
   success_rate=100.00%
-  p95=14143.22ms
+  p95=14069.87ms
   trace_success=1
   replans=1
   applied=1
@@ -1310,7 +1315,7 @@ Applied:
   actor_recreate=1
   live_migration=0
   runtime_workers=1
-  exec_ms=15413.68
+  exec_ms=16340.36
   cost_model=1
   expert_plan=1
   expert_plan_shards=8
@@ -1328,6 +1333,10 @@ Applied:
   runtime_plan_applied=0
   runtime_plan_verified=0
   physical_expert_migration=0
+  runtime_verification_level=contract_seen_only
+  runtime_verified_placement=0
+  runtime_remap_ep=0
+  runtime_a2a_counters=0
 ```
 
 這代表：
@@ -1347,6 +1356,8 @@ Applied:
 - `runtime_apply_success=0`、`runtime_verify_success=0`、
   `runtime_plan_applied=0`、`runtime_plan_verified=0` 是目前正確結果，因為
   hook 仍是 observe-only，沒有真的改 vLLM EP rank mapping 或搬 expert weights。
+- `runtime_verification_level=contract_seen_only` 代表 runtime 已看過 placement
+  contract；它不是 `physical_migration_verified`。
 
 這組 run 使用 single-worker same-node recreate mode，因此
 `runtime_workers=1` 是預期結果：它表示 same-node recreate capacity entry 代表

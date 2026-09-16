@@ -1,6 +1,6 @@
 # SpotServe Performance Summary
 
-Last updated: 2026-09-06
+Last updated: 2026-09-16
 
 This page is intentionally short. It keeps only the commands needed to rerun
 each version's benchmark path and a compact performance summary. V6, V7, V8,
@@ -335,22 +335,22 @@ and the sweep will fail during setup with a Ray scheduling warning for
 | V3 | `benchmark_matrix_recovery_correctness.yaml` | Recovery policies turn forced failures into successes; latency is not the main metric. | Stable correctness check. |
 | V4 | `benchmark_matrix_vllm_dense.yaml` | Dense vLLM compatibility milestone; black-box recovery smoke only. | Rerun if backend image/model changed. |
 | V5 | `benchmark_matrix_vllm_moe.yaml`, `benchmark_matrix_vllm_dense_vs_moe.yaml` | MoE compatibility milestone; no MoE-specific speedup claim. | Rerun after backend/model changes. |
-| V6 | `benchmark_matrix_reparallelization_performance.yaml` | Shared Qwen2 MoE single-worker same-node recreate run improves success from 37.50% to 100.00%; trace replay succeeds, one replan is applied, the logical expert placement plan is emitted with 8 shards/full coverage, movement diff is observed, observe-only vLLM placement hooks are available/attempted, and the execution model is reported as expert-aware actor recreate. This validates the control-plane/logical placement/runtime-hook plumbing path, not physical expert weight movement. | Phase 5B actor-recreate run refreshed 2026-09-06. |
+| V6 | `benchmark_matrix_reparallelization_performance.yaml` | Shared Qwen2 MoE single-worker same-node recreate run improves success from 37.50% to 100.00%; trace replay succeeds, one replan is applied, the logical expert placement plan is emitted with 8 shards/full coverage, movement diff/runtime contract observability is reported, and the execution model is expert-aware actor recreate. This validates the control-plane/logical placement/runtime-hook plumbing path, not physical expert weight movement. | Phase 5B actor-recreate run refreshed 2026-09-15. |
 | V7 | `benchmark_matrix_context_migration_performance.yaml` | Shared Qwen2 MoE run keeps both versions at 100% success; preemption is injected, one context-migration plan executes, selected-plan KV/expert/queue costs are reported, and route metadata is consumed from patched vLLM runtime top-k instrumentation. V7 verifies low-cost target selection and prefix warmup/context planning, not physical expert migration or true remote expert-dispatch traffic. | Runtime top-k MoE run refreshed 2026-08-30. |
-| V8 | `benchmark_matrix_stateful_recovery_performance.yaml` | Shared Qwen2 MoE run keeps both versions at 100% success; stateful recovery restores once, restores 16 tokens and 6 KV blocks, has no fallback, and reports separated KV compatibility vs EP/locality signals. | Phase 3 MoE-aware recovery run refreshed 2026-08-30. |
+| V8 | `benchmark_matrix_stateful_recovery_performance.yaml` | Shared Qwen2 MoE run keeps both versions at 100% success; stateful recovery restores once, restores 16 tokens and 6 KV blocks, has no fallback, and reports separated KV compatibility vs EP/locality signals. Latest run verifies the patched vLLM true KV restore path with `true_kv_rate=100.00%`. | Phase 3 MoE-aware recovery run refreshed 2026-09-16. |
 | V9 | `risk_aware_scheduling_synthetic.json` | Placement-quality improvement: lower-risk / longer-lived node selection. | Synthetic result; live latency/SLO impact still requires a real workload. |
-| V7-V9 core | `benchmark_matrix_spotserve_core_performance.yaml` | One live matrix deploys baseline and applied variants of the same model. Applied enables context/KV migration, stateful recovery, and risk-aware scheduling together, with runtime MoE top-k route metadata and Phase 3 recovery compatibility/locality signals. | Refreshed 2026-08-30. |
-| V7-V9 trace sweep | `benchmark_matrix_spotserve_core_trace_sweep.yaml` | Runs the same baseline/applied core pair across busy-recover, fast-recover, slow-recover, no-recover, dead-after-preempt, and double-preempt traces. | Pending run. |
+| V7-V9 core | `benchmark_matrix_spotserve_core_performance.yaml` | One live matrix deploys baseline and applied variants of the same model. Applied enables context migration, stateful recovery policy, and risk-aware scheduling together, with runtime MoE top-k route metadata and Phase 3 recovery compatibility/locality signals. The core run validates integrated control flow; use the standalone V8 matrix for the cleanest true-KV-restore evidence. | Refreshed 2026-09-16. |
+| V7-V9 trace sweep | `benchmark_matrix_spotserve_core_trace_sweep.yaml` | Runs the same baseline/applied core pair across busy-recover, fast-recover, slow-recover, no-recover, dead-after-preempt, and double-preempt traces. Use it as a robustness sweep after the single core matrix succeeds; keep scenario-level claims tied to `latest_comparisons.json` or the pasted benchmark summary. | Validation path available; primary numbers are not duplicated here. |
 
 | Metric | Baseline | Applied | Result | Status |
 |---|---|---|---|---|
 | V6 success rate | Reparallelization disabled | Reparallelization applied | `37.50% -> 100.00%` | `3/8 -> 8/8`; clean success also improves from `37.50%` to `100.00%`, with `0` fallbacks. |
 | V6 trace replay | Reparallelization disabled | Reparallelization applied | `1 success, 0 failed -> 1 success, 0 failed` | The preemption event replay completed on both runs, so the replan metrics are valid. |
-| V6 overall p95 | Reparallelization disabled | Reparallelization applied | `180041.97ms -> 14143.22ms` | Applied reduces overall p95 by `165898.75ms`. |
-| V6 replan-window p95 | Reparallelization disabled | Reparallelization applied | `180041.97ms -> 14143.22ms` | Replan-window success improves from `0.00%` to `100.00%`. |
-| V6 post-replan p95 | Reparallelization disabled | Reparallelization applied | `180007.45ms -> 1060.02ms` | Post-replan success improves from `0.00%` to `100.00%`. |
-| V6 replan execution | Reparallelization disabled | Reparallelization applied | `0 replans -> 1 replan, 1 applied, 0 failed` | Lifecycle verified; average execution duration was `15413.68ms`. |
-| V6 expert execution model | Reparallelization disabled | Reparallelization applied | `0 -> actor_recreate=1, live_migration=0, runtime_workers=1` | Phase 5B confirms expert-aware actor recreate with observe-only placement contract. |
+| V6 overall p95 | Reparallelization disabled | Reparallelization applied | `180102.20ms -> 14069.87ms` | Latest applied run reduces overall p95 by `166032.33ms`. |
+| V6 replan-window p95 | Reparallelization disabled | Reparallelization applied | `180102.20ms -> 14069.87ms` | Replan-window success improves from `0.00%` to `100.00%`. |
+| V6 post-replan p95 | Reparallelization disabled | Reparallelization applied | `180045.50ms -> 1036.97ms` | Post-replan success improves from `0.00%` to `100.00%`. |
+| V6 replan execution | Reparallelization disabled | Reparallelization applied | `0 replans -> 1 replan, 1 applied, 0 failed` | Lifecycle verified; latest average execution duration was `16340.36ms`. |
+| V6 expert execution model | Reparallelization disabled | Reparallelization applied | `0 -> actor_recreate=1, live_migration=0, runtime_workers=1` | Phase 5B confirms expert-aware actor recreate with observe-only placement/runtime contract. |
 | V6 workload-aware cost model | Reparallelization disabled | Reparallelization applied | `0 -> 1 cost-model event` | Selected estimates: replan window `5800.00ms`, model load `5500.00ms`, migration `300.00ms`. |
 | V6 logical expert placement | Reparallelization disabled | Reparallelization applied | `0 -> 1 plan, 8 shards, coverage=1.00` | Phase 4 logical placement was emitted; physical expert migration remains `0`. |
 | V6 expert movement diff | Reparallelization disabled | Reparallelization applied | `0 -> 1 movement observation, moved=0, moved_bytes=0, move_cost=0.00ms` | Phase 4E compared selected placement against the current runtime snapshot. `moved=0` is expected for this single-worker same-node recreate run. |
@@ -361,16 +361,16 @@ and the sweep will fail during setup with a Ray scheduling warning for
 | V7 MoE post-migration p95 | Context migration disabled | Context migration applied | `1023.59ms -> 1033.12ms` | Near parity after migration. |
 | V7 MoE migration signals | Context migration disabled | Context migration applied | `0 -> 1 context migration, 1 plan, 1 prefix-warmup/KV success, 228 migrated/warmed tokens` | Selected-plan costs were `kv=293.00`, `expert=0.00`, `queue=0.00`; route metadata was `vllm_runtime_topk/runtime_observed_topk`. Reusable blocks stayed `0`, so do not claim true KV block transfer from this V7 row. |
 | V8 MoE success rate | Token replay | Stateful recovery | `100.00% -> 100.00%` | New backend, `3/3 -> 3/3`. |
-| V8 MoE overall p95 | Token replay | Stateful recovery | `49201.94ms -> 2374.77ms` | Stateful recovery reduces overall p95 by `46827.17ms`. |
-| V8 MoE failure-window p95 | Token replay | Stateful recovery | `49201.94ms -> 2374.77ms` | Failure-window p95 improves by `95.17%`. |
-| V8 MoE post-recovery p95 | Token replay | Stateful recovery | `1082.20ms -> 1070.37ms` | Post-recovery latency stays near parity. |
-| V8 MoE restore signals | Token replay | Stateful recovery | `0 -> 1 restore, 16 restored tokens, 6 restored blocks, 0 fallback, true_kv_rate=100.00%` | True KV restore path verified for this run. |
+| V8 MoE overall p95 | Token replay | Stateful recovery | `48739.13ms -> 5157.64ms` | Latest stateful recovery run reduces overall p95 by `43581.49ms`. |
+| V8 MoE failure-window p95 | Token replay | Stateful recovery | `48739.13ms -> 5157.64ms` | Failure-window p95 improves by `89.42%`. |
+| V8 MoE post-recovery p95 | Token replay | Stateful recovery | Near steady-state parity | The main win is avoiding token replay during the failure window. |
+| V8 MoE restore signals | Token replay | Stateful recovery | `0 -> 1 restore, 16 restored tokens, 6 restored blocks, 0 fallback, true_kv_rate=100.00%` | Latest run reported `state_restores=1/1`, `state_blocks=6`, `response_blocks=6`, `true_kv_restores=1`, and `supports_state_restore=1`. |
 | V8 MoE recovery compatibility | Token replay | Stateful recovery | `0 -> 1 KV-compatible, 0 EP-required, 1 EP mismatch, locality=1.00, remote_tokens=0, expert_cost=0.00` | Confirms EP mismatch was reported as topology/locality information, not used as a hard KV restore rejection. |
-| V7-V9 live combined overall p95 | Token replay + no context migration + health-only scheduling | Stateful recovery + context/KV migration + risk-aware scheduling | `48965.38ms -> 2656.23ms` | Overall p95 improves by `46309.15ms`, about `18.43x` faster. |
+| V7-V9 live combined overall p95 | Token replay + no context migration + health-only scheduling | Stateful recovery + context migration + risk-aware scheduling | Latest core run completed `8/8 -> 8/8` | Integrated control flow succeeded; standalone V7/V8 matrices remain the cleaner source for individual speedup claims. |
 | V7-V9 live migration-window p95 | Context migration disabled | Context/KV migration applied | `37195.15ms -> 1026.63ms` | Migration window improves by `36168.52ms`. |
 | V7-V9 live failure-window p95 | Token replay | Stateful recovery | `2226.07ms -> 2429.70ms` | In this combined timing, stateful failure window is slower by `203.62ms`; standalone V8 remains the cleaner stateful-recovery speedup result. |
 | V7-V9 live post-recovery p95 | Token replay | Stateful recovery | `1042.62ms -> 1041.89ms` | Post-recovery steady-state latency is near parity. |
-| V7-V9 live core signals | Baseline policies | Applied policies | `0 -> 1 context migration, 1 KV success, route=vllm_runtime_topk/runtime_observed_topk, 1 state restore, 3 true KV blocks, 3 risk scheduling events` | All three core code paths ran in one applied benchmark. |
+| V7-V9 live core signals | Baseline policies | Applied policies | `0 -> 1 context migration, route=vllm_runtime_topk/runtime_observed_topk, 1 state event, 1 state fallback, 3 risk scheduling events` | Latest core run proves the integrated V7/V8/V9 control paths execute together, but this matrix fell back for stateful restore; use standalone V8 for true KV restore evidence. |
 | V7-V9 live recovery compatibility | Token replay | Stateful recovery | `0 -> 1 KV-compatible, 0 EP-required, 1 EP mismatch, locality=1.00, remote_tokens=0, expert_cost=0.00` | Combined run also preserves the Phase 3 separation between KV restore correctness and EP/locality signals. |
 | V7-V9 live selected spot risk | Health-only scheduling | Risk-aware scheduling | `0.9000 -> 0.9000` | Single worker node, so V9 decision path ran but had no alternate lower-risk placement. |
 | V9 avg selected spot risk | Health-only scheduling | Risk-aware scheduling | `0.6333 -> 0.1500` | `76.32%` lower synthetic placement risk. |
@@ -392,7 +392,7 @@ Notes:
   `state_recovery_ep_layout_required_count`,
   `state_recovery_expert_placement_mismatch_count`, and recovery locality
   fields.
-- The 2026-09-06 V6 table uses shared `Qwen2-MoE-Tiny` with
+- The 2026-09-15 V6 table uses shared `Qwen2-MoE-Tiny` with
   `SPOTSERVE_REPARALLELIZATION_LOAD_FORMAT=auto`. The applied run reported
   `trace_success=1`, `replans=1`, `applied=1`, `cost_model=1`,
   `expert_plan=1`, `expert_plan_shards=8`, and
@@ -413,8 +413,8 @@ Notes:
   `_spotserve_counts_as_runtime_worker=true`, so the expected summary is
   `runtime_workers=1`, `exec_model=expert_aware_actor_recreate`,
   `actor_recreate=1`, and `live_migration=0`. The refreshed run reported those
-  values. This still represents same-node actor recreate, not multi-worker
-  runtime relocation.
+  values, plus `expert_plan=1` and `expert_plan_shards=8`. This still
+  represents same-node actor recreate, not multi-worker runtime relocation.
   `replanning_expert_placement_plan_physical_migration_events=0`, so this row
   must not be used as evidence of physical expert weight movement.
 - A 2026-07-28 V7 dense-side run used `/models/vllm/vllm-dense-baseline`;
@@ -425,15 +425,21 @@ Notes:
   `route_kind=runtime_observed_topk`, so runtime MoE routing instrumentation
   reached the V7 planner/summary. It still warmed/replayed prefix tokens and
   did not report reusable context blocks.
-- The 2026-08-30 V8 MoE table uses shared `Qwen2-MoE-Tiny` with
+- The 2026-09-16 V8 MoE table uses shared `Qwen2-MoE-Tiny` with
   `SPOTSERVE_STATEFUL_RECOVERY_LOAD_FORMAT=auto`. The applied run reported
-  `state_restores=1/1`, `state_blocks=6`, `true_kv_restores=1`,
+  `state_restores=1/1`, `state_tokens=16`, `state_blocks=6`,
+  `response_blocks=6`, `true_kv_restores=1`, `true_kv_rate=100.00%`,
+  `true_kv_blocks=6`, `supports_state_restore=1`,
   `recovery_kv_compatible=1`, `recovery_ep_required=0`,
   `recovery_ep_mismatch=1`, and `recovery_locality=1.00`.
 - For the live V7-V9 core benchmark, require the applied summary to show
-  `context_migration_events > 0`, `state_restore_successes_total > 0`, and
-  `risk_scheduling_events > 0` before claiming that all three core paths ran
-  together.
+  `context_migration_events > 0`, stateful recovery policy evidence
+  (`state_recovery_events > 0` or `state_events > 0`), and
+  `risk_scheduling_events > 0` before claiming that all three control paths ran
+  together. Require `state_restore_successes_total > 0`,
+  `true_kv_restore_successes_total > 0`, and `state_restore_fallback_count = 0`
+  only when claiming true KV restore inside the core matrix. The standalone V8
+  matrix is the primary true-KV-restore evidence.
 - For Phase 4 pre-work, use `context_migration_moe_routed_tokens`,
   `context_migration_moe_local_routed_tokens`,
   `context_migration_moe_remote_routed_tokens`,
@@ -521,13 +527,15 @@ Notes:
   or recovery used a stable target placement view. The corresponding
   `*_placement_handshake_attempts` and `*_placement_handshake_successes` fields
   show whether the runtime could verify the target epoch/fingerprint.
-- The 2026-08-30 V7-V9 core table uses shared `Qwen2-MoE-Tiny` with
+- The 2026-09-16 V7-V9 core table uses shared `Qwen2-MoE-Tiny` with
   `SPOTSERVE_CORE_LOAD_FORMAT=auto`. The applied run reported
   `context_migrations=1`, `route_source=vllm_runtime_topk`,
   `route_kind=runtime_observed_topk`, `kv_successes=1`,
-  `state_restores=1/1`, `true_kv_restores=1`, `true_kv_blocks=3`,
-  `recovery_kv_compatible=1`, `recovery_ep_required=0`,
-  `recovery_ep_mismatch=1`, and `risk_scheduling_events=3`.
+  `state_events=1`, `state_fallbacks=1`, `true_kv_restores=0`,
+  `supports_state_restore=0`, `recovery_kv_compatible=1`,
+  `recovery_ep_required=0`, `recovery_ep_mismatch=1`, and
+  `risk_scheduling_events=3`. This is an integrated control-flow result, not
+  the primary true-KV-restore result.
 - For the V7-V9 trace sweep, baseline and applied use the same trace file
   inside each scenario. The benchmark runner fills in each run's model name at
   replay time. This sweep expects two ready vLLM instances, so rerun
