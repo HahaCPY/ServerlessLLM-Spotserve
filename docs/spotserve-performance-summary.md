@@ -591,6 +591,33 @@ Notes:
   apply/verify `1/1`, `runtime_active_remap=1`, `runtime_step_barrier=1`, four
   moved shards (0.75 MiB), a 133.18 ms runtime remap, and 3192.94 ms p95
   request latency. This remains fixed-EP active remap evidence only.
+- The next runtime boundary is now explicit. EP-size changes use controlled
+  actor recreation and are labeled `actor_recreate_ep_resize`; they are not
+  reported as in-place remaps. Cross-node remap can be required with
+  `require_cross_node_expert_migration` and fails unless distinct physical host
+  IDs and actual cross-host moved shards are observed. The vLLM CUDA
+  communicator patch records real dispatch/combine invocations and observed
+  tensor payload bytes when `VLLM_SPOTSERVE_A2A_TRACE=1`. A rebuild and new
+  runtime runs are still required before recording EP2-to-EP4, cross-node, or
+  all-to-all reduction as experimental results.
+- The 2026-09-25 `11-01-35` active-request run passed fixed-EP physical remap
+  (`2/2`, trace `1/1`, four moved shards, runtime apply/verify `1/1`, active
+  remap and step barrier both `1`). Its A2A instrumentation was enabled, but
+  calls and payload were zero. This is expected for that run's `TP=2, DP=1`
+  shape: vLLM 0.11.2 enables its MoE all-to-all kernels only when `DP > 1`.
+  It is therefore neither evidence of A2A reduction nor an instrumentation
+  failure. Use `benchmark_matrix_expert_remap_dp2_a2a_performance.yaml` for
+  the new `TP=1, DP=2, EP=2` inference gate, then run
+  `verify_spotserve_all_to_all_traffic.py`. The runtime gate passes only when
+  actual dispatch/combine counter deltas and payload bytes are greater than
+  zero. DP2 physical remap remains rejected because its transfer collective
+  requires coordination across independent DP EngineCores.
+- The 2026-09-25 DP2 A2A gate passed. The inference benchmark completed `2/2`
+  requests with 1149.20 ms p95. Four additional verifier requests increased
+  real runtime collective calls by 512, input payload by 486080 bytes, and
+  output payload by 488128 bytes, for 974208 observed payload bytes. Internode
+  calls remained zero as expected on one physical host. This validates A2A
+  observability, not A2A traffic reduction.
 - For the placement ordering guard, require
   `context_migration_placement_handshake_stale = 0` and
   `state_recovery_placement_handshake_stale = 0` before claiming that migration

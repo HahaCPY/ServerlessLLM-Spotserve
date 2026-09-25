@@ -88,7 +88,8 @@ if ! grep -q '"can_restore_cross_node": False' \
 fi
 
 if [[ "${SPOTSERVE_REQUIRE_MOE_ROUTE_INSTRUMENTATION:-0}" == "1" ||
-    "${SPOTSERVE_REQUIRE_EXPERT_PLACEMENT_RUNTIME_HOOKS:-0}" == "1" ]]; then
+    "${SPOTSERVE_REQUIRE_EXPERT_PLACEMENT_RUNTIME_HOOKS:-0}" == "1" ||
+    "${SPOTSERVE_REQUIRE_ALL_TO_ALL_INSTRUMENTATION:-0}" == "1" ]]; then
     MISSING_MOE_MARKERS=()
     if [[ ! -f "$VLLM_PATH/spotserve_moe.py" ]] ||
         ! grep -q "def record_moe_routing" "$VLLM_PATH/spotserve_moe.py"; then
@@ -114,6 +115,11 @@ if [[ "${SPOTSERVE_REQUIRE_MOE_ROUTE_INSTRUMENTATION:-0}" == "1" ||
     if ! grep -q "moe_request_context(req_ids, num_scheduled_tokens_np)" \
         "$VLLM_PATH/v1/worker/gpu_model_runner.py"; then
         MISSING_MOE_MARKERS+=("gpu_model_runner.moe_request_context")
+    fi
+    if [[ "${SPOTSERVE_REQUIRE_ALL_TO_ALL_INSTRUMENTATION:-0}" == "1" ]] &&
+        ! grep -q "record_all_to_all_collective" \
+            "$VLLM_PATH/distributed/device_communicators/cuda_communicator.py"; then
+        MISSING_MOE_MARKERS+=("cuda_communicator.record_all_to_all_collective")
     fi
     if ! grep -q "def get_request_moe_metadata" \
         "$VLLM_PATH/v1/worker/worker_base.py"; then

@@ -172,6 +172,16 @@ def main():
         replan = event.get("result", {}).get(model_name, {}).get(
             "reparallelization", {}
         )
+        execution = replan.get("execution", {})
+        if execution.get("reparallelization_execution_model") != (
+            "actor_recreate_ep_resize"
+        ):
+            raise RuntimeError(
+                "EP transition was not classified as controlled actor "
+                f"recreate: {execution}"
+            )
+        if not execution.get("dynamic_ep_resize"):
+            raise RuntimeError("EP transition did not report dynamic_ep_resize")
         if replan.get("expert_placement_plan_movement_source") != (
             "runtime_expert_placement_shards"
         ):
@@ -206,6 +216,15 @@ def main():
                 "expert_placement_plan_estimated_weight_movement_cost_ms"
             ),
             "runtime_verified_placement": True,
+            "execution_model": execution[
+                "reparallelization_execution_model"
+            ],
+            "source_effective_expert_parallel_size": execution[
+                "source_effective_expert_parallel_size"
+            ],
+            "target_effective_expert_parallel_size": execution[
+                "target_effective_expert_parallel_size"
+            ],
             "physical_weight_migration": bool(
                 after.get("expert_placement_physical_weight_migration")
             ),

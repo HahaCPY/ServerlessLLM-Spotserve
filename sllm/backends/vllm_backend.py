@@ -1131,6 +1131,50 @@ class VllmBackend(SllmBackend):
                     "expert_placement_runtime_can_measure_all_to_all", False
                 )
             ),
+            "expert_placement_runtime_all_to_all_counters_available": bool(
+                runtime_status.get(
+                    "expert_placement_runtime_all_to_all_counters_available",
+                    False,
+                )
+            ),
+            "expert_placement_runtime_all_to_all_collective_calls": int(
+                runtime_status.get(
+                    "expert_placement_runtime_all_to_all_collective_calls", 0
+                ) or 0
+            ),
+            "expert_placement_runtime_all_to_all_dispatch_calls": int(
+                runtime_status.get(
+                    "expert_placement_runtime_all_to_all_dispatch_calls", 0
+                ) or 0
+            ),
+            "expert_placement_runtime_all_to_all_combine_calls": int(
+                runtime_status.get(
+                    "expert_placement_runtime_all_to_all_combine_calls", 0
+                ) or 0
+            ),
+            "expert_placement_runtime_all_to_all_observed_input_bytes": int(
+                runtime_status.get(
+                    "expert_placement_runtime_all_to_all_observed_input_bytes",
+                    0,
+                ) or 0
+            ),
+            "expert_placement_runtime_all_to_all_observed_output_bytes": int(
+                runtime_status.get(
+                    "expert_placement_runtime_all_to_all_observed_output_bytes",
+                    0,
+                ) or 0
+            ),
+            "expert_placement_runtime_all_to_all_internode_calls": int(
+                runtime_status.get(
+                    "expert_placement_runtime_all_to_all_internode_calls", 0
+                ) or 0
+            ),
+            "expert_placement_runtime_all_to_all_measurement_kind": str(
+                runtime_status.get(
+                    "expert_placement_runtime_all_to_all_measurement_kind",
+                    "unavailable",
+                ) or "unavailable"
+            ),
             "expert_placement_runtime_capability_reason": str(
                 runtime_status.get(
                     "expert_placement_runtime_capability_reason",
@@ -1568,6 +1612,14 @@ class VllmBackend(SllmBackend):
             "expert_placement_runtime_can_verify_physical_placement": False,
             "expert_placement_runtime_can_remap_live_ep_rank": False,
             "expert_placement_runtime_can_measure_all_to_all": False,
+            "expert_placement_runtime_all_to_all_counters_available": False,
+            "expert_placement_runtime_all_to_all_collective_calls": 0,
+            "expert_placement_runtime_all_to_all_dispatch_calls": 0,
+            "expert_placement_runtime_all_to_all_combine_calls": 0,
+            "expert_placement_runtime_all_to_all_observed_input_bytes": 0,
+            "expert_placement_runtime_all_to_all_observed_output_bytes": 0,
+            "expert_placement_runtime_all_to_all_internode_calls": 0,
+            "expert_placement_runtime_all_to_all_measurement_kind": "unavailable",
             "expert_placement_runtime_capability_reason": "",
             "expert_placement_physical_migration_required": False,
             "expert_placement_plan_applied": False,
@@ -1743,6 +1795,31 @@ class VllmBackend(SllmBackend):
                     _runtime_hook_worker_int_sum(
                         apply_result, "cross_node_moved_local_weight_bytes"
                     )
+                )
+                status[
+                    "expert_placement_runtime_all_to_all_counters_available"
+                ] = _runtime_hook_any_truthy(
+                    apply_result, "all_to_all_available"
+                )
+                for status_suffix, result_key in (
+                    ("collective_calls", "all_to_all_collective_calls"),
+                    ("dispatch_calls", "all_to_all_dispatch_calls"),
+                    ("combine_calls", "all_to_all_combine_calls"),
+                    ("observed_input_bytes", "all_to_all_observed_input_bytes"),
+                    ("observed_output_bytes", "all_to_all_observed_output_bytes"),
+                    ("internode_calls", "all_to_all_internode_calls"),
+                ):
+                    status[
+                        "expert_placement_runtime_all_to_all_" + status_suffix
+                    ] = _runtime_hook_worker_int_sum(apply_result, result_key)
+                status[
+                    "expert_placement_runtime_all_to_all_measurement_kind"
+                ] = (
+                    "runtime_collective_tensor_payload"
+                    if status[
+                        "expert_placement_runtime_all_to_all_counters_available"
+                    ]
+                    else "unavailable"
                 )
                 _merge_expert_placement_runtime_capabilities(
                     status, apply_result

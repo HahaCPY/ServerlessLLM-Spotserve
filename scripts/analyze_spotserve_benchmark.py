@@ -775,6 +775,33 @@ def summarize_replanning_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         ),
         "replanning_execution_applied": execution_statuses.count("applied"),
         "replanning_execution_failed": execution_statuses.count("failed"),
+        "replanning_dynamic_ep_resize_events": sum(
+            1
+            for row in replanning_rows
+            if row.get("reparallelization_dynamic_ep_resize")
+        ),
+        "replanning_source_effective_expert_parallel_sizes": ",".join(
+            sorted({
+                str(row.get(
+                    "reparallelization_source_effective_expert_parallel_size"
+                ))
+                for row in replanning_rows
+                if safe_int(row.get(
+                    "reparallelization_source_effective_expert_parallel_size"
+                ), 0) > 0
+            })
+        ),
+        "replanning_target_effective_expert_parallel_sizes": ",".join(
+            sorted({
+                str(row.get(
+                    "reparallelization_target_effective_expert_parallel_size"
+                ))
+                for row in replanning_rows
+                if safe_int(row.get(
+                    "reparallelization_target_effective_expert_parallel_size"
+                ), 0) > 0
+            })
+        ),
         "replanning_execution_models": compact_values(execution_models),
         "replanning_expert_placement_execution_models": compact_values(
             expert_execution_models
@@ -1209,6 +1236,74 @@ def summarize_replanning_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
                 0,
             )
             for row in replanning_rows
+        ),
+        "replanning_expert_placement_runtime_all_to_all_counters_available": sum(
+            safe_int(
+                row.get(
+                    "expert_placement_runtime_all_to_all_counters_available_count"
+                ),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_total_expert_placement_runtime_all_to_all_collective_calls": sum(
+            safe_int(
+                row.get("expert_placement_runtime_all_to_all_collective_calls"),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_total_expert_placement_runtime_all_to_all_dispatch_calls": sum(
+            safe_int(
+                row.get("expert_placement_runtime_all_to_all_dispatch_calls"),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_total_expert_placement_runtime_all_to_all_combine_calls": sum(
+            safe_int(
+                row.get("expert_placement_runtime_all_to_all_combine_calls"),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_total_expert_placement_runtime_all_to_all_observed_input_bytes": sum(
+            safe_int(
+                row.get(
+                    "expert_placement_runtime_all_to_all_observed_input_bytes"
+                ),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_total_expert_placement_runtime_all_to_all_observed_output_bytes": sum(
+            safe_int(
+                row.get(
+                    "expert_placement_runtime_all_to_all_observed_output_bytes"
+                ),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_total_expert_placement_runtime_all_to_all_internode_calls": sum(
+            safe_int(
+                row.get("expert_placement_runtime_all_to_all_internode_calls"),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_expert_placement_runtime_all_to_all_measurement_kinds": ",".join(
+            sorted(
+                {
+                    str(row.get(
+                        "expert_placement_runtime_all_to_all_measurement_kinds"
+                    ))
+                    for row in replanning_rows
+                    if row.get(
+                        "expert_placement_runtime_all_to_all_measurement_kinds"
+                    )
+                }
+            )
         ),
         "replanning_expert_placement_runtime_actual_placement_available": sum(
             safe_int(

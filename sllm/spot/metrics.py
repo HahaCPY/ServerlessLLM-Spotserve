@@ -392,6 +392,32 @@ def make_replanning_event(
         "expert_placement_runtime_can_measure_all_to_all_count": (
             expert_placement_runtime.get("can_measure_all_to_all_count", 0)
         ),
+        "expert_placement_runtime_all_to_all_counters_available_count": (
+            expert_placement_runtime.get(
+                "all_to_all_counters_available_count", 0
+            )
+        ),
+        "expert_placement_runtime_all_to_all_collective_calls": (
+            expert_placement_runtime.get("all_to_all_collective_calls", 0)
+        ),
+        "expert_placement_runtime_all_to_all_dispatch_calls": (
+            expert_placement_runtime.get("all_to_all_dispatch_calls", 0)
+        ),
+        "expert_placement_runtime_all_to_all_combine_calls": (
+            expert_placement_runtime.get("all_to_all_combine_calls", 0)
+        ),
+        "expert_placement_runtime_all_to_all_observed_input_bytes": (
+            expert_placement_runtime.get("all_to_all_observed_input_bytes", 0)
+        ),
+        "expert_placement_runtime_all_to_all_observed_output_bytes": (
+            expert_placement_runtime.get("all_to_all_observed_output_bytes", 0)
+        ),
+        "expert_placement_runtime_all_to_all_internode_calls": (
+            expert_placement_runtime.get("all_to_all_internode_calls", 0)
+        ),
+        "expert_placement_runtime_all_to_all_measurement_kinds": (
+            expert_placement_runtime.get("all_to_all_measurement_kinds", "")
+        ),
         "expert_placement_runtime_actual_placement_available_count": (
             expert_placement_runtime.get(
                 "runtime_expert_placement_available_count", 0
@@ -455,6 +481,15 @@ def make_replanning_event(
         "reparallelization_execution_model": replanning_execution_model,
         "reparallelization_execution_model_reason": (
             replanning_execution_model_reason
+        ),
+        "reparallelization_dynamic_ep_resize": bool(
+            execution.get("dynamic_ep_resize", False)
+        ),
+        "reparallelization_source_effective_expert_parallel_size": execution.get(
+            "source_effective_expert_parallel_size", 0
+        ),
+        "reparallelization_target_effective_expert_parallel_size": execution.get(
+            "target_effective_expert_parallel_size", 0
         ),
         "expert_placement_execution_model": expert_execution_model,
         "expert_placement_execution_model_reason": (

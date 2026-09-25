@@ -1858,6 +1858,50 @@ request latency p95: 3192.94 ms
 這筆結果再次通過 active-request fixed-EP gate；它不擴張既有 claim，仍不代表
 EP-size resize、跨節點 expert 搬動或 all-to-all traffic reduction。
 
+### 2026-09-25：EP resize、cross-node 與 all-to-all 驗證補強
+
+目前三項缺口已拆成獨立、fail-closed 的 runtime contract：
+
+1. **動態 EP size**：vLLM process group 無法在既有 engine 內安全改大小，因此
+   不宣稱 live in-place resize。當 source 與 target 的 effective EP size 不同時，
+   controller 會走 controlled actor recreate，並回報
+   `actor_recreate_ep_resize`、source EP、target EP 與
+   `dynamic_ep_resize=true`。`scripts/verify_spotserve_ep_transition.py` 會比對
+   TP2/EP2 與 TP4/EP4 的 runtime-observed ownership、coverage 與 execution model。
+2. **跨節點 expert weight movement**：planner 新增
+   `require_cross_node_expert_migration`。啟用後會把 `require_cross_node=true`
+   傳到 runtime。runtime 必須觀察到至少兩個不同
+   `SPOTSERVE_PHYSICAL_HOST_ID`，且至少一個 expert shard 的來源與目的 host
+   不同，否則 apply 直接失敗。單機多 container 不得通過這個 gate。
+3. **真實 all-to-all instrumentation**：vLLM patch 現在掛在
+   `CudaCommunicator.dispatch()` / `combine()`，記錄實際 all-to-all manager
+   invocation 的 calls、input/output tensor payload bytes、backend 與 internode
+   calls。這不是由 routing histogram 推估。這些數值是 collective API boundary
+   的 tensor payload，不等同 NIC wire bytes。
+
+`scripts/verify_spotserve_all_to_all_traffic.py` 可在固定 workload 前後取 runtime
+counter delta；帶入 `--baseline-report` 時會計算 payload reduction ratio，若
+candidate 未下降會 fail closed。只有 baseline/candidate 使用相同 workload 且
+counter delta 均大於零時，才可宣稱 all-to-all payload reduction。
+
+這批 runtime hook 需要 rebuild image；僅 `SPOTSERVE_SYNC_SOURCE=1` 不會修改
+image 內的 vLLM communicator：
+
+```bash
+MODEL_FOLDER=/work/spotserve-models \
+SPOTSERVE_REPARALLELIZATION_MODEL_PATH=/models/Qwen2-MoE-Tiny \
+SPOTSERVE_REPARALLELIZATION_LOAD_FORMAT=auto \
+VLLM_SPOTSERVE_EXPERT_REMAP=1 \
+VLLM_SPOTSERVE_ACTIVE_REQUEST_REMAP=1 \
+VLLM_SPOTSERVE_A2A_TRACE=1 \
+SPOTSERVE_REQUIRE_ALL_TO_ALL_INSTRUMENTATION=1 \
+scripts/prepare_spotserve.sh --deploy-set expert-remap-active-performance
+```
+
+目前 coding 狀態：controlled EP resize 與 A2A counter 路徑已完成；兩者仍需在
+rebuild image 上跑 runtime verifier。cross-node hard gate 已完成，但實際
+cross-node success 必須使用至少兩台 physical worker hosts。
+
 已安裝 active-remap vLLM patch 的 image 可用下列命令同步 controller
 程式並重跑；若 image 尚未包含 patched runtime，先不要使用 `--skip-build`：
 
@@ -1896,6 +1940,73 @@ expert placement，再用 before/after placement snapshot 驗證哪些 experts
 transition via actor recreate」。因為 `can_remap_live_ep_rank=false` 且
 `can_measure_all_to_all=false`，仍不能宣稱 arbitrary live EP resize 或
 real all-to-all traffic reduction。
+
+### 2026-09-26：DP2 all-to-all runtime gate
+
+2026-09-25 的 active-request 結果中，`runtime_a2a_counters=1` 但
+`runtime_a2a_calls=0`。這不是 physical remap 失敗，而是測試使用
+`TP=2, DP=1`。vLLM 0.11.2 的 `FusedMoEParallelConfig.use_all2all_kernels`
+只有在 `data_parallel_size > 1 and use_ep` 時才成立；因此 EP size 雖由
+`TP * DP = 2` 推導，該配置仍不會走 all-to-all prepare/finalize path。
+
+本階段補強如下：
+
+- `can_measure_all_to_all` 改為 fail closed：只有 runtime 實際觀察到至少一個
+  dispatch/combine collective 才為 true；僅開啟 trace 環境變數不算成功。
+- DP2 可用來量測 A2A traffic，但 physical remap 仍 fail closed。vLLM 每個 DP
+  rank 有獨立 EngineCore；目前 hook 無法保證所有 DP EngineCores 同時進入
+  expert-transfer collective，因此允許 DP2 remap 會 deadlock。
+- vLLM MoE capability 新增 `TP1 x DP2` 與 `TP2 x DP2` shape。
+- planner 的 `min_data_parallel_size` 與 ServerlessLLM `min_replica_count`
+  已拆開，不再把 vLLM DP 誤當成獨立 serving replicas。
+- 新增 `benchmark_matrix_expert_remap_dp2_a2a_performance.yaml`，使用
+  `TP=1, DP=2, EP=2` 與 `allgather_reducescatter`，只做 inference，不觸發
+  remap。benchmark 保留 model，後續由
+  `verify_spotserve_all_to_all_traffic.py` 驗證 counter delta。
+
+DP2 gate 的通過條件是：
+
+```text
+benchmark success_rate = 1.0
+a2a-report.delta.collective_calls > 0
+a2a-report.observed_payload_bytes > 0
+```
+
+2026-09-25 的 DP2 runtime gate 已通過：benchmark requests `2/2`，p95
+`1149.20 ms`；後續 verifier 對四個 requests 觀察到：
+
+```text
+collective call delta: 512
+input payload delta: 486080 bytes
+output payload delta: 488128 bytes
+total observed payload: 974208 bytes
+internode call delta: 0
+```
+
+這證明 `TP1 x DP2 x EP2` inference 確實走過 patched vLLM 的 real
+dispatch/combine collective boundary。`internode=0` 符合本次 single-host
+環境。這筆結果不是 traffic reduction 證據，因為尚未有相同 workload 的
+baseline/candidate payload 比較。
+
+這只能證明真實 collective traffic 可觀測。對
+`allgather_reducescatter` 而言，總 payload 可能不隨 expert placement 改變；
+因此「traffic reduction」仍必須以相同 workload 的 baseline/candidate counter
+delta 實測，且 candidate bytes 嚴格小於 baseline 才能宣稱。不能用 routing
+histogram 或 estimated remote tokens 代替這個結果。
+
+三項剩餘驗證的精確狀態：
+
+```text
+dynamic EP size:
+  coding complete as controlled actor recreate; TP2/EP2 -> TP4/EP4 verifier pending
+
+cross-node movement:
+  runtime hard gate complete; success requires two distinct physical host IDs
+
+real all-to-all traffic:
+  DP2 inference/measurement gate added; DP2 physical remap is explicitly rejected;
+  payload reduction remains an experimental result, not a completed claim
+```
 
 ### Milestone E: Physical Cross-node Validation
 

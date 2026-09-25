@@ -10,7 +10,10 @@ from sllm.vllm_expert_remap import (
     _cross_node_movement,
     _layers_for_plan,
     _target_ep_rank,
+    get_all_to_all_counters,
     prepare_expert_remap,
+    record_all_to_all_collective,
+    reset_all_to_all_counters,
 )
 from vllm.v1.engine.core import EngineCore
 
@@ -112,6 +115,20 @@ class ExpertRemapPreflightTests(unittest.TestCase):
         layers, _ = _layers_for_plan(self.model, self.plan)
         self.assertEqual(layers[0].old_local_ids, [0, 1])
         self.assertEqual(layers[0].new_local_ids, [0, 2])
+
+    def test_rejects_fixed_ep_remap_across_data_parallel_engines(self):
+        experts = self.model.layers[0].experts
+        experts.vllm_config.parallel_config.tensor_parallel_size = 1
+        experts.vllm_config.parallel_config.data_parallel_size = 2
+        self.plan["target_parallel_plan"]["tensor_parallel_size"] = 1
+        self.plan["target_parallel_plan"]["data_parallel_size"] = 2
+
+        result = prepare_expert_remap(self.model, self.plan)
+
+        self.assertFalse(result["ready"])
+        self.assertEqual(
+            result["reason"], "data_parallel_expert_remap_not_supported"
+        )
 
     def test_rejects_parallel_size_change(self):
         self.plan["target_parallel_plan"]["tensor_parallel_size"] = 4
@@ -227,6 +244,47 @@ class CrossNodeMovementTests(unittest.TestCase):
             _cross_node_movement([layer], old_indices, ["", ""], 0),
             (0, 0),
         )
+
+
+class AllToAllCounterTests(unittest.TestCase):
+    def setUp(self):
+        reset_all_to_all_counters()
+
+    def tearDown(self):
+        reset_all_to_all_counters()
+
+    def test_disabled_counter_does_not_claim_measurement(self):
+        manager = SimpleNamespace(internode=False)
+        with patch.dict(os.environ, {"VLLM_SPOTSERVE_A2A_TRACE": "0"}):
+            record_all_to_all_collective(
+                "dispatch", torch.zeros(2, 4), torch.zeros(4, 4), manager
+            )
+            counters = get_all_to_all_counters()
+        self.assertFalse(counters["enabled"])
+        self.assertFalse(counters["available"])
+        self.assertEqual(counters["collective_calls"], 0)
+
+    def test_records_real_collective_boundary_payload(self):
+        manager = SimpleNamespace(internode=True)
+        with patch.dict(os.environ, {"VLLM_SPOTSERVE_A2A_TRACE": "1"}):
+            record_all_to_all_collective(
+                "dispatch",
+                (torch.zeros(2, 4), torch.zeros(2, 8)),
+                (torch.zeros(4, 4), torch.zeros(4, 8)),
+                manager,
+            )
+            record_all_to_all_collective(
+                "combine", torch.zeros(4, 4), torch.zeros(2, 4), manager
+            )
+            counters = get_all_to_all_counters()
+        self.assertTrue(counters["enabled"])
+        self.assertTrue(counters["available"])
+        self.assertEqual(counters["dispatch_calls"], 1)
+        self.assertEqual(counters["combine_calls"], 1)
+        self.assertEqual(counters["collective_calls"], 2)
+        self.assertEqual(counters["internode_calls"], 2)
+        self.assertEqual(counters["observed_input_bytes"], 160)
+        self.assertEqual(counters["observed_output_bytes"], 224)
 
 
 if __name__ == "__main__":

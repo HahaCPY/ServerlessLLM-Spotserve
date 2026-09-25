@@ -539,7 +539,7 @@ def generate_parallel_candidates(
     min_replica_count = _positive_int(
         planner_config,
         "min_replica_count",
-        int(planner_config.get("min_data_parallel_size", 1) or 1),
+        1,
     )
     target_replica_gpus = _positive_int(
         planner_config, "target_replica_gpus", 1
@@ -949,6 +949,12 @@ def _supported_config_candidates(
     max_tensor_parallel_size = _positive_int(
         planner_config, "max_tensor_parallel_size", available_gpus
     )
+    min_data_parallel_size = _positive_int(
+        planner_config, "min_data_parallel_size", 1
+    )
+    max_data_parallel_size = _positive_int(
+        planner_config, "max_data_parallel_size", available_gpus
+    )
     min_pipeline_parallel_size = _positive_int(
         planner_config, "min_pipeline_parallel_size", 1
     )
@@ -958,7 +964,7 @@ def _supported_config_candidates(
     min_replica_count = _positive_int(
         planner_config,
         "min_replica_count",
-        int(planner_config.get("min_data_parallel_size", 1) or 1),
+        1,
     )
     max_replica_count = _positive_int(
         planner_config, "max_replica_count", available_gpus
@@ -1045,6 +1051,12 @@ def _supported_config_candidates(
             min_tensor_parallel_size
             <= tensor_parallel_size
             <= max_tensor_parallel_size
+        ):
+            continue
+        if not (
+            min_data_parallel_size
+            <= data_parallel_size
+            <= max_data_parallel_size
         ):
             continue
         if not min_replica_count <= replica_count <= max_replica_count:

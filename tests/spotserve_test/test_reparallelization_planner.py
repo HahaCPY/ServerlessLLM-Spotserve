@@ -268,6 +268,62 @@ def test_workload_cost_model_is_opt_in_for_reparallelization_score():
     assert decision["selected_config"]["reason"] == "expensive_full_gpu_plan"
 
 
+def test_vllm_dp_filter_is_independent_from_sllm_replica_count():
+    decision = plan_dynamic_reparallelization(
+        model_name="dp2-moe",
+        worker_nodes={
+            "0": {
+                "ray_node_id": "node-0",
+                "address": "10.0.0.1",
+                "free_gpu": 2,
+                "total_gpu": 2,
+                "state": "ready",
+            }
+        },
+        model_config={
+            "model": "dp2-moe",
+            "backend": "vllm",
+            "num_gpus": 2,
+            "backend_capability": {
+                "supported_configs": [
+                    {
+                        "tensor_parallel_size": 1,
+                        "pipeline_parallel_size": 1,
+                        "data_parallel_size": 2,
+                        "replica_count": 1,
+                        "enable_expert_parallel": True,
+                        "num_gpus": 2,
+                        "reason": "dp2_ep2",
+                    },
+                    {
+                        "tensor_parallel_size": 2,
+                        "pipeline_parallel_size": 1,
+                        "data_parallel_size": 1,
+                        "replica_count": 1,
+                        "enable_expert_parallel": True,
+                        "num_gpus": 2,
+                        "reason": "tp2_ep2",
+                    },
+                ]
+            },
+        },
+        planner_config={
+            "min_tensor_parallel_size": 1,
+            "max_tensor_parallel_size": 1,
+            "min_data_parallel_size": 2,
+            "max_data_parallel_size": 2,
+            "min_replica_count": 1,
+            "max_replica_count": 1,
+        },
+        event="preempt",
+        backend="vllm",
+    )
+
+    assert decision["action"] == "reparallelize"
+    assert decision["selected_data_parallel_size"] == 2
+    assert decision["selected_replica_count"] == 1
+
+
 def test_workload_cost_model_can_prefer_lower_replan_cost():
     decision = plan_dynamic_reparallelization(
         model_name="cost-aware-vllm",

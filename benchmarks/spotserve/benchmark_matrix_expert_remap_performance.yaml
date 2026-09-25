@@ -22,6 +22,11 @@
     "replanning_avg_expert_placement_runtime_remap_duration_ms",
     "replanning_expert_placement_runtime_active_request_remap",
     "replanning_expert_placement_runtime_step_boundary_barrier",
+    "replanning_expert_placement_runtime_all_to_all_counters_available",
+    "replanning_total_expert_placement_runtime_all_to_all_collective_calls",
+    "replanning_total_expert_placement_runtime_all_to_all_observed_input_bytes",
+    "replanning_total_expert_placement_runtime_all_to_all_observed_output_bytes",
+    "replanning_total_expert_placement_runtime_all_to_all_internode_calls",
     "phase_replan_window_success_rate",
     "phase_post_replan_success_rate",
     "phase_post_replan_latency_p95_ms"

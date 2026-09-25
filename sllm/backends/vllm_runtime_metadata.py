@@ -694,6 +694,22 @@ def get_vllm_model_resource_profile(
             for value in runtime_expert_placement_shards.values()
         )
     )
+    all_to_all_counters_available = _to_bool(
+        runtime_metadata.get("all_to_all_counters_available"),
+        default=False,
+    )
+    all_to_all_collective_calls = _optional_non_negative_int(
+        runtime_metadata.get("all_to_all_collective_calls")
+    ) or 0
+    all_to_all_observed_input_bytes = _optional_non_negative_int(
+        runtime_metadata.get("all_to_all_observed_input_bytes")
+    ) or 0
+    all_to_all_observed_output_bytes = _optional_non_negative_int(
+        runtime_metadata.get("all_to_all_observed_output_bytes")
+    ) or 0
+    all_to_all_internode_calls = _optional_non_negative_int(
+        runtime_metadata.get("all_to_all_internode_calls")
+    ) or 0
 
     profile = {
         "model_name": model_name,
@@ -837,6 +853,11 @@ def get_vllm_model_resource_profile(
         "expert_placement_runtime_can_measure_all_to_all": (
             can_measure_all_to_all
         ),
+        "all_to_all_counters_available": all_to_all_counters_available,
+        "all_to_all_collective_calls": all_to_all_collective_calls,
+        "all_to_all_observed_input_bytes": all_to_all_observed_input_bytes,
+        "all_to_all_observed_output_bytes": all_to_all_observed_output_bytes,
+        "all_to_all_internode_calls": all_to_all_internode_calls,
         "expert_placement_runtime_capability_reason": (
             runtime_capability_reason
         ),
@@ -1097,6 +1118,21 @@ def get_vllm_runtime_metadata(
         "expert_placement_runtime_can_measure_all_to_all": (
             profile["expert_placement_runtime_can_measure_all_to_all"]
         ),
+        "all_to_all_counters_available": profile[
+            "all_to_all_counters_available"
+        ],
+        "all_to_all_collective_calls": profile[
+            "all_to_all_collective_calls"
+        ],
+        "all_to_all_observed_input_bytes": profile[
+            "all_to_all_observed_input_bytes"
+        ],
+        "all_to_all_observed_output_bytes": profile[
+            "all_to_all_observed_output_bytes"
+        ],
+        "all_to_all_internode_calls": profile[
+            "all_to_all_internode_calls"
+        ],
         "expert_placement_runtime_capability_reason": (
             profile["expert_placement_runtime_capability_reason"]
         ),

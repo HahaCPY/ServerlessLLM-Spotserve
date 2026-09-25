@@ -233,6 +233,35 @@ def test_live_expert_remap_can_opt_into_active_requests():
     assert payload["allow_active_requests"] is True
 
 
+def test_cross_node_expert_migration_is_explicit_fail_closed_requirement():
+    plan = build_logical_expert_placement_plan(
+        model_name="tiny-moe",
+        target_parallel_plan={
+            "backend": "vllm",
+            "tensor_parallel_size": 2,
+            "data_parallel_size": 1,
+            "enable_expert_parallel": True,
+            "effective_expert_parallel_size": 2,
+        },
+        model_config={
+            "backend_config": {
+                "model_config": {
+                    "num_hidden_layers": 1,
+                    "num_experts": 4,
+                }
+            }
+        },
+        planner_config={
+            "enable_live_expert_remap": True,
+            "require_cross_node_expert_migration": True,
+            "target_expert_placement_strategy": "round_robin",
+        },
+    )
+
+    assert plan is not None
+    assert plan.to_dict()["require_cross_node"] is True
+
+
 def test_replan_movement_uses_observed_vllm_placement_over_derived_snapshot():
     observed = {}
     for layer_id in range(2):

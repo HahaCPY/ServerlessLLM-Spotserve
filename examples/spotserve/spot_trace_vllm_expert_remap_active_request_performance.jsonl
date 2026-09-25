@@ -1,1 +1,1 @@
-{"time": 1.0, "event": "add", "node_id": "0", "node_info": {"free_gpu": 2, "total_gpu": 4, "state": "ready"}, "model_name": "vllm-expert-remap-active-perf"}
+{"time": 1.0, "event": "add", "node_id": "0", "node_info": {"free_gpu": 2, "total_gpu": 4, "state": "ready"}}

@@ -1,0 +1,29 @@
+{
+  "endpoint": "http://127.0.0.1:8345/v1/chat/completions",
+  "output_dir": "results/spotserve_expert_remap_dp2_a2a_performance",
+  "comparison_fields": [
+    "success_rate",
+    "clean_success_rate",
+    "latency_p95_ms",
+    "throughput_req_s"
+  ],
+  "runs": [
+    {
+      "name": "vllm-expert-remap-dp2-a2a-applied",
+      "model": "vllm-expert-remap-dp2-a2a-perf",
+      "backend": "vllm",
+      "policy": "none",
+      "deploy_config": "examples/spotserve/config-vllm-expert-remap-dp2-a2a-performance.json",
+      "delete_models_before_run": [
+        "vllm-expert-remap-dp2-a2a-perf"
+      ],
+      "delete_after_run": false,
+      "min_ready_instances": 1,
+      "ready_timeout_s": 600,
+      "workload": "benchmarks/spotserve/workloads/expert_remap_dp2_a2a_performance.jsonl",
+      "request_timeout_s": 240,
+      "router_metrics_path": "/tmp/spotserve-work/results/spotserve_expert_remap_dp2_a2a_performance/vllm-expert-remap-dp2-a2a-router.jsonl"
+    }
+  ],
+  "comparisons": []
+}

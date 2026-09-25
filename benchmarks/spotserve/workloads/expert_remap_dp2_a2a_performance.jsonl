@@ -1,0 +1,2 @@
+{"time": 0.0, "request_id": "dp2-a2a-warmup-0001", "messages": [{"role": "user", "content": "Explain expert parallel inference in one sentence."}], "max_tokens": 16, "temperature": 0, "benchmark_phase": "warmup"}
+{"time": 2.0, "request_id": "dp2-a2a-measure-0002", "messages": [{"role": "user", "content": "Explain all-to-all communication in one sentence."}], "max_tokens": 16, "temperature": 0, "benchmark_phase": "measurement"}

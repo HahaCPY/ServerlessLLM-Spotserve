@@ -1260,6 +1260,36 @@ class RoundRobinRouter(SllmRouter):
                         deployment = await self.reparallelization_executor.apply(
                             plan
                         )
+                        if (
+                            active_deployment is not None
+                            and active_deployment.plan.effective_expert_parallel_size
+                            != plan.effective_expert_parallel_size
+                        ):
+                            execution_model.update({
+                                "reparallelization_execution_model": (
+                                    "actor_recreate_ep_resize"
+                                ),
+                                "reparallelization_execution_model_reason": (
+                                    "ep_process_group_size_changed"
+                                ),
+                                "expert_placement_execution_model": (
+                                    "expert_aware_actor_recreate_ep_resize"
+                                ),
+                                "expert_placement_execution_model_reason": (
+                                    "vllm_ep_size_requires_engine_recreate"
+                                ),
+                                "expert_placement_runtime_contract_mode": (
+                                    "actor_recreate_ep_resize"
+                                ),
+                                "source_effective_expert_parallel_size": (
+                                    active_deployment.plan
+                                    .effective_expert_parallel_size
+                                ),
+                                "target_effective_expert_parallel_size": (
+                                    plan.effective_expert_parallel_size
+                                ),
+                                "dynamic_ep_resize": True,
+                            })
                     expert_placement_runtime = (
                         await self._deployment_expert_placement_runtime_status(
                             deployment
@@ -1854,6 +1884,14 @@ class RoundRobinRouter(SllmRouter):
                 "expert_placement_runtime_can_verify_physical_placement",
                 "expert_placement_runtime_can_remap_live_ep_rank",
                 "expert_placement_runtime_can_measure_all_to_all",
+                "expert_placement_runtime_all_to_all_counters_available",
+                "expert_placement_runtime_all_to_all_collective_calls",
+                "expert_placement_runtime_all_to_all_dispatch_calls",
+                "expert_placement_runtime_all_to_all_combine_calls",
+                "expert_placement_runtime_all_to_all_observed_input_bytes",
+                "expert_placement_runtime_all_to_all_observed_output_bytes",
+                "expert_placement_runtime_all_to_all_internode_calls",
+                "expert_placement_runtime_all_to_all_measurement_kind",
                 "expert_placement_runtime_capability_reason",
                 "reparallelization_execution_model",
                 "reparallelization_execution_model_reason",
@@ -1991,6 +2029,30 @@ class RoundRobinRouter(SllmRouter):
             ),
             "can_measure_all_to_all_count": count_truthy(
                 "expert_placement_runtime_can_measure_all_to_all"
+            ),
+            "all_to_all_counters_available_count": count_truthy(
+                "expert_placement_runtime_all_to_all_counters_available"
+            ),
+            "all_to_all_collective_calls": sum_int(
+                "expert_placement_runtime_all_to_all_collective_calls"
+            ),
+            "all_to_all_dispatch_calls": sum_int(
+                "expert_placement_runtime_all_to_all_dispatch_calls"
+            ),
+            "all_to_all_combine_calls": sum_int(
+                "expert_placement_runtime_all_to_all_combine_calls"
+            ),
+            "all_to_all_observed_input_bytes": sum_int(
+                "expert_placement_runtime_all_to_all_observed_input_bytes"
+            ),
+            "all_to_all_observed_output_bytes": sum_int(
+                "expert_placement_runtime_all_to_all_observed_output_bytes"
+            ),
+            "all_to_all_internode_calls": sum_int(
+                "expert_placement_runtime_all_to_all_internode_calls"
+            ),
+            "all_to_all_measurement_kinds": compact_values(
+                "expert_placement_runtime_all_to_all_measurement_kind"
             ),
             "runtime_expert_placement_available_count": count_truthy(
                 "runtime_expert_placement_available"

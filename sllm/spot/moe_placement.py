@@ -97,6 +97,7 @@ class ExpertPlacementPlan:
     physical_weight_migration: bool = False
     live_expert_remap: bool = False
     allow_active_requests: bool = False
+    require_cross_node: bool = False
     physical_migration_required: bool = False
     expert_placement_snapshot: Mapping[str, Mapping[str, Any]] = field(
         default_factory=dict
@@ -146,6 +147,7 @@ class ExpertPlacementPlan:
             "physical_weight_migration": self.physical_weight_migration,
             "live_expert_remap": self.live_expert_remap,
             "allow_active_requests": self.allow_active_requests,
+            "require_cross_node": self.require_cross_node,
             "expert_placement_physical_migration_required": (
                 self.physical_migration_required
             ),
@@ -913,6 +915,14 @@ def build_logical_expert_placement_plan(
         if isinstance(active_remap_value, str)
         else bool(active_remap_value)
     )
+    require_cross_node_value = planner_config.get(
+        "require_cross_node_expert_migration", False
+    )
+    require_cross_node = (
+        require_cross_node_value.strip().lower() in {"1", "true", "yes", "on"}
+        if isinstance(require_cross_node_value, str)
+        else bool(require_cross_node_value)
+    )
     if placement_strategy == "linear":
         base_experts, remainder = divmod(num_experts, target_rank_count)
         expert_rank_indices = [
@@ -1010,6 +1020,7 @@ def build_logical_expert_placement_plan(
         physical_weight_migration=False,
         live_expert_remap=live_expert_remap,
         allow_active_requests=live_expert_remap and allow_active_requests,
+        require_cross_node=live_expert_remap and require_cross_node,
         physical_migration_required=live_expert_remap,
         expert_placement_snapshot=expert_placement_snapshot,
         shards=tuple(shards),

@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Mapping
@@ -20,6 +21,93 @@ _TRUTHY = {"1", "true", "yes", "on"}
 _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 _EP_RANK_RE = re.compile(r"^(?:replica:0/)?ep-rank:(\d+)$")
 _LAST_REMAP: dict[str, Any] = {}
+_ALL_TO_ALL_LOCK = threading.Lock()
+_ALL_TO_ALL_COUNTERS: dict[str, Any] = {
+    "dispatch_calls": 0,
+    "combine_calls": 0,
+    "dispatch_input_bytes": 0,
+    "dispatch_output_bytes": 0,
+    "combine_input_bytes": 0,
+    "combine_output_bytes": 0,
+    "internode_calls": 0,
+    "backends": {},
+}
+
+
+def _tensor_payload_bytes(value: Any) -> int:
+    if isinstance(value, torch.Tensor):
+        return int(value.numel()) * int(value.element_size())
+    if isinstance(value, (tuple, list)):
+        return sum(_tensor_payload_bytes(item) for item in value)
+    if isinstance(value, Mapping):
+        return sum(_tensor_payload_bytes(item) for item in value.values())
+    return 0
+
+
+def all_to_all_counters_enabled() -> bool:
+    return os.environ.get(
+        "VLLM_SPOTSERVE_A2A_TRACE", ""
+    ).strip().lower() in _TRUTHY
+
+
+def record_all_to_all_collective(
+    phase: str,
+    inputs: Any,
+    outputs: Any,
+    manager: Any,
+) -> None:
+    """Record payload crossing vLLM's real EP communicator boundary.
+
+    These are observed tensor payload bytes at the dispatch/combine API, not
+    an estimate from router probabilities and not physical wire bytes.
+    """
+    if not all_to_all_counters_enabled():
+        return
+    normalized_phase = str(phase).strip().lower()
+    if normalized_phase not in {"dispatch", "combine"}:
+        raise ValueError(f"unsupported_all_to_all_phase:{phase}")
+    backend = type(manager).__name__ if manager is not None else "unknown"
+    with _ALL_TO_ALL_LOCK:
+        _ALL_TO_ALL_COUNTERS[f"{normalized_phase}_calls"] += 1
+        _ALL_TO_ALL_COUNTERS[f"{normalized_phase}_input_bytes"] += (
+            _tensor_payload_bytes(inputs)
+        )
+        _ALL_TO_ALL_COUNTERS[f"{normalized_phase}_output_bytes"] += (
+            _tensor_payload_bytes(outputs)
+        )
+        if bool(getattr(manager, "internode", False)):
+            _ALL_TO_ALL_COUNTERS["internode_calls"] += 1
+        backends = _ALL_TO_ALL_COUNTERS["backends"]
+        backends[backend] = int(backends.get(backend, 0)) + 1
+
+
+def get_all_to_all_counters() -> dict[str, Any]:
+    with _ALL_TO_ALL_LOCK:
+        counters = {
+            key: dict(value) if isinstance(value, dict) else value
+            for key, value in _ALL_TO_ALL_COUNTERS.items()
+        }
+    counters["enabled"] = all_to_all_counters_enabled()
+    counters["collective_calls"] = int(counters["dispatch_calls"]) + int(
+        counters["combine_calls"]
+    )
+    counters["observed_input_bytes"] = int(
+        counters["dispatch_input_bytes"]
+    ) + int(counters["combine_input_bytes"])
+    counters["observed_output_bytes"] = int(
+        counters["dispatch_output_bytes"]
+    ) + int(counters["combine_output_bytes"])
+    counters["available"] = bool(
+        counters["enabled"] and counters["collective_calls"] > 0
+    )
+    counters["measurement_kind"] = "runtime_collective_tensor_payload"
+    return counters
+
+
+def reset_all_to_all_counters() -> None:
+    with _ALL_TO_ALL_LOCK:
+        for key in tuple(_ALL_TO_ALL_COUNTERS):
+            _ALL_TO_ALL_COUNTERS[key] = {} if key == "backends" else 0
 
 
 @dataclass
@@ -100,6 +188,12 @@ def _layers_for_plan(model: Any, plan: Mapping[str, Any]) -> tuple[list[_Layer],
         if module.ep_rank != ep_rank or module.ep_size != ep_size:
             raise ValueError("ep_group_mismatch")
         runtime_parallel = module.vllm_config.parallel_config
+        # Each vLLM DP rank owns an independent EngineCore.  The current
+        # ServerlessLLM hook enters collectives through one EngineCore only,
+        # so a DP-spanning remap would leave the other ranks outside the
+        # transfer collective and deadlock.  Keep DP2 available for traffic
+        # instrumentation, but fail closed for physical remap until a
+        # coordinator can barrier every DP EngineCore simultaneously.
         if int(runtime_parallel.data_parallel_size) != 1:
             raise ValueError("data_parallel_expert_remap_not_supported")
         for field in ("tensor_parallel_size", "data_parallel_size"):
@@ -319,6 +413,7 @@ def remap_expert_weights(model: Any, plan: Mapping[str, Any]) -> dict[str, Any]:
         layer.module.expert_map.copy_(updated)
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+    all_to_all = get_all_to_all_counters()
     result = {
         "applied": True,
         "success": True,
@@ -329,7 +424,10 @@ def remap_expert_weights(model: Any, plan: Mapping[str, Any]) -> dict[str, Any]:
         "verification_level": "weights_and_expert_map_verified",
         "can_verify_physical_placement": True,
         "can_remap_live_ep_rank": False,
-        "can_measure_all_to_all": False,
+        # Instrumentation being enabled is not proof that this parallel shape
+        # traversed an EP collective.  Report measurement support only after
+        # at least one real dispatch/combine call has been observed.
+        "can_measure_all_to_all": bool(all_to_all["available"]),
         "moved_local_expert_shards": moved,
         "moved_local_weight_bytes": local_bytes,
         "physical_host_ids_observed": bool(all(host_ids)),
@@ -343,6 +441,9 @@ def remap_expert_weights(model: Any, plan: Mapping[str, Any]) -> dict[str, Any]:
         "contract_seen_worker_total": 1,
         "worker_rank": group.rank(),
     }
+    result.update({
+        f"all_to_all_{key}": value for key, value in all_to_all.items()
+    })
     _LAST_REMAP.clear()
     _LAST_REMAP.update(result)
     return result
@@ -355,5 +456,13 @@ def last_remap_status(plan: Mapping[str, Any]) -> dict[str, Any]:
         and _LAST_REMAP.get("placement_fingerprint")
         == str(plan.get("placement_fingerprint") or "")
     ):
-        return dict(_LAST_REMAP)
+        result = dict(_LAST_REMAP)
+        result.update({
+            f"all_to_all_{key}": value
+            for key, value in get_all_to_all_counters().items()
+        })
+        result["can_measure_all_to_all"] = bool(
+            result.get("all_to_all_available", False)
+        )
+        return result
     return {}
