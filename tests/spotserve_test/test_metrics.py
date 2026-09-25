@@ -62,6 +62,15 @@ def test_replanning_event_exposes_runtime_expert_placement_hook_status():
                     "contract_seen_worker_count": 2,
                     "contract_seen_worker_total": 2,
                     "physical_weight_migration_count": 0,
+                    "runtime_moved_expert_shards": 4,
+                    "runtime_moved_weight_bytes": 786432,
+                    "runtime_remap_duration_ms": 12.25,
+                    "active_request_remap_count": 1,
+                    "step_boundary_barrier_count": 1,
+                    "physical_host_ids_observed_count": 1,
+                    "cross_node_weight_migration_count": 1,
+                    "cross_node_moved_expert_shards": 2,
+                    "cross_node_moved_weight_bytes": 393216,
                     "verification_levels": "contract_seen_only",
                     "verified_placement_count": 0,
                     "can_verify_physical_placement_count": 0,
@@ -113,6 +122,15 @@ def test_replanning_event_exposes_runtime_expert_placement_hook_status():
     assert event["expert_placement_runtime_contract_seen_worker_count"] == 2
     assert event["expert_placement_runtime_contract_seen_worker_total"] == 2
     assert event["expert_placement_runtime_physical_weight_migration_count"] == 0
+    assert event["expert_placement_runtime_moved_expert_shards"] == 4
+    assert event["expert_placement_runtime_moved_weight_bytes"] == 786432
+    assert event["expert_placement_runtime_remap_duration_ms"] == 12.25
+    assert event["expert_placement_runtime_active_request_remap_count"] == 1
+    assert event["expert_placement_runtime_step_boundary_barrier_count"] == 1
+    assert event["expert_placement_runtime_physical_host_ids_observed_count"] == 1
+    assert event["expert_placement_runtime_cross_node_weight_migration_count"] == 1
+    assert event["expert_placement_runtime_cross_node_moved_expert_shards"] == 2
+    assert event["expert_placement_runtime_cross_node_moved_weight_bytes"] == 393216
     assert event["expert_placement_runtime_verification_levels"] == (
         "contract_seen_only"
     )
@@ -147,3 +165,24 @@ def test_replanning_event_exposes_runtime_expert_placement_hook_status():
     assert event["expert_placement_runtime_contract_modes"] == (
         "observe_only_contract"
     )
+
+
+def test_quiescent_remap_reports_actor_recreate_and_physical_remap_separately():
+    event = make_replanning_event(
+        model="moe-model",
+        event="preempt",
+        node_id="0",
+        instance_id="instance-0",
+        decision={
+            "action": "reparallelize",
+            "execution": {
+                "status": "applied",
+                "reparallelization_execution_model": "actor_recreate",
+                "expert_placement_execution_model": "quiescent_fixed_ep_remap",
+            },
+        },
+    )
+
+    assert event["expert_placement_actor_recreate"] is True
+    assert event["expert_placement_quiescent_remap"] is True
+    assert event["expert_placement_live_migration"] is False

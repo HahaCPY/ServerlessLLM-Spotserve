@@ -1,5 +1,6 @@
 import asyncio
 import json
+from contextlib import suppress
 
 import pytest
 
@@ -7,6 +8,41 @@ from sllm.routers.roundrobin_router import RoundRobinRouter
 from sllm.spot.reparallelization import ParallelPlan
 from sllm.spot.vllm_deployment_adapter import VllmDeployment
 from sllm.utils import InstanceHandle, InstanceState
+
+
+@pytest.mark.asyncio
+async def test_auto_scaler_waits_for_reparallelization_execution():
+    router = RoundRobinRouter(
+        model_name="test-model",
+        resource_requirements={"num_cpus": 1, "num_gpus": 0},
+        backend="vllm",
+        backend_config={},
+        router_config={"enable_reparallelization": True},
+    )
+    router.auto_scaling_config = {
+        "min_instances": 1,
+        "max_instances": 1,
+        "target": 1,
+    }
+    router.loop_interval = 0.01
+    created = []
+
+    async def create_instance():
+        created.append(True)
+
+    router._create_instance = create_instance
+    router._reparallelization_execution_active = True
+    task = asyncio.create_task(router._auto_scaler_loop())
+    try:
+        await asyncio.sleep(0.05)
+        assert not created
+        router._reparallelization_execution_active = False
+        await asyncio.sleep(0.05)
+        assert created
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
 
 
 class FakeContextBackend:
@@ -1569,6 +1605,22 @@ async def test_router_runtime_status_keeps_expert_contract_seen_fields():
         instances={target.instance_id: target},
     )
 
+    original_get_runtime_metadata = target.backend_instance.get_runtime_metadata
+
+    async def get_runtime_metadata_with_actual_placement(**kwargs):
+        metadata = await original_get_runtime_metadata(**kwargs)
+        metadata["runtime_expert_placement_available"] = True
+        metadata["runtime_expert_placement_worker_count"] = 1
+        metadata["runtime_expert_placement_shard_count"] = 1
+        metadata["runtime_expert_placement_shards"] = {
+            "layer:0/expert:1": {"rank_id": "replica:0/ep-rank:0"}
+        }
+        return metadata
+
+    target.backend_instance.get_runtime_metadata = (
+        get_runtime_metadata_with_actual_placement
+    )
+
     status = await router._deployment_expert_placement_runtime_status(
         deployment
     )
@@ -1584,9 +1636,135 @@ async def test_router_runtime_status_keeps_expert_contract_seen_fields():
     assert status["can_verify_physical_placement_count"] == 0
     assert status["can_remap_live_ep_rank_count"] == 0
     assert status["can_measure_all_to_all_count"] == 0
+    assert status["runtime_expert_placement_available_count"] == 1
+    assert status["runtime_expert_placement_worker_count"] == 1
+    assert status["runtime_expert_placement_shard_count"] == 1
     assert status["capability_reasons"] == (
         "vllm_live_ep_rank_remap_not_supported"
     )
+
+
+@pytest.mark.asyncio
+async def test_reparallelization_runtime_metadata_uses_ready_actor_after_stale_match():
+    router = RoundRobinRouter(
+        model_name="test-model",
+        resource_requirements={"num_cpus": 1, "num_gpus": 0},
+        backend="vllm",
+        backend_config={},
+        router_config={"enable_reparallelization": True},
+    )
+    stale_match = InstanceHandle(
+        instance_id="instance-replan",
+        max_queue_length=1,
+        num_gpu=0,
+        backend_instance=None,
+    )
+    ready = InstanceHandle(
+        instance_id="instance-replan",
+        max_queue_length=1,
+        num_gpu=0,
+        backend_instance=FakeMoeRuntimeTargetBackend(expert_ids=[0, 1]),
+    )
+    await ready.mark_ready(node_id="node-a")
+    router.ready_inference_instances[ready.instance_id] = ready
+
+    metadata = await router._reparallelization_runtime_metadata_snapshot(
+        [stale_match]
+    )
+
+    profile = metadata["model_resource_profile"]
+    assert profile["placement_source"] == "runtime_fixture"
+    assert profile["expert_placement_available"] is True
+    assert profile["expert_placement_snapshot"] == {
+        "layer:0/expert:0": {"rank_id": "rank-0"},
+        "layer:0/expert:1": {"rank_id": "rank-1"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_first_replan_remaps_ready_vllm_actor_in_place(monkeypatch):
+    router = RoundRobinRouter(
+        model_name="test-model",
+        resource_requirements={"num_cpus": 1, "num_gpus": 2},
+        backend="vllm",
+        backend_config={
+            "tensor_parallel_size": 2,
+            "data_parallel_size": 1,
+            "pipeline_parallel_size": 1,
+            "enable_expert_parallel": True,
+        },
+        router_config={"enable_reparallelization": True},
+    )
+    applied_plans = []
+
+    class ApplyHook:
+        async def remote(self, plan):
+            applied_plans.append(plan)
+            return {"success": True}
+
+    class Backend:
+        apply_expert_placement_plan = ApplyHook()
+
+    ready = InstanceHandle(
+        instance_id="instance-0",
+        max_queue_length=1,
+        num_gpu=2,
+        node_id="0",
+        backend_instance=Backend(),
+    )
+    await ready.mark_ready(node_id="0")
+    router.ready_inference_instances[ready.instance_id] = ready
+    router.model_loading_scheduler = object()
+    plan = ParallelPlan(
+        model_name="test-model",
+        backend="vllm",
+        tensor_parallel_size=2,
+        data_parallel_size=1,
+        enable_expert_parallel=True,
+        num_gpus=2,
+        target_nodes=["0"],
+        expert_placement_plan={
+            "placement_fingerprint": "new-placement",
+            "live_expert_remap": True,
+            "allow_active_requests": True,
+        },
+    )
+
+    async def worker_nodes():
+        return {"0": {"free_gpu": 2, "total_gpu": 4, "state": "ready"}}
+
+    async def runtime_metadata(_matches):
+        return {}
+
+    async def runtime_status(_deployment):
+        return {"metadata_count": 1, "active_request_remap_count": 1}
+
+    router._snapshot_reparallelization_worker_nodes = worker_nodes
+    router._reparallelization_runtime_metadata_snapshot = runtime_metadata
+    router._deployment_expert_placement_runtime_status = runtime_status
+    monkeypatch.setattr(
+        "sllm.routers.roundrobin_router.plan_dynamic_reparallelization",
+        lambda **_kwargs: {
+            "action": "reparallelize",
+            "parallel_plan": plan.to_dict(),
+        },
+    )
+
+    decision = await router._replan_after_spot_event(
+        event="add",
+        node_id="0",
+        instance_id=None,
+        matches=[],
+        worker_node_updates={"0": {"free_gpu": 2, "total_gpu": 4}},
+    )
+
+    assert len(applied_plans) == 1
+    assert decision["execution"]["status"] == "applied"
+    assert decision["execution"]["reparallelization_execution_model"] == (
+        "in_place_expert_remap"
+    )
+    assert router.ready_inference_instances[ready.instance_id] is ready
+    assert ready.state == InstanceState.READY
 
 
 @pytest.mark.asyncio

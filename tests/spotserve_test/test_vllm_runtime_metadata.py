@@ -168,6 +168,16 @@ def test_vllm_model_resource_profile_reports_placement_contract():
             "expert_placement_contract_seen_worker_count": 2,
             "expert_placement_contract_seen_worker_total": 2,
             "expert_placement_physical_weight_migration": True,
+            "expert_placement_quiescent_remap_enabled": True,
+            "expert_placement_runtime_moved_expert_shards": 4,
+            "expert_placement_runtime_moved_weight_bytes": 786432,
+            "expert_placement_runtime_remap_duration_ms": 42.5,
+            "expert_placement_runtime_active_request_remap": True,
+            "expert_placement_runtime_step_boundary_barrier": True,
+            "expert_placement_runtime_physical_host_ids_observed": True,
+            "expert_placement_runtime_cross_node_weight_migration": True,
+            "expert_placement_runtime_cross_node_moved_expert_shards": 2,
+            "expert_placement_runtime_cross_node_moved_weight_bytes": 393216,
         },
     )
 
@@ -213,6 +223,16 @@ def test_vllm_model_resource_profile_reports_placement_contract():
     assert profile["expert_placement_contract_seen_worker_count"] == 2
     assert profile["expert_placement_contract_seen_worker_total"] == 2
     assert profile["expert_placement_physical_weight_migration"] is True
+    assert profile["expert_placement_quiescent_remap_enabled"] is True
+    assert profile["expert_placement_runtime_moved_expert_shards"] == 4
+    assert profile["expert_placement_runtime_moved_weight_bytes"] == 786432
+    assert profile["expert_placement_runtime_remap_duration_ms"] == 42.5
+    assert profile["expert_placement_runtime_active_request_remap"] is True
+    assert profile["expert_placement_runtime_step_boundary_barrier"] is True
+    assert profile["expert_placement_runtime_physical_host_ids_observed"] is True
+    assert profile["expert_placement_runtime_cross_node_weight_migration"] is True
+    assert profile["expert_placement_runtime_cross_node_moved_expert_shards"] == 2
+    assert profile["expert_placement_runtime_cross_node_moved_weight_bytes"] == 393216
     assert profile["expert_placement_runtime_verification_level"] == (
         "physical_migration_verified"
     )
@@ -253,6 +273,9 @@ def test_vllm_runtime_metadata_exposes_placement_contract():
             "expert_placement_verify_success": True,
             "expert_placement_verify_reason": "runtime_verify_succeeded",
             "expert_placement_contract_seen_by_runtime": True,
+            "expert_placement_runtime_moved_expert_shards": 2,
+            "expert_placement_runtime_moved_weight_bytes": 393216,
+            "expert_placement_runtime_remap_duration_ms": 17.25,
         },
     )
 
@@ -285,6 +308,9 @@ def test_vllm_runtime_metadata_exposes_placement_contract():
     assert metadata["expert_placement_verify_reason"] == "runtime_verify_succeeded"
     assert metadata["expert_placement_contract_seen_by_runtime"] is True
     assert metadata["expert_placement_physical_weight_migration"] is False
+    assert metadata["expert_placement_runtime_moved_expert_shards"] == 2
+    assert metadata["expert_placement_runtime_moved_weight_bytes"] == 393216
+    assert metadata["expert_placement_runtime_remap_duration_ms"] == 17.25
     assert metadata["expert_placement_runtime_verification_level"] == (
         "runtime_placement_verified"
     )

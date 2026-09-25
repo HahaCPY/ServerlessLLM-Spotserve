@@ -1,0 +1,2 @@
+{"time": 0.0, "benchmark_phase": "replan_window", "request_id": "active-remap-long-0001", "messages": [{"role": "user", "content": "Write a repetitive but coherent paragraph about why expert placement matters for mixture-of-experts inference. Keep going until the token limit."}], "max_tokens": 256, "ignore_eos": true, "_spotserve_token_delay_s": 1.0, "temperature": 0.0}
+{"time": 20.0, "benchmark_phase": "post_replan", "request_id": "active-remap-after-0002", "messages": [{"role": "user", "content": "after active expert remap"}], "max_tokens": 8, "temperature": 0.0}

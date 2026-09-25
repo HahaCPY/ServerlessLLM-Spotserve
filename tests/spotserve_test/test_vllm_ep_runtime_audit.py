@@ -24,6 +24,10 @@ def apply_expert_placement_plan():
 def verify_expert_placement_plan():
     return {"reason": "physical_expert_placement_verification_not_supported",
             "hook_kind": "spotserve_observation_only"}
+def inspect_runtime_expert_placement():
+    pass
+def _compare_runtime_expert_placement():
+    pass
 """,
     )
     write(
@@ -50,6 +54,7 @@ clear_moe_request_metadata([])
         """
 def get_request_moe_metadata(): pass
 def get_moe_runtime_metadata(): pass
+def _spotserve_runtime_expert_placement_snapshot(): pass
 def apply_expert_placement_plan(): pass
 def verify_expert_placement_plan(): pass
 """,
@@ -79,6 +84,7 @@ async def verify_expert_placement_plan(): pass
     assert source_checks["forward_path_has_moe_request_context"] is True
     assert source_checks["route_recording_hooks"] == 2
     assert source_checks["apply_verify_boundary_present"] is True
+    assert source_checks["runtime_layout_inspector_present"] is True
     assert source_checks["observe_only_markers_present"] is True
 
 

@@ -1,0 +1,49 @@
+{
+  "endpoint": "http://127.0.0.1:8345/v1/chat/completions",
+  "output_dir": "results/spotserve_expert_remap_performance",
+  "comparison_fields": [
+    "success_rate",
+    "clean_success_rate",
+    "trace_replay_success",
+    "latency_p95_ms",
+    "replanning_events",
+    "replanning_execution_applied",
+    "replanning_expert_placement_quiescent_remap_events",
+    "replanning_expert_placement_runtime_apply_success",
+    "replanning_expert_placement_runtime_verify_success",
+    "replanning_expert_placement_runtime_physical_weight_migration",
+    "replanning_expert_placement_runtime_verified_placement",
+    "replanning_expert_placement_runtime_quiescent_remap",
+    "replanning_total_expert_placement_runtime_moved_expert_shards",
+    "replanning_total_expert_placement_runtime_moved_weight_bytes",
+    "replanning_expert_placement_runtime_cross_node_weight_migration",
+    "replanning_total_expert_placement_runtime_cross_node_moved_expert_shards",
+    "replanning_total_expert_placement_runtime_cross_node_moved_weight_bytes",
+    "replanning_avg_expert_placement_runtime_remap_duration_ms",
+    "replanning_expert_placement_runtime_active_request_remap",
+    "replanning_expert_placement_runtime_step_boundary_barrier",
+    "phase_replan_window_success_rate",
+    "phase_post_replan_success_rate",
+    "phase_post_replan_latency_p95_ms"
+  ],
+  "runs": [
+    {
+      "name": "vllm-expert-remap-applied",
+      "model": "vllm-expert-remap-perf",
+      "backend": "vllm",
+      "policy": "none",
+      "deploy_config": "examples/spotserve/config-vllm-expert-remap-performance.json",
+      "delete_models_before_run": [
+        "vllm-expert-remap-perf"
+      ],
+      "delete_after_run": true,
+      "min_ready_instances": 1,
+      "ready_timeout_s": 300,
+      "workload": "benchmarks/spotserve/workloads/reparallelization_vllm_performance.jsonl",
+      "trace": "examples/spotserve/spot_trace_vllm_expert_remap_performance.jsonl",
+      "trace_event_timeout_s": 600,
+      "router_metrics_path": "/tmp/spotserve-work/results/spotserve_expert_remap_performance/vllm-expert-remap-router.jsonl"
+    }
+  ],
+  "comparisons": []
+}

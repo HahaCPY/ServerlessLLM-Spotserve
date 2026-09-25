@@ -582,11 +582,18 @@ def source_has_available_expert_route_histogram(
 
 
 def target_expert_placement_keys(target: MigrationTarget) -> set[str]:
-    raw = _metadata_value(
-        target,
-        "expert_placement_snapshot",
-        "expert_placement",
-    )
+    raw = None
+    if _to_bool(
+        _metadata_value(target, "runtime_expert_placement_available"),
+        default=False,
+    ):
+        raw = _metadata_value(target, "runtime_expert_placement_shards")
+    if raw is None:
+        raw = _metadata_value(
+            target,
+            "expert_placement_snapshot",
+            "expert_placement",
+        )
     return _placement_expert_keys(raw)
 
 

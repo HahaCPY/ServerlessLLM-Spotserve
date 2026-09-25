@@ -96,6 +96,17 @@ class FakeMoeMetadataEngine(FakeMetadataEngine):
                 }
             },
             "placement_source": "runtime_hook",
+            "runtime_expert_placement_available": True,
+            "runtime_expert_placement_worker_count": 1,
+            "runtime_expert_placement_shard_count": 1,
+            "runtime_expert_placement_shards": {
+                "layer:0/expert:1": [
+                    {
+                        "rank_id": "worker:0/ep-rank:1",
+                        "weight_resident": True,
+                    }
+                ]
+            },
         }
 
 
@@ -111,6 +122,43 @@ class FakeExpertPlacementRuntime:
     def verify_expert_placement_plan(self, expert_placement_plan):
         self.verified_plan = dict(expert_placement_plan)
         return {"verified": True, "reason": "runtime_verify_succeeded"}
+
+
+class FakePhysicalExpertPlacementRuntime(FakeExpertPlacementRuntime):
+    async def apply_expert_placement_plan(self, expert_placement_plan):
+        self.applied_plan = dict(expert_placement_plan)
+        return {
+            "applied": True,
+            "success": True,
+            "physical_weight_migration": True,
+            "runtime_verified_placement": True,
+            "worker_count": 2,
+            "worker_success_count": 2,
+            "worker_results": [
+                {
+                    "applied": True,
+                    "moved_local_expert_shards": 2,
+                    "moved_local_weight_bytes": 393216,
+                    "remap_duration_ms": 11.5,
+                },
+                {
+                    "applied": True,
+                    "moved_local_expert_shards": 2,
+                    "moved_local_weight_bytes": 393216,
+                    "remap_duration_ms": 12.25,
+                },
+            ],
+        }
+
+    def verify_expert_placement_plan(self, expert_placement_plan):
+        self.verified_plan = dict(expert_placement_plan)
+        return {
+            "verified": True,
+            "success": True,
+            "physical_weight_migration": True,
+            "runtime_verified_placement": True,
+            "can_verify_physical_placement": True,
+        }
 
 
 class FakeObserveOnlyExpertPlacementRuntime:
@@ -542,6 +590,28 @@ def test_engine_parallel_metadata_derives_moe_placement_from_model_config(
     assert metadata["placement_source"] == "derived_from_model_config"
     assert metadata["expert_placement_snapshot"]["layer:0/expert:2"][
         "rank_id"
+    ] == "ep-rank-1"
+
+
+def test_engine_parallel_metadata_respects_round_robin_placement(tmp_path):
+    model_path = tmp_path / "moe-model"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        '{"num_hidden_layers": 1, "num_experts": 4}',
+        encoding="utf-8",
+    )
+    backend = make_backend(
+        object(),
+        pretrained_model_name_or_path=str(model_path),
+        enable_expert_parallel=True,
+        tensor_parallel_size=2,
+        expert_placement_strategy="round_robin",
+    )
+
+    metadata = backend._engine_parallel_metadata()
+
+    assert metadata["expert_placement_snapshot"]["layer:0/expert:2"][
+        "rank_id"
     ] == "ep-rank-0"
 
 
@@ -679,6 +749,44 @@ async def test_backend_calls_runtime_expert_placement_apply_and_verify_hooks():
     assert metadata["expert_placement_contract_seen_by_all_workers"] is False
     assert metadata["expert_placement_physical_weight_migration"] is False
     assert metadata["expert_placement_contract_reason"] == "verified_runtime_plan"
+
+
+@pytest.mark.asyncio
+async def test_backend_reports_runtime_observed_expert_weight_transfer():
+    snapshot = {
+        "layer:0/expert:1": {
+            "layer_id": 0,
+            "expert_id": 1,
+            "rank_id": "replica:0/ep-rank:1",
+            "node_id": "node-0",
+        }
+    }
+    backend = make_backend(
+        FakePhysicalExpertPlacementRuntime(),
+        enable_expert_parallel=True,
+        tensor_parallel_size=2,
+        expert_placement_physical_migration_required=True,
+        expert_placement_plan={
+            "expert_placement_available": True,
+            "placement_fingerprint": "plan-fp",
+            "live_expert_remap": True,
+            "expert_placement_physical_migration_required": True,
+            "expert_placement_snapshot": snapshot,
+        },
+        expert_placement_snapshot=snapshot,
+    )
+
+    await backend._apply_configured_expert_placement_plan()
+    metadata = backend._engine_parallel_metadata()
+
+    assert metadata["expert_placement_physical_weight_migration"] is True
+    assert metadata["expert_placement_runtime_moved_expert_shards"] == 4
+    assert metadata["expert_placement_runtime_moved_weight_bytes"] == 786432
+    assert metadata["expert_placement_runtime_remap_duration_ms"] == 12.25
+    assert metadata["expert_placement_runtime_verified_placement"] is True
+    assert metadata["expert_placement_runtime_verification_level"] == (
+        "physical_migration_verified"
+    )
 
 
 @pytest.mark.asyncio
@@ -907,6 +1015,17 @@ async def test_runtime_metadata_reads_moe_placement_from_runtime_hook():
             "rank_id": "rank-1",
             "node_id": "node-0",
         }
+    }
+    assert profile["runtime_expert_placement_available"] is True
+    assert profile["runtime_expert_placement_worker_count"] == 1
+    assert profile["runtime_expert_placement_shard_count"] == 1
+    assert profile["runtime_expert_placement_shards"] == {
+        "layer:0/expert:1": [
+            {
+                "rank_id": "worker:0/ep-rank:1",
+                "weight_resident": True,
+            }
+        ]
     }
 
 

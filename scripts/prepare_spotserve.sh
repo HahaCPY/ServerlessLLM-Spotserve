@@ -17,6 +17,7 @@ Options:
   --cleanup-only     Prune stale build artifacts and exit
   --deploy-set SET   Models to deploy: standard, correctness,
                      reparallelization, reparallelization-performance,
+                     expert-remap-active-performance,
                      reparallelization-multi-worker-performance,
                      context-migration-performance,
                      stateful-recovery-performance,
@@ -155,8 +156,8 @@ while [[ $# -gt 0 ]]; do
       ;;
     --deploy-set)
       DEPLOY_SET="${2:-}"
-      if [[ "$DEPLOY_SET" != "standard" && "$DEPLOY_SET" != "correctness" && "$DEPLOY_SET" != "reparallelization" && "$DEPLOY_SET" != "reparallelization-performance" && "$DEPLOY_SET" != "reparallelization-multi-worker-performance" && "$DEPLOY_SET" != "context-migration-performance" && "$DEPLOY_SET" != "stateful-recovery-performance" && "$DEPLOY_SET" != "spotserve-core-performance" && "$DEPLOY_SET" != "vllm-dense" && "$DEPLOY_SET" != "vllm-moe" && "$DEPLOY_SET" != "vllm-blackbox" && "$DEPLOY_SET" != "all" ]]; then
-        echo "--deploy-set must be one of: standard, correctness, reparallelization, reparallelization-performance, reparallelization-multi-worker-performance, context-migration-performance, stateful-recovery-performance, spotserve-core-performance, vllm-dense, vllm-moe, vllm-blackbox, all" >&2
+      if [[ "$DEPLOY_SET" != "standard" && "$DEPLOY_SET" != "correctness" && "$DEPLOY_SET" != "reparallelization" && "$DEPLOY_SET" != "reparallelization-performance" && "$DEPLOY_SET" != "expert-remap-active-performance" && "$DEPLOY_SET" != "reparallelization-multi-worker-performance" && "$DEPLOY_SET" != "context-migration-performance" && "$DEPLOY_SET" != "stateful-recovery-performance" && "$DEPLOY_SET" != "spotserve-core-performance" && "$DEPLOY_SET" != "vllm-dense" && "$DEPLOY_SET" != "vllm-moe" && "$DEPLOY_SET" != "vllm-blackbox" && "$DEPLOY_SET" != "all" ]]; then
+        echo "--deploy-set must be one of: standard, correctness, reparallelization, reparallelization-performance, expert-remap-active-performance, reparallelization-multi-worker-performance, context-migration-performance, stateful-recovery-performance, spotserve-core-performance, vllm-dense, vllm-moe, vllm-blackbox, all" >&2
         exit 2
       fi
       shift 2
@@ -231,7 +232,7 @@ maybe_use_repo_model_folder() {
     MODEL_FOLDER="${ROOT_DIR}/model"
   fi
 }
-if [[ "$DEPLOY_SET" == "reparallelization" || "$DEPLOY_SET" == "reparallelization-performance" || "$DEPLOY_SET" == "reparallelization-multi-worker-performance" ]]; then
+if [[ "$DEPLOY_SET" == "reparallelization" || "$DEPLOY_SET" == "reparallelization-performance" || "$DEPLOY_SET" == "expert-remap-active-performance" || "$DEPLOY_SET" == "reparallelization-multi-worker-performance" ]]; then
   maybe_use_repo_model_folder "$REPARALLELIZATION_MODEL_PATH"
 elif [[ "$DEPLOY_SET" == "context-migration-performance" ]]; then
   maybe_use_repo_model_folder "$CONTEXT_MIGRATION_MODEL_PATH"
@@ -255,7 +256,7 @@ if [[ -n "${SPOTSERVE_COMPOSE_SERVICES:-}" ]]; then
   read -r -a COMPOSE_SERVICES <<<"$SPOTSERVE_COMPOSE_SERVICES"
 elif [[ "$DEPLOY_SET" == "reparallelization-multi-worker-performance" || "$DEPLOY_SET" == "spotserve-core-performance" ]]; then
   COMPOSE_SERVICES=("$COMPOSE_SERVICE" "sllm_worker_0" "sllm_worker_1")
-elif [[ "$DEPLOY_SET" == "reparallelization" || "$DEPLOY_SET" == "reparallelization-performance" || "$DEPLOY_SET" == "context-migration-performance" || "$DEPLOY_SET" == "stateful-recovery-performance" || "$DEPLOY_SET" == "spotserve-core-performance" || "$DEPLOY_SET" == "vllm-dense" || "$DEPLOY_SET" == "vllm-moe" || "$DEPLOY_SET" == "vllm-blackbox" || "$DEPLOY_SET" == "all" ]]; then
+elif [[ "$DEPLOY_SET" == "reparallelization" || "$DEPLOY_SET" == "reparallelization-performance" || "$DEPLOY_SET" == "expert-remap-active-performance" || "$DEPLOY_SET" == "context-migration-performance" || "$DEPLOY_SET" == "stateful-recovery-performance" || "$DEPLOY_SET" == "spotserve-core-performance" || "$DEPLOY_SET" == "vllm-dense" || "$DEPLOY_SET" == "vllm-moe" || "$DEPLOY_SET" == "vllm-blackbox" || "$DEPLOY_SET" == "all" ]]; then
   COMPOSE_SERVICES=("$COMPOSE_SERVICE" "sllm_worker_0")
   if [[ "$REPARALLELIZATION_MULTI_WORKER" == "1" && ( "$DEPLOY_SET" == "reparallelization" || "$DEPLOY_SET" == "reparallelization-performance" || "$DEPLOY_SET" == "all" ) ]]; then
     COMPOSE_SERVICES+=("sllm_worker_1")
@@ -416,7 +417,7 @@ for attempt in $(seq 1 60); do
   sleep 2
 done
 
-if [[ "$DEPLOY_SET" == "reparallelization" || "$DEPLOY_SET" == "reparallelization-performance" || "$DEPLOY_SET" == "reparallelization-multi-worker-performance" || "$DEPLOY_SET" == "context-migration-performance" || "$DEPLOY_SET" == "stateful-recovery-performance" || "$DEPLOY_SET" == "spotserve-core-performance" || "$DEPLOY_SET" == "vllm-dense" || "$DEPLOY_SET" == "vllm-moe" || "$DEPLOY_SET" == "vllm-blackbox" || "$DEPLOY_SET" == "all" ]]; then
+if [[ "$DEPLOY_SET" == "reparallelization" || "$DEPLOY_SET" == "reparallelization-performance" || "$DEPLOY_SET" == "expert-remap-active-performance" || "$DEPLOY_SET" == "reparallelization-multi-worker-performance" || "$DEPLOY_SET" == "context-migration-performance" || "$DEPLOY_SET" == "stateful-recovery-performance" || "$DEPLOY_SET" == "spotserve-core-performance" || "$DEPLOY_SET" == "vllm-dense" || "$DEPLOY_SET" == "vllm-moe" || "$DEPLOY_SET" == "vllm-blackbox" || "$DEPLOY_SET" == "all" ]]; then
   log "Checking vLLM worker resources"
   podman exec "$WORKER_CONTAINER" bash -lc \
     "mkdir -p /hf-cache/hub /hf-cache/modules && chmod -R a+rwX /hf-cache && touch /hf-cache/modules/.spotserve-write-test"
@@ -563,7 +564,7 @@ EOF
       sleep 2
     done
   fi
-  if [[ "$DEPLOY_SET" == "reparallelization" || "$DEPLOY_SET" == "reparallelization-performance" || "$DEPLOY_SET" == "reparallelization-multi-worker-performance" || "$DEPLOY_SET" == "all" ]] &&
+  if [[ "$DEPLOY_SET" == "reparallelization" || "$DEPLOY_SET" == "reparallelization-performance" || "$DEPLOY_SET" == "expert-remap-active-performance" || "$DEPLOY_SET" == "reparallelization-multi-worker-performance" || "$DEPLOY_SET" == "all" ]] &&
       [[ "$REPARALLELIZATION_MODEL_PATH" == /* ]]; then
     for attempt in $(seq 1 90); do
       if podman exec "$WORKER_CONTAINER" test -f "${REPARALLELIZATION_MODEL_PATH}/config.json"; then
@@ -741,7 +742,7 @@ podman cp benchmarks/spotserve/. "${CONTAINER}:${WORKDIR_IN_CONTAINER}/benchmark
 podman cp examples/spotserve/. "${CONTAINER}:${WORKDIR_IN_CONTAINER}/examples/spotserve"
 podman cp scripts/. "${CONTAINER}:${WORKDIR_IN_CONTAINER}/scripts"
 
-if [[ "$DEPLOY_SET" == "reparallelization" || "$DEPLOY_SET" == "reparallelization-performance" || "$DEPLOY_SET" == "reparallelization-multi-worker-performance" || "$DEPLOY_SET" == "all" ]]; then
+if [[ "$DEPLOY_SET" == "reparallelization" || "$DEPLOY_SET" == "reparallelization-performance" || "$DEPLOY_SET" == "expert-remap-active-performance" || "$DEPLOY_SET" == "reparallelization-multi-worker-performance" || "$DEPLOY_SET" == "all" ]]; then
   log "Applying vLLM reparallelization config override"
   podman exec -i "$CONTAINER" "$HEAD_PYTHON" - \
     "$WORKDIR_IN_CONTAINER" \
@@ -757,6 +758,8 @@ load_format = sys.argv[3]
 for relative_path in (
     "examples/spotserve/config-vllm-reparallelization-baseline-performance.json",
     "examples/spotserve/config-vllm-reparallelization-applied-performance.json",
+    "examples/spotserve/config-vllm-expert-remap-performance.json",
+    "examples/spotserve/config-vllm-expert-remap-active-request-performance.json",
     "examples/spotserve/config-vllm-reparallelization-applied-multi-worker-performance.json",
     "examples/spotserve/config-vllm-reparallelization-baseline-multi-worker-performance.json",
     "examples/spotserve/config-vllm-reparallelization-baseline-gpu-smoke.json",
@@ -939,6 +942,9 @@ if [[ "$SKIP_DEPLOY" -eq 0 ]]; then
   if [[ "$DEPLOY_SET" == "reparallelization-performance" || "$DEPLOY_SET" == "all" ]]; then
     log "Reparallelization performance configs will be deployed one run at a time by the benchmark runner"
   fi
+  if [[ "$DEPLOY_SET" == "expert-remap-active-performance" || "$DEPLOY_SET" == "all" ]]; then
+    log "Active expert-remap performance config will be deployed by the benchmark runner"
+  fi
   if [[ "$DEPLOY_SET" == "reparallelization-multi-worker-performance" || "$DEPLOY_SET" == "all" ]]; then
     log "Reparallelization multi-worker performance configs will be deployed one run at a time by the benchmark runner"
   fi
@@ -1049,6 +1055,41 @@ ${HEAD_PYTHON} benchmarks/spotserve/run_benchmark.py \\
   --ray-address auto \\
   --ray-namespace sllm
 '
+
+Run the opt-in TP2/EP2 physical expert remap validation with:
+
+podman exec ${CONTAINER} bash -lc '
+cd ${WORKDIR_IN_CONTAINER} &&
+${HEAD_PYTHON} benchmarks/spotserve/run_benchmark.py \\
+  --config benchmarks/spotserve/benchmark_matrix_expert_remap_performance.yaml \\
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \\
+  --request-timeout 180 \\
+  --trace-event-timeout 600 \\
+  --ray-address auto \\
+  --ray-namespace sllm
+'
+EOF
+fi
+
+if [[ "$DEPLOY_SET" == "expert-remap-active-performance" || "$DEPLOY_SET" == "all" ]]; then
+  cat <<EOF
+
+Run the active-request fixed-EP expert remap validation with:
+
+podman exec ${CONTAINER} bash -lc '
+cd ${WORKDIR_IN_CONTAINER} &&
+${HEAD_PYTHON} benchmarks/spotserve/run_benchmark.py \\
+  --config benchmarks/spotserve/benchmark_matrix_expert_remap_active_request_performance.yaml \\
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \\
+  --request-timeout 240 \\
+  --trace-event-timeout 600 \\
+  --ray-address auto \\
+  --ray-namespace sllm
+'
+
+This deploy set requires containers started with:
+
+VLLM_SPOTSERVE_EXPERT_REMAP=1 VLLM_SPOTSERVE_ACTIVE_REQUEST_REMAP=1
 EOF
 fi
 

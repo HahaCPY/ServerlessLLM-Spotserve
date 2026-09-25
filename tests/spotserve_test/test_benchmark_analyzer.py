@@ -423,6 +423,43 @@ def test_true_kv_summary_uses_response_evidence_for_legacy_router_rows():
     assert summary["true_kv_restore_evidence_sources"] == "raw_response"
 
 
+def test_replanning_summary_distinguishes_unknown_weight_bytes():
+    analyzer = load_analyzer()
+    summary = analyzer.summarize_replanning_metrics([{
+        "type": "reparallelization",
+        "action": "reparallelize",
+        "expert_placement_plan_available": True,
+        "expert_placement_plan_moved_experts": 6,
+        "expert_placement_plan_moved_weight_bytes": None,
+        "expert_placement_plan_estimated_weight_movement_cost_ms": None,
+    }])
+
+    assert summary[
+        "replanning_expert_placement_plan_unknown_weight_bytes_events"
+    ] == 1
+    assert summary[
+        "replanning_expert_placement_plan_unknown_cost_events"
+    ] == 1
+    assert summary[
+        "replanning_avg_expert_placement_plan_weight_movement_cost_ms"
+    ] == 0
+
+    bytes_known = analyzer.summarize_replanning_metrics([{
+        "type": "reparallelization",
+        "action": "reparallelize",
+        "expert_placement_plan_available": True,
+        "expert_placement_plan_moved_experts": 6,
+        "expert_placement_plan_moved_weight_bytes": 1179648,
+        "expert_placement_plan_estimated_weight_movement_cost_ms": None,
+    }])
+    assert bytes_known[
+        "replanning_expert_placement_plan_unknown_weight_bytes_events"
+    ] == 0
+    assert bytes_known[
+        "replanning_expert_placement_plan_unknown_cost_events"
+    ] == 1
+
+
 def test_replanning_summary_exposes_workload_cost_metrics():
     analyzer = load_analyzer()
 
@@ -500,6 +537,9 @@ def test_replanning_summary_exposes_workload_cost_metrics():
                 "expert_placement_runtime_contract_seen_worker_count": 2,
                 "expert_placement_runtime_contract_seen_worker_total": 2,
                 "expert_placement_runtime_physical_weight_migration_count": 0,
+                "expert_placement_runtime_moved_expert_shards": 4,
+                "expert_placement_runtime_moved_weight_bytes": 786432,
+                "expert_placement_runtime_remap_duration_ms": 12.25,
                 "expert_placement_runtime_verification_levels": (
                     "contract_seen_only"
                 ),
@@ -611,6 +651,12 @@ def test_replanning_summary_exposes_workload_cost_metrics():
     assert summary[
         "replanning_total_expert_placement_plan_moved_weight_bytes"
     ] == 4096
+    assert summary[
+        "replanning_expert_placement_plan_unknown_weight_bytes_events"
+    ] == 0
+    assert summary[
+        "replanning_expert_placement_plan_unknown_cost_events"
+    ] == 0
     assert (
         summary[
             "replanning_avg_expert_placement_plan_weight_movement_cost_ms"
@@ -664,6 +710,24 @@ def test_replanning_summary_exposes_workload_cost_metrics():
             "replanning_expert_placement_runtime_physical_weight_migration"
         ]
         == 0
+    )
+    assert (
+        summary[
+            "replanning_total_expert_placement_runtime_moved_expert_shards"
+        ]
+        == 4
+    )
+    assert (
+        summary[
+            "replanning_total_expert_placement_runtime_moved_weight_bytes"
+        ]
+        == 786432
+    )
+    assert (
+        summary[
+            "replanning_avg_expert_placement_runtime_remap_duration_ms"
+        ]
+        == 12.25
     )
     assert (
         summary[
@@ -1117,3 +1181,43 @@ def test_context_migration_summary_exposes_moe_locality_metrics():
         summary["context_migration_moe_remote_routed_tokens_by_expert"]
         == '{"layer:0/expert:2": 4}'
     )
+
+
+def test_quiescent_remap_summary_counts_underlying_actor_recreate():
+    analyzer = load_analyzer()
+    summary = analyzer.summarize_replanning_metrics([{
+        "type": "reparallelization",
+        "action": "reparallelize",
+        "reparallelization_execution_model": "actor_recreate",
+        "expert_placement_execution_model": "quiescent_fixed_ep_remap",
+        "expert_placement_quiescent_remap": True,
+        "expert_placement_actor_recreate": False,
+    }])
+
+    assert summary["replanning_expert_placement_actor_recreate_events"] == 1
+    assert summary["replanning_expert_placement_quiescent_remap_events"] == 1
+
+
+def test_cross_node_weight_movement_requires_runtime_evidence():
+    analyzer = load_analyzer()
+    summary = analyzer.summarize_replanning_metrics([{
+        "type": "reparallelization",
+        "action": "reparallelize",
+        "expert_placement_runtime_physical_host_ids_observed_count": 1,
+        "expert_placement_runtime_cross_node_weight_migration_count": 1,
+        "expert_placement_runtime_cross_node_moved_expert_shards": 2,
+        "expert_placement_runtime_cross_node_moved_weight_bytes": 393216,
+        "expert_placement_runtime_active_request_remap_count": 1,
+        "expert_placement_runtime_step_boundary_barrier_count": 1,
+    }])
+
+    assert summary["replanning_expert_placement_runtime_physical_host_ids_observed"] == 1
+    assert summary["replanning_expert_placement_runtime_cross_node_weight_migration"] == 1
+    assert summary["replanning_expert_placement_runtime_active_request_remap"] == 1
+    assert summary["replanning_expert_placement_runtime_step_boundary_barrier"] == 1
+    assert summary[
+        "replanning_total_expert_placement_runtime_cross_node_moved_expert_shards"
+    ] == 2
+    assert summary[
+        "replanning_total_expert_placement_runtime_cross_node_moved_weight_bytes"
+    ] == 393216

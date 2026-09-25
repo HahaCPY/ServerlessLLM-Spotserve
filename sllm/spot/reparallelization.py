@@ -297,13 +297,13 @@ class ParallelConfig:
     throughput_estimate_req_s: float = 0.0
     load_time_estimate_ms: float = 0.0
     migration_cost_estimate_ms: float = 0.0
-    expert_weight_movement_cost_estimate_ms: float = 0.0
+    expert_weight_movement_cost_estimate_ms: Optional[float] = 0.0
     expert_placement_movement_observation_available: bool = False
     expert_placement_movement_source: str = "unavailable"
     expert_placement_moved_expert_count: int = 0
     expert_placement_stationary_expert_count: int = 0
     expert_placement_unknown_movement_expert_count: int = 0
-    expert_placement_moved_weight_bytes: int = 0
+    expert_placement_moved_weight_bytes: Optional[int] = 0
     queue_penalty_ms: float = 0.0
     replan_window_cost_ms: float = 0.0
     score_components: Dict[str, float] = field(default_factory=dict)
@@ -830,8 +830,11 @@ def _score_parallel_candidates_for_workload(
             max(0.0, arrival_rate_req_s - throughput_estimate_req_s)
             * float(snapshot["queue_penalty_ms_per_req_s"])
         )
-        expert_weight_movement_cost_estimate_ms = (
+        raw_expert_weight_movement_cost_estimate_ms = (
             candidate.expert_weight_movement_cost_estimate_ms
+        )
+        expert_weight_movement_cost_estimate_ms = (
+            raw_expert_weight_movement_cost_estimate_ms or 0.0
         )
         replan_window_cost_ms = (
             load_time_estimate_ms
@@ -896,7 +899,7 @@ def _score_parallel_candidates_for_workload(
                     float(migration_cost_estimate_ms)
                 ),
                 expert_weight_movement_cost_estimate_ms=(
-                    float(expert_weight_movement_cost_estimate_ms)
+                    raw_expert_weight_movement_cost_estimate_ms
                 ),
                 queue_penalty_ms=float(queue_penalty_ms),
                 replan_window_cost_ms=float(replan_window_cost_ms),
@@ -942,6 +945,23 @@ def _supported_config_candidates(
     )
     min_tensor_parallel_size = _positive_int(
         planner_config, "min_tensor_parallel_size", 1
+    )
+    max_tensor_parallel_size = _positive_int(
+        planner_config, "max_tensor_parallel_size", available_gpus
+    )
+    min_pipeline_parallel_size = _positive_int(
+        planner_config, "min_pipeline_parallel_size", 1
+    )
+    max_pipeline_parallel_size = _positive_int(
+        planner_config, "max_pipeline_parallel_size", available_gpus
+    )
+    min_replica_count = _positive_int(
+        planner_config,
+        "min_replica_count",
+        int(planner_config.get("min_data_parallel_size", 1) or 1),
+    )
+    max_replica_count = _positive_int(
+        planner_config, "max_replica_count", available_gpus
     )
     candidates: List[ParallelConfig] = []
     for plan in supported_configs:
@@ -1021,7 +1041,19 @@ def _supported_config_candidates(
                 )
             )
 
-        if tensor_parallel_size < min_tensor_parallel_size:
+        if not (
+            min_tensor_parallel_size
+            <= tensor_parallel_size
+            <= max_tensor_parallel_size
+        ):
+            continue
+        if not min_replica_count <= replica_count <= max_replica_count:
+            continue
+        if not (
+            min_pipeline_parallel_size
+            <= pipeline_parallel_size
+            <= max_pipeline_parallel_size
+        ):
             continue
 
         if total_gpus > available_gpus:
@@ -1165,11 +1197,12 @@ def _attach_expert_placement_movement_estimates(
                 candidate,
                 expert_weight_movement_cost_estimate_ms=(
                     _nonnegative_float(
-                        plan_payload.get(
-                            "estimated_expert_weight_movement_cost_ms",
-                            0.0,
-                        )
+                        plan_payload["estimated_expert_weight_movement_cost_ms"]
                     )
+                    if plan_payload.get(
+                        "estimated_expert_weight_movement_cost_ms"
+                    ) is not None
+                    else None
                 ),
                 expert_placement_movement_observation_available=bool(
                     plan_payload.get("movement_observation_available", False)
@@ -1186,8 +1219,10 @@ def _attach_expert_placement_movement_estimates(
                 expert_placement_unknown_movement_expert_count=_safe_int(
                     plan_payload.get("unknown_movement_expert_count"), 0
                 ),
-                expert_placement_moved_weight_bytes=_safe_int(
-                    plan_payload.get("moved_weight_bytes"), 0
+                expert_placement_moved_weight_bytes=(
+                    _safe_int(plan_payload["moved_weight_bytes"], 0)
+                    if plan_payload.get("moved_weight_bytes") is not None
+                    else None
                 ),
             )
         )
@@ -1223,6 +1258,23 @@ def plan_dynamic_reparallelization(
     model_config = model_config or {}
     backend_name = str(backend or model_config.get("backend", "unknown"))
     planner_config = dict(planner_config or {})
+    live_remap_value = planner_config.get("enable_live_expert_remap", False)
+    live_remap_enabled = (
+        live_remap_value.strip().lower() in {"1", "true", "yes", "on"}
+        if isinstance(live_remap_value, str)
+        else bool(live_remap_value)
+    )
+    if live_remap_enabled:
+        planner_config["max_replica_count"] = min(
+            _positive_int(planner_config, "max_replica_count", 1),
+            1,
+        )
+        planner_config["max_pipeline_parallel_size"] = min(
+            _positive_int(
+                planner_config, "max_pipeline_parallel_size", 1
+            ),
+            1,
+        )
     if "target_replica_gpus" not in planner_config:
         planner_config["target_replica_gpus"] = max(
             int(

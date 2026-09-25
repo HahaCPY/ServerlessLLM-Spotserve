@@ -14,7 +14,8 @@ preemption-aware flow 裡。
 已完成：SpotServe-style control-plane prototype + vLLM MoE compatibility
 已完成：patched vLLM/NIXL true KV stateful restore benchmark
 部分完成：MoE-aware target selection、logical expert placement planning、
-          runtime placement contract observability
+          runtime placement contract observability、runtime actual
+          expert-placement verification
 尚未完成：live physical expert weight migration / live EP rank remapping /
           real all-to-all traffic reduction
 ```
@@ -23,7 +24,7 @@ preemption-aware flow 裡。
 
 | SpotServe 核心 | 專案主要位置 | 目前狀態 |
 |---|---|---|
-| Dynamic re-parallelization | `sllm/spot/reparallelization.py`, `sllm/spot/reparallelization_executor.py`, `sllm/spot/vllm_deployment_adapter.py`, `sllm/routers/roundrobin_router.py` | 控制平面、workload/cost-aware plan、vLLM actor recreate/切流、logical ExpertPlacementPlan 與 observe-only runtime contract 已做；不是 in-place MoE expert weight migration |
+| Dynamic re-parallelization | `sllm/spot/reparallelization.py`, `sllm/spot/reparallelization_executor.py`, `sllm/spot/vllm_deployment_adapter.py`, `sllm/routers/roundrobin_router.py` | 控制平面、workload/cost-aware plan、vLLM actor recreate/切流、logical ExpertPlacementPlan、runtime actual placement introspection 已做；不是 in-place MoE expert weight migration |
 | Low-cost context migration | `sllm/spot/context_migration.py`, `sllm/backends/vllm_context_metadata.py`, `sllm/routers/roundrobin_router.py` | 有 context metadata 與低成本 mapping planner；但 V7 本身多數是 planning / prefix warmup，不等於 true KV block migration |
 | Stateful recovery | `sllm/spot/stateful_recovery.py`, `sllm/backends/vllm_state_metadata.py`, `sllm/backends/vllm_backend.py`, `sllm/routers/roundrobin_router.py` | recovery decision、fallback、patched vLLM/NIXL hooks 有接；standalone V8 benchmark 已驗證 true KV restore，未 patch 或 core matrix capability 不足時仍會 token replay fallback |
 | Preemptible simulation | `sllm/spot/trace_reader.py`, `sllm/spot/preemption_simulator.py`, `sllm/app_lib.py`, `sllm/controller.py` | JSONL trace replay 模擬 `add/remove/preempt/recover/dead`，不是真 cloud spot provider integration |
@@ -376,11 +377,12 @@ weight migration。
 - 這不是完整 SpotServe optimizer，也還沒有 monetary cost model。
 - 目前是 expert-aware actor recreate / ready 後切流，不是 runtime 內部
   in-place repartition。
-- `ExpertPlacementPlan` 目前可以被 runtime hook 看到，但 vLLM hook 回報的是
-  `contract_seen_only` / observe-only，不是
-  `physical_migration_verified`。
-- `runtime_verified_placement=0`、`runtime_physical_migration=0`、
-  `runtime_remap_ep=0`、`runtime_a2a_counters=0` 是目前正確結果。
+- `ExpertPlacementPlan` 目前可以被 runtime hook 看到；patched vLLM 也會嘗試
+  掃描 loaded model 的 actual resident experts。若 actual placement 與 plan 的
+  rank subset 相符，可以升級為 `runtime_placement_verified`。
+- 即使 `runtime_verified_placement=1`，只要
+  `runtime_physical_migration=0`、`runtime_remap_ep=0`、
+  `runtime_a2a_counters=0`，仍不能 claim physical migration。
 
 實驗邊界：
 

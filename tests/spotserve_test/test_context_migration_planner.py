@@ -444,6 +444,52 @@ def test_expert_dispatch_cost_uses_routing_weighted_locality():
     assert result["route_histogram_kind"] == "runtime_observed_topk"
 
 
+def test_expert_dispatch_cost_prefers_runtime_actual_placement():
+    result = estimate_expert_dispatch_cost(
+        ContextMetadata(
+            request_id="req-runtime-placement",
+            instance_id="old-a",
+            node_id="node-0",
+            metadata={
+                "moe_route_histogram_available": True,
+                "per_request_expert_route_histogram": {
+                    "req-runtime-placement": {
+                        "layer:0/expert:1": 10,
+                    }
+                },
+            },
+        ),
+        MigrationTarget(
+            instance_id="new-a",
+            node_id="node-1",
+            metadata={
+                "expert_placement_available": True,
+                "expert_placement_snapshot": {
+                    "layer:0/expert:1": {"rank_id": "logical-rank"}
+                },
+                "runtime_expert_placement_available": True,
+                "runtime_expert_placement_shards": {
+                    "layer:0/expert:2": [
+                        {
+                            "rank_id": "worker:0/ep-rank:0",
+                            "weight_resident": True,
+                        }
+                    ]
+                },
+            },
+        ),
+        planner_config={"enable_moe_expert_locality": True},
+    )
+
+    assert result["available"] is True
+    assert result["locality_ratio"] == 0.0
+    assert result["estimated_remote_routing_ratio"] == 1.0
+    assert result["estimated_remote_routed_tokens"] == 10
+    assert result["remote_routed_tokens_by_expert"] == {
+        "layer:0/expert:1": 10
+    }
+
+
 def test_queue_penalty_prefers_less_loaded_target():
     source = ContextMetadata(
         request_id="req-queue",

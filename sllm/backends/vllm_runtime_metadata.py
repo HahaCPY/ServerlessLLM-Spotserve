@@ -461,6 +461,41 @@ def get_vllm_model_resource_profile(
         ),
         default=False,
     )
+    runtime_moved_expert_shards = _optional_non_negative_int(
+        runtime_metadata.get("expert_placement_runtime_moved_expert_shards")
+    ) or 0
+    runtime_moved_weight_bytes = _optional_non_negative_int(
+        runtime_metadata.get("expert_placement_runtime_moved_weight_bytes")
+    ) or 0
+    runtime_remap_duration_ms = _non_negative_float(
+        runtime_metadata.get("expert_placement_runtime_remap_duration_ms"), 0.0
+    )
+    runtime_active_request_remap = _to_bool(
+        runtime_metadata.get("expert_placement_runtime_active_request_remap"),
+        default=False,
+    )
+    runtime_step_boundary_barrier = _to_bool(
+        runtime_metadata.get("expert_placement_runtime_step_boundary_barrier"),
+        default=False,
+    )
+    runtime_physical_host_ids_observed = _to_bool(
+        runtime_metadata.get("expert_placement_runtime_physical_host_ids_observed"),
+        default=False,
+    )
+    runtime_cross_node_weight_migration = _to_bool(
+        runtime_metadata.get("expert_placement_runtime_cross_node_weight_migration"),
+        default=False,
+    )
+    runtime_cross_node_moved_expert_shards = _optional_non_negative_int(
+        runtime_metadata.get(
+            "expert_placement_runtime_cross_node_moved_expert_shards"
+        )
+    ) or 0
+    runtime_cross_node_moved_weight_bytes = _optional_non_negative_int(
+        runtime_metadata.get(
+            "expert_placement_runtime_cross_node_moved_weight_bytes"
+        )
+    ) or 0
     runtime_verified_placement = _to_bool(
         _first_present(
             runtime_metadata.get("expert_placement_runtime_verified_placement"),
@@ -614,6 +649,13 @@ def get_vllm_model_resource_profile(
         ),
         default=False,
     )
+    expert_quiescent_remap_enabled = _to_bool(
+        _first_present(
+            runtime_metadata.get("expert_placement_quiescent_remap_enabled"),
+            backend_config.get("expert_placement_quiescent_remap_enabled"),
+        ),
+        default=False,
+    )
     expert_physical_migration_required = _to_bool(
         _first_present(
             runtime_metadata.get(
@@ -622,6 +664,35 @@ def get_vllm_model_resource_profile(
             backend_config.get("expert_placement_physical_migration_required"),
         ),
         default=False,
+    )
+    runtime_expert_placement_shards = runtime_metadata.get(
+        "runtime_expert_placement_shards"
+    )
+    if not isinstance(runtime_expert_placement_shards, Mapping):
+        runtime_expert_placement_shards = {}
+    runtime_expert_placement_worker_snapshots = runtime_metadata.get(
+        "runtime_expert_placement_worker_snapshots"
+    )
+    if not isinstance(runtime_expert_placement_worker_snapshots, Mapping):
+        runtime_expert_placement_worker_snapshots = {}
+    runtime_expert_placement_available = _to_bool(
+        runtime_metadata.get("runtime_expert_placement_available"),
+        default=_has_payload(runtime_expert_placement_shards),
+    )
+    runtime_expert_placement_worker_count = (
+        _optional_non_negative_int(
+            runtime_metadata.get("runtime_expert_placement_worker_count")
+        )
+        or len(runtime_expert_placement_worker_snapshots)
+    )
+    runtime_expert_placement_shard_count = (
+        _optional_non_negative_int(
+            runtime_metadata.get("runtime_expert_placement_shard_count")
+        )
+        or sum(
+            len(value) if isinstance(value, list) else 1
+            for value in runtime_expert_placement_shards.values()
+        )
     )
 
     profile = {
@@ -686,6 +757,9 @@ def get_vllm_model_resource_profile(
         "expert_placement_live_migration_enabled": (
             expert_live_migration_enabled
         ),
+        "expert_placement_quiescent_remap_enabled": (
+            expert_quiescent_remap_enabled
+        ),
         "expert_placement_physical_migration_required": (
             expert_physical_migration_required
         ),
@@ -721,6 +795,33 @@ def get_vllm_model_resource_profile(
         "expert_placement_physical_weight_migration": (
             physical_weight_migration
         ),
+        "expert_placement_runtime_moved_expert_shards": (
+            runtime_moved_expert_shards
+        ),
+        "expert_placement_runtime_moved_weight_bytes": (
+            runtime_moved_weight_bytes
+        ),
+        "expert_placement_runtime_remap_duration_ms": (
+            runtime_remap_duration_ms
+        ),
+        "expert_placement_runtime_active_request_remap": (
+            runtime_active_request_remap
+        ),
+        "expert_placement_runtime_step_boundary_barrier": (
+            runtime_step_boundary_barrier
+        ),
+        "expert_placement_runtime_physical_host_ids_observed": (
+            runtime_physical_host_ids_observed
+        ),
+        "expert_placement_runtime_cross_node_weight_migration": (
+            runtime_cross_node_weight_migration
+        ),
+        "expert_placement_runtime_cross_node_moved_expert_shards": (
+            runtime_cross_node_moved_expert_shards
+        ),
+        "expert_placement_runtime_cross_node_moved_weight_bytes": (
+            runtime_cross_node_moved_weight_bytes
+        ),
         "expert_placement_runtime_verification_level": (
             runtime_verification_level
         ),
@@ -739,6 +840,23 @@ def get_vllm_model_resource_profile(
         "expert_placement_runtime_capability_reason": (
             runtime_capability_reason
         ),
+        "runtime_expert_placement_available": (
+            runtime_expert_placement_available
+        ),
+        "runtime_expert_placement_worker_count": (
+            runtime_expert_placement_worker_count
+        ),
+        "runtime_expert_placement_shard_count": (
+            runtime_expert_placement_shard_count
+        ),
+        "runtime_expert_placement_shards": {
+            str(key): value
+            for key, value in runtime_expert_placement_shards.items()
+        },
+        "runtime_expert_placement_worker_snapshots": {
+            str(key): value
+            for key, value in runtime_expert_placement_worker_snapshots.items()
+        },
         "moe_route_histogram_available": route_histogram_available,
         "moe_route_histogram_source": route_histogram_source,
         "moe_route_histogram_kind": route_histogram_kind,
@@ -875,6 +993,9 @@ def get_vllm_runtime_metadata(
         "expert_placement_live_migration_enabled": (
             profile["expert_placement_live_migration_enabled"]
         ),
+        "expert_placement_quiescent_remap_enabled": (
+            profile["expert_placement_quiescent_remap_enabled"]
+        ),
         "expert_placement_physical_migration_required": (
             profile["expert_placement_physical_migration_required"]
         ),
@@ -931,6 +1052,33 @@ def get_vllm_runtime_metadata(
         ),
         "expert_placement_physical_weight_migration": (
             profile["expert_placement_physical_weight_migration"]
+        ),
+        "expert_placement_runtime_moved_expert_shards": (
+            profile["expert_placement_runtime_moved_expert_shards"]
+        ),
+        "expert_placement_runtime_moved_weight_bytes": (
+            profile["expert_placement_runtime_moved_weight_bytes"]
+        ),
+        "expert_placement_runtime_remap_duration_ms": (
+            profile["expert_placement_runtime_remap_duration_ms"]
+        ),
+        "expert_placement_runtime_active_request_remap": (
+            profile["expert_placement_runtime_active_request_remap"]
+        ),
+        "expert_placement_runtime_step_boundary_barrier": (
+            profile["expert_placement_runtime_step_boundary_barrier"]
+        ),
+        "expert_placement_runtime_physical_host_ids_observed": (
+            profile["expert_placement_runtime_physical_host_ids_observed"]
+        ),
+        "expert_placement_runtime_cross_node_weight_migration": (
+            profile["expert_placement_runtime_cross_node_weight_migration"]
+        ),
+        "expert_placement_runtime_cross_node_moved_expert_shards": (
+            profile["expert_placement_runtime_cross_node_moved_expert_shards"]
+        ),
+        "expert_placement_runtime_cross_node_moved_weight_bytes": (
+            profile["expert_placement_runtime_cross_node_moved_weight_bytes"]
         ),
         "expert_placement_runtime_verification_level": (
             profile["expert_placement_runtime_verification_level"]

@@ -121,6 +121,12 @@ def make_replanning_event(
             decision.get("expert_placement_live_migration_enabled", False),
         )
     )
+    expert_quiescent_remap_enabled = bool(
+        execution.get(
+            "expert_placement_quiescent_remap_enabled",
+            decision.get("expert_placement_quiescent_remap_enabled", False),
+        )
+    )
     expert_physical_migration_required = bool(
         execution.get(
             "expert_placement_physical_migration_required",
@@ -342,6 +348,33 @@ def make_replanning_event(
         "expert_placement_runtime_physical_weight_migration_count": (
             expert_placement_runtime.get("physical_weight_migration_count", 0)
         ),
+        "expert_placement_runtime_moved_expert_shards": (
+            expert_placement_runtime.get("runtime_moved_expert_shards", 0)
+        ),
+        "expert_placement_runtime_moved_weight_bytes": (
+            expert_placement_runtime.get("runtime_moved_weight_bytes", 0)
+        ),
+        "expert_placement_runtime_remap_duration_ms": (
+            expert_placement_runtime.get("runtime_remap_duration_ms", 0.0)
+        ),
+        "expert_placement_runtime_active_request_remap_count": (
+            expert_placement_runtime.get("active_request_remap_count", 0)
+        ),
+        "expert_placement_runtime_step_boundary_barrier_count": (
+            expert_placement_runtime.get("step_boundary_barrier_count", 0)
+        ),
+        "expert_placement_runtime_physical_host_ids_observed_count": (
+            expert_placement_runtime.get("physical_host_ids_observed_count", 0)
+        ),
+        "expert_placement_runtime_cross_node_weight_migration_count": (
+            expert_placement_runtime.get("cross_node_weight_migration_count", 0)
+        ),
+        "expert_placement_runtime_cross_node_moved_expert_shards": (
+            expert_placement_runtime.get("cross_node_moved_expert_shards", 0)
+        ),
+        "expert_placement_runtime_cross_node_moved_weight_bytes": (
+            expert_placement_runtime.get("cross_node_moved_weight_bytes", 0)
+        ),
         "expert_placement_runtime_verification_levels": (
             expert_placement_runtime.get("verification_levels", "")
         ),
@@ -358,6 +391,21 @@ def make_replanning_event(
         ),
         "expert_placement_runtime_can_measure_all_to_all_count": (
             expert_placement_runtime.get("can_measure_all_to_all_count", 0)
+        ),
+        "expert_placement_runtime_actual_placement_available_count": (
+            expert_placement_runtime.get(
+                "runtime_expert_placement_available_count", 0
+            )
+        ),
+        "expert_placement_runtime_actual_placement_worker_count": (
+            expert_placement_runtime.get(
+                "runtime_expert_placement_worker_count", 0
+            )
+        ),
+        "expert_placement_runtime_actual_placement_shard_count": (
+            expert_placement_runtime.get(
+                "runtime_expert_placement_shard_count", 0
+            )
         ),
         "expert_placement_runtime_capability_reasons": (
             expert_placement_runtime.get("capability_reasons", "")
@@ -394,6 +442,11 @@ def make_replanning_event(
         "expert_placement_runtime_live_migration_count": (
             expert_placement_runtime.get("expert_placement_live_migration_count", 0)
         ),
+        "expert_placement_runtime_quiescent_remap_count": (
+            expert_placement_runtime.get(
+                "expert_placement_quiescent_remap_count", 0
+            )
+        ),
         "expert_placement_runtime_physical_migration_required_count": (
             expert_placement_runtime.get(
                 "expert_placement_physical_migration_required_count", 0
@@ -411,15 +464,26 @@ def make_replanning_event(
         "expert_placement_live_migration_enabled": (
             expert_live_migration_enabled
         ),
+        "expert_placement_quiescent_remap_enabled": (
+            expert_quiescent_remap_enabled
+        ),
         "expert_placement_physical_migration_required": (
             expert_physical_migration_required
         ),
         "expert_placement_actor_recreate": (
             expert_execution_model == "expert_aware_actor_recreate"
+            or (
+                replanning_execution_model == "actor_recreate"
+                and expert_execution_model == "quiescent_fixed_ep_remap"
+            )
         ),
         "expert_placement_live_migration": (
             expert_live_migration_enabled
             or expert_execution_model == "live_expert_weight_migration"
+        ),
+        "expert_placement_quiescent_remap": (
+            expert_quiescent_remap_enabled
+            or expert_execution_model == "quiescent_fixed_ep_remap"
         ),
         "selected_score": decision.get(
             "selected_score", selected_config.get("score", 0.0)

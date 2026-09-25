@@ -21,6 +21,12 @@ SOURCE_MARKERS = {
             "record_moe_routing": "def record_moe_routing",
             "apply_hook": "def apply_expert_placement_plan",
             "verify_hook": "def verify_expert_placement_plan",
+            "runtime_layout_inspector": (
+                "def inspect_runtime_expert_placement"
+            ),
+            "runtime_layout_comparator": (
+                "def _compare_runtime_expert_placement"
+            ),
             "observe_only_reason": (
                 "physical_expert_placement_migration_not_supported"
             ),
@@ -58,6 +64,9 @@ SOURCE_MARKERS = {
         "markers": {
             "request_moe_metadata_hook": "def get_request_moe_metadata",
             "runtime_moe_metadata_hook": "def get_moe_runtime_metadata",
+            "runtime_placement_snapshot": (
+                "def _spotserve_runtime_expert_placement_snapshot"
+            ),
             "apply_hook": "def apply_expert_placement_plan",
             "verify_hook": "def verify_expert_placement_plan",
         },
@@ -186,6 +195,11 @@ def audit_source_tree(package_root: Optional[str | Path]) -> Dict[str, Any]:
             and engine_core.get("verify_rpc")
             and async_llm.get("apply_client")
             and async_llm.get("verify_client")
+        ),
+        "runtime_layout_inspector_present": bool(
+            spotserve_moe.get("runtime_layout_inspector")
+            and spotserve_moe.get("runtime_layout_comparator")
+            and worker_base.get("runtime_placement_snapshot")
         ),
         "observe_only_markers_present": bool(
             spotserve_moe.get("observe_only_reason")
@@ -396,6 +410,9 @@ def classify_audit_report(report: Mapping[str, Any]) -> Dict[str, Any]:
             and runtime_probe.get("verify_callable")
         )
     )
+    layout_inspector_present = bool(
+        source_checks.get("runtime_layout_inspector_present")
+    )
     if physical_supported:
         classification = "physical_expert_migration_supported"
         verification_level = "physical_migration_verified"
@@ -438,6 +455,7 @@ def classify_audit_report(report: Mapping[str, Any]) -> Dict[str, Any]:
         "classification": classification,
         "runtime_verification_level": verification_level,
         "can_claim_physical_expert_migration": physical_supported,
+        "runtime_layout_inspector_present": layout_inspector_present,
         "runtime_verified_placement": runtime_verified_placement,
         "runtime_can_verify_physical_placement": (
             can_verify_physical_placement

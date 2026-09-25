@@ -405,10 +405,13 @@ Notes:
   After Phase 4D observe-only hook plumbing, it reported
   `runtime_apply_hooks=1`, `runtime_apply_success=0`,
   `runtime_verify_hooks=1`, and `runtime_verify_success=0`.
-  After the runtime capability split, a correct observe-only run should also
-  report `runtime_level=contract_seen_only`,
-  `runtime_verified_placement=0`, `runtime_physical_migration=0`,
-  `runtime_remap_ep=0`, and `runtime_a2a_counters=0`.
+  After the runtime capability split, a correct observe-only run should report
+  either `runtime_level=contract_seen_only` when only the contract was seen, or
+  `runtime_level=runtime_placement_verified` when patched vLLM can inspect the
+  loaded model and match resident experts against the plan. In both cases,
+  `runtime_physical_migration=0`, `runtime_remap_ep=0`, and
+  `runtime_a2a_counters=0` must remain true until live migration/all-to-all
+  instrumentation exists.
   After Phase 5B, the single-worker same-node recreate capacity entry is marked
   `_spotserve_counts_as_runtime_worker=true`, so the expected summary is
   `runtime_workers=1`, `exec_model=expert_aware_actor_recreate`,
@@ -512,6 +515,16 @@ Notes:
   before running the audit. The 2026-09-06 `sllm_worker_0` audit reported vLLM
   `0.11.2`, source markers present, `contract_seen_by_runtime=true`, but
   `applied=false`, `verified=false`, and `physical_weight_migration=false`.
+- For Phase 5C, after rebuilding the image with the updated
+  `runtime_moe_metadata.patch`, runtime metadata may include
+  `runtime_expert_placement_available`,
+  `runtime_expert_placement_worker_count`,
+  `runtime_expert_placement_shard_count`, and
+  `runtime_expert_placement_shards`. Context migration and recovery should use
+  this actual runtime placement before falling back to logical
+  `expert_placement_snapshot`. This verifies resident expert placement, not
+  live expert migration; `runtime_physical_migration`, `runtime_remap_ep`, and
+  `runtime_a2a_counters` should still be `0`.
 - For Phase 5B, the current execution claim should be actor recreate, not live
   weight movement. A valid re-parallelization run should report
   `replanning_expert_placement_actor_recreate_events > 0`,
@@ -521,6 +534,63 @@ Notes:
   `replanning_execution_models=actor_recreate`,
   `replanning_expert_placement_execution_models=expert_aware_actor_recreate`,
   and `replanning_expert_placement_contract_modes=observe_only_contract`.
+- For the active-request fixed-EP remap path, prepare the environment with
+  `VLLM_SPOTSERVE_EXPERT_REMAP=1` and
+  `VLLM_SPOTSERVE_ACTIVE_REQUEST_REMAP=1`, then use
+  `--deploy-set expert-remap-active-performance` and run
+  `benchmark_matrix_expert_remap_active_request_performance.yaml`. A valid run
+  should report `replanning_execution_models=in_place_expert_remap`,
+  `replanning_expert_placement_execution_models=active_fixed_ep_remap`,
+  `replanning_expert_placement_runtime_active_request_remap > 0`,
+  `replanning_expert_placement_runtime_step_boundary_barrier > 0`,
+  `replanning_expert_placement_runtime_physical_weight_migration > 0`,
+  and `replanning_expert_placement_runtime_verified_placement > 0`.
+  The 2026-09-22 `02-33-05` run had 3/3 successful requests and verified
+  physical movement of four expert shards (0.75 MiB), but it used actor
+  recreate: `runtime_active_remap=0` and `runtime_step_barrier=0`.
+  It does not pass the active-request gate. The controller now initializes
+  its vLLM deployment adapter before comparing the active and selected plans;
+  the active benchmark trace uses an `add` event so the original actor remains
+  READY. For a preemption event,
+  the target actor is PREEMPTING and is excluded from in-place remap.
+  The next attempt on 2026-09-22 failed during vLLM engine startup, before
+  trace replay or remap: the worker log reported only 1.25 GiB free on a
+  15.47 GiB GPU, below the 6.96 GiB required by
+  `gpu_memory_utilization=0.45`. At inspection time, external Python
+  processes held about 14 GiB each on GPUs 1-3 while GPU 0 was free;
+  `/v1/models` was empty. This is an environment capacity failure and does
+  not validate or invalidate the active-remap implementation. Re-run after
+  two GPUs have sufficient free memory; do not count this run in latency or
+  correctness comparisons.
+- The 2026-09-23 `01-08-25` active-request rerun passes the full gate: requests
+  `3/3`, trace replay `1/1`, replan applied `1/1`,
+  `execution_model=active_fixed_ep_remap`, `actor_recreate=0`, runtime
+  apply/verify `1/1`, `runtime_active_remap=1`,
+  `runtime_step_barrier=1`, `runtime_physical_migration=1`, and runtime moved
+  four expert shards / 786432 bytes in 168.12 ms. The runtime reported two
+  workers and eight actual shards. This validates synchronous step-boundary
+  active-request fixed-EP remap only; EP-size remap, cross-node movement, and
+  all-to-all counters remain unverified.
+- The active fixture was tightened again on 2026-09-24. The previous warmup
+  could delay dispatch until after the trace event, and test token pacing is
+  applied per DELTA output chunk rather than per token. The workload now sends
+  the long request at `t=0`, applies a one-second per-chunk hold, and replays
+  `add` at `t=1`. Run `12-27-04` passed with requests `2/2`, trace `1/1`,
+  replan applied `1/1`, `runtime_active_remap=1`,
+  `runtime_step_barrier=1`, runtime apply/verify `1/1`, four moved shards
+  (786432 bytes), and a 117.99 ms runtime remap. An earlier startup-only
+  failure that day did not reach trace replay; Ray also warned that its session
+  filesystem was over 95% used, so that attempt is classified as an
+  environment/startup failure rather than a remap result.
+- On 2026-09-25, the first actor failed during startup while its replacement
+  was already `starting`. The benchmark runner previously aborted on any
+  historical failed actor. It now keeps waiting while a non-failed startup
+  candidate exists and fails early only after three failed-only polls. Run
+  `08-55-34` then passed with requests `2/2`, trace `1/1`, replan applied
+  `1/1`, `execution_model=active_fixed_ep_remap`, `actor_recreate=0`, runtime
+  apply/verify `1/1`, `runtime_active_remap=1`, `runtime_step_barrier=1`, four
+  moved shards (0.75 MiB), a 133.18 ms runtime remap, and 3192.94 ms p95
+  request latency. This remains fixed-EP active remap evidence only.
 - For the placement ordering guard, require
   `context_migration_placement_handshake_stale = 0` and
   `state_recovery_placement_handshake_stale = 0` before claiming that migration

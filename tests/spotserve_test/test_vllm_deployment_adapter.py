@@ -12,17 +12,26 @@ class _Remote:
 
 class _Actor:
     def __init__(self):
+        self.applied_expert_plans = []
+
         async def init_backend():
             return None
 
         async def get_runtime_metadata(**kwargs):
             return {"backend": "vllm", "status": "running"}
 
+        async def apply_expert_placement_plan(*, expert_placement_plan):
+            self.applied_expert_plans.append(dict(expert_placement_plan))
+            return {"success": True, "applied": True, "verified": True}
+
         async def stop():
             return None
 
         self.init_backend = _Remote(init_backend)
         self.get_runtime_metadata = _Remote(get_runtime_metadata)
+        self.apply_expert_placement_plan = _Remote(
+            apply_expert_placement_plan
+        )
         self.stop = _Remote(stop)
 
 
@@ -54,6 +63,105 @@ class _SnapshotScheduler(_Scheduler):
             return worker_nodes
 
         self._get_worker_nodes = _Remote(get_worker_nodes)
+
+
+def test_vllm_adapter_propagates_opt_in_quiescent_remap():
+    adapter = VllmDeploymentAdapter(
+        model_name="m",
+        backend_config={"tensor_parallel_size": 1},
+        resource_requirements={"num_cpus": 1, "num_gpus": 1},
+        scheduler=_Scheduler(),
+        traffic_switcher=lambda *_: None,
+    )
+    plan = ParallelPlan(
+        model_name="m",
+        backend="vllm",
+        tensor_parallel_size=2,
+        data_parallel_size=1,
+        enable_expert_parallel=True,
+        num_gpus=2,
+        expert_placement_plan={
+            "expert_placement_available": True,
+            "placement_fingerprint": "remap-test",
+            "live_expert_remap": True,
+            "expert_placement_physical_migration_required": True,
+        },
+    )
+
+    config = adapter._plan_backend_config(plan)
+
+    assert config["expert_placement_execution_model"] == (
+        "quiescent_fixed_ep_remap"
+    )
+    assert config["expert_placement_runtime_contract_mode"] == (
+        "quiescent_fixed_ep_remap"
+    )
+    assert config["expert_placement_live_migration_enabled"] is False
+    assert config["expert_placement_quiescent_remap_enabled"] is True
+    assert config["expert_placement_physical_migration_required"] is True
+
+
+@pytest.mark.asyncio
+async def test_vllm_adapter_remaps_existing_workers_in_place():
+    actor = _Actor()
+    adapter = VllmDeploymentAdapter(
+        model_name="m",
+        backend_config={
+            "tensor_parallel_size": 2,
+            "enable_expert_parallel": True,
+        },
+        resource_requirements={"num_cpus": 1, "num_gpus": 2},
+        scheduler=_Scheduler(),
+        traffic_switcher=lambda *_: None,
+    )
+    handle = adapter_module.InstanceHandle(
+        instance_id="i-0",
+        max_queue_length=1,
+        num_gpu=2,
+        node_id="node-0",
+        backend_instance=actor,
+    )
+    current = adapter_module.VllmDeployment(
+        plan=ParallelPlan(
+            model_name="m",
+            backend="vllm",
+            tensor_parallel_size=2,
+            data_parallel_size=1,
+            enable_expert_parallel=True,
+            num_gpus=2,
+            target_nodes=["node-0"],
+        ),
+        instances={"i-0": handle},
+        backend_config=dict(adapter.backend_config),
+        resource_requirements=dict(adapter.resource_requirements),
+    )
+    plan = ParallelPlan(
+        model_name="m",
+        backend="vllm",
+        tensor_parallel_size=2,
+        data_parallel_size=1,
+        enable_expert_parallel=True,
+        num_gpus=2,
+        target_nodes=["node-0"],
+        expert_placement_plan={
+            "expert_placement_available": True,
+            "placement_fingerprint": "active-remap",
+            "live_expert_remap": True,
+            "allow_active_requests": True,
+            "expert_placement_physical_migration_required": True,
+        },
+    )
+
+    updated = await adapter.remap_workers_in_place(current, plan)
+
+    assert updated.instances == current.instances
+    assert actor.applied_expert_plans[0]["allow_active_requests"] is True
+    assert updated.backend_config["reparallelization_execution_model"] == (
+        "in_place_expert_remap"
+    )
+    assert updated.backend_config["expert_placement_execution_model"] == (
+        "active_fixed_ep_remap"
+    )
 
 
 @pytest.mark.asyncio

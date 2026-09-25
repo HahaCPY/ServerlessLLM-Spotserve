@@ -110,18 +110,38 @@ class VllmDeploymentAdapter:
             else {}
         )
         if expert_placement_plan:
+            live_expert_remap = bool(
+                expert_placement_plan.get("live_expert_remap", False)
+            )
+            physical_migration_required = bool(
+                expert_placement_plan.get(
+                    "expert_placement_physical_migration_required",
+                    live_expert_remap,
+                )
+            )
             config["expert_placement_plan"] = expert_placement_plan
             config["expert_placement_execution_model"] = (
-                "expert_aware_actor_recreate"
+                "quiescent_fixed_ep_remap"
+                if live_expert_remap
+                else "expert_aware_actor_recreate"
             )
             config["expert_placement_execution_model_reason"] = (
-                "logical_expert_placement_plan_carried_into_recreated_actor"
+                "opt_in_weight_transfer_after_actor_load"
+                if live_expert_remap
+                else "logical_expert_placement_plan_carried_into_recreated_actor"
             )
             config["expert_placement_runtime_contract_mode"] = (
-                "observe_only_contract"
+                "quiescent_fixed_ep_remap"
+                if live_expert_remap
+                else "observe_only_contract"
             )
             config["expert_placement_live_migration_enabled"] = False
-            config["expert_placement_physical_migration_required"] = False
+            config["expert_placement_quiescent_remap_enabled"] = (
+                live_expert_remap
+            )
+            config["expert_placement_physical_migration_required"] = (
+                physical_migration_required
+            )
             config["expert_placement_runtime_verification_level"] = (
                 "unavailable"
             )
@@ -324,6 +344,61 @@ class VllmDeploymentAdapter:
         if deployment.plan != plan:
             raise ValueError("deployment plan changed before traffic switch")
         return await _call(self.traffic_switcher, deployment, plan)
+
+    async def remap_workers_in_place(
+        self,
+        deployment: VllmDeployment,
+        plan: ParallelPlan,
+    ) -> VllmDeployment:
+        expert_placement_plan = (
+            dict(plan.expert_placement_plan)
+            if isinstance(plan.expert_placement_plan, Mapping)
+            else {}
+        )
+        if not expert_placement_plan:
+            raise ValueError("expert_placement_plan_required")
+        results: Dict[str, Any] = {}
+        for instance_id, handle in deployment.instances.items():
+            actor = handle.backend_instance
+            if actor is None:
+                raise RuntimeError(f"missing_backend_actor:{instance_id}")
+            apply_rpc = getattr(actor, "apply_expert_placement_plan", None)
+            if apply_rpc is None:
+                raise RuntimeError(
+                    f"runtime_apply_hook_unavailable:{instance_id}"
+                )
+            result = await _call(
+                apply_rpc.remote,
+                expert_placement_plan=expert_placement_plan,
+            )
+            results[instance_id] = result
+            if not isinstance(result, Mapping) or not result.get("success"):
+                raise RuntimeError(
+                    "in_place_expert_remap_failed:"
+                    f"{instance_id}:{result}"
+                )
+        backend_config = self._plan_backend_config(plan)
+        backend_config["reparallelization_execution_model"] = (
+            "in_place_expert_remap"
+        )
+        backend_config["reparallelization_execution_model_reason"] = (
+            "fixed_ep_runtime_expert_weight_remap"
+        )
+        backend_config["expert_placement_execution_model"] = (
+            "active_fixed_ep_remap"
+            if expert_placement_plan.get("allow_active_requests")
+            else "quiescent_fixed_ep_remap"
+        )
+        backend_config["expert_placement_execution_model_reason"] = (
+            "runtime_apply_on_existing_actor"
+        )
+        self.backend_config = dict(backend_config)
+        return VllmDeployment(
+            plan=plan,
+            instances=dict(deployment.instances),
+            backend_config=backend_config,
+            resource_requirements=dict(deployment.resource_requirements),
+        )
 
     async def drain_workers(self, deployment: Optional[VllmDeployment]) -> None:
         if deployment is None:
