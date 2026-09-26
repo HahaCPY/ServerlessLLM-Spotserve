@@ -773,6 +773,7 @@ for relative_path in (
     "examples/spotserve/config-vllm-expert-remap-performance.json",
     "examples/spotserve/config-vllm-expert-remap-active-request-performance.json",
     "examples/spotserve/config-vllm-expert-remap-dp2-a2a-performance.json",
+    "examples/spotserve/config-vllm-expert-remap-dp2-coordinated-performance.json",
     "examples/spotserve/config-vllm-reparallelization-applied-multi-worker-performance.json",
     "examples/spotserve/config-vllm-reparallelization-baseline-multi-worker-performance.json",
     "examples/spotserve/config-vllm-reparallelization-baseline-gpu-smoke.json",
@@ -1131,6 +1132,17 @@ ${HEAD_PYTHON} scripts/verify_spotserve_all_to_all_traffic.py \
   --requests 4 \
   --max-tokens 32 \
   --output results/spotserve_expert_remap_dp2_a2a_performance/a2a-report.json
+'
+
+After rebuilding with the all-DP-engine two-phase placement hook, run the
+sequential quiescent DP2 physical remap validation with:
+
+podman exec ${CONTAINER} bash -lc '
+cd ${WORKDIR_IN_CONTAINER} &&
+${HEAD_PYTHON} scripts/verify_spotserve_dp2_coordinated_remap.py \
+  --endpoint http://127.0.0.1:8343 \
+  --request-timeout 240 \
+  --event-timeout 600
 '
 EOF
 fi

@@ -1994,6 +1994,55 @@ baseline/candidate payload 比較。
 delta 實測，且 candidate bytes 嚴格小於 baseline 才能宣稱。不能用 routing
 histogram 或 estimated remote tokens 代替這個結果。
 
+### 2026-09-26：All-DP-Engine Remap Coordinator
+
+前一版 DP2 remap 只透過單一 EngineCore 進入 expert-transfer collective，另一個
+DP rank 沒有同時進入，因而 deadlock。第一版 all-DP broadcast 仍有另一個 race：
+若一個 EngineCore 有 active request、另一個已 idle，前者會拒絕、後者卻會進入
+transfer collective。2026-09-26 的 `03-34-13` run 正好觸發此情況，event 在
+600 秒後 timeout，requests 為 `0/2`；因此該 run 是失敗結果，不能當作 DP2
+physical remap 證據。
+
+runtime patch 現改為 all-DP-engine 兩階段協議：
+
+```text
+AsyncLLM
+-> enumerate core_engines
+-> concurrently call side-effect-free preflight on every DP EngineCore
+-> if any EngineCore rejects, no EngineCore enters transfer
+-> only if every preflight succeeds, concurrently commit apply
+-> verify on every DP EngineCore
+-> every EngineCore enters its local worker collective
+-> aggregate every DP engine and worker result
+```
+
+placement plan 只有在 `dp_engine_coordinated=true` 且
+`dp_engine_count == runtime data_parallel_size` 時才能通過 DP remap preflight。
+runtime metadata 也改為聚合所有 DP EngineCore，避免 planner 只看到 DP rank 0
+而把其餘 experts 標成 `missing_current_expert`。
+
+新增 `verify_spotserve_dp2_coordinated_remap.py` 作為主要 correctness gate。它不以
+固定 trace timestamp 猜測 request 是否完成，而是依序等待 warmup request 完成、
+router concurrency 歸零，再送 placement event，最後驗證 apply/verify、runtime
+placement 與 post-remap inference。原本的 timed benchmark 仍可作 concurrency
+stress test，但不能單獨證明 quiescent DP2 remap。
+
+2026-09-26 sequential gate 已通過：pre-remap request 與 post-remap request 都
+完成，event 前 router concurrency 為零；runtime 對 2 個 DP EngineCore 完成
+apply/verify，實際搬動 4 個 expert shards、786432 bytes，remap duration 為
+123.13 ms，且 runtime placement verification 成功。因此目前可宣稱同一個
+physical host 上的 `TP1 x DP2 x EP2` coordinated physical expert remap 已驗證。
+這筆結果不代表 cross-host migration、EP resize 或 A2A traffic reduction。
+
+這項 runtime patch 需要 rebuild image，`SPOTSERVE_SYNC_SOURCE=1` 無法更新
+image 內的 `vllm/v1/engine/async_llm.py`。
+
+vLLM 0.11.2 本身有 elastic-EP resize API，但只支援 Ray DP backend。目前
+ServerlessLLM backend actor 已先向 Ray 持有整組 GPU，若直接啟用 vLLM nested
+Ray DP actors，會形成兩層 GPU resource ownership。完成 allocation ownership
+整合以前，live in-place EP resize 仍不可安全啟用；EP2 -> EP4 繼續使用
+controlled actor recreate，不把它誤稱為 live resize。
+
 三項剩餘驗證的精確狀態：
 
 ```text
@@ -2004,7 +2053,7 @@ cross-node movement:
   runtime hard gate complete; success requires two distinct physical host IDs
 
 real all-to-all traffic:
-  DP2 inference/measurement gate added; DP2 physical remap is explicitly rejected;
+  DP2 inference/measurement and coordinated physical-remap gates passed;
   payload reduction remains an experimental result, not a completed claim
 ```
 

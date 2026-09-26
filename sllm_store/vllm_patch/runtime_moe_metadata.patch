@@ -797,7 +797,7 @@ diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
 index c0c1f913b..ab4269b7e 100644
 --- a/vllm/v1/engine/async_llm.py
 +++ b/vllm/v1/engine/async_llm.py
-@@ -355,6 +355,84 @@ class AsyncLLM(EngineClient):
+@@ -355,6 +355,149 @@ class AsyncLLM(EngineClient):
              "staged": True,
              "expected_blocks": len(params["remote_block_ids"]),
          }
@@ -846,9 +846,20 @@ index c0c1f913b..ab4269b7e 100644
 +        return metadata
 +
 +    async def get_moe_runtime_metadata(self, **_: Any) -> dict[str, Any]:
-+        return await self.engine_core.call_utility_async(
-+            "get_moe_runtime_metadata"
-+        )
++        engine_core = self.engine_core
++        engines = list(getattr(engine_core, "core_engines", ()) or ())
++        call_one = getattr(engine_core, "_call_utility_async", None)
++        if len(engines) <= 1 or not callable(call_one):
++            return await engine_core.call_utility_async(
++                "get_moe_runtime_metadata"
++            )
++        results = await asyncio.gather(*(
++            call_one("get_moe_runtime_metadata", engine=engine)
++            for engine in engines
++        ))
++        from sllm.vllm_expert_remap import aggregate_dp_engine_moe_metadata
++
++        return aggregate_dp_engine_moe_metadata(list(results))
 +
 +    async def apply_expert_placement_plan(
 +        self,
@@ -861,8 +872,8 @@ index c0c1f913b..ab4269b7e 100644
 +            or kwargs.get("plan")
 +            or {}
 +        )
-+        return await self.engine_core.call_utility_async(
-+            "apply_expert_placement_plan", plan
++        return await self._spotserve_call_placement_hook_all_dp_engines(
++            "apply_expert_placement_plan", plan, "applied"
 +        )
 +
 +    async def verify_expert_placement_plan(
@@ -876,9 +887,63 @@ index c0c1f913b..ab4269b7e 100644
 +            or kwargs.get("plan")
 +            or {}
 +        )
-+        return await self.engine_core.call_utility_async(
-+            "verify_expert_placement_plan", plan
++        return await self._spotserve_call_placement_hook_all_dp_engines(
++            "verify_expert_placement_plan", plan, "verified"
 +        )
++
++    async def _spotserve_call_placement_hook_all_dp_engines(
++        self,
++        method: str,
++        plan: dict[str, Any],
++        success_key: str,
++    ) -> dict[str, Any]:
++        """Enter placement collectives on every local DP EngineCore."""
++        engine_core = self.engine_core
++        engines = list(getattr(engine_core, "core_engines", ()) or ())
++        call_one = getattr(engine_core, "_call_utility_async", None)
++        if len(engines) <= 1 or not callable(call_one):
++            return await engine_core.call_utility_async(method, plan)
++
++        coordinated_plan = dict(plan)
++        coordinated_plan["dp_engine_coordinated"] = True
++        coordinated_plan["dp_engine_count"] = len(engines)
++        if method == "apply_expert_placement_plan" and plan.get(
++            "live_expert_remap"
++        ) is True:
++            preflight_results = await asyncio.gather(*(
++                call_one(
++                    "prepare_expert_placement_plan",
++                    coordinated_plan,
++                    engine=engine,
++                )
++                for engine in engines
++            ))
++            from sllm.vllm_expert_remap import aggregate_dp_engine_hook_results
++
++            preflight = aggregate_dp_engine_hook_results(
++                list(preflight_results), "ready"
++            )
++            if not preflight["ready"]:
++                preflight.update({
++                    "applied": False,
++                    "success": False,
++                    "dp_engine_preflight_passed": False,
++                })
++                return preflight
++            coordinated_plan["dp_preflight_coordinated"] = True
++            coordinated_plan["active_requests_at_barrier"] = bool(
++                preflight.get("active_requests_at_barrier")
++            )
++        results = await asyncio.gather(*(
++            call_one(method, coordinated_plan, engine=engine)
++            for engine in engines
++        ))
++        from sllm.vllm_expert_remap import aggregate_dp_engine_hook_results
++
++        result = aggregate_dp_engine_hook_results(list(results), success_key)
++        if method == "apply_expert_placement_plan":
++            result["dp_engine_preflight_passed"] = True
++        return result
 -
 +
      async def add_request(
@@ -894,7 +959,7 @@ index 5bc564f36..7fbdc4101 100644
  
  import msgspec
  import zmq
-@@ -654,6 +654,378 @@ class EngineCore:
+@@ -654,6 +654,402 @@ class EngineCore:
              for request_id in list(requests)
          ]
  
@@ -1184,48 +1249,72 @@ index 5bc564f36..7fbdc4101 100644
 +            "worker_results": worker_results,
 +        }
 +
++    def prepare_expert_placement_plan(
++        self,
++        expert_placement_plan: Mapping[str, Any] | None = None,
++    ) -> dict[str, Any]:
++        plan = dict(expert_placement_plan or {})
++        active_requests = self.scheduler.has_unfinished_requests()
++        if active_requests and not plan.get("allow_active_requests") is True:
++            return {
++                "ready": False,
++                "success": False,
++                "reason": "active_requests_must_be_drained_before_expert_remap",
++                "worker_count": 0,
++                "active_requests_at_barrier": True,
++                "step_boundary_barrier": True,
++            }
++        if active_requests and os.environ.get(
++            "VLLM_SPOTSERVE_ACTIVE_REQUEST_REMAP"
++        ) != "1":
++            return {
++                "ready": False,
++                "success": False,
++                "reason": "active_request_remap_not_enabled",
++                "worker_count": 0,
++                "active_requests_at_barrier": True,
++                "step_boundary_barrier": True,
++            }
++        if active_requests and (
++            self.batch_queue is not None or self.async_scheduling
++        ):
++            return {
++                "ready": False,
++                "success": False,
++                "reason": "active_request_remap_requires_sync_step_boundary",
++                "worker_count": 0,
++                "active_requests_at_barrier": True,
++                "step_boundary_barrier": False,
++            }
++        preflights = self.model_executor.collective_rpc(
++            "prepare_expert_placement_plan", args=(plan,),
++        )
++        result = self._aggregate_expert_placement_hook_results(
++            preflights,
++            "ready",
++            "expert_remap_preflight_failed",
++        )
++        result["active_requests_at_barrier"] = bool(active_requests)
++        result["step_boundary_barrier"] = True
++        return result
++
 +    def apply_expert_placement_plan(
 +        self,
 +        expert_placement_plan: Mapping[str, Any] | None = None,
 +    ) -> dict[str, Any]:
 +        plan = dict(expert_placement_plan or {})
++        active_requests = False
 +        if plan.get("live_expert_remap") is True:
-+            active_requests = self.scheduler.has_unfinished_requests()
-+            if active_requests and not plan.get("allow_active_requests") is True:
-+                return {
-+                    "applied": False,
-+                    "reason": "active_requests_must_be_drained_before_expert_remap",
-+                    "worker_count": 0,
-+                }
-+            if active_requests and os.environ.get(
-+                "VLLM_SPOTSERVE_ACTIVE_REQUEST_REMAP"
-+            ) != "1":
-+                return {
-+                    "applied": False,
-+                    "reason": "active_request_remap_not_enabled",
-+                    "worker_count": 0,
-+                }
-+            if active_requests and (
-+                self.batch_queue is not None or self.async_scheduling
-+            ):
-+                return {
-+                    "applied": False,
-+                    "reason": "active_request_remap_requires_sync_step_boundary",
-+                    "worker_count": 0,
-+                }
-+            preflights = self.model_executor.collective_rpc(
-+                "prepare_expert_placement_plan", args=(plan,),
-+            )
-+            if not preflights or not all(
-+                isinstance(result, dict) and result.get("ready")
-+                for result in preflights
-+            ):
-+                return {
-+                    "applied": False,
-+                    "reason": "expert_remap_preflight_failed",
-+                    "worker_count": len(preflights or []),
-+                    "worker_results": preflights or [],
-+                }
++            if plan.get("dp_preflight_coordinated") is True:
++                active_requests = bool(plan.get("active_requests_at_barrier"))
++            else:
++                preflight = self.prepare_expert_placement_plan(plan)
++                if not preflight["ready"]:
++                    preflight["applied"] = False
++                    return preflight
++                active_requests = bool(
++                    preflight.get("active_requests_at_barrier")
++                )
 +        try:
 +            snapshots = self.model_executor.collective_rpc(
 +                "apply_expert_placement_plan",

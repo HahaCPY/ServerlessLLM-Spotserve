@@ -133,6 +133,18 @@ if [[ "${SPOTSERVE_REQUIRE_MOE_ROUTE_INSTRUMENTATION:-0}" == "1" ||
         "$VLLM_PATH/v1/engine/async_llm.py"; then
         MISSING_MOE_MARKERS+=("async_llm.verify_expert_placement_plan")
     fi
+    if ! grep -q "def _spotserve_call_placement_hook_all_dp_engines" \
+        "$VLLM_PATH/v1/engine/async_llm.py"; then
+        MISSING_MOE_MARKERS+=("async_llm.all_dp_engine_placement_hook")
+    fi
+    if ! grep -q '"prepare_expert_placement_plan"' \
+        "$VLLM_PATH/v1/engine/async_llm.py"; then
+        MISSING_MOE_MARKERS+=("async_llm.all_dp_engine_preflight")
+    fi
+    if ! grep -q "def prepare_expert_placement_plan" \
+        "$VLLM_PATH/v1/engine/core.py"; then
+        MISSING_MOE_MARKERS+=("engine_core.prepare_expert_placement_plan")
+    fi
     if ! grep -q "def apply_expert_placement_plan" \
         "$VLLM_PATH/v1/worker/worker_base.py"; then
         MISSING_MOE_MARKERS+=("worker_base.apply_expert_placement_plan")

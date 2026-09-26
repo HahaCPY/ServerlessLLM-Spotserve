@@ -10,6 +10,8 @@ from sllm.vllm_expert_remap import (
     _cross_node_movement,
     _layers_for_plan,
     _target_ep_rank,
+    aggregate_dp_engine_hook_results,
+    aggregate_dp_engine_moe_metadata,
     get_all_to_all_counters,
     prepare_expert_remap,
     record_all_to_all_collective,
@@ -127,8 +129,93 @@ class ExpertRemapPreflightTests(unittest.TestCase):
 
         self.assertFalse(result["ready"])
         self.assertEqual(
-            result["reason"], "data_parallel_expert_remap_not_supported"
+            result["reason"], "data_parallel_expert_remap_not_coordinated"
         )
+
+        self.plan["dp_engine_coordinated"] = True
+        self.plan["dp_engine_count"] = 2
+        result = prepare_expert_remap(self.model, self.plan)
+        self.assertTrue(result["ready"], result)
+
+    def test_aggregates_every_dp_engine_result(self):
+        result = aggregate_dp_engine_hook_results(
+            [
+                {
+                    "applied": True,
+                    "worker_results": [
+                        {
+                            "applied": True,
+                            "worker_rank": 0,
+                            "physical_weight_migration": True,
+                            "moved_local_expert_shards": 2,
+                            "moved_local_weight_bytes": 128,
+                        },
+                    ],
+                    "step_boundary_barrier": True,
+                },
+                {
+                    "applied": True,
+                    "worker_results": [
+                        {
+                            "applied": True,
+                            "worker_rank": 1,
+                            "physical_weight_migration": True,
+                            "moved_local_expert_shards": 2,
+                            "moved_local_weight_bytes": 128,
+                        },
+                    ],
+                    "step_boundary_barrier": True,
+                },
+            ],
+            "applied",
+        )
+        self.assertTrue(result["applied"])
+        self.assertEqual(result["dp_engine_count"], 2)
+        self.assertEqual(result["dp_engine_success_count"], 2)
+        self.assertEqual(result["worker_count"], 2)
+        self.assertTrue(result["physical_weight_migration"])
+        self.assertEqual(result["moved_local_expert_shards"], 4)
+        self.assertEqual(result["moved_local_weight_bytes"], 256)
+
+    def test_dp_preflight_failure_is_global(self):
+        result = aggregate_dp_engine_hook_results(
+            [
+                {
+                    "ready": False,
+                    "reason": "active_requests_must_be_drained_before_expert_remap",
+                    "active_requests_at_barrier": True,
+                },
+                {"ready": True, "worker_results": [{"ready": True}]},
+            ],
+            "ready",
+        )
+        self.assertFalse(result["ready"])
+        self.assertFalse(result["success"])
+        self.assertTrue(result["active_requests_at_barrier"])
+        self.assertEqual(result["dp_engine_success_count"], 1)
+
+    def test_aggregates_dp_engine_runtime_metadata(self):
+        result = aggregate_dp_engine_moe_metadata([
+            {
+                "global_expert_hotness": {"0": 3},
+                "runtime_expert_placement_shards": {
+                    "layer:0/expert:0": [{"ep_rank": 0}]
+                },
+                "runtime_expert_placement_worker_snapshots": {"0": {}},
+                "all_to_all_collective_calls": 4,
+            },
+            {
+                "global_expert_hotness": {"1": 5},
+                "runtime_expert_placement_shards": {
+                    "layer:0/expert:1": [{"ep_rank": 1}]
+                },
+                "runtime_expert_placement_worker_snapshots": {"0": {}},
+                "all_to_all_collective_calls": 6,
+            },
+        ])
+        self.assertEqual(result["runtime_expert_placement_worker_count"], 2)
+        self.assertEqual(result["runtime_expert_placement_shard_count"], 2)
+        self.assertEqual(result["all_to_all_collective_calls"], 10)
 
     def test_rejects_parallel_size_change(self):
         self.plan["target_parallel_plan"]["tensor_parallel_size"] = 4
@@ -183,6 +270,39 @@ class ActiveRequestBarrierTests(unittest.TestCase):
         self.assertEqual(
             result["reason"], "active_requests_must_be_drained_before_expert_remap"
         )
+
+    def test_preflight_reports_active_request_without_entering_apply(self):
+        calls = []
+
+        def rpc(method, args):
+            calls.append(method)
+            return [{"ready": True}]
+
+        self.core.model_executor.collective_rpc = rpc
+        result = EngineCore.prepare_expert_placement_plan(self.core, self.plan)
+
+        self.assertFalse(result["ready"])
+        self.assertTrue(result["active_requests_at_barrier"])
+        self.assertEqual(calls, [])
+
+    def test_coordinated_preflight_enters_apply_without_local_recheck(self):
+        calls = []
+
+        def rpc(method, args):
+            calls.append(method)
+            return [{"applied": True, "success": True}]
+
+        self.core.model_executor.collective_rpc = rpc
+        self.plan.update({
+            "dp_engine_coordinated": True,
+            "dp_engine_count": 2,
+            "dp_preflight_coordinated": True,
+            "active_requests_at_barrier": False,
+        })
+        result = EngineCore.apply_expert_placement_plan(self.core, self.plan)
+
+        self.assertTrue(result["applied"])
+        self.assertEqual(calls, ["apply_expert_placement_plan"])
 
     def test_rejects_async_and_batch_queue(self):
         self.plan["allow_active_requests"] = True

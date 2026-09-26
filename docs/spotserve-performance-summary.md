@@ -618,6 +618,22 @@ Notes:
   output payload by 488128 bytes, for 974208 observed payload bytes. Internode
   calls remained zero as expected on one physical host. This validates A2A
   observability, not A2A traffic reduction.
+- The first DP2 physical-remap attempt deadlocked because a utility request
+  entered the expert-transfer collective through only one DP EngineCore. A
+  subsequent all-DP broadcast run at `2026-09-26_03-34-13` also failed: one
+  EngineCore could reject an active request while an idle peer entered the
+  collective. The runtime patch now uses a global two-phase protocol: every
+  DP EngineCore completes a side-effect-free preflight, and apply starts only
+  if all engines agree. Runtime MoE metadata and verification are aggregated
+  across DP engines. The new sequential verifier waits for router concurrency
+  to reach zero before sending the event; a fixed trace timestamp is retained
+  only as a stress test, not as proof of quiescence.
+- The 2026-09-26 sequential DP2 gate passed after that fix. Both pre-remap and
+  post-remap inference completed, the router was idle before the event, and
+  runtime apply/verify each succeeded. Two DP EngineCores reported a verified
+  physical migration of four expert shards (786432 bytes) in 123.13 ms. This
+  validates same-host `TP1 x DP2 x EP2` coordinated physical remap; it does not
+  validate cross-host movement, live EP resizing, or A2A traffic reduction.
 - For the placement ordering guard, require
   `context_migration_placement_handshake_stale = 0` and
   `state_recovery_placement_handshake_stale = 0` before claiming that migration

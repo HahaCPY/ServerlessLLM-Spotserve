@@ -1,0 +1,37 @@
+{
+  "endpoint": "http://127.0.0.1:8345/v1/chat/completions",
+  "output_dir": "results/spotserve_expert_remap_dp2_coordinated_performance",
+  "comparison_fields": [
+    "success_rate",
+    "clean_success_rate",
+    "trace_replay_success",
+    "replanning_execution_applied",
+    "replanning_expert_placement_runtime_apply_success",
+    "replanning_expert_placement_runtime_verify_success",
+    "replanning_expert_placement_runtime_physical_weight_migration",
+    "replanning_expert_placement_runtime_verified_placement",
+    "replanning_total_expert_placement_runtime_moved_expert_shards",
+    "replanning_total_expert_placement_runtime_moved_weight_bytes"
+  ],
+  "runs": [
+    {
+      "name": "vllm-expert-remap-dp2-coordinated-applied",
+      "model": "vllm-expert-remap-dp2-coordinated-perf",
+      "backend": "vllm",
+      "policy": "none",
+      "deploy_config": "examples/spotserve/config-vllm-expert-remap-dp2-coordinated-performance.json",
+      "delete_models_before_run": [
+        "vllm-expert-remap-dp2-coordinated-perf"
+      ],
+      "delete_after_run": true,
+      "min_ready_instances": 1,
+      "ready_timeout_s": 600,
+      "workload": "benchmarks/spotserve/workloads/expert_remap_dp2_coordinated_performance.jsonl",
+      "trace": "examples/spotserve/spot_trace_vllm_expert_remap_dp2_coordinated_performance.jsonl",
+      "trace_event_timeout_s": 600,
+      "request_timeout_s": 240,
+      "router_metrics_path": "/tmp/spotserve-work/results/spotserve_expert_remap_dp2_coordinated_performance/vllm-expert-remap-dp2-coordinated-router.jsonl"
+    }
+  ],
+  "comparisons": []
+}

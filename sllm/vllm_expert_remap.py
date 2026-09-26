@@ -110,6 +110,234 @@ def reset_all_to_all_counters() -> None:
             _ALL_TO_ALL_COUNTERS[key] = {} if key == "backends" else 0
 
 
+def aggregate_dp_engine_hook_results(
+    engine_results: list[Any],
+    success_key: str,
+) -> dict[str, Any]:
+    """Combine placement-hook results returned by every DP EngineCore."""
+    normalized = [result for result in engine_results if isinstance(result, Mapping)]
+    worker_results: list[dict[str, Any]] = []
+    for result in normalized:
+        rows = result.get("worker_results")
+        if isinstance(rows, list):
+            worker_results.extend(row for row in rows if isinstance(row, dict))
+        else:
+            worker_results.append(dict(result))
+    succeeded = bool(normalized) and len(normalized) == len(engine_results) and all(
+        bool(result.get(success_key, result.get("success", False)))
+        for result in normalized
+    )
+    reason = ""
+    if not succeeded:
+        reason = next(
+            (
+                str(result.get("reason"))
+                for result in normalized
+                if not result.get(success_key, result.get("success", False))
+                and result.get("reason")
+            ),
+            "dp_engine_placement_hook_failed",
+        )
+    contract_seen_count = sum(
+        bool(row.get("contract_seen_by_runtime")) for row in worker_results
+    )
+    return {
+        success_key: succeeded,
+        "success": succeeded,
+        "reason": reason,
+        "dp_engine_coordinated": True,
+        "dp_engine_count": len(engine_results),
+        "dp_engine_success_count": sum(
+            bool(result.get(success_key, result.get("success", False)))
+            for result in normalized
+        ),
+        "worker_count": len(worker_results),
+        "worker_success_count": sum(
+            bool(row.get(success_key, row.get("success", False)))
+            for row in worker_results
+        ),
+        "contract_seen_count": contract_seen_count,
+        "contract_seen_by_runtime": bool(contract_seen_count),
+        "contract_seen_by_all_workers": bool(
+            worker_results and contract_seen_count == len(worker_results)
+        ),
+        "contract_seen_worker_count": sum(
+            int(row.get("contract_seen_worker_count", 0) or 0)
+            for row in worker_results
+        ),
+        "contract_seen_worker_total": sum(
+            int(row.get("contract_seen_worker_total", 0) or 0)
+            for row in worker_results
+        ),
+        "physical_weight_migration": any(
+            bool(row.get("physical_weight_migration"))
+            for row in worker_results
+        ),
+        "moved_local_expert_shards": sum(
+            int(row.get("moved_local_expert_shards", 0) or 0)
+            for row in worker_results
+        ),
+        "moved_local_weight_bytes": sum(
+            int(row.get("moved_local_weight_bytes", 0) or 0)
+            for row in worker_results
+        ),
+        "physical_host_ids_observed": bool(
+            worker_results
+            and all(row.get("physical_host_ids_observed") for row in worker_results)
+        ),
+        "cross_node_weight_migration": any(
+            bool(row.get("cross_node_weight_migration"))
+            for row in worker_results
+        ),
+        "cross_node_moved_local_expert_shards": sum(
+            int(row.get("cross_node_moved_local_expert_shards", 0) or 0)
+            for row in worker_results
+        ),
+        "cross_node_moved_local_weight_bytes": sum(
+            int(row.get("cross_node_moved_local_weight_bytes", 0) or 0)
+            for row in worker_results
+        ),
+        "remap_duration_ms": max(
+            (
+                float(row.get("remap_duration_ms", 0.0) or 0.0)
+                for row in worker_results
+            ),
+            default=0.0,
+        ),
+        "runtime_verified_placement": bool(
+            worker_results
+            and all(row.get("runtime_verified_placement") for row in worker_results)
+        ),
+        "verification_levels": ",".join(
+            sorted(
+                {
+                    str(row.get("verification_level"))
+                    for row in worker_results
+                    if row.get("verification_level")
+                }
+            )
+        ),
+        "can_verify_physical_placement": any(
+            bool(row.get("can_verify_physical_placement"))
+            for row in worker_results
+        ),
+        "can_remap_live_ep_rank": any(
+            bool(row.get("can_remap_live_ep_rank")) for row in worker_results
+        ),
+        "can_measure_all_to_all": any(
+            bool(row.get("can_measure_all_to_all")) for row in worker_results
+        ),
+        "capability_reasons": ",".join(
+            sorted(
+                {
+                    str(row.get("capability_reason"))
+                    for row in worker_results
+                    if row.get("capability_reason")
+                }
+            )
+        ),
+        "worker_results": worker_results,
+        "active_requests_at_barrier": any(
+            bool(result.get("active_requests_at_barrier"))
+            for result in normalized
+        ),
+        "step_boundary_barrier": bool(normalized) and all(
+            bool(result.get("step_boundary_barrier", True))
+            for result in normalized
+        ),
+    }
+
+
+def aggregate_dp_engine_moe_metadata(
+    engine_results: list[Any],
+) -> dict[str, Any]:
+    """Merge runtime placement and A2A counters from all DP EngineCores."""
+    global_hotness: dict[str, int] = {}
+    recent_hotness: dict[str, int] = {}
+    placement_shards: dict[str, list[dict[str, Any]]] = {}
+    worker_snapshots: dict[str, dict[str, Any]] = {}
+    a2a_worker_snapshots: list[dict[str, Any]] = []
+    tracing_enabled = False
+    for dp_rank, result in enumerate(engine_results):
+        if not isinstance(result, Mapping):
+            continue
+        tracing_enabled = tracing_enabled or bool(
+            result.get("moe_route_tracing_enabled")
+        )
+        for target, field in (
+            (global_hotness, "global_expert_hotness"),
+            (recent_hotness, "recent_window_expert_hotness"),
+        ):
+            values = result.get(field)
+            if isinstance(values, Mapping):
+                for key, value in values.items():
+                    target[str(key)] = target.get(str(key), 0) + int(value or 0)
+        shards = result.get("runtime_expert_placement_shards")
+        if isinstance(shards, Mapping):
+            for expert_key, rows in shards.items():
+                if not isinstance(rows, list):
+                    continue
+                placement_shards.setdefault(str(expert_key), []).extend(
+                    dict(row) for row in rows if isinstance(row, Mapping)
+                )
+        snapshots = result.get("runtime_expert_placement_worker_snapshots")
+        if isinstance(snapshots, Mapping):
+            for worker_key, snapshot in snapshots.items():
+                if isinstance(snapshot, Mapping):
+                    worker_snapshots[f"dp:{dp_rank}/worker:{worker_key}"] = dict(
+                        snapshot
+                    )
+        rows = result.get("all_to_all_worker_snapshots")
+        if isinstance(rows, list):
+            a2a_worker_snapshots.extend(
+                dict(row) for row in rows if isinstance(row, Mapping)
+            )
+
+    def sum_field(field: str) -> int:
+        return sum(
+            int(result.get(field, 0) or 0)
+            for result in engine_results
+            if isinstance(result, Mapping)
+        )
+
+    available = bool(global_hotness)
+    return {
+        "moe_route_tracing_enabled": tracing_enabled,
+        "moe_route_histogram_available": available,
+        "moe_route_histogram_source": (
+            "vllm_runtime_topk" if available else "unavailable"
+        ),
+        "moe_route_histogram_kind": (
+            "runtime_observed_topk" if available else "unavailable"
+        ),
+        "global_expert_hotness": global_hotness,
+        "recent_window_expert_hotness": recent_hotness,
+        "runtime_expert_placement_available": bool(placement_shards),
+        "runtime_expert_placement_worker_count": len(worker_snapshots),
+        "runtime_expert_placement_shard_count": sum(
+            len(rows) for rows in placement_shards.values()
+        ),
+        "runtime_expert_placement_shards": placement_shards,
+        "runtime_expert_placement_worker_snapshots": worker_snapshots,
+        "all_to_all_counters_available": any(
+            bool(result.get("all_to_all_counters_available"))
+            for result in engine_results
+            if isinstance(result, Mapping)
+        ),
+        "all_to_all_collective_calls": sum_field("all_to_all_collective_calls"),
+        "all_to_all_observed_input_bytes": sum_field(
+            "all_to_all_observed_input_bytes"
+        ),
+        "all_to_all_observed_output_bytes": sum_field(
+            "all_to_all_observed_output_bytes"
+        ),
+        "all_to_all_internode_calls": sum_field("all_to_all_internode_calls"),
+        "all_to_all_worker_snapshots": a2a_worker_snapshots,
+        "dp_engine_coordinated": True,
+        "dp_engine_count": len(engine_results),
+    }
+
+
 @dataclass
 class _Layer:
     name: str
@@ -194,8 +422,13 @@ def _layers_for_plan(model: Any, plan: Mapping[str, Any]) -> tuple[list[_Layer],
         # transfer collective and deadlock.  Keep DP2 available for traffic
         # instrumentation, but fail closed for physical remap until a
         # coordinator can barrier every DP EngineCore simultaneously.
-        if int(runtime_parallel.data_parallel_size) != 1:
-            raise ValueError("data_parallel_expert_remap_not_supported")
+        runtime_dp_size = int(runtime_parallel.data_parallel_size)
+        coordinated_dp_engines = int(plan.get("dp_engine_count", 0) or 0)
+        if runtime_dp_size != 1 and not (
+            plan.get("dp_engine_coordinated") is True
+            and coordinated_dp_engines == runtime_dp_size
+        ):
+            raise ValueError("data_parallel_expert_remap_not_coordinated")
         for field in ("tensor_parallel_size", "data_parallel_size"):
             target_value = target_parallel.get(field)
             if target_value is not None and int(target_value) != int(
