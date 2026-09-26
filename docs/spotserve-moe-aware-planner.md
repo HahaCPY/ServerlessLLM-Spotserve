@@ -2057,6 +2057,55 @@ real all-to-all traffic:
   payload reduction remains an experimental result, not a completed claim
 ```
 
+### A2A Reduction Experiment
+
+`benchmark_matrix_expert_remap_a2a_reduction_performance.yaml` 定義一個有順序
+的 baseline/remap experiment：
+
+```text
+warmup
+-> baseline counter snapshot
+-> replay workload
+-> baseline counter delta
+-> coordinated physical expert remap
+-> candidate counter snapshot
+-> replay the identical workload
+-> candidate counter delta
+-> compare observed payload bytes
+```
+
+為避免把 cache reuse 當成 communication reduction，這個 config 強制關閉
+prefix caching。workload 使用偶數 request 數量，讓 DP round-robin 的起始位置在
+兩個 measurement windows 一致；runner 也要求前後 inference outputs 完全相同、
+runtime apply/verify 成功且兩邊都觀測到真實 collective calls。
+
+`traffic_reduced=true` 且 candidate payload 嚴格小於 baseline 時，才支援 A2A
+reduction claim。若 `allgather_reducescatter` 前後 bytes 相同，實驗仍可成功完成，
+但會回報 `payload_invariant_for_allgather_reducescatter` 與
+`claim_supported=false`。這代表 backend 的 collective volume 不受 expert
+ownership 改變，而不是把零改善包裝成成功。
+
+2026-09-26 的三次重複 median 實驗結果如下：
+
+```text
+physical expert shards moved: 4
+baseline collective calls: 1000
+candidate collective calls: 1000
+baseline observed payload: 1801872 bytes
+candidate observed payload: 1801872 bytes
+baseline bytes / collective: 1801.872
+candidate bytes / collective: 1801.872
+payload reduction ratio: 0.0
+traffic_reduced: false
+claim_supported: false
+interpretation: payload_invariant_for_allgather_reducescatter
+```
+
+因此 A2A reduction benchmark 與量測流程已完成，但目前 backend 的 reduction
+claim 不成立。下一步若要真正降低 traffic，不能只改 expert ownership；需要使用
+具有 destination-aware token dispatch 的 all-to-all backend，或在 runtime 加入
+local-token bypass / variable-size dispatch，然後用同一個 matrix 重測。
+
 ### Milestone E: Physical Cross-node Validation
 
 目標：把 same-host simulation 擴展到真正多機 GPU。

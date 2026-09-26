@@ -1651,6 +1651,36 @@ def main():
         help="Only write raw benchmark files; skip summary and HTML report generation",
     )
     args = parser.parse_args()
+    config = load_config(Path(args.config))
+    if config.get("experiment_type") == "expert_remap_a2a_reduction":
+        script = (
+            Path(__file__).resolve().parents[2]
+            / "scripts/run_expert_remap_a2a_reduction.py"
+        )
+        command = [
+            sys.executable,
+            str(script),
+            "--config",
+            args.config,
+            "--request-timeout",
+            str(args.request_timeout),
+            "--event-timeout",
+            str(
+                args.trace_event_timeout
+                if args.trace_event_timeout is not None
+                else config.get("event_timeout_s", 600)
+            ),
+            "--ray-address",
+            args.ray_address,
+            "--ray-namespace",
+            args.ray_namespace,
+        ]
+        if args.endpoint:
+            command.extend(["--endpoint", args.endpoint])
+        completed = subprocess.run(command, check=False)
+        if completed.returncode:
+            sys.exit(completed.returncode)
+        return
     try:
         asyncio.run(main_async(args))
     except RuntimeError as exc:

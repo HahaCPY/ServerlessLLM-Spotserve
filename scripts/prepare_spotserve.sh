@@ -774,6 +774,7 @@ for relative_path in (
     "examples/spotserve/config-vllm-expert-remap-active-request-performance.json",
     "examples/spotserve/config-vllm-expert-remap-dp2-a2a-performance.json",
     "examples/spotserve/config-vllm-expert-remap-dp2-coordinated-performance.json",
+    "examples/spotserve/config-vllm-expert-remap-a2a-reduction-performance.json",
     "examples/spotserve/config-vllm-reparallelization-applied-multi-worker-performance.json",
     "examples/spotserve/config-vllm-reparallelization-baseline-multi-worker-performance.json",
     "examples/spotserve/config-vllm-reparallelization-baseline-gpu-smoke.json",
@@ -1143,6 +1144,19 @@ ${HEAD_PYTHON} scripts/verify_spotserve_dp2_coordinated_remap.py \
   --endpoint http://127.0.0.1:8343 \
   --request-timeout 240 \
   --event-timeout 600
+'
+
+Run the same-workload baseline/remap A2A reduction experiment with:
+
+podman exec ${CONTAINER} bash -lc '
+cd ${WORKDIR_IN_CONTAINER} &&
+${HEAD_PYTHON} benchmarks/spotserve/run_benchmark.py \
+  --config benchmarks/spotserve/benchmark_matrix_expert_remap_a2a_reduction_performance.yaml \
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \
+  --request-timeout 240 \
+  --trace-event-timeout 600 \
+  --ray-address auto \
+  --ray-namespace sllm
 '
 EOF
 fi

@@ -634,6 +634,20 @@ Notes:
   physical migration of four expert shards (786432 bytes) in 123.13 ms. This
   validates same-host `TP1 x DP2 x EP2` coordinated physical remap; it does not
   validate cross-host movement, live EP resizing, or A2A traffic reduction.
+- `benchmark_matrix_expert_remap_a2a_reduction_performance.yaml` now runs a
+  sequential same-workload comparison around the verified DP2 remap. Prefix
+  caching is disabled, baseline/candidate outputs must match, and each counter
+  window must contain real collectives. The report distinguishes a completed
+  measurement from a supported reduction claim: only strictly lower candidate
+  payload sets `traffic_reduced` and `claim_supported` to true. Equal payload
+  on `allgather_reducescatter` is reported as backend payload invariance.
+- The 2026-09-26 three-window median run completed successfully but did not
+  support a reduction claim. Four expert shards moved and runtime placement
+  remained verified, while both baseline and candidate recorded 1000
+  collectives and 1801872 bytes (1801.872 bytes per collective). The measured
+  reduction ratio was zero. This confirms that changing ownership alone does
+  not reduce payload for the current `allgather_reducescatter` backend; a
+  destination-aware variable-size backend or local-token bypass is required.
 - For the placement ordering guard, require
   `context_migration_placement_handshake_stale = 0` and
   `state_recovery_placement_handshake_stale = 0` before claiming that migration

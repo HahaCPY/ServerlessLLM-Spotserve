@@ -88,6 +88,34 @@ def infer(endpoint, model_name, prompt, timeout):
     return response
 
 
+def cleanup_model(endpoint, model_name, instance_ids):
+    try:
+        post_json(endpoint, "delete", {"model": model_name}, 120)
+    finally:
+        deadline = time.monotonic() + 30
+        pending = set(instance_ids)
+        while time.monotonic() < deadline:
+            pending.update(
+                row["name"]
+                for row in ray.util.list_named_actors(all_namespaces=True)
+                if row["namespace"] == "sllm"
+                and row["name"].startswith(f"{model_name}_")
+            )
+            live = set()
+            for instance_id in pending:
+                try:
+                    actor = ray.get_actor(instance_id, namespace="sllm")
+                    ray.kill(actor, no_restart=True)
+                    live.add(instance_id)
+                except ValueError:
+                    pass
+            if not live:
+                return
+            pending = live
+            time.sleep(0.5)
+        raise RuntimeError(f"Timed out cleaning backend actors: {sorted(pending)}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -125,10 +153,12 @@ def main():
         raise RuntimeError("Two free Ray GPUs are required for this test")
 
     registered = False
+    instance_ids = set()
     try:
         registered = True
         post_json(args.endpoint, "register", config, args.ready_timeout)
         instance_id, state = wait_for_instance(model_name, args.ready_timeout)
+        instance_ids.add(instance_id)
 
         infer(
             args.endpoint,
@@ -231,7 +261,7 @@ def main():
     finally:
         if registered:
             try:
-                post_json(args.endpoint, "delete", {"model": model_name}, 120)
+                cleanup_model(args.endpoint, model_name, instance_ids)
             except Exception as exc:
                 print(f"Cleanup warning for {model_name}: {exc}")
 
