@@ -710,6 +710,9 @@ def get_vllm_model_resource_profile(
     all_to_all_internode_calls = _optional_non_negative_int(
         runtime_metadata.get("all_to_all_internode_calls")
     ) or 0
+    all_to_all_measurement_kind = str(
+        runtime_metadata.get("all_to_all_measurement_kind") or "unavailable"
+    )
 
     profile = {
         "model_name": model_name,
@@ -858,6 +861,7 @@ def get_vllm_model_resource_profile(
         "all_to_all_observed_input_bytes": all_to_all_observed_input_bytes,
         "all_to_all_observed_output_bytes": all_to_all_observed_output_bytes,
         "all_to_all_internode_calls": all_to_all_internode_calls,
+        "all_to_all_measurement_kind": all_to_all_measurement_kind,
         "expert_placement_runtime_capability_reason": (
             runtime_capability_reason
         ),
@@ -1132,6 +1136,9 @@ def get_vllm_runtime_metadata(
         ],
         "all_to_all_internode_calls": profile[
             "all_to_all_internode_calls"
+        ],
+        "all_to_all_measurement_kind": profile[
+            "all_to_all_measurement_kind"
         ],
         "expert_placement_runtime_capability_reason": (
             profile["expert_placement_runtime_capability_reason"]

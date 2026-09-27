@@ -15,6 +15,7 @@ from sllm.vllm_expert_remap import (
     get_all_to_all_counters,
     prepare_expert_remap,
     record_all_to_all_collective,
+    record_sparse_all_to_all_transfer,
     reset_all_to_all_counters,
 )
 from vllm.v1.engine.core import EngineCore
@@ -203,6 +204,9 @@ class ExpertRemapPreflightTests(unittest.TestCase):
                 },
                 "runtime_expert_placement_worker_snapshots": {"0": {}},
                 "all_to_all_collective_calls": 4,
+                "all_to_all_measurement_kind": (
+                    "runtime_sparse_transfer_payload"
+                ),
             },
             {
                 "global_expert_hotness": {"1": 5},
@@ -211,11 +215,18 @@ class ExpertRemapPreflightTests(unittest.TestCase):
                 },
                 "runtime_expert_placement_worker_snapshots": {"0": {}},
                 "all_to_all_collective_calls": 6,
+                "all_to_all_measurement_kind": (
+                    "runtime_sparse_transfer_payload"
+                ),
             },
         ])
         self.assertEqual(result["runtime_expert_placement_worker_count"], 2)
         self.assertEqual(result["runtime_expert_placement_shard_count"], 2)
         self.assertEqual(result["all_to_all_collective_calls"], 10)
+        self.assertEqual(
+            result["all_to_all_measurement_kind"],
+            "runtime_sparse_transfer_payload",
+        )
 
     def test_rejects_parallel_size_change(self):
         self.plan["target_parallel_plan"]["tensor_parallel_size"] = 4
@@ -261,6 +272,9 @@ class ActiveRequestBarrierTests(unittest.TestCase):
             _aggregate_expert_placement_hook_results=(
                 EngineCore._aggregate_expert_placement_hook_results
             ),
+        )
+        self.core.prepare_expert_placement_plan = lambda plan: (
+            EngineCore.prepare_expert_placement_plan(self.core, plan)
         )
         self.plan = make_plan()
 
@@ -405,6 +419,34 @@ class AllToAllCounterTests(unittest.TestCase):
         self.assertEqual(counters["internode_calls"], 2)
         self.assertEqual(counters["observed_input_bytes"], 160)
         self.assertEqual(counters["observed_output_bytes"], 224)
+
+    def test_records_sparse_transfer_payload(self):
+        with patch.dict(os.environ, {"VLLM_SPOTSERVE_A2A_TRACE": "1"}):
+            record_sparse_all_to_all_transfer(
+                "dispatch",
+                sent_bytes=128,
+                received_bytes=96,
+                remote_rows=3,
+                local_rows=5,
+            )
+            record_sparse_all_to_all_transfer(
+                "combine",
+                sent_bytes=64,
+                received_bytes=80,
+                remote_rows=3,
+                local_rows=5,
+            )
+            counters = get_all_to_all_counters()
+        self.assertTrue(counters["available"])
+        self.assertEqual(counters["collective_calls"], 2)
+        self.assertEqual(counters["observed_input_bytes"], 192)
+        self.assertEqual(counters["observed_output_bytes"], 176)
+        self.assertEqual(counters["sparse_remote_rows"], 6)
+        self.assertEqual(counters["sparse_local_rows"], 10)
+        self.assertEqual(
+            counters["measurement_kind"],
+            "runtime_sparse_transfer_payload",
+        )
 
 
 if __name__ == "__main__":

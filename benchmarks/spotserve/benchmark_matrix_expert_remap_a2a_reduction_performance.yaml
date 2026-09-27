@@ -9,7 +9,7 @@
   "request_timeout_s": 240,
   "event_timeout_s": 600,
   "measurement_repetitions": 3,
-  "require_traffic_reduction": false,
+  "require_traffic_reduction": true,
   "comparison_fields": [
     "collective_calls",
     "observed_input_bytes",

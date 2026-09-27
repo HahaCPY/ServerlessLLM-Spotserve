@@ -30,6 +30,8 @@ _ALL_TO_ALL_COUNTERS: dict[str, Any] = {
     "combine_input_bytes": 0,
     "combine_output_bytes": 0,
     "internode_calls": 0,
+    "sparse_remote_rows": 0,
+    "sparse_local_rows": 0,
     "backends": {},
 }
 
@@ -81,6 +83,35 @@ def record_all_to_all_collective(
         backends[backend] = int(backends.get(backend, 0)) + 1
 
 
+def record_sparse_all_to_all_transfer(
+    phase: str,
+    *,
+    sent_bytes: int,
+    received_bytes: int,
+    remote_rows: int,
+    local_rows: int,
+) -> None:
+    """Record payload actually exchanged by the sparse token backend."""
+    if not all_to_all_counters_enabled():
+        return
+    normalized_phase = str(phase).strip().lower()
+    if normalized_phase not in {"dispatch", "combine"}:
+        raise ValueError(f"unsupported_all_to_all_phase:{phase}")
+    with _ALL_TO_ALL_LOCK:
+        _ALL_TO_ALL_COUNTERS[f"{normalized_phase}_calls"] += 1
+        _ALL_TO_ALL_COUNTERS[f"{normalized_phase}_input_bytes"] += int(
+            sent_bytes
+        )
+        _ALL_TO_ALL_COUNTERS[f"{normalized_phase}_output_bytes"] += int(
+            received_bytes
+        )
+        _ALL_TO_ALL_COUNTERS["sparse_remote_rows"] += int(remote_rows)
+        _ALL_TO_ALL_COUNTERS["sparse_local_rows"] += int(local_rows)
+        backends = _ALL_TO_ALL_COUNTERS["backends"]
+        backend = "SpotServeSparseAllToAll"
+        backends[backend] = int(backends.get(backend, 0)) + 1
+
+
 def get_all_to_all_counters() -> dict[str, Any]:
     with _ALL_TO_ALL_LOCK:
         counters = {
@@ -100,7 +131,11 @@ def get_all_to_all_counters() -> dict[str, Any]:
     counters["available"] = bool(
         counters["enabled"] and counters["collective_calls"] > 0
     )
-    counters["measurement_kind"] = "runtime_collective_tensor_payload"
+    counters["measurement_kind"] = (
+        "runtime_sparse_transfer_payload"
+        if counters["backends"].get("SpotServeSparseAllToAll")
+        else "runtime_collective_tensor_payload"
+    )
     return counters
 
 
@@ -332,6 +367,16 @@ def aggregate_dp_engine_moe_metadata(
             "all_to_all_observed_output_bytes"
         ),
         "all_to_all_internode_calls": sum_field("all_to_all_internode_calls"),
+        "all_to_all_measurement_kind": ",".join(
+            sorted(
+                {
+                    str(result.get("all_to_all_measurement_kind"))
+                    for result in engine_results
+                    if isinstance(result, Mapping)
+                    and result.get("all_to_all_measurement_kind")
+                }
+            )
+        ) or "unavailable",
         "all_to_all_worker_snapshots": a2a_worker_snapshots,
         "dp_engine_coordinated": True,
         "dp_engine_count": len(engine_results),
@@ -358,6 +403,9 @@ def _target_ep_rank(value: Any, ep_size: int) -> int:
 def _layers_for_plan(model: Any, plan: Mapping[str, Any]) -> tuple[list[_Layer], Any]:
     from vllm.distributed.parallel_state import get_ep_group
     from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+    from vllm.model_executor.layers.fused_moe.fused_moe_modular_method import (
+        FusedMoEModularMethod,
+    )
     from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
         UnquantizedFusedMoEMethod,
     )
@@ -402,7 +450,10 @@ def _layers_for_plan(model: Any, plan: Mapping[str, Any]) -> tuple[list[_Layer],
         if match is None:
             raise ValueError(f"moe_layer_id_unavailable:{name}")
         layer_id = int(match.group(1))
-        if not isinstance(module.quant_method, UnquantizedFusedMoEMethod):
+        quant_method = module.quant_method
+        if isinstance(quant_method, FusedMoEModularMethod):
+            quant_method = quant_method.old_quant_method
+        if not isinstance(quant_method, UnquantizedFusedMoEMethod):
             raise ValueError("quantized_expert_remap_not_supported")
         if (not module.use_ep or module.enable_eplb
                 or module.num_fused_shared_experts
@@ -411,6 +462,7 @@ def _layers_for_plan(model: Any, plan: Mapping[str, Any]) -> tuple[list[_Layer],
         if module.moe_parallel_config.all2all_backend not in {
             "naive",
             "allgather_reducescatter",
+            "spotserve_sparse",
         }:
             raise ValueError("all_to_all_backend_does_not_support_custom_map")
         if module.ep_rank != ep_rank or module.ep_size != ep_size:
@@ -464,7 +516,10 @@ def _layers_for_plan(model: Any, plan: Mapping[str, Any]) -> tuple[list[_Layer],
                 new_local.append(expert_id)
         if len(new_local) != local_count:
             raise ValueError(f"local_expert_count_change:{name}")
-        weights = list(module.get_expert_weights())
+        if isinstance(module.quant_method, FusedMoEModularMethod):
+            weights = [module.w13_weight, module.w2_weight]
+        else:
+            weights = list(module.get_expert_weights())
         if len(weights) != 2 or any(
             weight.shape[0] != local_count or not weight.is_contiguous()
             for weight in weights

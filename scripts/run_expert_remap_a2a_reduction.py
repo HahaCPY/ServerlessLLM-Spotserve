@@ -84,6 +84,9 @@ def runtime_profile(instance_id, state):
 def counters(profile):
     return {
         "available": bool(profile.get("all_to_all_counters_available")),
+        "measurement_kind": str(
+            profile.get("all_to_all_measurement_kind", "unavailable")
+        ),
         "collective_calls": int(profile.get("all_to_all_collective_calls", 0)),
         "observed_input_bytes": int(
             profile.get("all_to_all_observed_input_bytes", 0)
@@ -100,6 +103,7 @@ def counter_delta(after, before):
     delta["observed_payload_bytes"] = (
         delta["observed_input_bytes"] + delta["observed_output_bytes"]
     )
+    delta["measurement_kind"] = after["measurement_kind"]
     return delta
 
 
@@ -182,6 +186,13 @@ def measure_windows(
         )
         after = counters(runtime_profile(instance_id, state))
         trial["counters"] = counter_delta(after, before)
+        if trial["counters"]["measurement_kind"] != (
+            "runtime_sparse_transfer_payload"
+        ):
+            raise RuntimeError(
+                "Expected sparse A2A counters, observed "
+                f"{trial['counters']['measurement_kind']}"
+            )
         if trial["counters"]["collective_calls"] <= 0:
             raise RuntimeError("Measurement window observed no real A2A collectives")
         trials.append(trial)
@@ -204,6 +215,7 @@ def measure_windows(
             trial["throughput_req_s"] for trial in trials
         ),
         "counters": median_counters,
+        "measurement_kind": trials[0]["counters"]["measurement_kind"],
         "observed_payload_bytes_per_collective": (
             median_counters["observed_payload_bytes"] / calls
         ),
@@ -263,6 +275,11 @@ def main():
         raise RuntimeError("A2A reduction workload must contain an even request count")
 
     config = load_json(Path(matrix["deploy_config"]))
+    backend = str(config["backend_config"].get("all2all_backend", ""))
+    if backend != "spotserve_sparse":
+        raise RuntimeError(
+            "A2A reduction experiment requires all2all_backend=spotserve_sparse"
+        )
     model_name = f"vllm-a2a-reduction-{uuid.uuid4().hex[:8]}"
     config["model"] = model_name
     config["backend_config"]["enable_prefix_caching"] = False
@@ -361,13 +378,10 @@ def main():
             raise RuntimeError("Baseline observed no A2A tensor payload")
         reduction_ratio = (baseline_bytes - candidate_bytes) / baseline_bytes
         traffic_reduced = candidate_bytes < baseline_bytes
-        backend = str(config["backend_config"].get("all2all_backend", ""))
         if traffic_reduced:
             interpretation = "measured_collective_payload_reduction"
-        elif candidate_bytes == baseline_bytes and backend == (
-            "allgather_reducescatter"
-        ):
-            interpretation = "payload_invariant_for_allgather_reducescatter"
+        elif candidate_bytes == baseline_bytes:
+            interpretation = "sparse_payload_unchanged_for_selected_placement"
         else:
             interpretation = "measured_collective_payload_not_reduced"
 

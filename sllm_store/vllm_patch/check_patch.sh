@@ -24,6 +24,7 @@ PATCH_FILES=(
     "$SCRIPT_DIR/runtime_kv_metadata.patch"
     "$SCRIPT_DIR/runtime_kv_restore.patch"
     "$SCRIPT_DIR/runtime_moe_metadata.patch"
+    "$SCRIPT_DIR/runtime_sparse_a2a.patch"
 )
 
 VLLM_PATH_OUTPUT=$(python -c "import vllm; import os; print(os.path.dirname(os.path.abspath(vllm.__file__)))" 2>/dev/null)
@@ -161,4 +162,11 @@ if [[ "${SPOTSERVE_REQUIRE_MOE_ROUTE_INSTRUMENTATION:-0}" == "1" ||
         echo "Missing patched vLLM MoE/placement markers: ${MISSING_MOE_MARKERS[*]}" >&2
         exit 1
     fi
+fi
+
+if ! grep -q '"spotserve_sparse"' "$VLLM_PATH/envs.py" ||
+    ! grep -q "SpotServeSparsePrepareAndFinalize" \
+        "$VLLM_PATH/model_executor/layers/fused_moe/all2all_utils.py"; then
+    echo "Missing patched vLLM SpotServe sparse A2A backend" >&2
+    exit 1
 fi

@@ -2054,7 +2054,8 @@ cross-node movement:
 
 real all-to-all traffic:
   DP2 inference/measurement and coordinated physical-remap gates passed;
-  payload reduction remains an experimental result, not a completed claim
+  same-host sparse dispatch payload reduction passed;
+  internode traffic reduction remains unverified
 ```
 
 ### A2A Reduction Experiment
@@ -2080,12 +2081,16 @@ prefix caching。workload 使用偶數 request 數量，讓 DP round-robin 的�
 runtime apply/verify 成功且兩邊都觀測到真實 collective calls。
 
 `traffic_reduced=true` 且 candidate payload 嚴格小於 baseline 時，才支援 A2A
-reduction claim。若 `allgather_reducescatter` 前後 bytes 相同，實驗仍可成功完成，
+reduction claim。runner 另外要求 measurement kind 必須是
+`runtime_sparse_transfer_payload`，避免把固定大小 collective 的估計值誤當成
+destination-aware sparse transfer。若 `allgather_reducescatter` 前後 bytes 相同，
+實驗仍可成功完成，
 但會回報 `payload_invariant_for_allgather_reducescatter` 與
 `claim_supported=false`。這代表 backend 的 collective volume 不受 expert
 ownership 改變，而不是把零改善包裝成成功。
 
-2026-09-26 的三次重複 median 實驗結果如下：
+2026-09-26 先以 `allgather_reducescatter` 執行三次重複 median，得到負向
+baseline：
 
 ```text
 physical expert shards moved: 4
@@ -2101,10 +2106,31 @@ claim_supported: false
 interpretation: payload_invariant_for_allgather_reducescatter
 ```
 
-因此 A2A reduction benchmark 與量測流程已完成，但目前 backend 的 reduction
-claim 不成立。下一步若要真正降低 traffic，不能只改 expert ownership；需要使用
-具有 destination-aware token dispatch 的 all-to-all backend，或在 runtime 加入
-local-token bypass / variable-size dispatch，然後用同一個 matrix 重測。
+接著加入 `spotserve_sparse` backend。它從 runtime `topk_ids` 與目前
+`expert_map` 建立每個 token 的 destination ranks，本地 expert 路由不進網路，遠端
+token 則使用 variable-size `all_to_all_single` dispatch/combine。相同 workload、
+相同輸出與三次重複 median 的結果為：
+
+```text
+all-to-all backend: spotserve_sparse
+measurement kind: runtime_sparse_transfer_payload
+physical expert shards moved: 4
+outputs match: true
+baseline collective calls: 992
+candidate collective calls: 1000
+baseline observed payload: 1148928 bytes
+candidate observed payload: 931392 bytes
+payload reduction: 217536 bytes
+payload reduction ratio: 0.189338 (18.93%)
+traffic_reduced: true
+claim_supported: true
+interpretation: measured_collective_payload_reduction
+```
+
+因此目前可以宣稱：在這個 same-host、DP2/EP2、未量化 Qwen2-MoE-Tiny workload
+中，physical expert remap 配合 destination-aware sparse dispatch，使實際送收的
+GPU collective payload median 降低 18.93%。這仍不是跨實體主機或 NIC traffic
+reduction 證據；該次結果的 `internode_calls=0`，跨節點 claim 必須另外驗證。
 
 ### Milestone E: Physical Cross-node Validation
 

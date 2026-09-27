@@ -1,0 +1,110 @@
+diff --git a/vllm/envs.py b/vllm/envs.py
+index d83fb16a8..1cbfcf682 100644
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -171,6 +171,7 @@ if TYPE_CHECKING:
+         "deepep_low_latency",
+         "allgather_reducescatter",
+         "flashinfer_all2allv",
++        "spotserve_sparse",
+     ] = "allgather_reducescatter"
+     VLLM_MAX_TOKENS_PER_EXPERT_FP4_MOE: int = 163840
+     VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS: int = 1
+@@ -1222,6 +1223,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     # - "deepep_high_throughput", use deepep high-throughput kernels
+     # - "deepep_low_latency", use deepep low-latency kernels
+     # - "flashinfer_all2allv", use flashinfer alltoallv kernels for mnnvl
++    # - "spotserve_sparse", use routing-aware PyTorch variable-size all-to-all
+     "VLLM_ALL2ALL_BACKEND": env_with_choices(
+         "VLLM_ALL2ALL_BACKEND",
+         "allgather_reducescatter",
+@@ -1233,6 +1235,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
+             "deepep_low_latency",
+             "allgather_reducescatter",
+             "flashinfer_all2allv",
++            "spotserve_sparse",
+         ],
+     ),
+     # Flashinfer MoE backend for vLLM's fused Mixture-of-Experts support.
+diff --git a/vllm/config/parallel.py b/vllm/config/parallel.py
+index b8baf5717..b95f35a12 100644
+--- a/vllm/config/parallel.py
++++ b/vllm/config/parallel.py
+@@ -125,6 +125,7 @@ class ParallelConfig:
+             "deepep_low_latency",
+             "allgather_reducescatter",
+             "flashinfer_all2allv",
++            "spotserve_sparse",
+         ]
+         | None
+     ) = None
+@@ -138,7 +139,8 @@ class ParallelConfig:
+     - "pplx": Use pplx kernels
+     - "deepep_high_throughput": Use deepep high-throughput kernels
+     - "deepep_low_latency": Use deepep low-latency kernels
+-    - "flashinfer_all2allv": Use flashinfer alltoallv kernels for mnnvl"""
++    - "flashinfer_all2allv": Use flashinfer alltoallv kernels for mnnvl
++    - "spotserve_sparse": Use routing-aware PyTorch variable-size all-to-all"""
+     num_redundant_experts: int | None = None
+     """`num_redundant_experts` is deprecated and has been replaced with
+     `eplb_config.num_redundant_experts`. This will be removed in v0.12.0.
+diff --git a/vllm/distributed/device_communicators/cuda_communicator.py b/vllm/distributed/device_communicators/cuda_communicator.py
+index 61fb5eb42..790fc49cb 100644
+--- a/vllm/distributed/device_communicators/cuda_communicator.py
++++ b/vllm/distributed/device_communicators/cuda_communicator.py
+@@ -99,5 +99,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
+ 
+                 self.all2all_manager = AgRsAll2AllManager(self.cpu_group)
++            elif self.all2all_backend == "spotserve_sparse":
++                from .all2all import AgRsAll2AllManager
++
++                self.all2all_manager = AgRsAll2AllManager(self.cpu_group)
+             elif self.all2all_backend == "pplx":
+                 from .all2all import PPLXAll2AllManager
+ 
+diff --git a/vllm/model_executor/layers/fused_moe/config.py b/vllm/model_executor/layers/fused_moe/config.py
+index 730875b24..874bf87e2 100644
+--- a/vllm/model_executor/layers/fused_moe/config.py
++++ b/vllm/model_executor/layers/fused_moe/config.py
+@@ -700,6 +700,13 @@ class FusedMoEParallelConfig:
+     def use_pplx_kernels(self):
+         return self.use_all2all_kernels and self.all2all_backend == "pplx"
+ 
++    @property
++    def use_spotserve_sparse_kernels(self):
++        return (
++            self.use_all2all_kernels
++            and self.all2all_backend == "spotserve_sparse"
++        )
++
+     @property
+     def use_deepep_ht_kernels(self):
+         return (
+diff --git a/vllm/model_executor/layers/fused_moe/all2all_utils.py b/vllm/model_executor/layers/fused_moe/all2all_utils.py
+index 1e5f137bf..df67cb629 100644
+--- a/vllm/model_executor/layers/fused_moe/all2all_utils.py
++++ b/vllm/model_executor/layers/fused_moe/all2all_utils.py
+@@ -5,5 +5,6 @@ import torch
+ 
+ from vllm.distributed import (
++    get_dp_group,
+     get_ep_group,
+ )
+ from vllm.model_executor.layers.fused_moe.config import (
+@@ -69,7 +70,15 @@ def maybe_make_prepare_finalize(
+     # TODO: could allow this now
+     assert not moe.use_flashinfer_cutlass_kernels, "Must be created in modelopt.py"
+ 
+-    if moe.use_pplx_kernels:
++    if moe.moe_parallel_config.use_spotserve_sparse_kernels:
++        from sllm.vllm_sparse_a2a import SpotServeSparsePrepareAndFinalize
++
++        assert get_dp_group().world_size == moe.dp_size
++        prepare_finalize = SpotServeSparsePrepareAndFinalize(
++            dp_size=moe.dp_size,
++            ep_size=moe.ep_size,
++        )
++    elif moe.use_pplx_kernels:
+         assert quant_config is not None
+ 
+         hidden_dim_bytes, hidden_scale_bytes = pplx_hidden_dim_scale_bytes(

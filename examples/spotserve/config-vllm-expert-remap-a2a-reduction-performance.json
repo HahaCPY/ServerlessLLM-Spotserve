@@ -27,7 +27,7 @@
       "num_hidden_layers": 2,
       "num_experts": 4
     },
-    "all2all_backend": "allgather_reducescatter",
+    "all2all_backend": "spotserve_sparse",
     "expert_placement_strategy": "linear",
     "enable_prefix_caching": false,
     "enforce_eager": true,

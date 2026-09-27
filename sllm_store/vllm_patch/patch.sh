@@ -24,6 +24,7 @@ PATCH_FILES=(
     "$SCRIPT_DIR/runtime_kv_metadata.patch"
     "$SCRIPT_DIR/runtime_kv_restore.patch"
     "$SCRIPT_DIR/runtime_moe_metadata.patch"
+    "$SCRIPT_DIR/runtime_sparse_a2a.patch"
 )
 
 for PATCH_FILE in "${PATCH_FILES[@]}"; do
@@ -99,6 +100,11 @@ fi
 if ! grep -q "def verify_expert_placement_plan" \
     "$VLLM_PATH/v1/worker/worker_base.py"; then
     MISSING_MOE_MARKERS+=("worker_base.verify_expert_placement_plan")
+fi
+if ! grep -q '"spotserve_sparse"' "$VLLM_PATH/envs.py" ||
+    ! grep -q "SpotServeSparsePrepareAndFinalize" \
+        "$VLLM_PATH/model_executor/layers/fused_moe/all2all_utils.py"; then
+    MISSING_MOE_MARKERS+=("spotserve_sparse.all2all_backend")
 fi
 if [[ "${#MISSING_MOE_MARKERS[@]}" -gt 0 ]]; then
     echo "Missing patched vLLM MoE/placement markers: ${MISSING_MOE_MARKERS[*]}" >&2

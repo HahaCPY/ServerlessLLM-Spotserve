@@ -959,7 +959,15 @@ index 5bc564f36..7fbdc4101 100644
  
  import msgspec
  import zmq
-@@ -654,6 +654,402 @@ class EngineCore:
+@@ -338,3 +338,7 @@ class EngineCore:
++        if getattr(self, "_spotserve_expert_remap_failed", False):
++            raise RuntimeError(
++                "expert_weights_inconsistent_after_failed_remap"
++            )
+         # Check for any requests remaining in the scheduler - unfinished,
+         # or finished and not yet removed from the batch.
+         if not self.scheduler.has_requests():
+@@ -654,6 +654,411 @@ class EngineCore:
              for request_id in list(requests)
          ]
  
@@ -1112,6 +1120,15 @@ index 5bc564f36..7fbdc4101 100644
 +                int(row.get("internode_calls", 0) or 0)
 +                for row in all_to_all_snapshots
 +            ),
++            "all_to_all_measurement_kind": ",".join(
++                sorted(
++                    {
++                        str(row.get("measurement_kind"))
++                        for row in all_to_all_snapshots
++                        if row.get("measurement_kind")
++                    }
++                )
++            ) or "unavailable",
 +            "all_to_all_worker_snapshots": all_to_all_snapshots,
 +        }
 +
