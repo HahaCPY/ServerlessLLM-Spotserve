@@ -1,0 +1,81 @@
+{
+  "model": "vllm-expert-remap-a2a-reduction-perf",
+  "backend": "vllm",
+  "router_num_cpus": 0,
+  "num_cpus": 1,
+  "num_gpus": 2,
+  "auto_scaling_config": {
+    "metric": "concurrency",
+    "target": 1,
+    "min_instances": 1,
+    "max_instances": 1,
+    "keep_alive": 60
+  },
+  "backend_config": {
+    "pretrained_model_name_or_path": "/models/Qwen2-MoE-Tiny",
+    "load_format": "auto",
+    "torch_dtype": "float16",
+    "gpu_memory_utilization": 0.45,
+    "max_model_len": 512,
+    "max_num_seqs": 2,
+    "tensor_parallel_size": 1,
+    "pipeline_parallel_size": 1,
+    "data_parallel_size": 2,
+    "data_parallel_backend": "mp",
+    "enable_expert_parallel": true,
+    "model_config": {
+      "num_hidden_layers": 2,
+      "num_experts": 4
+    },
+    "all2all_backend": "spotserve_sparse",
+    "expert_placement_strategy": "linear",
+    "enable_prefix_caching": false,
+    "enforce_eager": true,
+    "trust_remote_code": true
+  },
+  "router_config": {
+    "count_preempting_toward_capacity": true,
+    "enable_reparallelization": true,
+    "reparallelization_config": {
+      "target_replica_gpus": 2,
+      "min_tensor_parallel_size": 1,
+      "max_tensor_parallel_size": 1,
+      "min_data_parallel_size": 2,
+      "max_data_parallel_size": 2,
+      "max_pipeline_parallel_size": 1,
+      "min_replica_count": 1,
+      "max_replica_count": 1,
+      "target_expert_placement_strategy": "round_robin",
+      "enable_live_expert_remap": true,
+      "allow_active_expert_remap_requests": false,
+      "enable_workload_cost_model": true,
+      "batch_size": 1,
+      "latency_estimate_ms": 1000,
+      "model_load_time_ms": 5000,
+      "load_time_per_gpu_ms": 500,
+      "migration_cost_ms": 200,
+      "migration_cost_per_replica_ms": 100,
+      "queue_penalty_ms_per_req_s": 1000,
+      "throughput_score_weight": 100,
+      "latency_penalty_weight": 0,
+      "load_time_penalty_weight": 0.1,
+      "migration_cost_penalty_weight": 0.1,
+      "queue_penalty_weight": 0.1,
+      "drain_timeout_s": 30,
+      "allow_stop_before_recreate": true,
+      "allow_preempting_target_recreate": true,
+      "synthetic_worker_nodes": {
+        "0": {
+          "ray_node_id": "synthetic-worker-0",
+          "address": "synthetic-0",
+          "_spotserve_counts_as_runtime_worker": true,
+          "runtime_worker_placeholder_reason": "same_node_a2a_reduction",
+          "free_gpu": 2,
+          "total_gpu": 4,
+          "state": "ready"
+        }
+      }
+    },
+    "metrics_path": "/tmp/spotserve-work/results/spotserve_expert_remap_a2a_reduction_performance/router.jsonl"
+  }
+}

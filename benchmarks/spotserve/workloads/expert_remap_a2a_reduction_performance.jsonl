@@ -1,0 +1,4 @@
+{"request_id":"a2a-reduction-0001","messages":[{"role":"user","content":"Explain why expert routing is useful in one sentence."}],"max_tokens":24,"temperature":0}
+{"request_id":"a2a-reduction-0002","messages":[{"role":"user","content":"Explain expert parallel inference in one sentence."}],"max_tokens":24,"temperature":0}
+{"request_id":"a2a-reduction-0003","messages":[{"role":"user","content":"Explain sparse mixture-of-experts in one sentence."}],"max_tokens":24,"temperature":0}
+{"request_id":"a2a-reduction-0004","messages":[{"role":"user","content":"Explain all-to-all communication in one sentence."}],"max_tokens":24,"temperature":0}

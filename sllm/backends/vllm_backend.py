@@ -211,6 +211,196 @@ def _runtime_hook_reason(result: Any, default: str) -> str:
     return default
 
 
+def _runtime_hook_str(result: Any, *keys: str, default: str = "") -> str:
+    if isinstance(result, Mapping):
+        for key in keys:
+            value = result.get(key)
+            if value not in (None, ""):
+                return str(value)
+    return default
+
+
+def _runtime_hook_any_truthy(result: Any, *keys: str) -> bool:
+    if any(_runtime_hook_bool(result, key, default=False) for key in keys):
+        return True
+    return any(
+        any(_runtime_hook_bool(row, key, default=False) for key in keys)
+        for row in _runtime_hook_worker_results(result)
+    )
+
+
+def _runtime_hook_int(result: Any, key: str, default: int = 0) -> int:
+    if isinstance(result, Mapping) and key in result:
+        parsed = _as_non_negative_int(result.get(key))
+        if parsed is not None:
+            return parsed
+    return default
+
+
+def _runtime_hook_worker_results(result: Any) -> List[Mapping[str, Any]]:
+    if not isinstance(result, Mapping):
+        return []
+    worker_results = result.get("worker_results")
+    if not isinstance(worker_results, Sequence) or isinstance(
+        worker_results, (str, bytes)
+    ):
+        return []
+    return [
+        cast(Mapping[str, Any], row)
+        for row in worker_results
+        if isinstance(row, Mapping)
+    ]
+
+
+def _runtime_hook_worker_truthy_count(
+    result: Any,
+    key: str,
+    *,
+    fallback_key: Optional[str] = None,
+) -> int:
+    rows = _runtime_hook_worker_results(result)
+    if not rows:
+        return 1 if _runtime_hook_bool(result, key, default=False) else 0
+    return sum(
+        1
+        for row in rows
+        if _runtime_hook_bool(row, key, default=False)
+        or (
+            fallback_key is not None
+            and _runtime_hook_bool(row, fallback_key, default=False)
+        )
+    )
+
+
+def _runtime_hook_worker_count(result: Any) -> int:
+    rows = _runtime_hook_worker_results(result)
+    return _runtime_hook_int(
+        result,
+        "worker_count",
+        len(rows) if rows else (1 if isinstance(result, Mapping) else 0),
+    )
+
+
+def _runtime_hook_worker_int_sum(result: Any, key: str) -> int:
+    rows = _runtime_hook_worker_results(result)
+    if rows:
+        return sum(_runtime_hook_int(row, key, 0) for row in rows)
+    return _runtime_hook_int(result, key, 0)
+
+
+def _runtime_hook_worker_float_max(result: Any, key: str) -> float:
+    rows = _runtime_hook_worker_results(result)
+    values = []
+    for row in rows or ([result] if isinstance(result, Mapping) else []):
+        try:
+            value = float(row.get(key, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if value >= 0:
+            values.append(value)
+    return max(values, default=0.0)
+
+
+def _runtime_hook_contract_seen_by_runtime(
+    result: Any,
+    plan_fingerprint: str,
+) -> bool:
+    if not isinstance(result, Mapping):
+        return False
+    if _runtime_hook_bool(result, "contract_seen_by_runtime", default=False):
+        return True
+    requested = str(result.get("placement_fingerprint") or "")
+    seen = str(result.get("last_seen_placement_fingerprint") or "")
+    if plan_fingerprint and requested == plan_fingerprint and seen == plan_fingerprint:
+        return True
+    rows = _runtime_hook_worker_results(result)
+    return bool(
+        rows
+        and all(
+            _runtime_hook_bool(row, "contract_seen_by_runtime", default=False)
+            or (
+                plan_fingerprint
+                and str(row.get("placement_fingerprint") or "") == plan_fingerprint
+                and str(row.get("last_seen_placement_fingerprint") or "")
+                == plan_fingerprint
+            )
+            for row in rows
+        )
+    )
+
+
+def _expert_placement_runtime_verification_level(
+    *,
+    contract_seen_by_runtime: bool,
+    hook_available: bool,
+    physical_weight_migration: bool,
+    plan_verified: bool,
+) -> str:
+    if physical_weight_migration and plan_verified:
+        return "physical_migration_verified"
+    if plan_verified:
+        return "runtime_placement_verified"
+    if contract_seen_by_runtime:
+        return "contract_seen_only"
+    if hook_available:
+        return "runtime_boundary_observe_only"
+    return "unavailable"
+
+
+def _merge_expert_placement_runtime_capabilities(
+    status: Dict[str, Any],
+    result: Any,
+) -> None:
+    status["expert_placement_runtime_verified_placement"] = bool(
+        status["expert_placement_runtime_verified_placement"]
+        or _runtime_hook_any_truthy(
+            result,
+            "runtime_verified_placement",
+            "verified_placement",
+            "expert_placement_runtime_verified_placement",
+        )
+    )
+    status["expert_placement_runtime_can_verify_physical_placement"] = bool(
+        status["expert_placement_runtime_can_verify_physical_placement"]
+        or _runtime_hook_any_truthy(
+            result,
+            "can_verify_physical_placement",
+            "physical_placement_verification_supported",
+            "expert_placement_runtime_can_verify_physical_placement",
+        )
+    )
+    status["expert_placement_runtime_can_remap_live_ep_rank"] = bool(
+        status["expert_placement_runtime_can_remap_live_ep_rank"]
+        or _runtime_hook_any_truthy(
+            result,
+            "can_remap_live_ep_rank",
+            "live_ep_rank_remap_supported",
+            "expert_placement_runtime_can_remap_live_ep_rank",
+        )
+    )
+    status["expert_placement_runtime_can_measure_all_to_all"] = bool(
+        status["expert_placement_runtime_can_measure_all_to_all"]
+        or _runtime_hook_any_truthy(
+            result,
+            "can_measure_all_to_all",
+            "all_to_all_traffic_available",
+            "real_all_to_all_traffic_available",
+            "expert_placement_runtime_can_measure_all_to_all",
+        )
+    )
+    capability_reason = _runtime_hook_str(
+        result,
+        "capability_reason",
+        "capability_reasons",
+        "expert_placement_runtime_capability_reason",
+        default="",
+    )
+    if capability_reason:
+        status["expert_placement_runtime_capability_reason"] = (
+            capability_reason
+        )
+
+
 def _expert_key_from_parts(parts: Sequence[Any]) -> str:
     cleaned = [str(part) for part in parts if str(part) not in {"", "None"}]
     if not cleaned:
@@ -487,8 +677,51 @@ class VllmBackend(SllmBackend):
             f"Creating new VLLM engine with config: {filtered_engine_config}"
         )
 
+        ray_dp_pack_strategy = backend_config.get("ray_dp_pack_strategy")
+        if ray_dp_pack_strategy is not None:
+            normalized_pack_strategy = str(ray_dp_pack_strategy).strip().lower()
+            if normalized_pack_strategy not in {"strict", "fill", "span"}:
+                raise ValueError(
+                    "ray_dp_pack_strategy must be strict, fill, or span"
+                )
+            os.environ["VLLM_RAY_DP_PACK_STRATEGY"] = normalized_pack_strategy
+
         self.engine_args = AsyncEngineArgs(**filtered_engine_config)
         self._async_engine_fields = async_engine_fields
+
+        self.elastic_ep_enabled = bool(
+            backend_config.get("spotserve_elastic_ep_enabled", False)
+        )
+        self.ray_dp_owns_gpus = bool(
+            backend_config.get("spotserve_vllm_ray_dp_owns_gpus", False)
+        )
+        if self.ray_dp_owns_gpus:
+            if backend_config.get("data_parallel_backend") != "ray":
+                raise ValueError(
+                    "SpotServe Ray-DP GPU ownership requires "
+                    "data_parallel_backend='ray'"
+                )
+            if int(backend_config.get("tensor_parallel_size", 1) or 1) != 1:
+                raise ValueError("SpotServe Ray-DP GPU ownership requires TP=1")
+            if int(backend_config.get("pipeline_parallel_size", 1) or 1) != 1:
+                raise ValueError("SpotServe Ray-DP GPU ownership requires PP=1")
+            if not backend_config.get("enable_expert_parallel", False):
+                raise ValueError(
+                    "SpotServe Ray-DP GPU ownership requires "
+                    "enable_expert_parallel=true"
+                )
+        if self.elastic_ep_enabled:
+            if not self.ray_dp_owns_gpus:
+                raise ValueError(
+                    "SpotServe elastic EP requires "
+                    "spotserve_vllm_ray_dp_owns_gpus=true"
+                )
+            if not backend_config.get("enable_eplb", False):
+                raise ValueError(
+                    "SpotServe elastic EP requires enable_eplb=true so vLLM "
+                    "can redistribute expert weights during EP resize"
+                )
+            os.environ.setdefault("SPOTSERVE_ELASTIC_EP_DEBUG_STACKS", "1")
 
         self.engine = None
         self.model_load_time_s = 0.0
@@ -579,16 +812,32 @@ class VllmBackend(SllmBackend):
             return None
 
         ep_size = max(1, int(effective_ep_size or 1))
+        strategy = str(
+            self.backend_config.get("expert_placement_strategy") or "linear"
+        )
+        if strategy not in {"linear", "round_robin"}:
+            return None
+        experts_per_rank, remainder = divmod(num_experts, ep_size)
+        linear_ranks = [
+            rank
+            for rank in range(ep_size)
+            for _ in range(experts_per_rank + int(rank < remainder))
+        ]
         placement: Dict[str, Any] = {}
         for layer_id in range(num_layers):
             for expert_id in range(num_experts):
-                rank_id = f"ep-rank-{expert_id % ep_size}"
+                rank_index = (
+                    linear_ranks[expert_id]
+                    if strategy == "linear"
+                    else expert_id % ep_size
+                )
+                rank_id = f"ep-rank-{rank_index}"
                 placement[f"layer:{layer_id}/expert:{expert_id}"] = {
                     "layer_id": layer_id,
                     "expert_id": expert_id,
                     "rank_id": rank_id,
                     "node_id": node_id,
-                    "gpu_id": str(expert_id % ep_size),
+                    "gpu_id": str(rank_index),
                     "placement_source": "derived_from_model_config",
                 }
         return placement
@@ -742,6 +991,9 @@ class VllmBackend(SllmBackend):
         raw_live_migration_enabled = runtime_status.get(
             "expert_placement_live_migration_enabled"
         )
+        raw_quiescent_remap_enabled = runtime_status.get(
+            "expert_placement_quiescent_remap_enabled"
+        )
         raw_physical_migration_required = runtime_status.get(
             "expert_placement_physical_migration_required"
         )
@@ -750,6 +1002,16 @@ class VllmBackend(SllmBackend):
             if raw_live_migration_enabled is not None
             else self._config_value_for_runtime(
                 "expert_placement_live_migration_enabled",
+                instance_id=instance_id,
+                node_id=node_id,
+            ),
+            default=False,
+        )
+        quiescent_remap_enabled = _as_bool(
+            raw_quiescent_remap_enabled
+            if raw_quiescent_remap_enabled is not None
+            else self._config_value_for_runtime(
+                "expert_placement_quiescent_remap_enabled",
                 instance_id=instance_id,
                 node_id=node_id,
             ),
@@ -794,6 +1056,16 @@ class VllmBackend(SllmBackend):
             "expert_placement_apply_success": bool(
                 runtime_status.get("expert_placement_apply_success", False)
             ),
+            "expert_placement_apply_worker_count": int(
+                runtime_status.get("expert_placement_apply_worker_count", 0)
+                or 0
+            ),
+            "expert_placement_apply_worker_success_count": int(
+                runtime_status.get(
+                    "expert_placement_apply_worker_success_count", 0
+                )
+                or 0
+            ),
             "expert_placement_apply_duration_ms": float(
                 runtime_status.get("expert_placement_apply_duration_ms", 0.0)
                 or 0.0
@@ -811,8 +1083,252 @@ class VllmBackend(SllmBackend):
             "expert_placement_verify_success": bool(
                 runtime_status.get("expert_placement_verify_success", False)
             ),
+            "expert_placement_verify_worker_count": int(
+                runtime_status.get("expert_placement_verify_worker_count", 0)
+                or 0
+            ),
+            "expert_placement_verify_worker_success_count": int(
+                runtime_status.get(
+                    "expert_placement_verify_worker_success_count", 0
+                )
+                or 0
+            ),
             "expert_placement_verify_reason": str(
                 runtime_status.get("expert_placement_verify_reason", "")
+                or ""
+            ),
+            "expert_placement_contract_seen_by_runtime": bool(
+                runtime_status.get(
+                    "expert_placement_contract_seen_by_runtime", False
+                )
+            ),
+            "expert_placement_contract_seen_by_all_workers": bool(
+                runtime_status.get(
+                    "expert_placement_contract_seen_by_all_workers", False
+                )
+            ),
+            "expert_placement_contract_seen_worker_count": int(
+                runtime_status.get(
+                    "expert_placement_contract_seen_worker_count", 0
+                )
+                or 0
+            ),
+            "expert_placement_contract_seen_worker_total": int(
+                runtime_status.get(
+                    "expert_placement_contract_seen_worker_total", 0
+                )
+                or 0
+            ),
+            "expert_placement_physical_weight_migration": bool(
+                runtime_status.get(
+                    "expert_placement_physical_weight_migration", False
+                )
+            ),
+            "expert_placement_runtime_moved_expert_shards": int(
+                runtime_status.get(
+                    "expert_placement_runtime_moved_expert_shards", 0
+                )
+                or 0
+            ),
+            "expert_placement_runtime_moved_weight_bytes": int(
+                runtime_status.get(
+                    "expert_placement_runtime_moved_weight_bytes", 0
+                )
+                or 0
+            ),
+            "expert_placement_runtime_remap_duration_ms": float(
+                runtime_status.get(
+                    "expert_placement_runtime_remap_duration_ms", 0.0
+                )
+                or 0.0
+            ),
+            "expert_placement_runtime_active_request_remap": bool(
+                runtime_status.get(
+                    "expert_placement_runtime_active_request_remap", False
+                )
+            ),
+            "expert_placement_runtime_step_boundary_barrier": bool(
+                runtime_status.get(
+                    "expert_placement_runtime_step_boundary_barrier", False
+                )
+            ),
+            "expert_placement_runtime_physical_host_ids_observed": bool(
+                runtime_status.get(
+                    "expert_placement_runtime_physical_host_ids_observed", False
+                )
+            ),
+            "expert_placement_runtime_physical_host_count": int(
+                runtime_status.get(
+                    "expert_placement_runtime_physical_host_count", 0
+                )
+                or 0
+            ),
+            "expert_placement_runtime_physical_host_ids": list(
+                runtime_status.get(
+                    "expert_placement_runtime_physical_host_ids", []
+                )
+                or []
+            ),
+            "expert_placement_runtime_ray_node_count": int(
+                runtime_status.get("expert_placement_runtime_ray_node_count", 0)
+                or 0
+            ),
+            "expert_placement_runtime_ray_node_ids": list(
+                runtime_status.get("expert_placement_runtime_ray_node_ids", [])
+                or []
+            ),
+            "expert_placement_runtime_failure_domain_count": int(
+                runtime_status.get(
+                    "expert_placement_runtime_failure_domain_count", 0
+                )
+                or 0
+            ),
+            "expert_placement_runtime_failure_domain_ids": list(
+                runtime_status.get(
+                    "expert_placement_runtime_failure_domain_ids", []
+                )
+                or []
+            ),
+            "expert_placement_runtime_host_mode": str(
+                runtime_status.get(
+                    "expert_placement_runtime_host_mode", "single_host"
+                )
+                or "single_host"
+            ),
+            "expert_placement_runtime_cross_failure_domain_weight_migration": bool(
+                runtime_status.get(
+                    "expert_placement_runtime_cross_failure_domain_weight_migration",
+                    False,
+                )
+            ),
+            "expert_placement_runtime_cross_failure_domain_moved_expert_shards": int(
+                runtime_status.get(
+                    "expert_placement_runtime_cross_failure_domain_moved_expert_shards",
+                    0,
+                )
+                or 0
+            ),
+            "expert_placement_runtime_cross_failure_domain_moved_weight_bytes": int(
+                runtime_status.get(
+                    "expert_placement_runtime_cross_failure_domain_moved_weight_bytes",
+                    0,
+                )
+                or 0
+            ),
+            "expert_placement_runtime_cross_node_weight_migration": bool(
+                runtime_status.get(
+                    "expert_placement_runtime_cross_node_weight_migration", False
+                )
+            ),
+            "expert_placement_runtime_cross_node_moved_expert_shards": int(
+                runtime_status.get(
+                    "expert_placement_runtime_cross_node_moved_expert_shards", 0
+                ) or 0
+            ),
+            "expert_placement_runtime_cross_node_moved_weight_bytes": int(
+                runtime_status.get(
+                    "expert_placement_runtime_cross_node_moved_weight_bytes", 0
+                ) or 0
+            ),
+            "expert_placement_runtime_verification_level": str(
+                runtime_status.get(
+                    "expert_placement_runtime_verification_level",
+                    _expert_placement_runtime_verification_level(
+                        contract_seen_by_runtime=bool(
+                            runtime_status.get(
+                                "expert_placement_contract_seen_by_runtime",
+                                False,
+                            )
+                        ),
+                        hook_available=bool(
+                            runtime_status.get(
+                                "expert_placement_apply_hook_available", False
+                            )
+                            or runtime_status.get(
+                                "expert_placement_verify_hook_available", False
+                            )
+                        ),
+                        physical_weight_migration=bool(
+                            runtime_status.get(
+                                "expert_placement_physical_weight_migration",
+                                False,
+                            )
+                        ),
+                        plan_verified=plan_verified,
+                    ),
+                )
+            ),
+            "expert_placement_runtime_verified_placement": bool(
+                runtime_status.get(
+                    "expert_placement_runtime_verified_placement",
+                    plan_verified,
+                )
+            ),
+            "expert_placement_runtime_can_verify_physical_placement": bool(
+                runtime_status.get(
+                    "expert_placement_runtime_can_verify_physical_placement",
+                    False,
+                )
+            ),
+            "expert_placement_runtime_can_remap_live_ep_rank": bool(
+                runtime_status.get(
+                    "expert_placement_runtime_can_remap_live_ep_rank", False
+                )
+            ),
+            "expert_placement_runtime_can_measure_all_to_all": bool(
+                runtime_status.get(
+                    "expert_placement_runtime_can_measure_all_to_all", False
+                )
+            ),
+            "expert_placement_runtime_all_to_all_counters_available": bool(
+                runtime_status.get(
+                    "expert_placement_runtime_all_to_all_counters_available",
+                    False,
+                )
+            ),
+            "expert_placement_runtime_all_to_all_collective_calls": int(
+                runtime_status.get(
+                    "expert_placement_runtime_all_to_all_collective_calls", 0
+                ) or 0
+            ),
+            "expert_placement_runtime_all_to_all_dispatch_calls": int(
+                runtime_status.get(
+                    "expert_placement_runtime_all_to_all_dispatch_calls", 0
+                ) or 0
+            ),
+            "expert_placement_runtime_all_to_all_combine_calls": int(
+                runtime_status.get(
+                    "expert_placement_runtime_all_to_all_combine_calls", 0
+                ) or 0
+            ),
+            "expert_placement_runtime_all_to_all_observed_input_bytes": int(
+                runtime_status.get(
+                    "expert_placement_runtime_all_to_all_observed_input_bytes",
+                    0,
+                ) or 0
+            ),
+            "expert_placement_runtime_all_to_all_observed_output_bytes": int(
+                runtime_status.get(
+                    "expert_placement_runtime_all_to_all_observed_output_bytes",
+                    0,
+                ) or 0
+            ),
+            "expert_placement_runtime_all_to_all_internode_calls": int(
+                runtime_status.get(
+                    "expert_placement_runtime_all_to_all_internode_calls", 0
+                ) or 0
+            ),
+            "expert_placement_runtime_all_to_all_measurement_kind": str(
+                runtime_status.get(
+                    "expert_placement_runtime_all_to_all_measurement_kind",
+                    "unavailable",
+                ) or "unavailable"
+            ),
+            "expert_placement_runtime_capability_reason": str(
+                runtime_status.get(
+                    "expert_placement_runtime_capability_reason",
+                    reason,
+                )
                 or ""
             ),
             "reparallelization_execution_model": replanning_execution_model,
@@ -826,6 +1342,9 @@ class VllmBackend(SllmBackend):
             "expert_placement_runtime_contract_mode": contract_mode,
             "expert_placement_live_migration_enabled": (
                 live_migration_enabled
+            ),
+            "expert_placement_quiescent_remap_enabled": (
+                quiescent_remap_enabled
             ),
             "expert_placement_physical_migration_required": (
                 physical_migration_required
@@ -1203,11 +1722,11 @@ class VllmBackend(SllmBackend):
             )
         return await _maybe_await(hook(**call_kwargs))
 
-    async def _apply_configured_expert_placement_plan(self) -> None:
+    async def _apply_configured_expert_placement_plan(self) -> Dict[str, Any]:
         plan = self._configured_expert_placement_plan()
         if not plan:
             self.expert_placement_runtime_status = {}
-            return
+            return self.expert_placement_runtime_status
 
         status: Dict[str, Any] = {
             "expert_placement_apply_hook_available": False,
@@ -1215,13 +1734,70 @@ class VllmBackend(SllmBackend):
             "expert_placement_apply_success": False,
             "expert_placement_apply_duration_ms": 0.0,
             "expert_placement_apply_reason": "",
+            "expert_placement_apply_worker_count": 0,
+            "expert_placement_apply_worker_success_count": 0,
             "expert_placement_verify_hook_available": False,
             "expert_placement_verify_attempted": False,
             "expert_placement_verify_success": False,
             "expert_placement_verify_reason": "",
+            "expert_placement_verify_worker_count": 0,
+            "expert_placement_verify_worker_success_count": 0,
+            "expert_placement_contract_seen_by_runtime": False,
+            "expert_placement_contract_seen_by_all_workers": False,
+            "expert_placement_contract_seen_worker_count": 0,
+            "expert_placement_contract_seen_worker_total": 0,
+            "expert_placement_physical_weight_migration": False,
+            "expert_placement_runtime_moved_expert_shards": 0,
+            "expert_placement_runtime_moved_weight_bytes": 0,
+            "expert_placement_runtime_remap_duration_ms": 0.0,
+            "expert_placement_runtime_active_request_remap": False,
+            "expert_placement_runtime_step_boundary_barrier": False,
+            "expert_placement_runtime_physical_host_ids_observed": False,
+            "expert_placement_runtime_physical_host_count": 0,
+            "expert_placement_runtime_physical_host_ids": [],
+            "expert_placement_runtime_ray_node_count": 0,
+            "expert_placement_runtime_ray_node_ids": [],
+            "expert_placement_runtime_failure_domain_count": 0,
+            "expert_placement_runtime_failure_domain_ids": [],
+            "expert_placement_runtime_host_mode": "single_host",
+            "expert_placement_runtime_cross_failure_domain_weight_migration": False,
+            "expert_placement_runtime_cross_failure_domain_moved_expert_shards": 0,
+            "expert_placement_runtime_cross_failure_domain_moved_weight_bytes": 0,
+            "expert_placement_runtime_cross_node_weight_migration": False,
+            "expert_placement_runtime_cross_node_moved_expert_shards": 0,
+            "expert_placement_runtime_cross_node_moved_weight_bytes": 0,
+            "expert_placement_runtime_verification_level": "unavailable",
+            "expert_placement_runtime_verified_placement": False,
+            "expert_placement_runtime_can_verify_physical_placement": False,
+            "expert_placement_runtime_can_remap_live_ep_rank": False,
+            "expert_placement_runtime_can_measure_all_to_all": False,
+            "expert_placement_runtime_all_to_all_counters_available": False,
+            "expert_placement_runtime_all_to_all_collective_calls": 0,
+            "expert_placement_runtime_all_to_all_dispatch_calls": 0,
+            "expert_placement_runtime_all_to_all_combine_calls": 0,
+            "expert_placement_runtime_all_to_all_observed_input_bytes": 0,
+            "expert_placement_runtime_all_to_all_observed_output_bytes": 0,
+            "expert_placement_runtime_all_to_all_internode_calls": 0,
+            "expert_placement_runtime_all_to_all_measurement_kind": "unavailable",
+            "expert_placement_runtime_capability_reason": "",
+            "expert_placement_physical_migration_required": False,
             "expert_placement_plan_applied": False,
             "expert_placement_plan_verified": False,
         }
+        plan_fingerprint = str(plan.get("placement_fingerprint") or "")
+        status["expert_placement_physical_migration_required"] = bool(
+            _as_bool(plan.get("physical_weight_migration"), default=False)
+            or _as_bool(
+                plan.get("expert_placement_physical_migration_required"),
+                default=False,
+            )
+            or _as_bool(
+                self._config_value_for_runtime(
+                    "expert_placement_physical_migration_required"
+                ),
+                default=False,
+            )
+        )
 
         apply_names = (
             "apply_expert_placement_plan",
@@ -1263,6 +1839,203 @@ class VllmBackend(SllmBackend):
                         if status["expert_placement_apply_success"]
                         else "runtime_apply_returned_false",
                     )
+                )
+                apply_worker_count = _runtime_hook_worker_count(apply_result)
+                status["expert_placement_apply_worker_count"] = (
+                    apply_worker_count
+                )
+                status["expert_placement_apply_worker_success_count"] = (
+                    _runtime_hook_int(
+                        apply_result,
+                        "worker_success_count",
+                        _runtime_hook_worker_truthy_count(
+                            apply_result,
+                            "applied",
+                            fallback_key="success",
+                        ),
+                    )
+                )
+                apply_contract_seen_count = _runtime_hook_int(
+                    apply_result,
+                    "contract_seen_count",
+                    _runtime_hook_worker_truthy_count(
+                        apply_result,
+                        "contract_seen_by_runtime",
+                    ),
+                )
+                apply_contract_seen_by_runtime = (
+                    _runtime_hook_contract_seen_by_runtime(
+                        apply_result,
+                        plan_fingerprint,
+                    )
+                )
+                if (
+                    apply_contract_seen_by_runtime
+                    and apply_contract_seen_count == 0
+                ):
+                    apply_contract_seen_count = apply_worker_count or 1
+                apply_contract_seen_worker_count = _runtime_hook_int(
+                    apply_result,
+                    "contract_seen_worker_count",
+                    apply_contract_seen_count,
+                )
+                apply_contract_seen_worker_total = _runtime_hook_int(
+                    apply_result,
+                    "contract_seen_worker_total",
+                    apply_worker_count,
+                )
+                status["expert_placement_contract_seen_by_runtime"] = (
+                    apply_contract_seen_by_runtime
+                )
+                status["expert_placement_contract_seen_worker_count"] = (
+                    apply_contract_seen_worker_count
+                )
+                status["expert_placement_contract_seen_worker_total"] = (
+                    apply_contract_seen_worker_total
+                )
+                status["expert_placement_contract_seen_by_all_workers"] = bool(
+                    apply_contract_seen_worker_total > 0
+                    and apply_contract_seen_worker_count
+                    == apply_contract_seen_worker_total
+                )
+                status["expert_placement_physical_weight_migration"] = (
+                    bool(status["expert_placement_physical_weight_migration"])
+                    or _runtime_hook_bool(
+                        apply_result,
+                        "physical_weight_migration",
+                        default=False,
+                    )
+                )
+                status["expert_placement_runtime_moved_expert_shards"] = (
+                    _runtime_hook_worker_int_sum(
+                        apply_result, "moved_local_expert_shards"
+                    )
+                )
+                status["expert_placement_runtime_moved_weight_bytes"] = (
+                    _runtime_hook_worker_int_sum(
+                        apply_result, "moved_local_weight_bytes"
+                    )
+                )
+                status["expert_placement_runtime_remap_duration_ms"] = (
+                    _runtime_hook_worker_float_max(
+                        apply_result, "remap_duration_ms"
+                    )
+                )
+                status["expert_placement_runtime_active_request_remap"] = (
+                    _runtime_hook_bool(
+                        apply_result,
+                        "active_requests_at_barrier",
+                        default=False,
+                    )
+                )
+                status["expert_placement_runtime_step_boundary_barrier"] = (
+                    _runtime_hook_bool(
+                        apply_result,
+                        "step_boundary_barrier",
+                        default=False,
+                    )
+                )
+                status["expert_placement_runtime_physical_host_ids_observed"] = (
+                    _runtime_hook_bool(
+                        apply_result, "physical_host_ids_observed", default=False
+                    )
+                )
+                status["expert_placement_runtime_physical_host_count"] = (
+                    _runtime_hook_int(apply_result, "physical_host_count", 0)
+                )
+                if isinstance(apply_result, Mapping):
+                    status["expert_placement_runtime_physical_host_ids"] = [
+                        str(value)
+                        for value in apply_result.get("physical_host_ids", [])
+                        if value
+                    ]
+                    status["expert_placement_runtime_ray_node_count"] = (
+                        _runtime_hook_int(apply_result, "ray_node_count", 0)
+                    )
+                    status["expert_placement_runtime_ray_node_ids"] = [
+                        str(value)
+                        for value in apply_result.get("ray_node_ids", [])
+                        if value
+                    ]
+                    status[
+                        "expert_placement_runtime_failure_domain_count"
+                    ] = _runtime_hook_int(
+                        apply_result, "failure_domain_count", 0
+                    )
+                    status[
+                        "expert_placement_runtime_failure_domain_ids"
+                    ] = [
+                        str(value)
+                        for value in apply_result.get(
+                            "failure_domain_ids", []
+                        )
+                        if value
+                    ]
+                    status["expert_placement_runtime_host_mode"] = str(
+                        apply_result.get("host_mode", "single_host")
+                        or "single_host"
+                    )
+                status[
+                    "expert_placement_runtime_cross_failure_domain_weight_migration"
+                ] = _runtime_hook_bool(
+                    apply_result,
+                    "cross_failure_domain_weight_migration",
+                    default=False,
+                )
+                status[
+                    "expert_placement_runtime_cross_failure_domain_moved_expert_shards"
+                ] = _runtime_hook_worker_int_sum(
+                    apply_result,
+                    "cross_failure_domain_moved_local_expert_shards",
+                )
+                status[
+                    "expert_placement_runtime_cross_failure_domain_moved_weight_bytes"
+                ] = _runtime_hook_worker_int_sum(
+                    apply_result,
+                    "cross_failure_domain_moved_local_weight_bytes",
+                )
+                status["expert_placement_runtime_cross_node_weight_migration"] = (
+                    _runtime_hook_bool(
+                        apply_result, "cross_node_weight_migration", default=False
+                    )
+                )
+                status["expert_placement_runtime_cross_node_moved_expert_shards"] = (
+                    _runtime_hook_worker_int_sum(
+                        apply_result, "cross_node_moved_local_expert_shards"
+                    )
+                )
+                status["expert_placement_runtime_cross_node_moved_weight_bytes"] = (
+                    _runtime_hook_worker_int_sum(
+                        apply_result, "cross_node_moved_local_weight_bytes"
+                    )
+                )
+                status[
+                    "expert_placement_runtime_all_to_all_counters_available"
+                ] = _runtime_hook_any_truthy(
+                    apply_result, "all_to_all_available"
+                )
+                for status_suffix, result_key in (
+                    ("collective_calls", "all_to_all_collective_calls"),
+                    ("dispatch_calls", "all_to_all_dispatch_calls"),
+                    ("combine_calls", "all_to_all_combine_calls"),
+                    ("observed_input_bytes", "all_to_all_observed_input_bytes"),
+                    ("observed_output_bytes", "all_to_all_observed_output_bytes"),
+                    ("internode_calls", "all_to_all_internode_calls"),
+                ):
+                    status[
+                        "expert_placement_runtime_all_to_all_" + status_suffix
+                    ] = _runtime_hook_worker_int_sum(apply_result, result_key)
+                status[
+                    "expert_placement_runtime_all_to_all_measurement_kind"
+                ] = (
+                    "runtime_collective_tensor_payload"
+                    if status[
+                        "expert_placement_runtime_all_to_all_counters_available"
+                    ]
+                    else "unavailable"
+                )
+                _merge_expert_placement_runtime_capabilities(
+                    status, apply_result
                 )
             finally:
                 status["expert_placement_apply_duration_ms"] = (
@@ -1311,6 +2084,99 @@ class VllmBackend(SllmBackend):
                         else "runtime_verify_returned_false",
                     )
                 )
+                verify_worker_count = _runtime_hook_worker_count(verify_result)
+                contract_seen_count = _runtime_hook_int(
+                    verify_result,
+                    "contract_seen_count",
+                    _runtime_hook_worker_truthy_count(
+                        verify_result,
+                        "contract_seen_by_runtime",
+                    ),
+                )
+                contract_seen_by_runtime = (
+                    _runtime_hook_contract_seen_by_runtime(
+                        verify_result,
+                        plan_fingerprint,
+                    )
+                )
+                if contract_seen_by_runtime and contract_seen_count == 0:
+                    contract_seen_count = verify_worker_count or 1
+                contract_seen_worker_count = _runtime_hook_int(
+                    verify_result,
+                    "contract_seen_worker_count",
+                    contract_seen_count,
+                )
+                contract_seen_worker_total = _runtime_hook_int(
+                    verify_result,
+                    "contract_seen_worker_total",
+                    verify_worker_count,
+                )
+                status["expert_placement_verify_worker_count"] = (
+                    verify_worker_count
+                )
+                status["expert_placement_verify_worker_success_count"] = (
+                    _runtime_hook_int(
+                        verify_result,
+                        "worker_success_count",
+                        _runtime_hook_worker_truthy_count(
+                            verify_result,
+                            "verified",
+                            fallback_key="success",
+                        ),
+                    )
+                )
+                status["expert_placement_contract_seen_by_runtime"] = bool(
+                    status["expert_placement_contract_seen_by_runtime"]
+                    or contract_seen_by_runtime
+                )
+                status["expert_placement_contract_seen_worker_count"] = (
+                    max(
+                        int(
+                            status[
+                                "expert_placement_contract_seen_worker_count"
+                            ]
+                            or 0
+                        ),
+                        contract_seen_worker_count,
+                    )
+                )
+                status["expert_placement_contract_seen_worker_total"] = (
+                    max(
+                        int(
+                            status[
+                                "expert_placement_contract_seen_worker_total"
+                            ]
+                            or 0
+                        ),
+                        contract_seen_worker_total,
+                    )
+                )
+                status["expert_placement_contract_seen_by_all_workers"] = bool(
+                    status["expert_placement_contract_seen_by_all_workers"]
+                    or (
+                        status[
+                            "expert_placement_contract_seen_worker_total"
+                        ]
+                        > 0
+                        and status[
+                            "expert_placement_contract_seen_worker_count"
+                        ]
+                        == status[
+                            "expert_placement_contract_seen_worker_total"
+                        ]
+                    )
+                )
+                status["expert_placement_physical_weight_migration"] = (
+                    bool(status["expert_placement_physical_weight_migration"])
+                    or _runtime_hook_bool(
+                        verify_result,
+                        "physical_weight_migration",
+                        default=False,
+                    )
+                )
+                _merge_expert_placement_runtime_capabilities(
+                    status, verify_result
+                )
 
         status["expert_placement_plan_applied"] = bool(
             status["expert_placement_apply_success"]
@@ -1319,7 +2185,89 @@ class VllmBackend(SllmBackend):
         status["expert_placement_plan_verified"] = bool(
             status["expert_placement_verify_success"]
         )
+        status["expert_placement_runtime_verified_placement"] = bool(
+            status["expert_placement_runtime_verified_placement"]
+            or status["expert_placement_plan_verified"]
+        )
+        if (
+            status["expert_placement_physical_weight_migration"]
+            and status["expert_placement_runtime_verified_placement"]
+        ):
+            status[
+                "expert_placement_runtime_can_verify_physical_placement"
+            ] = True
+        status["expert_placement_runtime_verification_level"] = (
+            _expert_placement_runtime_verification_level(
+                contract_seen_by_runtime=bool(
+                    status["expert_placement_contract_seen_by_runtime"]
+                ),
+                hook_available=bool(
+                    status["expert_placement_apply_hook_available"]
+                    or status["expert_placement_verify_hook_available"]
+                ),
+                physical_weight_migration=bool(
+                    status["expert_placement_physical_weight_migration"]
+                ),
+                plan_verified=bool(
+                    status["expert_placement_runtime_verified_placement"]
+                ),
+            )
+        )
+        if not status["expert_placement_runtime_capability_reason"]:
+            status["expert_placement_runtime_capability_reason"] = str(
+                status.get("expert_placement_verify_reason")
+                or status.get("expert_placement_apply_reason")
+                or status["expert_placement_runtime_verification_level"]
+            )
         self.expert_placement_runtime_status = status
+        if (
+            status["expert_placement_physical_migration_required"]
+            and not status["expert_placement_physical_weight_migration"]
+        ):
+            raise RuntimeError(
+                "required_physical_expert_placement_migration_not_supported"
+            )
+        return status
+
+    async def apply_expert_placement_plan(
+        self,
+        expert_placement_plan: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        if not isinstance(expert_placement_plan, Mapping):
+            return {
+                "applied": False,
+                "verified": False,
+                "success": False,
+                "reason": "expert_placement_plan_required",
+            }
+        self.backend_config["expert_placement_plan"] = dict(
+            expert_placement_plan
+        )
+        try:
+            status = await self._apply_configured_expert_placement_plan()
+        except Exception as exc:
+            status = dict(self.expert_placement_runtime_status or {})
+            status.setdefault("expert_placement_apply_reason", repr(exc))
+            return {
+                "applied": False,
+                "verified": False,
+                "success": False,
+                "reason": str(exc),
+                "runtime_status": status,
+            }
+        applied = bool(status.get("expert_placement_apply_success"))
+        verified = bool(status.get("expert_placement_verify_success"))
+        return {
+            "applied": applied,
+            "verified": verified,
+            "success": bool(applied and verified),
+            "reason": str(
+                status.get("expert_placement_verify_reason")
+                or status.get("expert_placement_apply_reason")
+                or ""
+            ),
+            "runtime_status": dict(status),
+        }
 
     async def _request_runtime_moe_metadata(
         self,
@@ -1389,6 +2337,84 @@ class VllmBackend(SllmBackend):
         )
         return dict(extra) if isinstance(extra, dict) else {}
 
+    def _verify_elastic_ep_runtime_placement(
+        self,
+        runtime_metadata: Mapping[str, Any],
+        expected_dp_size: int,
+    ) -> Dict[str, Any]:
+        """Verify an EPLB resize from the runtime's physical placement.
+
+        Elastic EPLB may replicate logical experts, so its physical layout
+        cannot be checked against the single-owner fixed-EP remap contract.
+        Instead, require every resized DP rank to expose resident weights,
+        the observed EP size to match the target, and complete logical expert
+        coverage across the aggregate runtime snapshot.
+        """
+        snapshots = runtime_metadata.get(
+            "runtime_expert_placement_worker_snapshots", {}
+        )
+        shards = runtime_metadata.get("runtime_expert_placement_shards", {})
+        if not isinstance(snapshots, Mapping):
+            snapshots = {}
+        if not isinstance(shards, Mapping):
+            shards = {}
+
+        expected_snapshot = self._instrumented_expert_placement_snapshot(
+            effective_ep_size=expected_dp_size,
+        ) or {}
+        expected_keys = set(expected_snapshot)
+        observed_keys = set(str(key) for key in shards)
+        unavailable_workers = sorted(
+            str(worker)
+            for worker, snapshot in snapshots.items()
+            if not isinstance(snapshot, Mapping)
+            or not snapshot.get("available")
+        )
+        observed_ep_sizes = {
+            int(row.get("ep_size"))
+            for rows in shards.values()
+            if isinstance(rows, Sequence)
+            and not isinstance(rows, (str, bytes))
+            for row in rows
+            if isinstance(row, Mapping) and row.get("ep_size") is not None
+        }
+        worker_count = int(
+            runtime_metadata.get(
+                "runtime_expert_placement_worker_count", len(snapshots)
+            )
+            or 0
+        )
+        missing_experts = sorted(expected_keys - observed_keys)
+        verified = bool(
+            worker_count == expected_dp_size
+            and len(snapshots) == expected_dp_size
+            and not unavailable_workers
+            and bool(observed_keys)
+            and not missing_experts
+            and observed_ep_sizes == {expected_dp_size}
+        )
+        if worker_count != expected_dp_size or len(snapshots) != expected_dp_size:
+            reason = "elastic_ep_runtime_worker_count_mismatch"
+        elif unavailable_workers:
+            reason = "elastic_ep_runtime_worker_placement_unavailable"
+        elif missing_experts:
+            reason = "elastic_ep_runtime_expert_coverage_incomplete"
+        elif observed_ep_sizes != {expected_dp_size}:
+            reason = "elastic_ep_runtime_ep_size_mismatch"
+        else:
+            reason = "elastic_ep_runtime_placement_verified"
+        return {
+            "verified": verified,
+            "reason": reason,
+            "worker_count": worker_count,
+            "worker_snapshot_count": len(snapshots),
+            "unavailable_workers": unavailable_workers,
+            "observed_ep_sizes": sorted(observed_ep_sizes),
+            "expected_expert_count": len(expected_keys),
+            "observed_expert_count": len(observed_keys),
+            "missing_experts": missing_experts,
+        }
+
     async def _request_runtime_metadata(
         self, result: RequestOutput
     ) -> Dict[str, Any]:
@@ -1422,6 +2448,162 @@ class VllmBackend(SllmBackend):
             self.model_load_time_s = time.monotonic() - started_at
             await self._apply_configured_expert_placement_plan()
             self.status = BackendStatus.RUNNING
+
+    async def scale_elastic_ep(
+        self,
+        new_data_parallel_size: int,
+        drain_timeout_s: float = 300.0,
+        expert_placement_plan: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Resize vLLM Ray-DP expert parallelism on the existing engine."""
+        new_dp = int(new_data_parallel_size)
+        if new_dp < 1:
+            raise ValueError("new_data_parallel_size must be positive")
+        async with self.status_lock:
+            if self.status != BackendStatus.RUNNING or self.engine is None:
+                raise RuntimeError("vLLM engine is not running")
+            if not self.elastic_ep_enabled or not self.ray_dp_owns_gpus:
+                raise RuntimeError("spotserve_elastic_ep_not_enabled")
+            scale = getattr(self.engine, "scale_elastic_ep", None)
+            if not callable(scale):
+                raise RuntimeError("vllm_scale_elastic_ep_not_available")
+            current_dp = int(
+                self.backend_config.get("data_parallel_size", 1) or 1
+            )
+            if current_dp == new_dp:
+                return {
+                    "resized": False,
+                    "previous_data_parallel_size": current_dp,
+                    "data_parallel_size": new_dp,
+                    "effective_expert_parallel_size": new_dp,
+                    "reason": "already_at_target_size",
+                }
+
+        started_at = time.monotonic()
+        resize_applied = False
+        try:
+            await scale(
+                new_dp,
+                drain_timeout=max(1, int(drain_timeout_s)),
+            )
+            resize_applied = True
+            runtime_metadata = await self._runtime_moe_metadata()
+            verification = self._verify_elastic_ep_runtime_placement(
+                runtime_metadata,
+                new_dp,
+            )
+            if not verification["verified"]:
+                raise RuntimeError(
+                    "elastic_ep_runtime_placement_verification_failed:"
+                    f"{verification}"
+                )
+        except Exception as resize_error:
+            if resize_applied:
+                try:
+                    await scale(
+                        current_dp,
+                        drain_timeout=max(1, int(drain_timeout_s)),
+                    )
+                except Exception as rollback_error:
+                    async with self.status_lock:
+                        self.status = BackendStatus.STOPPING
+                    raise RuntimeError(
+                        "elastic_ep_resize_rollback_failed:"
+                        f"resize_error={resize_error!r}; "
+                        f"rollback_error={rollback_error!r}"
+                    ) from resize_error
+                raise
+            # A failed process-group reconfiguration may leave only a subset
+            # of ranks usable. Stop accepting requests until the controller
+            # replaces this deployment.
+            async with self.status_lock:
+                self.status = BackendStatus.STOPPING
+            raise
+
+        self.backend_config["data_parallel_size"] = new_dp
+        self.backend_config["vllm_data_parallel_size"] = new_dp
+        self.backend_config["planned_effective_expert_parallel_size"] = new_dp
+        self.backend_config["planned_expert_parallel_size"] = new_dp
+        self.backend_config["expert_parallel_size_verified"] = True
+        self.backend_config["reparallelization_execution_model"] = (
+            "in_place_elastic_ep_resize"
+        )
+        self.backend_config["reparallelization_execution_model_reason"] = (
+            "vllm_ray_dp_elastic_ep"
+        )
+        # AsyncLLM updates its live vLLM config internally. Keep the retained
+        # construction args in sync because runtime metadata reads them first.
+        if getattr(self, "engine_args", None) is not None:
+            self.engine_args.data_parallel_size = new_dp
+        if expert_placement_plan:
+            # Preserve the planner contract for audit only. EPLB owns the
+            # physical replicated layout after an elastic resize.
+            self.backend_config["expert_placement_plan"] = dict(
+                expert_placement_plan
+            )
+        self.expert_placement_runtime_status = {
+            "reparallelization_execution_model": (
+                "in_place_elastic_ep_resize"
+            ),
+            "reparallelization_execution_model_reason": (
+                "vllm_ray_dp_elastic_ep"
+            ),
+            "expert_placement_execution_model": (
+                "quiescent_elastic_ep_resize"
+            ),
+            "expert_placement_execution_model_reason": (
+                "vllm_eplb_runtime_placement"
+            ),
+            "expert_placement_runtime_contract_mode": (
+                "runtime_observed_elastic_ep"
+            ),
+            "expert_placement_apply_hook_available": True,
+            "expert_placement_apply_attempted": True,
+            "expert_placement_apply_success": verification["verified"],
+            "expert_placement_apply_reason": verification["reason"],
+            "expert_placement_apply_worker_count": verification[
+                "worker_count"
+            ],
+            "expert_placement_apply_worker_success_count": (
+                verification["worker_count"]
+                - len(verification["unavailable_workers"])
+            ),
+            "expert_placement_verify_hook_available": True,
+            "expert_placement_verify_attempted": True,
+            "expert_placement_verify_success": verification["verified"],
+            "expert_placement_verify_reason": verification["reason"],
+            "expert_placement_verify_worker_count": verification[
+                "worker_count"
+            ],
+            "expert_placement_verify_worker_success_count": (
+                verification["worker_count"]
+                - len(verification["unavailable_workers"])
+            ),
+            "expert_placement_plan_applied": verification["verified"],
+            "expert_placement_plan_verified": verification["verified"],
+            "expert_placement_physical_weight_migration": verification[
+                "verified"
+            ],
+            "expert_placement_runtime_verified_placement": verification[
+                "verified"
+            ],
+            "expert_placement_runtime_can_verify_physical_placement": True,
+            "expert_placement_runtime_verification_level": (
+                "physical_migration_verified"
+                if verification["verified"]
+                else "runtime_placement_unverified"
+            ),
+            "elastic_ep_runtime_verification": verification,
+        }
+        return {
+            "resized": True,
+            "previous_data_parallel_size": current_dp,
+            "data_parallel_size": new_dp,
+            "effective_expert_parallel_size": new_dp,
+            "duration_ms": (time.monotonic() - started_at) * 1000,
+            "reason": "vllm_ray_dp_elastic_ep",
+            "runtime_placement_verification": verification,
+        }
 
     def _spotserve_runtime_identity(self) -> str:
         try:
@@ -2278,6 +3460,36 @@ class VllmBackend(SllmBackend):
             ),
             "expert_placement_verify_reason": parallel_metadata.get(
                 "expert_placement_verify_reason"
+            ),
+            "expert_placement_runtime_verification_level": (
+                parallel_metadata.get(
+                    "expert_placement_runtime_verification_level"
+                )
+            ),
+            "expert_placement_runtime_verified_placement": (
+                parallel_metadata.get(
+                    "expert_placement_runtime_verified_placement"
+                )
+            ),
+            "expert_placement_runtime_can_verify_physical_placement": (
+                parallel_metadata.get(
+                    "expert_placement_runtime_can_verify_physical_placement"
+                )
+            ),
+            "expert_placement_runtime_can_remap_live_ep_rank": (
+                parallel_metadata.get(
+                    "expert_placement_runtime_can_remap_live_ep_rank"
+                )
+            ),
+            "expert_placement_runtime_can_measure_all_to_all": (
+                parallel_metadata.get(
+                    "expert_placement_runtime_can_measure_all_to_all"
+                )
+            ),
+            "expert_placement_runtime_capability_reason": (
+                parallel_metadata.get(
+                    "expert_placement_runtime_capability_reason"
+                )
             ),
             "moe_route_histogram_available": parallel_metadata.get(
                 "moe_route_histogram_available"

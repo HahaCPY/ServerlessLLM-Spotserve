@@ -140,6 +140,17 @@ class InstanceHandle:
             self.ready = False
             self.state = InstanceState.DRAINING
 
+    async def mark_ready_after_drain(self, num_gpu: Optional[int] = None):
+        """Reopen admission after a successful or safely aborted drain."""
+        async with self.lock:
+            if self.state != InstanceState.DRAINING:
+                return False
+            if num_gpu is not None:
+                self.num_gpu = num_gpu
+            self.ready = True
+            self.state = InstanceState.READY
+            return True
+
     async def mark_preempting(self):
         async with self.lock:
             self.ready = False

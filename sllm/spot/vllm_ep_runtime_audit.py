@@ -21,6 +21,12 @@ SOURCE_MARKERS = {
             "record_moe_routing": "def record_moe_routing",
             "apply_hook": "def apply_expert_placement_plan",
             "verify_hook": "def verify_expert_placement_plan",
+            "runtime_layout_inspector": (
+                "def inspect_runtime_expert_placement"
+            ),
+            "runtime_layout_comparator": (
+                "def _compare_runtime_expert_placement"
+            ),
             "observe_only_reason": (
                 "physical_expert_placement_migration_not_supported"
             ),
@@ -58,6 +64,9 @@ SOURCE_MARKERS = {
         "markers": {
             "request_moe_metadata_hook": "def get_request_moe_metadata",
             "runtime_moe_metadata_hook": "def get_moe_runtime_metadata",
+            "runtime_placement_snapshot": (
+                "def _spotserve_runtime_expert_placement_snapshot"
+            ),
             "apply_hook": "def apply_expert_placement_plan",
             "verify_hook": "def verify_expert_placement_plan",
         },
@@ -186,6 +195,11 @@ def audit_source_tree(package_root: Optional[str | Path]) -> Dict[str, Any]:
             and engine_core.get("verify_rpc")
             and async_llm.get("apply_client")
             and async_llm.get("verify_client")
+        ),
+        "runtime_layout_inspector_present": bool(
+            spotserve_moe.get("runtime_layout_inspector")
+            and spotserve_moe.get("runtime_layout_comparator")
+            and worker_base.get("runtime_placement_snapshot")
         ),
         "observe_only_markers_present": bool(
             spotserve_moe.get("observe_only_reason")
@@ -321,9 +335,73 @@ def classify_audit_report(report: Mapping[str, Any]) -> Dict[str, Any]:
             or verify_result.get("reason")
             == "physical_expert_placement_verification_not_supported"
         )
+    contract_seen = False
+    for result in (apply_result, verify_result):
+        if isinstance(result, Mapping):
+            contract_seen = bool(
+                contract_seen
+                or result.get("contract_seen_by_runtime")
+                or result.get("contract_seen_by_all_workers")
+            )
 
     physical_supported = bool(
         apply_success and verify_success and physical_flag
+    )
+    runtime_verified_placement = bool(
+        verify_success
+        or _truthy_result(
+            verify_result,
+            "runtime_verified_placement",
+            "verified_placement",
+            "expert_placement_runtime_verified_placement",
+        )
+    )
+    can_verify_physical_placement = bool(
+        _truthy_result(
+            apply_result,
+            "can_verify_physical_placement",
+            "physical_placement_verification_supported",
+            "expert_placement_runtime_can_verify_physical_placement",
+        )
+        or _truthy_result(
+            verify_result,
+            "can_verify_physical_placement",
+            "physical_placement_verification_supported",
+            "expert_placement_runtime_can_verify_physical_placement",
+        )
+    )
+    can_verify_physical_placement = bool(
+        can_verify_physical_placement or physical_supported
+    )
+    can_remap_live_ep_rank = bool(
+        _truthy_result(
+            apply_result,
+            "can_remap_live_ep_rank",
+            "live_ep_rank_remap_supported",
+            "expert_placement_runtime_can_remap_live_ep_rank",
+        )
+        or _truthy_result(
+            verify_result,
+            "can_remap_live_ep_rank",
+            "live_ep_rank_remap_supported",
+            "expert_placement_runtime_can_remap_live_ep_rank",
+        )
+    )
+    can_measure_all_to_all = bool(
+        _truthy_result(
+            apply_result,
+            "can_measure_all_to_all",
+            "all_to_all_traffic_available",
+            "real_all_to_all_traffic_available",
+            "expert_placement_runtime_can_measure_all_to_all",
+        )
+        or _truthy_result(
+            verify_result,
+            "can_measure_all_to_all",
+            "all_to_all_traffic_available",
+            "real_all_to_all_traffic_available",
+            "expert_placement_runtime_can_measure_all_to_all",
+        )
     )
     boundary_present = bool(
         source_checks.get("apply_verify_boundary_present")
@@ -332,12 +410,21 @@ def classify_audit_report(report: Mapping[str, Any]) -> Dict[str, Any]:
             and runtime_probe.get("verify_callable")
         )
     )
+    layout_inspector_present = bool(
+        source_checks.get("runtime_layout_inspector_present")
+    )
     if physical_supported:
         classification = "physical_expert_migration_supported"
+        verification_level = "physical_migration_verified"
         recommended_execution_model = "live_expert_weight_migration"
         blocking_gaps: list[str] = []
     elif source_observe_only or runtime_observe_only:
         classification = "observe_only_expert_placement_contract"
+        verification_level = (
+            "contract_seen_only"
+            if contract_seen
+            else "runtime_boundary_observe_only"
+        )
         recommended_execution_model = "expert_aware_actor_recreate"
         blocking_gaps = [
             "apply_expert_placement_plan returns applied=false",
@@ -346,6 +433,11 @@ def classify_audit_report(report: Mapping[str, Any]) -> Dict[str, Any]:
         ]
     elif boundary_present:
         classification = "runtime_boundary_present_but_not_verified"
+        verification_level = (
+            "runtime_placement_verified"
+            if runtime_verified_placement
+            else "runtime_boundary_observe_only"
+        )
         recommended_execution_model = "expert_aware_actor_recreate"
         blocking_gaps = [
             "runtime apply/verify hooks are present but do not prove physical "
@@ -353,6 +445,7 @@ def classify_audit_report(report: Mapping[str, Any]) -> Dict[str, Any]:
         ]
     else:
         classification = "runtime_boundary_unavailable"
+        verification_level = "unavailable"
         recommended_execution_model = "actor_recreate_only"
         blocking_gaps = [
             "patched vLLM apply/verify expert placement hooks are unavailable",
@@ -360,7 +453,17 @@ def classify_audit_report(report: Mapping[str, Any]) -> Dict[str, Any]:
 
     return {
         "classification": classification,
+        "runtime_verification_level": verification_level,
         "can_claim_physical_expert_migration": physical_supported,
+        "runtime_layout_inspector_present": layout_inspector_present,
+        "runtime_verified_placement": runtime_verified_placement,
+        "runtime_can_verify_physical_placement": (
+            can_verify_physical_placement
+        ),
+        "runtime_can_remap_live_ep_rank": can_remap_live_ep_rank,
+        "runtime_can_measure_all_to_all": can_measure_all_to_all,
+        "runtime_contract_seen_by_runtime": contract_seen,
+        "runtime_physical_weight_migration": physical_flag,
         "recommended_execution_model": recommended_execution_model,
         "blocking_gaps": blocking_gaps,
     }

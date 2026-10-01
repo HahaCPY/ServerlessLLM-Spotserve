@@ -734,6 +734,26 @@ def summarize_replanning_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         safe_int(row.get("expert_placement_plan_moved_weight_bytes"), 0)
         for row in replanning_rows
     ]
+    expert_plan_unknown_weight_bytes_events = sum(
+        row.get("expert_placement_plan_moved_weight_bytes") is None
+        and (
+            safe_int(row.get("expert_placement_plan_moved_experts"), 0) > 0
+            or safe_int(
+                row.get("expert_placement_plan_unknown_movement_experts"), 0
+            ) > 0
+        )
+        for row in replanning_rows
+    )
+    expert_plan_unknown_cost_events = sum(
+        row.get("expert_placement_plan_estimated_weight_movement_cost_ms") is None
+        and (
+            safe_int(row.get("expert_placement_plan_moved_experts"), 0) > 0
+            or safe_int(
+                row.get("expert_placement_plan_unknown_movement_experts"), 0
+            ) > 0
+        )
+        for row in replanning_rows
+    )
     expert_plan_weight_movement_costs = numeric_values(
         "expert_placement_plan_estimated_weight_movement_cost_ms"
     )
@@ -755,6 +775,51 @@ def summarize_replanning_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         ),
         "replanning_execution_applied": execution_statuses.count("applied"),
         "replanning_execution_failed": execution_statuses.count("failed"),
+        "replanning_dynamic_ep_resize_events": sum(
+            1
+            for row in replanning_rows
+            if row.get("reparallelization_dynamic_ep_resize")
+        ),
+        "replanning_in_place_ep_resize_events": sum(
+            1
+            for row in replanning_rows
+            if row.get("reparallelization_in_place_ep_resize")
+        ),
+        "replanning_elastic_ep_admission_drained_events": sum(
+            1
+            for row in replanning_rows
+            if row.get("reparallelization_elastic_ep_admission_drained")
+        ),
+        "replanning_elastic_ep_drained_requests": sum(
+            safe_int(
+                row.get(
+                    "reparallelization_elastic_ep_drained_request_count"
+                )
+            )
+            for row in replanning_rows
+        ),
+        "replanning_source_effective_expert_parallel_sizes": ",".join(
+            sorted({
+                str(row.get(
+                    "reparallelization_source_effective_expert_parallel_size"
+                ))
+                for row in replanning_rows
+                if safe_int(row.get(
+                    "reparallelization_source_effective_expert_parallel_size"
+                ), 0) > 0
+            })
+        ),
+        "replanning_target_effective_expert_parallel_sizes": ",".join(
+            sorted({
+                str(row.get(
+                    "reparallelization_target_effective_expert_parallel_size"
+                ))
+                for row in replanning_rows
+                if safe_int(row.get(
+                    "reparallelization_target_effective_expert_parallel_size"
+                ), 0) > 0
+            })
+        ),
         "replanning_execution_models": compact_values(execution_models),
         "replanning_expert_placement_execution_models": compact_values(
             expert_execution_models
@@ -768,6 +833,11 @@ def summarize_replanning_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             if row.get("expert_placement_actor_recreate")
             or row.get("expert_placement_execution_model")
             == "expert_aware_actor_recreate"
+            or (
+                row.get("reparallelization_execution_model") == "actor_recreate"
+                and row.get("expert_placement_execution_model")
+                == "quiescent_fixed_ep_remap"
+            )
         ),
         "replanning_expert_placement_live_migration_events": sum(
             1
@@ -775,6 +845,13 @@ def summarize_replanning_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             if row.get("expert_placement_live_migration")
             or row.get("expert_placement_execution_model")
             == "live_expert_weight_migration"
+        ),
+        "replanning_expert_placement_quiescent_remap_events": sum(
+            1
+            for row in replanning_rows
+            if row.get("expert_placement_quiescent_remap")
+            or row.get("expert_placement_execution_model")
+            == "quiescent_fixed_ep_remap"
         ),
         "replanning_expert_placement_physical_migration_required_events": sum(
             1
@@ -944,6 +1021,12 @@ def summarize_replanning_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "replanning_total_expert_placement_plan_moved_weight_bytes": sum(
             expert_plan_moved_weight_bytes
         ),
+        "replanning_expert_placement_plan_unknown_weight_bytes_events": (
+            expert_plan_unknown_weight_bytes_events
+        ),
+        "replanning_expert_placement_plan_unknown_cost_events": (
+            expert_plan_unknown_cost_events
+        ),
         "replanning_avg_expert_placement_plan_weight_movement_cost_ms": (
             average(expert_plan_weight_movement_costs)
         ),
@@ -1012,6 +1095,274 @@ def summarize_replanning_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
                 for row in replanning_rows
             ]
         ),
+        "replanning_expert_placement_runtime_contract_seen": sum(
+            safe_int(
+                row.get("expert_placement_runtime_contract_seen_count"),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_expert_placement_runtime_contract_seen_all_workers": sum(
+            safe_int(
+                row.get(
+                    "expert_placement_runtime_contract_seen_all_workers_count"
+                ),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_expert_placement_runtime_contract_seen_worker_count": sum(
+            safe_int(
+                row.get("expert_placement_runtime_contract_seen_worker_count"),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_expert_placement_runtime_contract_seen_worker_total": sum(
+            safe_int(
+                row.get("expert_placement_runtime_contract_seen_worker_total"),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_expert_placement_runtime_physical_weight_migration": sum(
+            safe_int(
+                row.get(
+                    "expert_placement_runtime_physical_weight_migration_count"
+                ),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_total_expert_placement_runtime_moved_expert_shards": sum(
+            safe_int(
+                row.get("expert_placement_runtime_moved_expert_shards"),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_total_expert_placement_runtime_moved_weight_bytes": sum(
+            safe_int(
+                row.get("expert_placement_runtime_moved_weight_bytes"),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_expert_placement_runtime_physical_host_ids_observed": sum(
+            safe_int(
+                row.get("expert_placement_runtime_physical_host_ids_observed_count"),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_expert_placement_runtime_cross_node_weight_migration": sum(
+            safe_int(
+                row.get("expert_placement_runtime_cross_node_weight_migration_count"),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_total_expert_placement_runtime_cross_node_moved_expert_shards": sum(
+            safe_int(
+                row.get("expert_placement_runtime_cross_node_moved_expert_shards"),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_total_expert_placement_runtime_cross_node_moved_weight_bytes": sum(
+            safe_int(
+                row.get("expert_placement_runtime_cross_node_moved_weight_bytes"),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_avg_expert_placement_runtime_remap_duration_ms": average(
+            [
+                safe_float(
+                    row.get("expert_placement_runtime_remap_duration_ms"),
+                    0.0,
+                )
+                for row in replanning_rows
+                if safe_float(
+                    row.get("expert_placement_runtime_remap_duration_ms"),
+                    0.0,
+                )
+                > 0
+            ]
+        ),
+        "replanning_expert_placement_runtime_active_request_remap": sum(
+            safe_int(
+                row.get("expert_placement_runtime_active_request_remap_count"),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_expert_placement_runtime_step_boundary_barrier": sum(
+            safe_int(
+                row.get("expert_placement_runtime_step_boundary_barrier_count"),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_expert_placement_runtime_verification_levels": (
+            compact_values(
+                [
+                    str(
+                        row.get(
+                            "expert_placement_runtime_verification_levels",
+                            "",
+                        )
+                    )
+                    for row in replanning_rows
+                ]
+            )
+        ),
+        "replanning_expert_placement_runtime_verified_placement": sum(
+            safe_int(
+                row.get(
+                    "expert_placement_runtime_verified_placement_count"
+                ),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_expert_placement_runtime_can_verify_physical_placement": (
+            sum(
+                safe_int(
+                    row.get(
+                        "expert_placement_runtime_can_verify_physical_placement_count"
+                    ),
+                    0,
+                )
+                for row in replanning_rows
+            )
+        ),
+        "replanning_expert_placement_runtime_can_remap_live_ep_rank": sum(
+            safe_int(
+                row.get(
+                    "expert_placement_runtime_can_remap_live_ep_rank_count"
+                ),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_expert_placement_runtime_can_measure_all_to_all": sum(
+            safe_int(
+                row.get(
+                    "expert_placement_runtime_can_measure_all_to_all_count"
+                ),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_expert_placement_runtime_all_to_all_counters_available": sum(
+            safe_int(
+                row.get(
+                    "expert_placement_runtime_all_to_all_counters_available_count"
+                ),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_total_expert_placement_runtime_all_to_all_collective_calls": sum(
+            safe_int(
+                row.get("expert_placement_runtime_all_to_all_collective_calls"),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_total_expert_placement_runtime_all_to_all_dispatch_calls": sum(
+            safe_int(
+                row.get("expert_placement_runtime_all_to_all_dispatch_calls"),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_total_expert_placement_runtime_all_to_all_combine_calls": sum(
+            safe_int(
+                row.get("expert_placement_runtime_all_to_all_combine_calls"),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_total_expert_placement_runtime_all_to_all_observed_input_bytes": sum(
+            safe_int(
+                row.get(
+                    "expert_placement_runtime_all_to_all_observed_input_bytes"
+                ),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_total_expert_placement_runtime_all_to_all_observed_output_bytes": sum(
+            safe_int(
+                row.get(
+                    "expert_placement_runtime_all_to_all_observed_output_bytes"
+                ),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_total_expert_placement_runtime_all_to_all_internode_calls": sum(
+            safe_int(
+                row.get("expert_placement_runtime_all_to_all_internode_calls"),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_expert_placement_runtime_all_to_all_measurement_kinds": ",".join(
+            sorted(
+                {
+                    str(row.get(
+                        "expert_placement_runtime_all_to_all_measurement_kinds"
+                    ))
+                    for row in replanning_rows
+                    if row.get(
+                        "expert_placement_runtime_all_to_all_measurement_kinds"
+                    )
+                }
+            )
+        ),
+        "replanning_expert_placement_runtime_actual_placement_available": sum(
+            safe_int(
+                row.get(
+                    "expert_placement_runtime_actual_placement_available_count"
+                ),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_expert_placement_runtime_actual_placement_workers": sum(
+            safe_int(
+                row.get(
+                    "expert_placement_runtime_actual_placement_worker_count"
+                ),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_expert_placement_runtime_actual_placement_shards": sum(
+            safe_int(
+                row.get(
+                    "expert_placement_runtime_actual_placement_shard_count"
+                ),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_expert_placement_runtime_capability_reasons": (
+            compact_values(
+                [
+                    str(
+                        row.get(
+                            "expert_placement_runtime_capability_reasons",
+                            "",
+                        )
+                    )
+                    for row in replanning_rows
+                ]
+            )
+        ),
         "replanning_expert_placement_runtime_plan_applied": sum(
             safe_int(
                 row.get("expert_placement_runtime_plan_applied_count"),
@@ -1053,6 +1404,13 @@ def summarize_replanning_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "replanning_expert_placement_runtime_live_migration": sum(
             safe_int(
                 row.get("expert_placement_runtime_live_migration_count"),
+                0,
+            )
+            for row in replanning_rows
+        ),
+        "replanning_expert_placement_runtime_quiescent_remap": sum(
+            safe_int(
+                row.get("expert_placement_runtime_quiescent_remap_count"),
                 0,
             )
             for row in replanning_rows
@@ -1371,6 +1729,24 @@ def summarize_context_migration_metrics(
             )
             for row in migration_rows
         ),
+        "context_migration_selected_target_expert_placement_contract_seen": sum(
+            safe_int(
+                row.get(
+                    "selected_plan_target_expert_placement_contract_seen_count"
+                ),
+                0,
+            )
+            for row in migration_rows
+        ),
+        "context_migration_selected_target_expert_placement_contract_seen_all_workers": sum(
+            safe_int(
+                row.get(
+                    "selected_plan_target_expert_placement_contract_seen_all_workers_count"
+                ),
+                0,
+            )
+            for row in migration_rows
+        ),
         "context_migration_selected_target_expert_placement_contract_reasons": (
             compact_values([
                 str(reason)
@@ -1378,6 +1754,68 @@ def summarize_context_migration_metrics(
                 for reason in (
                     row.get(
                         "selected_plan_target_expert_placement_contract_reasons",
+                        [],
+                    )
+                    or []
+                )
+            ])
+        ),
+        "context_migration_selected_target_expert_placement_runtime_levels": (
+            compact_values([
+                str(level)
+                for row in migration_rows
+                for level in (
+                    row.get(
+                        "selected_plan_target_expert_placement_runtime_verification_levels",
+                        [],
+                    )
+                    or []
+                )
+            ])
+        ),
+        "context_migration_selected_target_expert_placement_runtime_verified": sum(
+            safe_int(
+                row.get(
+                    "selected_plan_target_expert_placement_runtime_verified_count"
+                ),
+                0,
+            )
+            for row in migration_rows
+        ),
+        "context_migration_selected_target_expert_placement_runtime_can_verify_physical": sum(
+            safe_int(
+                row.get(
+                    "selected_plan_target_expert_placement_runtime_can_verify_physical_count"
+                ),
+                0,
+            )
+            for row in migration_rows
+        ),
+        "context_migration_selected_target_expert_placement_runtime_can_remap_ep": sum(
+            safe_int(
+                row.get(
+                    "selected_plan_target_expert_placement_runtime_can_remap_ep_count"
+                ),
+                0,
+            )
+            for row in migration_rows
+        ),
+        "context_migration_selected_target_expert_placement_runtime_can_measure_a2a": sum(
+            safe_int(
+                row.get(
+                    "selected_plan_target_expert_placement_runtime_can_measure_a2a_count"
+                ),
+                0,
+            )
+            for row in migration_rows
+        ),
+        "context_migration_selected_target_expert_placement_runtime_capability_reasons": (
+            compact_values([
+                str(reason)
+                for row in migration_rows
+                for reason in (
+                    row.get(
+                        "selected_plan_target_expert_placement_runtime_capability_reasons",
                         [],
                     )
                     or []
@@ -1864,11 +2302,67 @@ def summarize_state_recovery_metrics(
             for row in state_rows
             if row.get("target_expert_placement_plan_verified")
         ),
+        "state_recovery_target_expert_placement_contract_seen": sum(
+            1
+            for row in state_rows
+            if row.get("target_expert_placement_contract_seen_by_runtime")
+        ),
+        "state_recovery_target_expert_placement_contract_seen_all_workers": (
+            sum(
+                1
+                for row in state_rows
+                if row.get(
+                    "target_expert_placement_contract_seen_by_all_workers"
+                )
+            )
+        ),
         "state_recovery_target_expert_placement_contract_reasons": (
             compact_values([
                 str(row.get("target_expert_placement_contract_reason"))
                 for row in state_rows
                 if row.get("target_expert_placement_contract_reason")
+            ])
+        ),
+        "state_recovery_target_expert_placement_runtime_levels": (
+            compact_values([
+                str(row.get("target_expert_placement_runtime_verification_level"))
+                for row in state_rows
+                if row.get("target_expert_placement_runtime_verification_level")
+            ])
+        ),
+        "state_recovery_target_expert_placement_runtime_verified": sum(
+            1
+            for row in state_rows
+            if row.get("target_expert_placement_runtime_verified_placement")
+        ),
+        "state_recovery_target_expert_placement_runtime_can_verify_physical": (
+            sum(
+                1
+                for row in state_rows
+                if row.get(
+                    "target_expert_placement_runtime_can_verify_physical_placement"
+                )
+            )
+        ),
+        "state_recovery_target_expert_placement_runtime_can_remap_ep": sum(
+            1
+            for row in state_rows
+            if row.get(
+                "target_expert_placement_runtime_can_remap_live_ep_rank"
+            )
+        ),
+        "state_recovery_target_expert_placement_runtime_can_measure_a2a": sum(
+            1
+            for row in state_rows
+            if row.get(
+                "target_expert_placement_runtime_can_measure_all_to_all"
+            )
+        ),
+        "state_recovery_target_expert_placement_runtime_capability_reasons": (
+            compact_values([
+                str(row.get("target_expert_placement_runtime_capability_reason"))
+                for row in state_rows
+                if row.get("target_expert_placement_runtime_capability_reason")
             ])
         ),
         "state_recovery_target_expert_placement_apply_hook_available": sum(

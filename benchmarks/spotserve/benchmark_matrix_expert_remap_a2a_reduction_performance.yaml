@@ -1,0 +1,21 @@
+{
+  "experiment_type": "expert_remap_a2a_reduction",
+  "name": "vllm-expert-remap-a2a-reduction",
+  "endpoint": "http://127.0.0.1:8343/v1/chat/completions",
+  "deploy_config": "examples/spotserve/config-vllm-expert-remap-a2a-reduction-performance.json",
+  "workload": "benchmarks/spotserve/workloads/expert_remap_a2a_reduction_performance.jsonl",
+  "output": "results/spotserve_expert_remap_a2a_reduction_performance/report.json",
+  "ready_timeout_s": 600,
+  "request_timeout_s": 240,
+  "event_timeout_s": 600,
+  "measurement_repetitions": 3,
+  "require_traffic_reduction": true,
+  "comparison_fields": [
+    "collective_calls",
+    "observed_input_bytes",
+    "observed_output_bytes",
+    "observed_payload_bytes",
+    "latency_p95_ms",
+    "throughput_req_s"
+  ]
+}

@@ -100,6 +100,17 @@ class FakeMoeMetadataEngine(FakeMetadataEngine):
                 }
             },
             "placement_source": "runtime_hook",
+            "runtime_expert_placement_available": True,
+            "runtime_expert_placement_worker_count": 1,
+            "runtime_expert_placement_shard_count": 1,
+            "runtime_expert_placement_shards": {
+                "layer:0/expert:1": [
+                    {
+                        "rank_id": "worker:0/ep-rank:1",
+                        "weight_resident": True,
+                    }
+                ]
+            },
         }
 
 
@@ -115,6 +126,104 @@ class FakeExpertPlacementRuntime:
     def verify_expert_placement_plan(self, expert_placement_plan):
         self.verified_plan = dict(expert_placement_plan)
         return {"verified": True, "reason": "runtime_verify_succeeded"}
+
+
+class FakePhysicalExpertPlacementRuntime(FakeExpertPlacementRuntime):
+    async def apply_expert_placement_plan(self, expert_placement_plan):
+        self.applied_plan = dict(expert_placement_plan)
+        return {
+            "applied": True,
+            "success": True,
+            "physical_weight_migration": True,
+            "runtime_verified_placement": True,
+            "worker_count": 2,
+            "worker_success_count": 2,
+            "worker_results": [
+                {
+                    "applied": True,
+                    "moved_local_expert_shards": 2,
+                    "moved_local_weight_bytes": 393216,
+                    "remap_duration_ms": 11.5,
+                },
+                {
+                    "applied": True,
+                    "moved_local_expert_shards": 2,
+                    "moved_local_weight_bytes": 393216,
+                    "remap_duration_ms": 12.25,
+                },
+            ],
+        }
+
+    def verify_expert_placement_plan(self, expert_placement_plan):
+        self.verified_plan = dict(expert_placement_plan)
+        return {
+            "verified": True,
+            "success": True,
+            "physical_weight_migration": True,
+            "runtime_verified_placement": True,
+            "can_verify_physical_placement": True,
+        }
+
+
+class FakeObserveOnlyExpertPlacementRuntime:
+    def __init__(self):
+        self.applied_plan = None
+        self.verified_plan = None
+
+    def apply_expert_placement_plan(self, expert_placement_plan):
+        self.applied_plan = dict(expert_placement_plan)
+        return {
+            "applied": False,
+            "success": False,
+            "reason": "physical_expert_placement_migration_not_supported",
+            "physical_weight_migration": False,
+            "placement_fingerprint": self.applied_plan.get(
+                "placement_fingerprint"
+            ),
+        }
+
+    def verify_expert_placement_plan(self, expert_placement_plan):
+        self.verified_plan = dict(expert_placement_plan)
+        fingerprint = self.verified_plan.get("placement_fingerprint")
+        return {
+            "verified": False,
+            "success": False,
+            "reason": "physical_expert_placement_verification_not_supported",
+            "physical_weight_migration": False,
+            "placement_fingerprint": fingerprint,
+            "last_seen_placement_fingerprint": fingerprint,
+            "contract_seen_by_runtime": True,
+        }
+
+
+class FakeApplyOnlyContractSeenRuntime:
+    def __init__(self):
+        self.applied_plan = None
+        self.verified_plan = None
+
+    def apply_expert_placement_plan(self, expert_placement_plan):
+        self.applied_plan = dict(expert_placement_plan)
+        fingerprint = self.applied_plan.get("placement_fingerprint")
+        return {
+            "applied": False,
+            "success": False,
+            "reason": "physical_expert_placement_migration_not_supported",
+            "physical_weight_migration": False,
+            "placement_fingerprint": fingerprint,
+            "last_seen_placement_fingerprint": fingerprint,
+            "contract_seen_by_runtime": True,
+            "contract_seen_worker_count": 1,
+            "contract_seen_worker_total": 1,
+        }
+
+    def verify_expert_placement_plan(self, expert_placement_plan):
+        self.verified_plan = dict(expert_placement_plan)
+        return {
+            "verified": False,
+            "success": False,
+            "reason": "physical_expert_placement_verification_not_supported",
+            "physical_weight_migration": False,
+        }
 
 
 class FakeEmptyRestoreEngine(FakeStatefulEngine):
@@ -501,6 +610,28 @@ def test_engine_parallel_metadata_derives_moe_placement_from_model_config(
     assert metadata["placement_source"] == "derived_from_model_config"
     assert metadata["expert_placement_snapshot"]["layer:0/expert:2"][
         "rank_id"
+    ] == "ep-rank-1"
+
+
+def test_engine_parallel_metadata_respects_round_robin_placement(tmp_path):
+    model_path = tmp_path / "moe-model"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        '{"num_hidden_layers": 1, "num_experts": 4}',
+        encoding="utf-8",
+    )
+    backend = make_backend(
+        object(),
+        pretrained_model_name_or_path=str(model_path),
+        enable_expert_parallel=True,
+        tensor_parallel_size=2,
+        expert_placement_strategy="round_robin",
+    )
+
+    metadata = backend._engine_parallel_metadata()
+
+    assert metadata["expert_placement_snapshot"]["layer:0/expert:2"][
+        "rank_id"
     ] == "ep-rank-0"
 
 
@@ -619,18 +750,225 @@ async def test_backend_calls_runtime_expert_placement_apply_and_verify_hooks():
     assert metadata["expert_placement_apply_hook_available"] is True
     assert metadata["expert_placement_apply_attempted"] is True
     assert metadata["expert_placement_apply_success"] is True
+    assert metadata["expert_placement_apply_worker_count"] == 1
+    assert metadata["expert_placement_apply_worker_success_count"] == 1
     assert metadata["expert_placement_apply_reason"] == (
         "runtime_apply_succeeded"
     )
     assert metadata["expert_placement_verify_hook_available"] is True
     assert metadata["expert_placement_verify_attempted"] is True
     assert metadata["expert_placement_verify_success"] is True
+    assert metadata["expert_placement_verify_worker_count"] == 1
+    assert metadata["expert_placement_verify_worker_success_count"] == 1
     assert metadata["expert_placement_verify_reason"] == (
         "runtime_verify_succeeded"
     )
     assert metadata["expert_placement_plan_applied"] is True
     assert metadata["expert_placement_plan_verified"] is True
+    assert metadata["expert_placement_contract_seen_by_runtime"] is False
+    assert metadata["expert_placement_contract_seen_by_all_workers"] is False
+    assert metadata["expert_placement_physical_weight_migration"] is False
     assert metadata["expert_placement_contract_reason"] == "verified_runtime_plan"
+
+
+@pytest.mark.asyncio
+async def test_backend_reports_runtime_observed_expert_weight_transfer():
+    snapshot = {
+        "layer:0/expert:1": {
+            "layer_id": 0,
+            "expert_id": 1,
+            "rank_id": "replica:0/ep-rank:1",
+            "node_id": "node-0",
+        }
+    }
+    backend = make_backend(
+        FakePhysicalExpertPlacementRuntime(),
+        enable_expert_parallel=True,
+        tensor_parallel_size=2,
+        expert_placement_physical_migration_required=True,
+        expert_placement_plan={
+            "expert_placement_available": True,
+            "placement_fingerprint": "plan-fp",
+            "live_expert_remap": True,
+            "expert_placement_physical_migration_required": True,
+            "expert_placement_snapshot": snapshot,
+        },
+        expert_placement_snapshot=snapshot,
+    )
+
+    await backend._apply_configured_expert_placement_plan()
+    metadata = backend._engine_parallel_metadata()
+
+    assert metadata["expert_placement_physical_weight_migration"] is True
+    assert metadata["expert_placement_runtime_moved_expert_shards"] == 4
+    assert metadata["expert_placement_runtime_moved_weight_bytes"] == 786432
+    assert metadata["expert_placement_runtime_remap_duration_ms"] == 12.25
+    assert metadata["expert_placement_runtime_verified_placement"] is True
+    assert metadata["expert_placement_runtime_verification_level"] == (
+        "physical_migration_verified"
+    )
+
+
+@pytest.mark.asyncio
+async def test_backend_reports_observe_only_contract_seen_without_plan_verify():
+    snapshot = {
+        "layer:0/expert:1": {
+            "layer_id": 0,
+            "expert_id": 1,
+            "rank_id": "replica:0/ep-rank:1",
+            "node_id": "node-0",
+        }
+    }
+    runtime = FakeObserveOnlyExpertPlacementRuntime()
+    backend = make_backend(
+        runtime,
+        enable_expert_parallel=True,
+        tensor_parallel_size=2,
+        placement_epoch=8,
+        expert_placement_plan={
+            "expert_placement_available": True,
+            "placement_epoch": 8,
+            "placement_source": "logical_reparallelization_planner",
+            "placement_fingerprint": "plan-fp",
+            "expert_placement_snapshot": snapshot,
+        },
+        expert_placement_snapshot=snapshot,
+    )
+
+    await backend._apply_configured_expert_placement_plan()
+    metadata = backend._engine_parallel_metadata(
+        instance_id="instance-0",
+        node_id="node-0",
+    )
+
+    assert runtime.applied_plan["placement_fingerprint"] == "plan-fp"
+    assert runtime.verified_plan["placement_fingerprint"] == "plan-fp"
+    assert metadata["expert_placement_apply_hook_available"] is True
+    assert metadata["expert_placement_apply_attempted"] is True
+    assert metadata["expert_placement_apply_success"] is False
+    assert metadata["expert_placement_verify_hook_available"] is True
+    assert metadata["expert_placement_verify_attempted"] is True
+    assert metadata["expert_placement_verify_success"] is False
+    assert metadata["expert_placement_contract_seen_by_runtime"] is True
+    assert metadata["expert_placement_contract_seen_worker_count"] == 1
+    assert metadata["expert_placement_contract_seen_worker_total"] == 1
+    assert metadata["expert_placement_contract_seen_by_all_workers"] is True
+    assert metadata["expert_placement_physical_weight_migration"] is False
+    assert metadata["expert_placement_runtime_verification_level"] == (
+        "contract_seen_only"
+    )
+    assert metadata["expert_placement_runtime_verified_placement"] is False
+    assert (
+        metadata[
+            "expert_placement_runtime_can_verify_physical_placement"
+        ]
+        is False
+    )
+    assert metadata["expert_placement_runtime_can_remap_live_ep_rank"] is False
+    assert metadata["expert_placement_runtime_can_measure_all_to_all"] is False
+    assert metadata["expert_placement_plan_applied"] is False
+    assert metadata["expert_placement_plan_verified"] is False
+    assert metadata["expert_placement_contract_reason"] == (
+        "physical_expert_placement_migration_not_supported"
+    )
+
+
+@pytest.mark.asyncio
+async def test_backend_keeps_contract_seen_from_apply_when_verify_is_observe_only():
+    snapshot = {
+        "layer:0/expert:1": {
+            "layer_id": 0,
+            "expert_id": 1,
+            "rank_id": "replica:0/ep-rank:1",
+            "node_id": "node-0",
+        }
+    }
+    runtime = FakeApplyOnlyContractSeenRuntime()
+    backend = make_backend(
+        runtime,
+        enable_expert_parallel=True,
+        tensor_parallel_size=2,
+        placement_epoch=8,
+        expert_placement_plan={
+            "expert_placement_available": True,
+            "placement_epoch": 8,
+            "placement_source": "logical_reparallelization_planner",
+            "placement_fingerprint": "plan-fp",
+            "expert_placement_snapshot": snapshot,
+        },
+        expert_placement_snapshot=snapshot,
+    )
+
+    await backend._apply_configured_expert_placement_plan()
+    metadata = backend._engine_parallel_metadata(
+        instance_id="instance-0",
+        node_id="node-0",
+    )
+
+    assert runtime.applied_plan["placement_fingerprint"] == "plan-fp"
+    assert runtime.verified_plan["placement_fingerprint"] == "plan-fp"
+    assert metadata["expert_placement_apply_success"] is False
+    assert metadata["expert_placement_verify_success"] is False
+    assert metadata["expert_placement_contract_seen_by_runtime"] is True
+    assert metadata["expert_placement_contract_seen_worker_count"] == 1
+    assert metadata["expert_placement_contract_seen_worker_total"] == 1
+    assert metadata["expert_placement_contract_seen_by_all_workers"] is True
+    assert metadata["expert_placement_runtime_verification_level"] == (
+        "contract_seen_only"
+    )
+    assert metadata["expert_placement_runtime_verified_placement"] is False
+    assert metadata["expert_placement_plan_applied"] is False
+    assert metadata["expert_placement_plan_verified"] is False
+
+
+@pytest.mark.asyncio
+async def test_backend_fails_closed_when_physical_migration_is_required():
+    snapshot = {
+        "layer:0/expert:1": {
+            "layer_id": 0,
+            "expert_id": 1,
+            "rank_id": "replica:0/ep-rank:1",
+            "node_id": "node-0",
+        }
+    }
+    backend = make_backend(
+        FakeObserveOnlyExpertPlacementRuntime(),
+        enable_expert_parallel=True,
+        tensor_parallel_size=2,
+        placement_epoch=8,
+        expert_placement_physical_migration_required=True,
+        expert_placement_plan={
+            "expert_placement_available": True,
+            "placement_epoch": 8,
+            "placement_source": "logical_reparallelization_planner",
+            "placement_fingerprint": "plan-fp",
+            "physical_weight_migration": True,
+            "expert_placement_snapshot": snapshot,
+        },
+        expert_placement_snapshot=snapshot,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="required_physical_expert_placement_migration_not_supported",
+    ):
+        await backend._apply_configured_expert_placement_plan()
+
+    assert backend.expert_placement_runtime_status[
+        "expert_placement_contract_seen_by_runtime"
+    ] is True
+    assert backend.expert_placement_runtime_status[
+        "expert_placement_physical_migration_required"
+    ] is True
+    assert backend.expert_placement_runtime_status[
+        "expert_placement_physical_weight_migration"
+    ] is False
+    assert backend.expert_placement_runtime_status[
+        "expert_placement_runtime_verification_level"
+    ] == "contract_seen_only"
+    assert backend.expert_placement_runtime_status[
+        "expert_placement_runtime_verified_placement"
+    ] is False
 
 
 @pytest.mark.asyncio
@@ -697,6 +1035,17 @@ async def test_runtime_metadata_reads_moe_placement_from_runtime_hook():
             "rank_id": "rank-1",
             "node_id": "node-0",
         }
+    }
+    assert profile["runtime_expert_placement_available"] is True
+    assert profile["runtime_expert_placement_worker_count"] == 1
+    assert profile["runtime_expert_placement_shard_count"] == 1
+    assert profile["runtime_expert_placement_shards"] == {
+        "layer:0/expert:1": [
+            {
+                "rank_id": "worker:0/ep-rank:1",
+                "weight_resident": True,
+            }
+        ]
     }
 
 

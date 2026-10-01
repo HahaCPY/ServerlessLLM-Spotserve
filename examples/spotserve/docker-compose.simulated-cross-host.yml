@@ -1,0 +1,106 @@
+services:
+  sllm_sim_head:
+    image: ${SPOTSERVE_IMAGE:-docker.io/serverlessllm/sllm:latest}
+    container_name: sllm_sim_head
+    environment:
+      - MODE=HEAD
+      - RAY_NUM_CPUS=4
+      - RAY_ADDRESS=127.0.0.1:6379
+      - RAY_TEMP_DIR=/raytmp/head
+      - PYTHONPATH=/workspace/spotserve
+      - HF_HOME=/hf-cache
+      - HF_HUB_DISABLE_XET=1
+    ports:
+      - "${SPOTSERVE_SIM_RAY_PORT:-6383}:6379"
+      - "${SPOTSERVE_SIM_HTTP_PORT:-8353}:8343"
+    shm_size: "10gb"
+    pids_limit: 32768
+    networks:
+      - simulated_hosts
+    volumes:
+      - ${SPOTSERVE_REPO_ROOT}:/workspace/spotserve
+      - ${SPOTSERVE_REPO_ROOT}/entrypoint.sh:/app/entrypoint.sh:ro
+      - /tmp/sllm-simulated-hosts/head:/raytmp/head
+      - ${HF_CACHE_DIR:-/tmp/sllm-hf-cache-rootless}:/hf-cache
+    command: []
+
+  sllm_sim_host_a:
+    image: ${SPOTSERVE_IMAGE:-docker.io/serverlessllm/sllm:latest}
+    container_name: sllm_sim_host_a
+    group_add:
+      - keep-groups
+    devices:
+      - "nvidia.com/gpu=${SPOTSERVE_SIM_HOST_A_GPU_0:-0}"
+      - "nvidia.com/gpu=${SPOTSERVE_SIM_HOST_A_GPU_1:-1}"
+    environment:
+      - MODE=WORKER
+      - WORKER_ID=0
+      - RAY_HEAD_ADDRESS=sllm_sim_head:6379
+      - RAY_TEMP_DIR=/raytmp/worker
+      - STORAGE_PATH=/models
+      - PYTHONPATH=/workspace/spotserve
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - SPOTSERVE_PHYSICAL_HOST_ID=${SPOTSERVE_SIMULATED_PHYSICAL_HOST_ID:-single-physical-host}
+      - SPOTSERVE_FAILURE_DOMAIN_ID=simulated-host-a
+      - VLLM_SPOTSERVE_EXPERT_REMAP=1
+      - VLLM_SPOTSERVE_ACTIVE_REQUEST_REMAP=1
+      - VLLM_SPOTSERVE_A2A_TRACE=1
+      - HF_HOME=/hf-cache
+      - HF_HUB_DISABLE_XET=1
+    shm_size: "10gb"
+    pids_limit: 32768
+    networks:
+      - simulated_hosts
+    volumes:
+      - ${MODEL_FOLDER}:/models:ro
+      - ${SPOTSERVE_REPO_ROOT}:/workspace/spotserve:ro
+      - ${SPOTSERVE_REPO_ROOT}/entrypoint.sh:/app/entrypoint.sh:ro
+      - /tmp/sllm-simulated-hosts/host-a:/raytmp/worker
+      - ${HF_CACHE_DIR:-/tmp/sllm-hf-cache-rootless}:/hf-cache
+    command: ["--mem-pool-size", "4GB", "--registration-required", "true"]
+    depends_on:
+      - sllm_sim_head
+
+  sllm_sim_host_b:
+    image: ${SPOTSERVE_IMAGE:-docker.io/serverlessllm/sllm:latest}
+    container_name: sllm_sim_host_b
+    group_add:
+      - keep-groups
+    devices:
+      - "nvidia.com/gpu=${SPOTSERVE_SIM_HOST_B_GPU_0:-2}"
+      - "nvidia.com/gpu=${SPOTSERVE_SIM_HOST_B_GPU_1:-3}"
+    environment:
+      - MODE=WORKER
+      - WORKER_ID=1
+      - RAY_HEAD_ADDRESS=sllm_sim_head:6379
+      - RAY_TEMP_DIR=/raytmp/worker
+      - STORAGE_PATH=/models
+      - PYTHONPATH=/workspace/spotserve
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - SPOTSERVE_PHYSICAL_HOST_ID=${SPOTSERVE_SIMULATED_PHYSICAL_HOST_ID:-single-physical-host}
+      - SPOTSERVE_FAILURE_DOMAIN_ID=simulated-host-b
+      - VLLM_SPOTSERVE_EXPERT_REMAP=1
+      - VLLM_SPOTSERVE_ACTIVE_REQUEST_REMAP=1
+      - VLLM_SPOTSERVE_A2A_TRACE=1
+      - HF_HOME=/hf-cache
+      - HF_HUB_DISABLE_XET=1
+    shm_size: "10gb"
+    pids_limit: 32768
+    networks:
+      - simulated_hosts
+    volumes:
+      - ${MODEL_FOLDER}:/models:ro
+      - ${SPOTSERVE_REPO_ROOT}:/workspace/spotserve:ro
+      - ${SPOTSERVE_REPO_ROOT}/entrypoint.sh:/app/entrypoint.sh:ro
+      - /tmp/sllm-simulated-hosts/host-b:/raytmp/worker
+      - ${HF_CACHE_DIR:-/tmp/sllm-hf-cache-rootless}:/hf-cache
+    command: ["--mem-pool-size", "4GB", "--registration-required", "true"]
+    depends_on:
+      - sllm_sim_head
+
+networks:
+  simulated_hosts:
+    name: sllm_simulated_hosts
+    driver: bridge

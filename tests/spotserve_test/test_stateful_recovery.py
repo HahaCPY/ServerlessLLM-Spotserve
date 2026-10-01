@@ -311,8 +311,35 @@ def test_planner_ranks_compatible_targets_by_expert_locality():
     assert selected["target_expert_placement_contract_available"] is True
     assert selected["target_expert_placement_plan_applied"] is False
     assert selected["target_expert_placement_plan_verified"] is False
+    assert (
+        selected["target_expert_placement_contract_seen_by_runtime"] is False
+    )
+    assert (
+        selected["target_expert_placement_contract_seen_by_all_workers"] is False
+    )
     assert selected["target_expert_placement_contract_reason"] == (
         "runtime_not_applied"
+    )
+    assert selected[
+        "target_expert_placement_runtime_verification_level"
+    ] == "unavailable"
+    assert (
+        selected["target_expert_placement_runtime_verified_placement"]
+        is False
+    )
+    assert (
+        selected[
+            "target_expert_placement_runtime_can_verify_physical_placement"
+        ]
+        is False
+    )
+    assert (
+        selected["target_expert_placement_runtime_can_remap_live_ep_rank"]
+        is False
+    )
+    assert (
+        selected["target_expert_placement_runtime_can_measure_all_to_all"]
+        is False
     )
     assert selected["target_expert_placement_apply_hook_available"] is False
     assert selected["target_expert_placement_apply_attempted"] is False

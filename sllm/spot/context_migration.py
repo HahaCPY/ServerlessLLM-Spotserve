@@ -166,7 +166,15 @@ class MigrationPlan:
     target_expert_placement_contract_available: bool = False
     target_expert_placement_plan_applied: bool = False
     target_expert_placement_plan_verified: bool = False
+    target_expert_placement_contract_seen_by_runtime: bool = False
+    target_expert_placement_contract_seen_by_all_workers: bool = False
     target_expert_placement_contract_reason: str = "unavailable"
+    target_expert_placement_runtime_verification_level: str = "unavailable"
+    target_expert_placement_runtime_verified_placement: bool = False
+    target_expert_placement_runtime_can_verify_physical_placement: bool = False
+    target_expert_placement_runtime_can_remap_live_ep_rank: bool = False
+    target_expert_placement_runtime_can_measure_all_to_all: bool = False
+    target_expert_placement_runtime_capability_reason: str = ""
     target_expert_placement_apply_hook_available: bool = False
     target_expert_placement_apply_attempted: bool = False
     target_expert_placement_apply_success: bool = False
@@ -253,8 +261,33 @@ class MigrationPlan:
             "target_expert_placement_plan_verified": (
                 self.target_expert_placement_plan_verified
             ),
+            "target_expert_placement_contract_seen_by_runtime": (
+                self.target_expert_placement_contract_seen_by_runtime
+            ),
+            "target_expert_placement_contract_seen_by_all_workers": (
+                self.target_expert_placement_contract_seen_by_all_workers
+            ),
             "target_expert_placement_contract_reason": (
                 self.target_expert_placement_contract_reason
+            ),
+            "target_expert_placement_runtime_verification_level": (
+                self.target_expert_placement_runtime_verification_level
+            ),
+            "target_expert_placement_runtime_verified_placement": (
+                self.target_expert_placement_runtime_verified_placement
+            ),
+            "target_expert_placement_runtime_can_verify_physical_placement": (
+                self
+                .target_expert_placement_runtime_can_verify_physical_placement
+            ),
+            "target_expert_placement_runtime_can_remap_live_ep_rank": (
+                self.target_expert_placement_runtime_can_remap_live_ep_rank
+            ),
+            "target_expert_placement_runtime_can_measure_all_to_all": (
+                self.target_expert_placement_runtime_can_measure_all_to_all
+            ),
+            "target_expert_placement_runtime_capability_reason": (
+                self.target_expert_placement_runtime_capability_reason
             ),
             "target_expert_placement_apply_hook_available": (
                 self.target_expert_placement_apply_hook_available
@@ -549,11 +582,18 @@ def source_has_available_expert_route_histogram(
 
 
 def target_expert_placement_keys(target: MigrationTarget) -> set[str]:
-    raw = _metadata_value(
-        target,
-        "expert_placement_snapshot",
-        "expert_placement",
-    )
+    raw = None
+    if _to_bool(
+        _metadata_value(target, "runtime_expert_placement_available"),
+        default=False,
+    ):
+        raw = _metadata_value(target, "runtime_expert_placement_shards")
+    if raw is None:
+        raw = _metadata_value(
+            target,
+            "expert_placement_snapshot",
+            "expert_placement",
+        )
     return _placement_expert_keys(raw)
 
 
@@ -604,9 +644,67 @@ def target_placement_marker(target: MigrationTarget) -> Dict[str, Any]:
             _metadata_value(target, "expert_placement_plan_verified"),
             default=False,
         ),
+        "target_expert_placement_contract_seen_by_runtime": _to_bool(
+            _metadata_value(
+                target,
+                "expert_placement_contract_seen_by_runtime",
+            ),
+            default=False,
+        ),
+        "target_expert_placement_contract_seen_by_all_workers": _to_bool(
+            _metadata_value(
+                target,
+                "expert_placement_contract_seen_by_all_workers",
+            ),
+            default=False,
+        ),
         "target_expert_placement_contract_reason": str(
             _metadata_value(target, "expert_placement_contract_reason")
             or "unavailable"
+        ),
+        "target_expert_placement_runtime_verification_level": str(
+            _metadata_value(
+                target,
+                "expert_placement_runtime_verification_level",
+            )
+            or "unavailable"
+        ),
+        "target_expert_placement_runtime_verified_placement": _to_bool(
+            _metadata_value(
+                target,
+                "expert_placement_runtime_verified_placement",
+            ),
+            default=False,
+        ),
+        "target_expert_placement_runtime_can_verify_physical_placement": (
+            _to_bool(
+                _metadata_value(
+                    target,
+                    "expert_placement_runtime_can_verify_physical_placement",
+                ),
+                default=False,
+            )
+        ),
+        "target_expert_placement_runtime_can_remap_live_ep_rank": _to_bool(
+            _metadata_value(
+                target,
+                "expert_placement_runtime_can_remap_live_ep_rank",
+            ),
+            default=False,
+        ),
+        "target_expert_placement_runtime_can_measure_all_to_all": _to_bool(
+            _metadata_value(
+                target,
+                "expert_placement_runtime_can_measure_all_to_all",
+            ),
+            default=False,
+        ),
+        "target_expert_placement_runtime_capability_reason": str(
+            _metadata_value(
+                target,
+                "expert_placement_runtime_capability_reason",
+            )
+            or ""
         ),
         "target_expert_placement_apply_hook_available": _to_bool(
             _metadata_value(target, "expert_placement_apply_hook_available"),
@@ -1363,9 +1461,49 @@ def plan_low_cost_migration(
                 target_expert_placement_plan_verified=placement_marker[
                     "target_expert_placement_plan_verified"
                 ],
+                target_expert_placement_contract_seen_by_runtime=(
+                    placement_marker[
+                        "target_expert_placement_contract_seen_by_runtime"
+                    ]
+                ),
+                target_expert_placement_contract_seen_by_all_workers=(
+                    placement_marker[
+                        "target_expert_placement_contract_seen_by_all_workers"
+                    ]
+                ),
                 target_expert_placement_contract_reason=placement_marker[
                     "target_expert_placement_contract_reason"
                 ],
+                target_expert_placement_runtime_verification_level=(
+                    placement_marker[
+                        "target_expert_placement_runtime_verification_level"
+                    ]
+                ),
+                target_expert_placement_runtime_verified_placement=(
+                    placement_marker[
+                        "target_expert_placement_runtime_verified_placement"
+                    ]
+                ),
+                target_expert_placement_runtime_can_verify_physical_placement=(
+                    placement_marker[
+                        "target_expert_placement_runtime_can_verify_physical_placement"
+                    ]
+                ),
+                target_expert_placement_runtime_can_remap_live_ep_rank=(
+                    placement_marker[
+                        "target_expert_placement_runtime_can_remap_live_ep_rank"
+                    ]
+                ),
+                target_expert_placement_runtime_can_measure_all_to_all=(
+                    placement_marker[
+                        "target_expert_placement_runtime_can_measure_all_to_all"
+                    ]
+                ),
+                target_expert_placement_runtime_capability_reason=(
+                    placement_marker[
+                        "target_expert_placement_runtime_capability_reason"
+                    ]
+                ),
                 target_expert_placement_apply_hook_available=placement_marker[
                     "target_expert_placement_apply_hook_available"
                 ],

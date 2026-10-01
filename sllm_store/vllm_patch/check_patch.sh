@@ -24,6 +24,8 @@ PATCH_FILES=(
     "$SCRIPT_DIR/runtime_kv_metadata.patch"
     "$SCRIPT_DIR/runtime_kv_restore.patch"
     "$SCRIPT_DIR/runtime_moe_metadata.patch"
+    "$SCRIPT_DIR/runtime_sparse_a2a.patch"
+    "$SCRIPT_DIR/runtime_elastic_ep.patch"
 )
 
 VLLM_PATH_OUTPUT=$(python -c "import vllm; import os; print(os.path.dirname(os.path.abspath(vllm.__file__)))" 2>/dev/null)
@@ -56,6 +58,17 @@ for PATCH_FILE in "${PATCH_FILES[@]}"; do
         # both patches are present.  Check the exported runtime markers in
         # that overlap case instead of reporting a false incompatibility.
         echo "$(basename "$PATCH_FILE") has been applied (overlap markers)"
+    elif [[ "$(basename "$PATCH_FILE")" == "runtime_kv_restore.patch" ]] &&
+        grep -q "async def export_inference_state" \
+            "$VLLM_PATH/v1/engine/async_llm.py" &&
+        grep -q "def restore_inference_state" \
+            "$VLLM_PATH/v1/engine/async_llm.py" &&
+        grep -q "def export_active_request" \
+            "$VLLM_PATH/distributed/kv_transfer/kv_connector/v1/nixl_connector.py"; then
+        # runtime_moe_metadata.patch extends engine/core.py after the restore
+        # patch, which can make a strict reverse dry-run fail even though the
+        # restore hooks are installed. Verify the public hook markers instead.
+        echo "$(basename "$PATCH_FILE") has been applied (overlap markers)"
     else
         echo "$(basename "$PATCH_FILE") is incompatible with the installed vLLM"
         exit 1
@@ -77,11 +90,17 @@ if ! grep -q '"can_restore_cross_node": False' \
 fi
 
 if [[ "${SPOTSERVE_REQUIRE_MOE_ROUTE_INSTRUMENTATION:-0}" == "1" ||
-    "${SPOTSERVE_REQUIRE_EXPERT_PLACEMENT_RUNTIME_HOOKS:-0}" == "1" ]]; then
+    "${SPOTSERVE_REQUIRE_EXPERT_PLACEMENT_RUNTIME_HOOKS:-0}" == "1" ||
+    "${SPOTSERVE_REQUIRE_ALL_TO_ALL_INSTRUMENTATION:-0}" == "1" ]]; then
     MISSING_MOE_MARKERS=()
     if [[ ! -f "$VLLM_PATH/spotserve_moe.py" ]] ||
         ! grep -q "def record_moe_routing" "$VLLM_PATH/spotserve_moe.py"; then
         MISSING_MOE_MARKERS+=("vllm.spotserve_moe")
+    fi
+    if [[ -f "$VLLM_PATH/spotserve_moe.py" ]] &&
+        ! grep -q "def inspect_runtime_expert_placement" \
+            "$VLLM_PATH/spotserve_moe.py"; then
+        MISSING_MOE_MARKERS+=("vllm.spotserve_moe.inspect_runtime_expert_placement")
     fi
     if [[ -f "$VLLM_PATH/spotserve_moe.py" ]] &&
         ! python -m py_compile "$VLLM_PATH/spotserve_moe.py"; then
@@ -99,6 +118,11 @@ if [[ "${SPOTSERVE_REQUIRE_MOE_ROUTE_INSTRUMENTATION:-0}" == "1" ||
         "$VLLM_PATH/v1/worker/gpu_model_runner.py"; then
         MISSING_MOE_MARKERS+=("gpu_model_runner.moe_request_context")
     fi
+    if [[ "${SPOTSERVE_REQUIRE_ALL_TO_ALL_INSTRUMENTATION:-0}" == "1" ]] &&
+        ! grep -q "record_all_to_all_collective" \
+            "$VLLM_PATH/distributed/device_communicators/cuda_communicator.py"; then
+        MISSING_MOE_MARKERS+=("cuda_communicator.record_all_to_all_collective")
+    fi
     if ! grep -q "def get_request_moe_metadata" \
         "$VLLM_PATH/v1/worker/worker_base.py"; then
         MISSING_MOE_MARKERS+=("worker_base.get_request_moe_metadata")
@@ -111,6 +135,18 @@ if [[ "${SPOTSERVE_REQUIRE_MOE_ROUTE_INSTRUMENTATION:-0}" == "1" ||
         "$VLLM_PATH/v1/engine/async_llm.py"; then
         MISSING_MOE_MARKERS+=("async_llm.verify_expert_placement_plan")
     fi
+    if ! grep -q "def _spotserve_call_placement_hook_all_dp_engines" \
+        "$VLLM_PATH/v1/engine/async_llm.py"; then
+        MISSING_MOE_MARKERS+=("async_llm.all_dp_engine_placement_hook")
+    fi
+    if ! grep -q '"prepare_expert_placement_plan"' \
+        "$VLLM_PATH/v1/engine/async_llm.py"; then
+        MISSING_MOE_MARKERS+=("async_llm.all_dp_engine_preflight")
+    fi
+    if ! grep -q "def prepare_expert_placement_plan" \
+        "$VLLM_PATH/v1/engine/core.py"; then
+        MISSING_MOE_MARKERS+=("engine_core.prepare_expert_placement_plan")
+    fi
     if ! grep -q "def apply_expert_placement_plan" \
         "$VLLM_PATH/v1/worker/worker_base.py"; then
         MISSING_MOE_MARKERS+=("worker_base.apply_expert_placement_plan")
@@ -119,8 +155,24 @@ if [[ "${SPOTSERVE_REQUIRE_MOE_ROUTE_INSTRUMENTATION:-0}" == "1" ||
         "$VLLM_PATH/v1/worker/worker_base.py"; then
         MISSING_MOE_MARKERS+=("worker_base.verify_expert_placement_plan")
     fi
+    if ! grep -q "def _spotserve_runtime_expert_placement_snapshot" \
+        "$VLLM_PATH/v1/worker/worker_base.py"; then
+        MISSING_MOE_MARKERS+=("worker_base.runtime_expert_placement_snapshot")
+    fi
     if [[ "${#MISSING_MOE_MARKERS[@]}" -gt 0 ]]; then
         echo "Missing patched vLLM MoE/placement markers: ${MISSING_MOE_MARKERS[*]}" >&2
         exit 1
     fi
+fi
+
+if ! grep -q '"spotserve_sparse"' "$VLLM_PATH/envs.py" ||
+    ! grep -q "SpotServeSparsePrepareAndFinalize" \
+        "$VLLM_PATH/model_executor/layers/fused_moe/all2all_utils.py"; then
+    echo "Missing patched vLLM SpotServe sparse A2A backend" >&2
+    exit 1
+fi
+if ! grep -q "falling back to ray.nodes()" \
+    "$VLLM_PATH/v1/engine/utils.py"; then
+    echo "Missing patched vLLM elastic EP Ray node fallback" >&2
+    exit 1
 fi

@@ -121,6 +121,12 @@ def make_replanning_event(
             decision.get("expert_placement_live_migration_enabled", False),
         )
     )
+    expert_quiescent_remap_enabled = bool(
+        execution.get(
+            "expert_placement_quiescent_remap_enabled",
+            decision.get("expert_placement_quiescent_remap_enabled", False),
+        )
+    )
     expert_physical_migration_required = bool(
         execution.get(
             "expert_placement_physical_migration_required",
@@ -327,6 +333,109 @@ def make_replanning_event(
         "expert_placement_runtime_verify_reasons": (
             expert_placement_runtime.get("verify_reasons", "")
         ),
+        "expert_placement_runtime_contract_seen_count": (
+            expert_placement_runtime.get("contract_seen_count", 0)
+        ),
+        "expert_placement_runtime_contract_seen_all_workers_count": (
+            expert_placement_runtime.get("contract_seen_all_workers_count", 0)
+        ),
+        "expert_placement_runtime_contract_seen_worker_count": (
+            expert_placement_runtime.get("contract_seen_worker_count", 0)
+        ),
+        "expert_placement_runtime_contract_seen_worker_total": (
+            expert_placement_runtime.get("contract_seen_worker_total", 0)
+        ),
+        "expert_placement_runtime_physical_weight_migration_count": (
+            expert_placement_runtime.get("physical_weight_migration_count", 0)
+        ),
+        "expert_placement_runtime_moved_expert_shards": (
+            expert_placement_runtime.get("runtime_moved_expert_shards", 0)
+        ),
+        "expert_placement_runtime_moved_weight_bytes": (
+            expert_placement_runtime.get("runtime_moved_weight_bytes", 0)
+        ),
+        "expert_placement_runtime_remap_duration_ms": (
+            expert_placement_runtime.get("runtime_remap_duration_ms", 0.0)
+        ),
+        "expert_placement_runtime_active_request_remap_count": (
+            expert_placement_runtime.get("active_request_remap_count", 0)
+        ),
+        "expert_placement_runtime_step_boundary_barrier_count": (
+            expert_placement_runtime.get("step_boundary_barrier_count", 0)
+        ),
+        "expert_placement_runtime_physical_host_ids_observed_count": (
+            expert_placement_runtime.get("physical_host_ids_observed_count", 0)
+        ),
+        "expert_placement_runtime_cross_node_weight_migration_count": (
+            expert_placement_runtime.get("cross_node_weight_migration_count", 0)
+        ),
+        "expert_placement_runtime_cross_node_moved_expert_shards": (
+            expert_placement_runtime.get("cross_node_moved_expert_shards", 0)
+        ),
+        "expert_placement_runtime_cross_node_moved_weight_bytes": (
+            expert_placement_runtime.get("cross_node_moved_weight_bytes", 0)
+        ),
+        "expert_placement_runtime_verification_levels": (
+            expert_placement_runtime.get("verification_levels", "")
+        ),
+        "expert_placement_runtime_verified_placement_count": (
+            expert_placement_runtime.get("verified_placement_count", 0)
+        ),
+        "expert_placement_runtime_can_verify_physical_placement_count": (
+            expert_placement_runtime.get(
+                "can_verify_physical_placement_count", 0
+            )
+        ),
+        "expert_placement_runtime_can_remap_live_ep_rank_count": (
+            expert_placement_runtime.get("can_remap_live_ep_rank_count", 0)
+        ),
+        "expert_placement_runtime_can_measure_all_to_all_count": (
+            expert_placement_runtime.get("can_measure_all_to_all_count", 0)
+        ),
+        "expert_placement_runtime_all_to_all_counters_available_count": (
+            expert_placement_runtime.get(
+                "all_to_all_counters_available_count", 0
+            )
+        ),
+        "expert_placement_runtime_all_to_all_collective_calls": (
+            expert_placement_runtime.get("all_to_all_collective_calls", 0)
+        ),
+        "expert_placement_runtime_all_to_all_dispatch_calls": (
+            expert_placement_runtime.get("all_to_all_dispatch_calls", 0)
+        ),
+        "expert_placement_runtime_all_to_all_combine_calls": (
+            expert_placement_runtime.get("all_to_all_combine_calls", 0)
+        ),
+        "expert_placement_runtime_all_to_all_observed_input_bytes": (
+            expert_placement_runtime.get("all_to_all_observed_input_bytes", 0)
+        ),
+        "expert_placement_runtime_all_to_all_observed_output_bytes": (
+            expert_placement_runtime.get("all_to_all_observed_output_bytes", 0)
+        ),
+        "expert_placement_runtime_all_to_all_internode_calls": (
+            expert_placement_runtime.get("all_to_all_internode_calls", 0)
+        ),
+        "expert_placement_runtime_all_to_all_measurement_kinds": (
+            expert_placement_runtime.get("all_to_all_measurement_kinds", "")
+        ),
+        "expert_placement_runtime_actual_placement_available_count": (
+            expert_placement_runtime.get(
+                "runtime_expert_placement_available_count", 0
+            )
+        ),
+        "expert_placement_runtime_actual_placement_worker_count": (
+            expert_placement_runtime.get(
+                "runtime_expert_placement_worker_count", 0
+            )
+        ),
+        "expert_placement_runtime_actual_placement_shard_count": (
+            expert_placement_runtime.get(
+                "runtime_expert_placement_shard_count", 0
+            )
+        ),
+        "expert_placement_runtime_capability_reasons": (
+            expert_placement_runtime.get("capability_reasons", "")
+        ),
         "expert_placement_runtime_plan_applied_count": (
             expert_placement_runtime.get("plan_applied_count", 0)
         ),
@@ -359,6 +468,11 @@ def make_replanning_event(
         "expert_placement_runtime_live_migration_count": (
             expert_placement_runtime.get("expert_placement_live_migration_count", 0)
         ),
+        "expert_placement_runtime_quiescent_remap_count": (
+            expert_placement_runtime.get(
+                "expert_placement_quiescent_remap_count", 0
+            )
+        ),
         "expert_placement_runtime_physical_migration_required_count": (
             expert_placement_runtime.get(
                 "expert_placement_physical_migration_required_count", 0
@@ -368,6 +482,24 @@ def make_replanning_event(
         "reparallelization_execution_model_reason": (
             replanning_execution_model_reason
         ),
+        "reparallelization_dynamic_ep_resize": bool(
+            execution.get("dynamic_ep_resize", False)
+        ),
+        "reparallelization_in_place_ep_resize": bool(
+            execution.get("in_place_ep_resize", False)
+        ),
+        "reparallelization_elastic_ep_admission_drained": bool(
+            execution.get("elastic_ep_admission_drained", False)
+        ),
+        "reparallelization_elastic_ep_drained_request_count": int(
+            execution.get("elastic_ep_drained_request_count", 0) or 0
+        ),
+        "reparallelization_source_effective_expert_parallel_size": execution.get(
+            "source_effective_expert_parallel_size", 0
+        ),
+        "reparallelization_target_effective_expert_parallel_size": execution.get(
+            "target_effective_expert_parallel_size", 0
+        ),
         "expert_placement_execution_model": expert_execution_model,
         "expert_placement_execution_model_reason": (
             expert_execution_model_reason
@@ -376,15 +508,26 @@ def make_replanning_event(
         "expert_placement_live_migration_enabled": (
             expert_live_migration_enabled
         ),
+        "expert_placement_quiescent_remap_enabled": (
+            expert_quiescent_remap_enabled
+        ),
         "expert_placement_physical_migration_required": (
             expert_physical_migration_required
         ),
         "expert_placement_actor_recreate": (
             expert_execution_model == "expert_aware_actor_recreate"
+            or (
+                replanning_execution_model == "actor_recreate"
+                and expert_execution_model == "quiescent_fixed_ep_remap"
+            )
         ),
         "expert_placement_live_migration": (
             expert_live_migration_enabled
             or expert_execution_model == "live_expert_weight_migration"
+        ),
+        "expert_placement_quiescent_remap": (
+            expert_quiescent_remap_enabled
+            or expert_execution_model == "quiescent_fixed_ep_remap"
         ),
         "selected_score": decision.get(
             "selected_score", selected_config.get("score", 0.0)
@@ -555,6 +698,26 @@ def make_context_migration_event(
             str(plan.get("target_expert_placement_verify_reason"))
             for plan in plans
             if plan.get("target_expert_placement_verify_reason")
+        }
+    )
+    selected_target_runtime_verification_levels = sorted(
+        {
+            str(plan.get("target_expert_placement_runtime_verification_level"))
+            for plan in plans
+            if plan.get(
+                "target_expert_placement_runtime_verification_level"
+            )
+            and plan.get(
+                "target_expert_placement_runtime_verification_level"
+            )
+            != "unavailable"
+        }
+    )
+    selected_target_runtime_capability_reasons = sorted(
+        {
+            str(plan.get("target_expert_placement_runtime_capability_reason"))
+            for plan in plans
+            if plan.get("target_expert_placement_runtime_capability_reason")
         }
     )
     selected_target_placement_sources = [
@@ -744,8 +907,68 @@ def make_context_migration_event(
                 if plan.get("target_expert_placement_plan_verified")
             )
         ),
+        "selected_plan_target_expert_placement_contract_seen_count": (
+            sum(
+                1
+                for plan in plans
+                if plan.get(
+                    "target_expert_placement_contract_seen_by_runtime"
+                )
+            )
+        ),
+        "selected_plan_target_expert_placement_contract_seen_all_workers_count": (
+            sum(
+                1
+                for plan in plans
+                if plan.get(
+                    "target_expert_placement_contract_seen_by_all_workers"
+                )
+            )
+        ),
         "selected_plan_target_expert_placement_contract_reasons": (
             selected_target_contract_reasons
+        ),
+        "selected_plan_target_expert_placement_runtime_verification_levels": (
+            selected_target_runtime_verification_levels
+        ),
+        "selected_plan_target_expert_placement_runtime_verified_count": (
+            sum(
+                1
+                for plan in plans
+                if plan.get(
+                    "target_expert_placement_runtime_verified_placement"
+                )
+            )
+        ),
+        "selected_plan_target_expert_placement_runtime_can_verify_physical_count": (
+            sum(
+                1
+                for plan in plans
+                if plan.get(
+                    "target_expert_placement_runtime_can_verify_physical_placement"
+                )
+            )
+        ),
+        "selected_plan_target_expert_placement_runtime_can_remap_ep_count": (
+            sum(
+                1
+                for plan in plans
+                if plan.get(
+                    "target_expert_placement_runtime_can_remap_live_ep_rank"
+                )
+            )
+        ),
+        "selected_plan_target_expert_placement_runtime_can_measure_a2a_count": (
+            sum(
+                1
+                for plan in plans
+                if plan.get(
+                    "target_expert_placement_runtime_can_measure_all_to_all"
+                )
+            )
+        ),
+        "selected_plan_target_expert_placement_runtime_capability_reasons": (
+            selected_target_runtime_capability_reasons
         ),
         "selected_plan_target_expert_placement_apply_hook_available_count": (
             sum(
@@ -1083,8 +1306,52 @@ def make_state_recovery_event(
         "target_expert_placement_plan_verified": selected_candidate.get(
             "target_expert_placement_plan_verified", False
         ),
+        "target_expert_placement_contract_seen_by_runtime": (
+            selected_candidate.get(
+                "target_expert_placement_contract_seen_by_runtime", False
+            )
+        ),
+        "target_expert_placement_contract_seen_by_all_workers": (
+            selected_candidate.get(
+                "target_expert_placement_contract_seen_by_all_workers", False
+            )
+        ),
         "target_expert_placement_contract_reason": selected_candidate.get(
             "target_expert_placement_contract_reason", "unavailable"
+        ),
+        "target_expert_placement_runtime_verification_level": (
+            selected_candidate.get(
+                "target_expert_placement_runtime_verification_level",
+                "unavailable",
+            )
+        ),
+        "target_expert_placement_runtime_verified_placement": (
+            selected_candidate.get(
+                "target_expert_placement_runtime_verified_placement", False
+            )
+        ),
+        "target_expert_placement_runtime_can_verify_physical_placement": (
+            selected_candidate.get(
+                "target_expert_placement_runtime_can_verify_physical_placement",
+                False,
+            )
+        ),
+        "target_expert_placement_runtime_can_remap_live_ep_rank": (
+            selected_candidate.get(
+                "target_expert_placement_runtime_can_remap_live_ep_rank",
+                False,
+            )
+        ),
+        "target_expert_placement_runtime_can_measure_all_to_all": (
+            selected_candidate.get(
+                "target_expert_placement_runtime_can_measure_all_to_all",
+                False,
+            )
+        ),
+        "target_expert_placement_runtime_capability_reason": (
+            selected_candidate.get(
+                "target_expert_placement_runtime_capability_reason", ""
+            )
         ),
         "target_expert_placement_apply_hook_available": (
             selected_candidate.get(

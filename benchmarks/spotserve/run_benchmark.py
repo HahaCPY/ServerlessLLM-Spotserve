@@ -32,6 +32,7 @@ class BenchmarkSpotEvent(NamedTuple):
     instance_id: Optional[str]
     instance_index: Optional[int]
     instance_selector: Optional[str]
+    node_info: Optional[Dict[str, Any]] = None
 
 
 BENCHMARK_ONLY_WORKLOAD_KEYS = {
@@ -40,7 +41,7 @@ BENCHMARK_ONLY_WORKLOAD_KEYS = {
     "phase",
 }
 
-SUPPORTED_SPOT_EVENTS = {"preempt", "recover", "dead"}
+SUPPORTED_SPOT_EVENTS = {"add", "remove", "preempt", "recover", "dead"}
 
 
 def load_config(path: Path) -> Dict[str, Any]:
@@ -94,6 +95,11 @@ def load_spot_trace_events(
                 f"{path}: spot event must target node_id, instance_id, "
                 "instance_index, or instance_selector"
             )
+        if event in {"add", "remove"} and row.get("node_id") is None:
+            raise ValueError(f"{path}: {event} event requires node_id")
+        node_info = row.get("node_info")
+        if node_info is not None and not isinstance(node_info, Mapping):
+            raise ValueError(f"{path}: node_info must be an object")
         model_name = row.get("model_name") or default_model_name
         if (
             instance_index is not None or instance_selector is not None
@@ -110,6 +116,7 @@ def load_spot_trace_events(
                 instance_id=row.get("instance_id"),
                 instance_index=instance_index,
                 instance_selector=instance_selector,
+                node_info=dict(node_info) if node_info is not None else None,
             )
         )
     return events
@@ -197,6 +204,7 @@ def build_comparisons(
         "replanning_execution_failed",
         "replanning_expert_placement_actor_recreate_events",
         "replanning_expert_placement_live_migration_events",
+        "replanning_expert_placement_quiescent_remap_events",
         "replanning_expert_placement_physical_migration_required_events",
         "replanning_workload_cost_model_events",
         "replanning_avg_execution_duration_ms",
@@ -214,7 +222,24 @@ def build_comparisons(
         "replanning_max_expert_placement_plan_moved_experts",
         "replanning_total_expert_placement_plan_moved_weight_bytes",
         "replanning_avg_expert_placement_plan_weight_movement_cost_ms",
+        "replanning_expert_placement_runtime_contract_seen",
+        "replanning_expert_placement_runtime_contract_seen_all_workers",
+        "replanning_expert_placement_runtime_physical_weight_migration",
+        "replanning_total_expert_placement_runtime_moved_expert_shards",
+        "replanning_total_expert_placement_runtime_moved_weight_bytes",
+        "replanning_expert_placement_runtime_physical_host_ids_observed",
+        "replanning_expert_placement_runtime_cross_node_weight_migration",
+        "replanning_total_expert_placement_runtime_cross_node_moved_expert_shards",
+        "replanning_total_expert_placement_runtime_cross_node_moved_weight_bytes",
+        "replanning_avg_expert_placement_runtime_remap_duration_ms",
+        "replanning_expert_placement_runtime_active_request_remap",
+        "replanning_expert_placement_runtime_step_boundary_barrier",
+        "replanning_expert_placement_runtime_verified_placement",
+        "replanning_expert_placement_runtime_can_verify_physical_placement",
+        "replanning_expert_placement_runtime_can_remap_live_ep_rank",
+        "replanning_expert_placement_runtime_can_measure_all_to_all",
         "replanning_expert_placement_runtime_live_migration",
+        "replanning_expert_placement_runtime_quiescent_remap",
         "replanning_expert_placement_runtime_physical_migration_required",
         "replanning_max_ready_worker_node_count",
         "replanning_max_runtime_worker_node_count",
@@ -744,6 +769,7 @@ async def wait_for_ready_instances(
         return
     deadline = time.monotonic() + timeout_s
     latest_states: Dict[str, Any] = {}
+    failed_only_polls = 0
     while time.monotonic() < deadline:
         latest_states = await get_model_instance_states(
             model_name, ray_address, ray_namespace
@@ -760,7 +786,16 @@ async def wait_for_ready_instances(
             for instance_id, state in latest_states.items()
             if is_failed_instance_state(state)
         }
-        if failed_instances:
+        startup_candidates = {
+            instance_id: state
+            for instance_id, state in latest_states.items()
+            if not is_failed_instance_state(state)
+        }
+        if failed_instances and not startup_candidates:
+            failed_only_polls += 1
+        else:
+            failed_only_polls = 0
+        if failed_only_polls >= 3:
             raise RuntimeError(
                 f"Instance startup failed while waiting for "
                 f"{min_ready_instances} ready instances for {model_name}; "
@@ -966,6 +1001,8 @@ async def replay_trace_over_http(
                 "instance_id": instance_id,
                 "model_name": event.model_name,
             }
+            if event.event == "add":
+                payload["node_info"] = event.node_info or {}
             log_file.write(f"Replaying spot event: {payload}\n")
             log_file.flush()
             result = await asyncio.to_thread(
@@ -1358,12 +1395,25 @@ async def main_async(args):
                     f"{summary.get('replanning_execution_applied', 0)}, "
                     f"failed="
                     f"{summary.get('replanning_execution_failed', 0)}, "
+                    f"ep_resize="
+                    f"{summary.get('replanning_dynamic_ep_resize_events', 0)}, "
+                    f"in_place_ep_resize="
+                    f"{summary.get('replanning_in_place_ep_resize_events', 0)}, "
+                    f"ep_admission_drained="
+                    f"{summary.get('replanning_elastic_ep_admission_drained_events', 0)}, "
+                    f"ep_drained_requests="
+                    f"{summary.get('replanning_elastic_ep_drained_requests', 0)}, "
+                    f"ep_transition="
+                    f"{summary.get('replanning_source_effective_expert_parallel_sizes', '') or 'n/a'}->"
+                    f"{summary.get('replanning_target_effective_expert_parallel_sizes', '') or 'n/a'}, "
                     f"exec_model="
                     f"{summary.get('replanning_expert_placement_execution_models', '') or summary.get('replanning_execution_models', 'unavailable')}, "
                     f"actor_recreate="
                     f"{summary.get('replanning_expert_placement_actor_recreate_events', 0)}, "
                     f"live_migration="
                     f"{summary.get('replanning_expert_placement_live_migration_events', 0)}, "
+                    f"quiescent_remap="
+                    f"{summary.get('replanning_expert_placement_quiescent_remap_events', 0)}, "
                     f"exec_ms="
                     f"{summary.get('replanning_avg_execution_duration_ms', 0.0):.2f}, "
                     f"cost_model="
@@ -1382,6 +1432,8 @@ async def main_async(args):
                     f"{summary.get('replanning_total_expert_placement_plan_moved_weight_bytes', 0) / (1024 * 1024):.2f}, "
                     f"expert_move_ms="
                     f"{summary.get('replanning_avg_expert_placement_plan_weight_movement_cost_ms', 0.0):.2f}, "
+                    f"expert_move_cost_unknown="
+                    f"{summary.get('replanning_expert_placement_plan_unknown_cost_events', 0)}, "
                     f"runtime_apply_hooks="
                     f"{summary.get('replanning_expert_placement_runtime_apply_hook_available', 0)}, "
                     f"runtime_apply_success="
@@ -1389,7 +1441,45 @@ async def main_async(args):
                     f"runtime_verify_hooks="
                     f"{summary.get('replanning_expert_placement_runtime_verify_hook_available', 0)}, "
                     f"runtime_verify_success="
-                    f"{summary.get('replanning_expert_placement_runtime_verify_success', 0)}"
+                    f"{summary.get('replanning_expert_placement_runtime_verify_success', 0)}, "
+                    f"runtime_contract_seen="
+                    f"{summary.get('replanning_expert_placement_runtime_contract_seen', 0)}, "
+                    f"runtime_level="
+                    f"{summary.get('replanning_expert_placement_runtime_verification_levels', '') or 'unavailable'}, "
+                    f"runtime_verified_placement="
+                    f"{summary.get('replanning_expert_placement_runtime_verified_placement', 0)}, "
+                    f"runtime_physical_migration="
+                    f"{summary.get('replanning_expert_placement_runtime_physical_weight_migration', 0)}, "
+                    f"runtime_moved_shards="
+                    f"{summary.get('replanning_total_expert_placement_runtime_moved_expert_shards', 0)}, "
+                    f"runtime_moved_mb="
+                    f"{summary.get('replanning_total_expert_placement_runtime_moved_weight_bytes', 0) / (1024 * 1024):.2f}, "
+                    f"runtime_cross_node_shards="
+                    f"{summary.get('replanning_total_expert_placement_runtime_cross_node_moved_expert_shards', 0)}, "
+                    f"runtime_cross_node_mb="
+                    f"{summary.get('replanning_total_expert_placement_runtime_cross_node_moved_weight_bytes', 0) / (1024 * 1024):.2f}, "
+                    f"runtime_remap_ms="
+                    f"{summary.get('replanning_avg_expert_placement_runtime_remap_duration_ms', 0.0):.2f}, "
+                    f"runtime_active_remap="
+                    f"{summary.get('replanning_expert_placement_runtime_active_request_remap', 0)}, "
+                    f"runtime_step_barrier="
+                    f"{summary.get('replanning_expert_placement_runtime_step_boundary_barrier', 0)}, "
+                    f"runtime_remap_ep="
+                    f"{summary.get('replanning_expert_placement_runtime_can_remap_live_ep_rank', 0)}, "
+                    f"runtime_a2a_counters="
+                    f"{summary.get('replanning_expert_placement_runtime_can_measure_all_to_all', 0)}, "
+                    f"runtime_a2a_calls="
+                    f"{summary.get('replanning_total_expert_placement_runtime_all_to_all_collective_calls', 0)}, "
+                    f"runtime_a2a_payload_mb="
+                    f"{(summary.get('replanning_total_expert_placement_runtime_all_to_all_observed_input_bytes', 0) + summary.get('replanning_total_expert_placement_runtime_all_to_all_observed_output_bytes', 0)) / (1024 * 1024):.2f}, "
+                    f"runtime_a2a_internode_calls="
+                    f"{summary.get('replanning_total_expert_placement_runtime_all_to_all_internode_calls', 0)}, "
+                    f"runtime_actual_placement="
+                    f"{summary.get('replanning_expert_placement_runtime_actual_placement_available', 0)}, "
+                    f"runtime_actual_workers="
+                    f"{summary.get('replanning_expert_placement_runtime_actual_placement_workers', 0)}, "
+                    f"runtime_actual_shards="
+                    f"{summary.get('replanning_expert_placement_runtime_actual_placement_shards', 0)}"
                 )
             context_migration_suffix = ""
             if int(summary.get("context_migration_events", 0) or 0) > 0:
@@ -1567,6 +1657,160 @@ def main():
         help="Only write raw benchmark files; skip summary and HTML report generation",
     )
     args = parser.parse_args()
+    config = load_config(Path(args.config))
+    if config.get("experiment_type") == "expert_remap_a2a_reduction":
+        script = (
+            Path(__file__).resolve().parents[2]
+            / "scripts/run_expert_remap_a2a_reduction.py"
+        )
+        command = [
+            sys.executable,
+            str(script),
+            "--config",
+            args.config,
+            "--request-timeout",
+            str(args.request_timeout),
+            "--event-timeout",
+            str(
+                args.trace_event_timeout
+                if args.trace_event_timeout is not None
+                else config.get("event_timeout_s", 600)
+            ),
+            "--ray-address",
+            args.ray_address,
+            "--ray-namespace",
+            args.ray_namespace,
+        ]
+        if args.endpoint:
+            command.extend(["--endpoint", args.endpoint])
+        completed = subprocess.run(command, check=False)
+        if completed.returncode:
+            sys.exit(completed.returncode)
+        return
+    if config.get("experiment_type") == "elastic_ep_resize":
+        script = (
+            Path(__file__).resolve().parents[2]
+            / "scripts/verify_spotserve_elastic_ep_resize.py"
+        )
+        endpoint = args.endpoint or config.get(
+            "endpoint", "http://127.0.0.1:8343"
+        )
+        endpoint = str(endpoint).removesuffix("/v1/chat/completions")
+        command = [
+            sys.executable,
+            str(script),
+            "--config",
+            str(config["deploy_config"]),
+            "--model-path",
+            str(config.get("model_path", "/models/Qwen2-MoE-Tiny")),
+            "--endpoint",
+            endpoint,
+            "--ready-timeout",
+            str(config.get("ready_timeout_s", 600)),
+            "--event-timeout",
+            str(
+                args.trace_event_timeout
+                if args.trace_event_timeout is not None
+                else config.get("event_timeout_s", 600)
+            ),
+            "--minimum-free-gpu-memory-mib",
+            str(config.get("minimum_free_gpu_memory_mib", 8192)),
+            "--output",
+            str(config.get(
+                "output",
+                "results/spotserve_elastic_ep_resize_performance/report.json",
+            )),
+        ]
+        if config.get("active_request_drain", False):
+            command.append("--active-request-drain")
+        completed = subprocess.run(command, check=False)
+        if completed.returncode:
+            sys.exit(completed.returncode)
+        return
+    if config.get("experiment_type") == "cross_host_expert_remap":
+        script = (
+            Path(__file__).resolve().parents[2]
+            / "scripts/verify_spotserve_cross_host_expert_remap.py"
+        )
+        endpoint = args.endpoint or config.get(
+            "endpoint", "http://127.0.0.1:8343"
+        )
+        endpoint = str(endpoint).removesuffix("/v1/chat/completions")
+        command = [
+            sys.executable,
+            str(script),
+            "--config",
+            str(config["deploy_config"]),
+            "--model-path",
+            str(config.get("model_path", "/models/Qwen2-MoE-Tiny")),
+            "--endpoint",
+            endpoint,
+            "--ready-timeout",
+            str(config.get("ready_timeout_s", 600)),
+            "--event-timeout",
+            str(
+                args.trace_event_timeout
+                if args.trace_event_timeout is not None
+                else config.get("event_timeout_s", 600)
+            ),
+            "--request-timeout",
+            str(args.request_timeout),
+            "--output",
+            str(
+                config.get(
+                    "output",
+                    "results/spotserve_cross_host_expert_remap_performance/"
+                    "report.json",
+                )
+            ),
+        ]
+        for worker_id in config.get("target_worker_ids", ["0", "1"]):
+            command.extend(["--target-worker-id", str(worker_id)])
+        if config.get("require_internode_a2a", True):
+            command.append("--require-internode-a2a")
+        completed = subprocess.run(command, check=False)
+        if completed.returncode:
+            sys.exit(completed.returncode)
+        return
+    if config.get("experiment_type") == "simulated_cross_host_expert_remap":
+        script = (
+            Path(__file__).resolve().parents[2]
+            / "scripts/verify_spotserve_simulated_cross_host_remap.py"
+        )
+        endpoint = args.endpoint or config.get(
+            "endpoint", "http://127.0.0.1:8343"
+        )
+        endpoint = str(endpoint).removesuffix("/v1/chat/completions")
+        command = [
+            sys.executable,
+            str(script),
+            "--config",
+            str(config["deploy_config"]),
+            "--model-path",
+            str(config.get("model_path", "/models/Qwen2-MoE-Tiny")),
+            "--endpoint",
+            endpoint,
+            "--ready-timeout",
+            str(config.get("ready_timeout_s", 600)),
+            "--event-timeout",
+            str(
+                args.trace_event_timeout
+                if args.trace_event_timeout is not None
+                else config.get("event_timeout_s", 600)
+            ),
+            "--request-timeout",
+            str(args.request_timeout),
+            "--output",
+            str(config["output"]),
+        ]
+        for worker_id in config.get("target_worker_ids", ["0", "1"]):
+            command.extend(["--target-worker-id", str(worker_id)])
+        if config.get("require_internode_a2a", True):
+            command.append("--require-internode-a2a")
+        completed = subprocess.run(command, check=False)
+        if completed.returncode:
+            sys.exit(completed.returncode)
+        return
     try:
         asyncio.run(main_async(args))
     except RuntimeError as exc:

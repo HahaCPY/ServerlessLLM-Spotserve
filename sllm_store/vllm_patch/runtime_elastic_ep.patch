@@ -1,0 +1,313 @@
+diff --git a/vllm/v1/engine/utils.py b/vllm/v1/engine/utils.py
+--- a/vllm/v1/engine/utils.py
++++ b/vllm/v1/engine/utils.py
+@@ -539,6 +539,8 @@ class CoreEngineActorManager:
+         """
+         Add placement groups for new data parallel size.
+         """
++        from types import SimpleNamespace
++
+         import ray
+         from ray._private.state import (
+             available_resources_per_node,
+@@ -555,7 +557,24 @@ class CoreEngineActorManager:
+         dp_master_ip = old_vllm_config.parallel_config.data_parallel_master_ip
+         world_size = old_vllm_config.parallel_config.world_size
+ 
+-        nodes = list_nodes()
++        try:
++            nodes = list_nodes()
++        except Exception as exc:
++            # Minimal Ray installations may omit the dashboard State API.
++            # GCS still exposes the alive node IDs and addresses via ray.nodes().
++            logger.warning(
++                "Ray State API unavailable during elastic EP scale-up; "
++                "falling back to ray.nodes(): %s",
++                exc,
++            )
++            nodes = [
++                SimpleNamespace(
++                    node_ip=str(node.get("NodeManagerAddress", "")),
++                    node_id=str(node.get("NodeID", "")),
++                )
++                for node in ray.nodes()
++                if node.get("Alive", False)
++            ]
+         nodes = sorted(nodes, key=lambda node: node.node_ip != dp_master_ip)
+         assert nodes[0].node_ip == dp_master_ip, "The first node must be the head node"
+         assert len(nodes) == 1 or nodes[1].node_ip != dp_master_ip, (
+diff --git a/vllm/model_executor/models/qwen2_moe.py b/vllm/model_executor/models/qwen2_moe.py
+--- a/vllm/model_executor/models/qwen2_moe.py
++++ b/vllm/model_executor/models/qwen2_moe.py
+@@ -36,7 +36,7 @@ from transformers import Qwen2MoeConfig
+ 
+ from vllm.attention import Attention
+ from vllm.compilation.decorators import support_torch_compile
+-from vllm.config import CacheConfig, VllmConfig
++from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
+ from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.activation import SiluAndMul
+@@ -58,7 +58,7 @@
+ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+ from vllm.sequence import IntermediateTensors
+ 
+-from .interfaces import SupportsLoRA, SupportsPP
++from .interfaces import MixtureOfExperts, SupportsLoRA, SupportsPP
+ from .utils import (
+     AutoWeightsLoader,
+     extract_layer_index,
+@@ -125,6 +125,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
+     ):
+         super().__init__()
+         self.tp_size = get_tensor_model_parallel_world_size()
++        parallel_config = get_current_vllm_config().parallel_config
+ 
+         if self.tp_size > config.num_experts:
+             raise ValueError(
+@@ -166,6 +167,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
+             renormalize=config.norm_topk_prob,
+             quant_config=quant_config,
+             prefix=f"{prefix}.experts",
++            enable_eplb=parallel_config.enable_eplb,
++            num_redundant_experts=(
++                parallel_config.eplb_config.num_redundant_experts
++            ),
+         )
+ 
+     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+@@ -527,7 +532,9 @@ class Qwen2MoeModel(nn.Module):
+         return loaded_params
+ 
+ 
+-class Qwen2MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
++class Qwen2MoeForCausalLM(
++    nn.Module, SupportsPP, SupportsLoRA, MixtureOfExperts
++):
+     fall_back_to_pt_during_load = False
+     packed_modules_mapping = {
+         "qkv_proj": [
+@@ -566,6 +573,49 @@ class Qwen2MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
+         self.make_empty_intermediate_tensors = (
+             self.model.make_empty_intermediate_tensors
+         )
++
++        self.expert_weights = []
++        self.moe_layers = []
++        for layer in self.model.layers:
++            mlp = getattr(layer, "mlp", None)
++            if isinstance(mlp, Qwen2MoeSparseMoeBlock):
++                self.moe_layers.append(mlp.experts)
++
++        self.num_moe_layers = len(self.moe_layers)
++        if not self.moe_layers:
++            raise RuntimeError("No Qwen2MoeSparseMoeBlock found in model.layers")
++
++        example_moe = self.moe_layers[0]
++        self.num_logical_experts = config.num_experts
++        self.num_physical_experts = (
++            config.num_experts
++            + vllm_config.parallel_config.eplb_config.num_redundant_experts
++        )
++        self.num_local_physical_experts = example_moe.local_num_experts
++        self.num_routed_experts = config.num_experts
++        self.num_redundant_experts = (
++            self.num_physical_experts - self.num_logical_experts
++        )
++        self.num_expert_groups = 1
++        self.num_shared_experts = int(
++            config.shared_expert_intermediate_size > 0
++        )
++
++    def update_physical_experts_metadata(
++        self,
++        num_physical_experts: int,
++        num_local_physical_experts: int,
++    ) -> None:
++        assert self.num_local_physical_experts == num_local_physical_experts
++        self.num_physical_experts = num_physical_experts
++        self.num_redundant_experts = (
++            num_physical_experts - self.num_logical_experts
++        )
++        for moe in self.moe_layers:
++            moe.global_num_experts = num_physical_experts
++            moe.moe_config.num_experts = num_physical_experts
++            moe.local_num_experts = num_local_physical_experts
++            moe.update_expert_map()
+ 
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+         return self.model.embed_input_ids(input_ids)
+diff --git a/vllm/distributed/eplb/eplb_state.py b/vllm/distributed/eplb/eplb_state.py
+--- a/vllm/distributed/eplb/eplb_state.py
++++ b/vllm/distributed/eplb/eplb_state.py
+@@ -674,6 +674,36 @@ class EplbState:
+                 )
+                 eplb_model_state.logical_replica_count.copy_(new_logical_replica_count)
+ 
++                new_num_physical_experts = new_physical_to_logical_map.shape[1]
++                if (
++                    eplb_model_state.expert_load_pass.shape[-1]
++                    != new_num_physical_experts
++                ):
++                    eplb_model_state.expert_load_pass = torch.zeros(
++                        (
++                            eplb_model_state.model.num_moe_layers,
++                            new_num_physical_experts,
++                        ),
++                        dtype=torch.int32,
++                        device=self.device,
++                    )
++                    eplb_model_state.expert_load_window = torch.zeros(
++                        (
++                            self.expert_load_window_size,
++                            eplb_model_state.model.num_moe_layers,
++                            new_num_physical_experts,
++                        ),
++                        dtype=torch.int32,
++                        device=self.device,
++                    )
++                    eplb_model_state.model.expert_weights.clear()
++                    eplb_model_state.model.set_eplb_state(
++                        eplb_model_state.expert_load_pass,
++                        eplb_model_state.logical_to_physical_map,
++                        eplb_model_state.logical_replica_count,
++                    )
++                    self.expert_load_window_step = 0
++
+         if is_main_rank:
+             assert time_start is not None
+             torch.cuda.synchronize()
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -1635,6 +1635,11 @@ class DPEngineCoreProc(EngineCore):
+                 for input_socket, _ in poller.poll():
+                     # (RequestType, RequestData)
+                     type_frame, *data_frames = input_socket.recv_multipart(copy=False)
++                    if (
++                        input_socket is coord_socket
++                        and bytes(type_frame.buffer) == b"READY"
++                    ):
++                        continue
+                     request_type = EngineCoreRequestType(bytes(type_frame.buffer))
+ 
+                     # Deserialize the request data.
+@@ -1893,6 +1893,7 @@ class DPEngineCoreProc(EngineCore):
+         parallel_config.data_parallel_master_port = (
+             reconfig_request.new_data_parallel_master_port
+         )
++        parallel_config._data_parallel_master_port_list.clear()
+         if reconfig_request.new_data_parallel_rank != -2:
+             self.dp_rank = parallel_config.data_parallel_rank
+             self.dp_group = parallel_config.stateless_init_dp_group()
+diff --git a/vllm/v1/engine/coordinator.py b/vllm/v1/engine/coordinator.py
+--- a/vllm/v1/engine/coordinator.py
++++ b/vllm/v1/engine/coordinator.py
+@@ -231,6 +231,7 @@ class DPCoordinatorProc:
+                         new_engine_count = decoded[1]
+                         current_count = len(self.engines)
+                         if new_engine_count > current_count:
++                            added_engine_count = new_engine_count - current_count
+                             for _ in range(new_engine_count - current_count):
+                                 self.engines.append(EngineState())
+                             # NOTE(yongji): handle the case
+@@ -256,6 +257,16 @@ class DPCoordinatorProc:
+                                 current_count,
+                                 new_engine_count,
+                             )
++                            # New EngineCore actors subscribe during their
++                            # constructors and wait for READY. Repeat the
++                            # startup handshake for the added subscribers.
++                            for _ in range(added_engine_count):
++                                if publish_back.recv() != b"\x01":
++                                    raise RuntimeError(
++                                        "Unexpected DP engine subscription "
++                                        "during elastic EP scale-up"
++                                    )
++                            publish_back.send(b"READY")
+                         else:
+                             self.engines = self.engines[:new_engine_count]
+                             logger.info(
+diff --git a/vllm/v1/engine/core_client.py b/vllm/v1/engine/core_client.py
+--- a/vllm/v1/engine/core_client.py
++++ b/vllm/v1/engine/core_client.py
+@@ -1301,6 +1301,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
+         # for them to be sent
+         reconfig_futures = []
+         self.vllm_config.parallel_config.data_parallel_master_port = get_open_port()
++        self.vllm_config.parallel_config._data_parallel_master_port_list.clear()
+         for engine in self.core_engines:
+             reconfig_request = ReconfigureDistributedRequest(
+                 new_data_parallel_size=new_data_parallel_size,
+@@ -1329,6 +1330,22 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
+             )
+             reconfig_futures.append(asyncio.create_task(coro))
+ 
++        # Let every utility task send its reconfiguration request before the
++        # synchronous Ray actor creation below blocks this event loop. Without
++        # this yield, new ranks wait for old ranks in Gloo while old ranks are
++        # still idle in their request queues.
++        await asyncio.sleep(0)
+         logger.info("All reconfigure messages sent, starting engine creation")
+ 
++        # New Ray engine actors wait for a READY handshake from the DP
++        # coordinator in their constructors. Grow the coordinator first;
++        # notifying it after actor creation creates a circular wait.
++        self._ensure_stats_update_task()
++        scale_up_marker = msgspec.msgpack.encode(
++            ("SCALE_ELASTIC_EP", new_data_parallel_size)
++        )
++        while self.resources.stats_update_socket is None:
++            await asyncio.sleep(0)
++        await self.resources.stats_update_socket.send(scale_up_marker)
++
+         # Phase 2: Create new engines now that reconfig messages have been sent
+@@ -1361,14 +1377,6 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
+         logger.info("Waiting for existing engines to complete reconfiguration")
+         await asyncio.gather(*reconfig_futures)
+ 
+-        # Notify coordinator about scale up through existing
+-        # stats_update_task connection
+-        self._ensure_stats_update_task()
+-        scale_up_marker = msgspec.msgpack.encode(
+-            ("SCALE_ELASTIC_EP", new_data_parallel_size)
+-        )
+-        await self.first_req_send_socket.send(scale_up_marker)
+-
+         # Update the parallel config
+         self.vllm_config.parallel_config.data_parallel_size = new_data_parallel_size
+         logger.info(
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -687,6 +687,7 @@ class Worker(WorkerBase):
+         parallel_config.data_parallel_master_port = (
+             reconfig_request.new_data_parallel_master_port
+         )
++        parallel_config._data_parallel_master_port_list.clear()
+ 
+     def _reconfigure_moe(
+         self, old_ep_size: int, new_ep_size: int
+diff --git a/vllm/config/parallel.py b/vllm/config/parallel.py
+--- a/vllm/config/parallel.py
++++ b/vllm/config/parallel.py
+@@ -424,7 +424,8 @@ class ParallelConfig:
+         # dp rank 1: has_unfinished_seqs=False
+         # aggregated: has_unfinished_seqs=True
+         # so this is an OR operation, i.e. MAX in integers
+-        torch.distributed.all_reduce(tensor, op=ReduceOp.MAX, group=dp_group)
++        work = dp_group.allreduce(tensor, op=ReduceOp.MAX)
++        work.wait()
+         aggregated_has_unfinished = bool(tensor.item())
+         return aggregated_has_unfinished
+ 
+@@ -436,7 +437,8 @@ class ParallelConfig:
+         tensor = torch.tensor([kv_cache_memory], dtype=torch.int64, device="cpu")
+         # we cannot use broadcast for stateless dp group since it depends
+         # on global rank
+-        torch.distributed.all_reduce(tensor, op=ReduceOp.MIN, group=dp_group)
++        work = dp_group.allreduce(tensor, op=ReduceOp.MIN)
++        work.wait()
+         return tensor.item()
+ 
+     def compute_hash(self):

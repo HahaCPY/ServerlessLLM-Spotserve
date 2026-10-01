@@ -243,8 +243,8 @@ class ExpertPlacementPlan:
     moved_expert_count: int
     stationary_expert_count: int
     unknown_movement_expert_count: int
-    moved_weight_bytes: int
-    estimated_expert_weight_movement_cost_ms: float
+    moved_weight_bytes: int | None
+    estimated_expert_weight_movement_cost_ms: float | None
     estimated_dispatch_cost: float
     estimated_load_balance_penalty: float
     reason: str
@@ -921,8 +921,8 @@ Applied:
   placement metadata 估計，不是真實 vLLM all-to-all / remote dispatch traffic
   counter。真實 traffic counter 仍屬後續工作。
 
-2026-08-30 的 V8 stateful recovery performance run 已驗證 Phase 3 的主要
-control-plane path：
+2026-09-16 的 V8 stateful recovery performance run 已驗證 Phase 3 的主要
+runtime restore path：
 
 ```text
 Benchmark:
@@ -931,16 +931,19 @@ Model:
   /models/Qwen2-MoE-Tiny
 Token replay:
   successes=3/3
-  p95=49201.94ms
+  p95=48739.13ms
 Stateful recovery:
   successes=3/3
-  p95=2374.77ms
+  p95=5157.64ms
   state_restores=1/1
   state_tokens=16
   state_blocks=6
+  response_blocks=6
   state_fallbacks=0
   true_kv_restores=1
   true_kv_rate=100.00%
+  true_kv_blocks=6
+  supports_state_restore=1
   recovery_kv_compatible=1
   recovery_ep_required=0
   recovery_ep_mismatch=1
@@ -952,32 +955,33 @@ Stateful recovery:
 這個結果的重點不是 `EP mismatch=1` 有問題，而是相反：planner/runtime
 正確把它視為 topology/locality signal。因為 `recovery_ep_required=0`，
 EP mismatch 不會硬擋 KV restore；同一個 run 同時有
-`recovery_kv_compatible=1`、`state_blocks=6`、`true_kv_restores=1`，代表
-KV restore correctness 與 expert locality 已經被分開報告。
+`recovery_kv_compatible=1`、`state_blocks=6`、`response_blocks=6`、
+`true_kv_restores=1`，代表 KV restore correctness 與 expert locality 已經
+被分開報告。
 
 仍不能宣稱已量測真實 remote expert dispatch traffic；這次
 `recovery_remote_tokens=0` / `recovery_expert_cost=0.00` 是根據 route histogram
 與 target placement metadata 的估計結果。
 
-2026-08-30 的 V7-V9 core combined run 也確認三個核心可以在同一個 applied
-benchmark 中一起運作：
+2026-09-16 的 V7-V9 core combined run 也確認三個核心可以在同一個 applied
+benchmark 中一起運作，但這個 matrix 不應取代 standalone V8 true-KV-restore
+證據：
 
 ```text
 Benchmark:
   benchmark_matrix_spotserve_core_performance.yaml
 Baseline:
   successes=8/8
-  p95=48965.38ms
 Applied:
   successes=8/8
-  p95=2656.23ms
   context_migrations=1
   route_source=vllm_runtime_topk
   route_kind=runtime_observed_topk
   kv_successes=1
-  state_restores=1/1
-  true_kv_restores=1
-  true_kv_blocks=3
+  state_events=1
+  state_fallbacks=1
+  true_kv_restores=0
+  supports_state_restore=0
   recovery_kv_compatible=1
   recovery_ep_required=0
   recovery_ep_mismatch=1
@@ -987,8 +991,9 @@ Applied:
 
 這組結果可以用來 claim「V7 context planning、V8 stateful recovery、V9
 risk-aware scheduling 的 code paths 可以合在同一個 live benchmark 內執行」。
-但它仍不應被寫成 physical expert migration 或真實 remote expert dispatch traffic
-已完成。
+但它仍不應被寫成 physical expert migration、真實 remote expert dispatch traffic
+已完成，或 true KV restore 已在 core matrix 中完成。true KV restore 的主要
+證據應使用 standalone `benchmark_matrix_stateful_recovery_performance.yaml`。
 
 ### Phase 4 前置小步：Expert Dispatch Observability
 
@@ -1076,8 +1081,10 @@ prefix warmup，recovery 會退回 token replay fallback。這讓 V7/V8 的 loca
 完成條件：
 
 - `ExpertPlacementPlan` 可序列化到 metrics。（已完成 logical plan）
-- preempted GPU 上的 experts 可被重新配置到 ready GPUs。（尚未完成
-  physical weight movement）
+- preempted GPU 上的 experts 可被重新配置到 ready GPUs。fixed-EP physical
+  remap 與 quiescent same-host EP2 -> EP4 已完成；cross-host transport、
+  distributed reservation 與 fail-closed runtime gate 已實作，但仍需在兩台
+  實體 GPU hosts 產生通過報告。active-request in-place EP resize 仍未完成。
 - planner cost 同時考慮 GPU capacity、expert movement、dispatch cost。
 - 明確定義 SpotServe planner 與 vLLM EPLB 的責任邊界：SpotServe 負責
   resource-change / preemption-aware topology planning，vLLM EPLB 負責
@@ -1087,6 +1094,10 @@ prefix warmup，recovery 會退回 token replay fallback。這讓 V7/V8 的 loca
 
 - V6 re-parallelization planner 會從 selected `ParallelPlan` 與 MoE model
   topology 產生 deterministic logical `ExpertPlacementPlan`。
+- vLLM 的 EP 預設使用 `linear` placement：以連續的 expert ID 分配到各
+  EP rank；若 backend config 設定 `expert_placement_strategy=round_robin`，
+  planner 才使用交錯分配。logical plan 必須和 vLLM 實際策略一致，否則
+  request 仍可能成功，但 `runtime_placement_verified` 應該失敗。
 - 若 router/head container 看不到模型的 `config.json`，planner 會嘗試使用
   active vLLM worker runtime metadata；只要 runtime 回報
   `expert_placement_snapshot`，logical planner 可以從 snapshot 反推出
@@ -1189,8 +1200,9 @@ expert_placement_plan_verified=false
 ```
 
 Phase 4E 補上 logical expert movement diff / cost estimate。planner 在產生
-新的 `ExpertPlacementPlan` 時，會把 target placement 和 replan 前從 runtime
-metadata 收到的 current `expert_placement_snapshot` 做 normalized diff：
+新的 `ExpertPlacementPlan` 時，優先把 target placement 和舊 actor 實測的
+`runtime_expert_placement_shards` 做 normalized diff。由 model config 推導的
+`expert_placement_snapshot` 不是實測 placement，不能用來宣稱觀測到 movement：
 
 ```text
 current expert placement snapshot
@@ -1205,9 +1217,15 @@ current expert placement snapshot
 
 這一步解決的是「planner 是否知道新地圖和舊地圖差在哪裡」。它仍然不是
 physical expert migration：`physical_weight_migration=false`、runtime
-`apply/verify success=false` 仍然是正確狀態。若 runtime 沒有提供 current
+`apply_success=false` 仍然是正確狀態；`verify_success=true` 只表示新 actor
+的 placement 符合 plan。若 runtime 沒有提供 current
 placement snapshot，movement observation 會是 unavailable，planner 不會憑空
-宣稱 expert 被搬動。
+宣稱 expert 被搬動。若 runtime 未提供 expert weight size，`moved_weight_bytes`
+會是 `null`（未知），不是 0；`estimated_expert_weight_movement_cost_ms`
+也會是 `null`，除非另有不依賴 bytes 的固定成本設定。即使
+`moved_weight_bytes` 有值，它也只是「換了 logical EP rank 的權重大小總和」，
+不是 actor recreate 期間實際傳輸的 bytes。沒有設定成本係數時，非零 movement
+的 cost estimate 同樣是 `null`，不是零成本。
 
 movement cost 目前只作為 cost model 的可觀測 component；若設定
 `expert_weight_movement_cost_ms_per_gib`、
@@ -1215,8 +1233,8 @@ movement cost 目前只作為 cost model 的可觀測 component；若設定
 `expert_weight_movement_bandwidth_bytes_per_s`，它會被加進 selected
 `replan_window_cost_ms`，並受
 `expert_weight_movement_penalty_weight` 控制。沒有設定 expert weight size 或
-movement cost 時，moved bytes / movement cost 會自然為 0，不會改變既有 V6
-benchmark 行為。
+movement cost 時，不會假設 moved bytes 或 movement cost 為 0；scoring
+仍只使用可估計的成本，實驗報表另外標出未知 weight bytes 的事件數。
 
 benchmark/analyzer 會新增檢查：
 
@@ -1224,6 +1242,8 @@ benchmark/analyzer 會新增檢查：
 replanning_expert_placement_plan_movement_observation_events
 replanning_max_expert_placement_plan_moved_experts
 replanning_total_expert_placement_plan_moved_weight_bytes
+replanning_expert_placement_plan_unknown_weight_bytes_events
+replanning_expert_placement_plan_unknown_cost_events
 replanning_avg_expert_placement_plan_weight_movement_cost_ms
 replanning_avg_selected_expert_weight_movement_cost_estimate_ms
 ```
@@ -1284,7 +1304,7 @@ phase4-movement-penalized:
 4 claim 從「logical/control-plane placement」推進到「runtime-applied
 placement」。
 
-2026-09-06 的 V6 re-parallelization performance benchmark 已驗證目前
+2026-09-15 的 V6 re-parallelization performance benchmark 已驗證目前
 logical/control-plane placement、movement diff 與 observe-only runtime hook
 plumbing path：
 
@@ -1295,13 +1315,13 @@ model = /models/Qwen2-MoE-Tiny
 Disabled:
   successes=3/8
   success_rate=37.50%
-  p95=180041.97ms
+  p95=180102.20ms
   trace_success=1
 
 Applied:
   successes=8/8
   success_rate=100.00%
-  p95=14143.22ms
+  p95=14069.87ms
   trace_success=1
   replans=1
   applied=1
@@ -1310,7 +1330,7 @@ Applied:
   actor_recreate=1
   live_migration=0
   runtime_workers=1
-  exec_ms=15413.68
+  exec_ms=16340.36
   cost_model=1
   expert_plan=1
   expert_plan_shards=8
@@ -1328,6 +1348,10 @@ Applied:
   runtime_plan_applied=0
   runtime_plan_verified=0
   physical_expert_migration=0
+  runtime_verification_level=contract_seen_only
+  runtime_verified_placement=0
+  runtime_remap_ep=0
+  runtime_a2a_counters=0
 ```
 
 這代表：
@@ -1347,6 +1371,8 @@ Applied:
 - `runtime_apply_success=0`、`runtime_verify_success=0`、
   `runtime_plan_applied=0`、`runtime_plan_verified=0` 是目前正確結果，因為
   hook 仍是 observe-only，沒有真的改 vLLM EP rank mapping 或搬 expert weights。
+- `runtime_verification_level=contract_seen_only` 代表 runtime 已看過 placement
+  contract；它不是 `physical_migration_verified`。
 
 這組 run 使用 single-worker same-node recreate mode，因此
 `runtime_workers=1` 是預期結果：它表示 same-node recreate capacity entry 代表
@@ -1456,6 +1482,20 @@ phase5_gate:
 能作為 placement contract / observability boundary，不能把它寫成 live
 physical expert migration。
 
+Phase 5A 後續補強的 runtime observability 會把這個邊界拆得更清楚：
+
+```text
+expert_placement_contract_seen_by_runtime = true
+expert_placement_contract_seen_by_all_workers = true
+expert_placement_plan_applied = false
+expert_placement_plan_verified = false
+expert_placement_physical_weight_migration = false
+```
+
+這代表每個 vLLM worker hook 已經看過同一份 placement contract，但 runtime
+仍沒有證明 expert tensor 被 live remap 或搬移。因此它只能證明 control-plane
+到 runtime hook 的 handshake 成功，不能宣稱 physical expert migration。
+
 ### Phase 5B: Expert-aware Actor Recreate Execution Model
 
 Phase 5B 先把目前能安全宣稱的 execution model 固定下來：
@@ -1488,6 +1528,13 @@ expert_placement_physical_migration_required = false
 replanning_expert_placement_actor_recreate_events > 0
 replanning_expert_placement_live_migration_events = 0
 replanning_expert_placement_physical_migration_required_events = 0
+replanning_expert_placement_runtime_contract_seen > 0
+replanning_expert_placement_runtime_physical_weight_migration = 0
+replanning_expert_placement_runtime_verification_levels = contract_seen_only
+replanning_expert_placement_runtime_verified_placement = 0
+replanning_expert_placement_runtime_can_verify_physical_placement = 0
+replanning_expert_placement_runtime_can_remap_live_ep_rank = 0
+replanning_expert_placement_runtime_can_measure_all_to_all = 0
 ```
 
 如果未來真的完成 physical expert migration，這些欄位才應該轉成：
@@ -1496,6 +1543,10 @@ replanning_expert_placement_physical_migration_required_events = 0
 expert_placement_execution_model = live_expert_weight_migration
 expert_placement_live_migration_enabled = true
 expert_placement_physical_migration_required = true
+replanning_expert_placement_runtime_verification_levels = physical_migration_verified
+replanning_expert_placement_runtime_verified_placement > 0
+replanning_expert_placement_runtime_physical_weight_migration > 0
+replanning_expert_placement_runtime_can_verify_physical_placement > 0
 ```
 
 所以目前 Phase 5B 的 claim 是：
@@ -1506,6 +1557,635 @@ vLLM actors with a logical expert placement contract.
 It does not execute live physical expert weight migration.
 ```
 
+也就是：
+
+```text
+contract_seen_only
+-> runtime 已收到 / 看過 ExpertPlacementPlan contract
+-> 不代表 expert tensor 已搬動
+-> 不代表 live EP rank mapping 已更新
+-> 不代表 all-to-all dispatch traffic 已下降
+
+physical_migration_verified
+-> runtime apply 成功
+-> runtime verify 成功
+-> physical_weight_migration=true
+-> 才能宣稱真正 physical expert weight migration
+```
+
+### Phase 5C: Runtime-verified Expert Placement
+
+Phase 5C 把 runtime boundary 往前推一步：不再只看
+`ExpertPlacementPlan` contract 是否被 runtime hook 看過，而是讓 patched vLLM
+嘗試回報「目前這個 worker 實際 resident 的 local experts」。
+
+vLLM MoE expert layout 目前可從 `FusedMoE` layer 讀到：
+
+```text
+global_num_experts / logical_num_experts
+local_num_experts
+expert_map
+moe_parallel_config.ep_rank
+moe_parallel_config.ep_size
+```
+
+vLLM 的 EP 語意是：
+
+```text
+EP enabled:
+  each device owns a set of experts fully
+  expert_map maps global expert id -> local expert index
+
+EP disabled / ep_size = 1:
+  all experts are local to the single EP rank
+```
+
+因此 Phase 5C 新增的 runtime introspection 會：
+
+```text
+1. WorkerBase 從 self.model_runner.get_model() 取得 loaded model。
+2. 掃描 named_modules() 中疑似 FusedMoE 的 layer。
+3. 透過 expert_map 找出本 worker local 的 global expert ids。
+4. 掃描 local expert weight tensors，估算 resident weight bytes。
+5. 回報 runtime_expert_placement_shards / worker_snapshots。
+```
+
+新的驗證語意：
+
+```text
+contract_seen_only
+-> runtime hook 看過 ExpertPlacementPlan
+-> 不代表 actual local experts 與 plan 相符
+
+runtime_placement_verified
+-> runtime 已掃到 resident expert weights
+-> actual local experts 與 ExpertPlacementPlan 的 rank subset 相符
+-> 仍不代表 live migration，因為 physical_weight_migration=false
+
+physical_migration_verified
+-> runtime apply/verify 都成功
+-> physical_weight_migration=true
+-> 才能宣稱 live physical expert migration
+```
+
+這次實作更新：
+
+- `vllm.spotserve_moe.inspect_runtime_expert_placement()`：read-only 掃描
+  loaded model 的 local experts。
+- `WorkerBase._spotserve_runtime_expert_placement_snapshot()`：把 loaded model
+  actual placement snapshot 傳給 apply/verify hook。
+- `get_moe_runtime_metadata()`：回報
+  `runtime_expert_placement_available`、
+  `runtime_expert_placement_worker_count`、
+  `runtime_expert_placement_shard_count`、
+  `runtime_expert_placement_shards`。
+- `verify_expert_placement_plan()`：只驗證屬於本 worker / EP rank 的 subset；
+  multi-rank plan 不會要求每個 worker 擁有全部 experts。
+- `estimate_expert_dispatch_cost()`：target 同時有 logical plan 與 runtime
+  actual placement 時，優先使用 `runtime_expert_placement_shards`。
+
+這一步回答了三個前置問題：
+
+```text
+experts 權重在哪？
+-> vLLM FusedMoE layer 的 local expert tensors，例如 w13 / w2 類 weights。
+
+EP rank 怎麼決定 local experts？
+-> FusedMoE.expert_map 與 moe_parallel_config.ep_rank / ep_size。
+
+worker init/load model 後能不能重新掛載 expert weights？
+-> 目前沒有安全 live remap API。現階段只能 read-only 驗證 resident experts；
+   真正 relocation 仍應走 controlled actor recreate with changed placement。
+```
+
+所以 Phase 5C 後，合理 claim 是：
+
+```text
+The runtime can report and verify actual resident expert placement when the
+loaded vLLM model exposes FusedMoE expert maps.
+```
+
+仍不能 claim：
+
+```text
+physical expert weight migration
+live EP rank remapping
+real all-to-all traffic reduction
+```
+
+### Phase 5D: Quiescent Fixed-EP Expert Remap (Experimental)
+
+現在新增一條明確 opt-in 的 runtime 路徑：`sllm/vllm_expert_remap.py`
+使用 vLLM EPLB 的 `rearrange_expert_weights_inplace()` 在既有 EP group
+內搬運 unquantized FusedMoE expert tensor，並原地更新 `expert_map`。
+搬前、搬後以每個 expert 的權重 SHA-256 比對；所有 EP ranks 的預檢必須
+通過，且 engine 沒有 unfinished requests，才會開始 collective transfer。
+
+限制與語意要保持嚴格：
+
+- 預設關閉。worker 環境需 `VLLM_SPOTSERVE_EXPERT_REMAP=1`，傳入的
+  `ExpertPlacementPlan` 也需 `live_expert_remap=true`、非空
+  `placement_fingerprint` 與完整 `expert_to_target_rank`。
+- 僅支援 **相同 TP/EP size 且 DP=1**、單 replica、每個 expert 恰好一份、
+  各 rank expert 數量不變、unquantized FusedMoE。EPLB、quantized weights、
+  redundant experts、shared fused experts 和動態 EP 縮放都會在預檢拒絕。
+- 這裡的「live」預設只表示**不重建既有 engine 的固定 EP remap**。
+  2026-09-22 後新增一個更嚴格的 opt-in active-request 模式：
+  plan 必須帶 `allow_active_requests=true`，worker 也必須設定
+  `VLLM_SPOTSERVE_ACTIVE_REQUEST_REMAP=1`。runtime 只允許在 synchronous
+  `EngineCore.step()` 邊界執行，且 `batch_queue is None`、`async_scheduling`
+  為 false。distributed collective 或 verify 失敗時，runtime/controller 會將
+  execution 標為 failed，不能把該次 replan 計為成功；目前不宣稱具有
+  transaction rollback 或失敗後原 engine 可安全繼續服務。
+- `physical_weight_migration=true` 只在至少一個 expert 跨 EP rank 進入
+  本 rank 且搬後權重摘要一致時回報；同 rank slot 重排不算跨 rank 傳輸。
+- `require_cross_node=true` 是 hard gate：runtime 必須看到 distinct
+  `SPOTSERVE_PHYSICAL_HOST_ID`，且至少一個 expert shard 從不同 physical host
+  進入本 rank，才會回報 `cross_node_weight_migration=true`。same-host mp
+  驗證會正確停在 `cross_node_requires_distinct_physical_host_ids`。
+- 這一步尚未量測或降低真實 inference all-to-all traffic，也不支援
+  live EP group size 變更。舊 benchmark 的 `expert_plan=1` 仍不能當成
+  physical migration 成功的證據。
+
+已驗證三層：worker 環境的 5 個預檢單元測試、兩張 GPU 上的 vLLM
+EPLB primitive + SpotServe 搬運器合成 tensor 實測，以及真實
+Qwen2-MoE-Tiny TP2/EP2 runtime apply/verify。真實模型從 linear placement
+`rank0={0,1}, rank1={2,3}` remap 為 round-robin placement
+`rank0={0,2}, rank1={1,3}`；兩層合計搬移 4 個 expert shards、786432 bytes，
+兩個 worker 都回報 `physical_weight_migration=true` 與
+`weights_and_expert_map_verified`，remap 前後相同 prompt 的 token IDs 一致。
+可重跑：
+
+```bash
+podman cp sllm/vllm_expert_remap.py sllm_worker_0:/opt/venvs/worker/lib/python3.11/site-packages/sllm/vllm_expert_remap.py
+podman cp tests/spotserve_test/test_vllm_expert_remap.py sllm_worker_0:/tmp/test_vllm_expert_remap.py
+podman cp scripts/verify_spotserve_expert_weight_transfer.py sllm_worker_0:/tmp/verify_spotserve_expert_weight_transfer.py
+podman exec sllm_worker_0 /opt/venvs/worker/bin/python /tmp/test_vllm_expert_remap.py
+podman exec sllm_worker_0 /opt/venvs/worker/bin/python /tmp/verify_spotserve_expert_weight_transfer.py
+podman cp scripts/verify_spotserve_qwen_ep_remap.py sllm_worker_0:/tmp/verify_spotserve_qwen_ep_remap.py
+podman exec sllm_worker_0 bash -lc '
+VLLM_SPOTSERVE_EXPERT_REMAP=1 \
+/opt/venvs/worker/bin/python /tmp/verify_spotserve_qwen_ep_remap.py \
+  --model /models/Qwen2-MoE-Tiny \
+  --output /tmp/qwen_quiescent_remap_report.json
+'
+podman exec sllm_worker_0 bash -lc '
+VLLM_SPOTSERVE_EXPERT_REMAP=1 \
+VLLM_SPOTSERVE_ACTIVE_REQUEST_REMAP=1 \
+/opt/venvs/worker/bin/python /tmp/verify_spotserve_qwen_ep_remap.py \
+  --model /models/Qwen2-MoE-Tiny \
+  --active-request \
+  --gpu-memory-utilization 0.45 \
+  --output /tmp/qwen_active_remap_report.json
+'
+```
+
+要驗證 **新的 vLLM apply hook**，必須重新 build image，因為
+`--skip-build` 不會更新已安裝的 vLLM patch；上述 `podman cp` 只驗證
+搬運器本身，並不更新 engine/core/worker hooks。正式 controller 路徑可用
+`benchmark_matrix_expert_remap_performance.yaml` 驗證，成功時至少必須看到：
+
+```text
+replanning_expert_placement_runtime_apply_success > 0
+replanning_expert_placement_runtime_verify_success > 0
+replanning_expert_placement_runtime_physical_weight_migration > 0
+replanning_expert_placement_runtime_verified_placement > 0
+replanning_total_expert_placement_runtime_moved_expert_shards > 0
+replanning_total_expert_placement_runtime_moved_weight_bytes > 0
+```
+
+active-request validation additionally requires:
+
+```text
+replanning_expert_placement_runtime_active_request_remap > 0
+replanning_expert_placement_runtime_step_boundary_barrier > 0
+```
+
+2026-09-21 的 TP2/EP2 Qwen2-MoE-Tiny 單次端到端驗證：
+
+```text
+run: 2026-09-21_11-50-59_vllm-expert-remap-applied
+requests: 8/8; trace replay: 1/1; replan applied: 1/1
+runtime apply/verify: 1/1; verification: physical_migration_verified
+runtime moved: 4 expert shards, 786432 bytes; remap duration: 190.90 ms
+runtime actual placement: 2 workers, 8 shards
+live EP remap: 0; all-to-all counters: 0
+```
+
+`runtime moved` 是 worker 回報的搬動量，和 planner 預估的
+`expert_plan_moved=4`、`expert_plan_moved_mb=0.75` 分開記錄。
+這是一個 correctness / observability run，沒有 latency 對照組，
+因此 `8/8` 與 p95 不代表 remap 降低了服務延遲。
+
+2026-09-22 後，active-request 的 standalone verifier 會在同一個 TP2/EP2
+engine 內先跑一個 deterministic baseline request，再於第二個 streaming
+request 已經產生第一個 token 後呼叫 `apply_expert_placement_plan()`。通過
+條件是 `active_requests_at_barrier=true`、`step_boundary_barrier=true`，
+且 active request 的 token ids 與 baseline 完全一致。這只能支持
+「synchronous step-boundary active-request fixed-EP remap」，不是任意
+continuous batching / async scheduling 下的無停頓 remap。
+
+2026-09-22 的 controller active-request benchmark (`02-33-05`) 是一個
+**未通過 active remap gate** 的紀錄：請求 `3/3`、trace `1/1`、runtime
+apply/verify `1/1`，且 runtime 回報搬動 4 個 expert shards / 0.75 MiB；
+但 `exec_model=quiescent_fixed_ep_remap`、`actor_recreate=1`、
+`runtime_active_remap=0`、`runtime_step_barrier=0`。因此它只驗證了
+quiescent physical remap，不能作為 active-request remap 的實驗結果。
+
+後續修正了兩個 controller/fixture 問題。首次 replan 先建立 vLLM
+deployment adapter，再取得 current actor snapshot，避免因 adapter 尚未
+建立而誤走 actor recreate；缺少 runtime MoE topology 時，benchmark
+config 提供兩層、每層四個 experts 的模型拓樸。active-request trace 改用
+`add` 容量事件，使原 actor 保持 READY；`preempt` 會把 actor 標為
+PREEMPTING，不能在相同即將退役的 actor 上把原地 remap 當成服務恢復。
+router 也禁止對非 READY actor 選用原地 remap。
+
+2026-09-23 已完成 controller active-request benchmark 重跑：
+
+```text
+run: 2026-09-23_01-08-25_vllm-expert-remap-active-request-applied
+requests: 3/3; trace replay: 1/1; replan applied: 1/1
+execution: active_fixed_ep_remap; actor recreate: 0
+runtime apply/verify: 1/1; verification: physical_migration_verified
+runtime active remap: 1; synchronous step-boundary barrier: 1
+runtime moved: 4 expert shards, 786432 bytes; remap duration: 168.12 ms
+runtime actual placement: 2 workers, 8 shards
+live EP-size remap: 0; all-to-all counters: 0
+```
+
+這次 trace 的 `add` event 延後到 35 秒，確保 warmup 結束且長 request 已進入
+runtime；workload 使用 test-only token pacing 擴大 active window。這個結果
+通過 active-request fixed-EP gate，但仍不是 active EP resize、跨節點搬動或
+all-to-all traffic reduction 的證據。
+
+2026-09-24 再次重跑時發現上述 warmup + 固定 35 秒事件仍會受 DELTA chunk
+數量影響：`_spotserve_token_delay_s` 是每個 runtime output chunk 的延遲，
+不是每 token 延遲。若 request 提早完成，physical remap 仍會成功，但
+`runtime_active_remap=0`。fixture 因此收斂為長 request 在 `t=0` 送出、每
+chunk 延遲 1 秒、`add` event 在 `t=1` 觸發，並移除會阻塞 request dispatch
+的 warmup。修正後結果為：
+
+```text
+run: 2026-09-24_12-27-04_vllm-expert-remap-active-request-applied
+requests: 2/2; trace replay: 1/1; replan applied: 1/1
+execution: active_fixed_ep_remap; actor recreate: 0
+runtime apply/verify: 1/1; verification: physical_migration_verified
+runtime active remap: 1; synchronous step-boundary barrier: 1
+runtime moved: 4 expert shards, 786432 bytes; remap duration: 117.99 ms
+runtime actual placement: 2 workers, 8 shards
+```
+
+同日第一次啟動曾在 `EngineCore` 初始化階段失敗，尚未進入 trace replay；
+立即重跑可正常啟動。當時 Ray 另回報 session filesystem 超過 95% 使用率，
+因此該次只記為 environment/startup failure，不納入 remap correctness 結果。
+
+2026-09-25 再次遇到第一個 actor 啟動失敗、controller 已建立 replacement
+actor 的情況。舊 benchmark runner 只要在 model status 看見任一歷史 failed
+actor 就立即中止，即使 replacement actor 已處於 `starting`，因此會把正常的
+startup retry 誤判為整個 setup 失敗。`wait_for_ready_instances()` 現在會在仍有
+非 failed/dead startup candidate 時繼續等待；只有連續三次輪詢都只剩 failed
+actor 才提早失敗。修正後重跑結果為：
+
+```text
+run: 2026-09-25_08-55-34_vllm-expert-remap-active-request-applied
+requests: 2/2; trace replay: 1/1; replan applied: 1/1
+execution: active_fixed_ep_remap; actor recreate: 0
+runtime apply/verify: 1/1; verification: physical_migration_verified
+runtime active remap: 1; synchronous step-boundary barrier: 1
+runtime moved: 4 expert shards, 0.75 MiB; remap duration: 133.18 ms
+runtime actual placement: 2 workers, 8 shards
+request latency p95: 3192.94 ms
+```
+
+這筆結果再次通過 active-request fixed-EP gate；它不擴張既有 claim，仍不代表
+EP-size resize、跨節點 expert 搬動或 all-to-all traffic reduction。
+
+### 2026-09-25：EP resize、cross-node 與 all-to-all 驗證補強
+
+目前三項缺口已拆成獨立、fail-closed 的 runtime contract：
+
+1. **動態 EP size**：vLLM process group 無法在既有 engine 內安全改大小，因此
+   不宣稱 live in-place resize。當 source 與 target 的 effective EP size 不同時，
+   controller 會走 controlled actor recreate，並回報
+   `actor_recreate_ep_resize`、source EP、target EP 與
+   `dynamic_ep_resize=true`。`scripts/verify_spotserve_ep_transition.py` 會比對
+   TP2/EP2 與 TP4/EP4 的 runtime-observed ownership、coverage 與 execution model。
+2. **跨節點 expert weight movement**：planner 新增
+   `require_cross_node_expert_migration`。啟用後會把 `require_cross_node=true`
+   傳到 runtime。runtime 必須觀察到至少兩個不同
+   `SPOTSERVE_PHYSICAL_HOST_ID`，且至少一個 expert shard 的來源與目的 host
+   不同，否則 apply 直接失敗。單機多 container 不得通過這個 gate。
+3. **真實 all-to-all instrumentation**：vLLM patch 現在掛在
+   `CudaCommunicator.dispatch()` / `combine()`，記錄實際 all-to-all manager
+   invocation 的 calls、input/output tensor payload bytes、backend 與 internode
+   calls。這不是由 routing histogram 推估。這些數值是 collective API boundary
+   的 tensor payload，不等同 NIC wire bytes。
+
+`scripts/verify_spotserve_all_to_all_traffic.py` 可在固定 workload 前後取 runtime
+counter delta；帶入 `--baseline-report` 時會計算 payload reduction ratio，若
+candidate 未下降會 fail closed。只有 baseline/candidate 使用相同 workload 且
+counter delta 均大於零時，才可宣稱 all-to-all payload reduction。
+
+這批 runtime hook 需要 rebuild image；僅 `SPOTSERVE_SYNC_SOURCE=1` 不會修改
+image 內的 vLLM communicator：
+
+```bash
+MODEL_FOLDER=/work/spotserve-models \
+SPOTSERVE_REPARALLELIZATION_MODEL_PATH=/models/Qwen2-MoE-Tiny \
+SPOTSERVE_REPARALLELIZATION_LOAD_FORMAT=auto \
+VLLM_SPOTSERVE_EXPERT_REMAP=1 \
+VLLM_SPOTSERVE_ACTIVE_REQUEST_REMAP=1 \
+VLLM_SPOTSERVE_A2A_TRACE=1 \
+SPOTSERVE_REQUIRE_ALL_TO_ALL_INSTRUMENTATION=1 \
+scripts/prepare_spotserve.sh --deploy-set expert-remap-active-performance
+```
+
+目前 coding 狀態：controlled EP resize 與 A2A counter 路徑已完成；兩者仍需在
+rebuild image 上跑 runtime verifier。cross-node hard gate 已完成，但實際
+cross-node success 必須使用至少兩台 physical worker hosts。
+
+已安裝 active-remap vLLM patch 的 image 可用下列命令同步 controller
+程式並重跑；若 image 尚未包含 patched runtime，先不要使用 `--skip-build`：
+
+```bash
+MODEL_FOLDER=/work/spotserve-models \
+SPOTSERVE_REPARALLELIZATION_MODEL_PATH=/models/Qwen2-MoE-Tiny \
+SPOTSERVE_REPARALLELIZATION_LOAD_FORMAT=auto \
+SPOTSERVE_SYNC_SOURCE=1 \
+VLLM_SPOTSERVE_EXPERT_REMAP=1 \
+VLLM_SPOTSERVE_ACTIVE_REQUEST_REMAP=1 \
+scripts/prepare_spotserve.sh --skip-build --deploy-set expert-remap-active-performance
+
+podman exec sllm_head bash -lc '
+cd /tmp/spotserve-work &&
+/opt/venvs/head/bin/python benchmarks/spotserve/run_benchmark.py \
+  --config benchmarks/spotserve/benchmark_matrix_expert_remap_active_request_performance.yaml \
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \
+  --request-timeout 240 --trace-event-timeout 600 \
+  --ray-address auto --ray-namespace sllm
+'
+```
+
+通過條件包含 `trace_success=1`、`exec_model=active_fixed_ep_remap`、
+`actor_recreate=0`、`runtime_active_remap=1`、`runtime_step_barrier=1`、
+`runtime_apply_success=1`、`runtime_verify_success=1`。單看成功率或
+`runtime_physical_migration=1` 不足以判定 active-request 路徑成功。
+
+改變 EP size 目前不走 in-place live remap。`target_rank_count != current EP
+size` 會被 runtime preflight 拒絕；要從 TP2/EP2 變成 TP4/EP4，現階段
+定義為 controlled actor recreate：先建立新 actor、由新 runtime 回報 actual
+expert placement，再用 before/after placement snapshot 驗證哪些 experts
+改變 EP owner。可用 `scripts/verify_spotserve_ep_transition.py` 在 4 張 GPU
+環境驗證這條 actor-recreate transition。
+
+這些結果支持「fixed-EP physical expert migration」與「controlled EP-size
+transition via actor recreate」。因為 `can_remap_live_ep_rank=false` 且
+`can_measure_all_to_all=false`，仍不能宣稱 arbitrary live EP resize 或
+real all-to-all traffic reduction。
+
+### 2026-09-26：DP2 all-to-all runtime gate
+
+2026-09-25 的 active-request 結果中，`runtime_a2a_counters=1` 但
+`runtime_a2a_calls=0`。這不是 physical remap 失敗，而是測試使用
+`TP=2, DP=1`。vLLM 0.11.2 的 `FusedMoEParallelConfig.use_all2all_kernels`
+只有在 `data_parallel_size > 1 and use_ep` 時才成立；因此 EP size 雖由
+`TP * DP = 2` 推導，該配置仍不會走 all-to-all prepare/finalize path。
+
+本階段補強如下：
+
+- `can_measure_all_to_all` 改為 fail closed：只有 runtime 實際觀察到至少一個
+  dispatch/combine collective 才為 true；僅開啟 trace 環境變數不算成功。
+- DP2 可用來量測 A2A traffic，但 physical remap 仍 fail closed。vLLM 每個 DP
+  rank 有獨立 EngineCore；目前 hook 無法保證所有 DP EngineCores 同時進入
+  expert-transfer collective，因此允許 DP2 remap 會 deadlock。
+- vLLM MoE capability 新增 `TP1 x DP2` 與 `TP2 x DP2` shape。
+- planner 的 `min_data_parallel_size` 與 ServerlessLLM `min_replica_count`
+  已拆開，不再把 vLLM DP 誤當成獨立 serving replicas。
+- 新增 `benchmark_matrix_expert_remap_dp2_a2a_performance.yaml`，使用
+  `TP=1, DP=2, EP=2` 與 `allgather_reducescatter`，只做 inference，不觸發
+  remap。benchmark 保留 model，後續由
+  `verify_spotserve_all_to_all_traffic.py` 驗證 counter delta。
+
+DP2 gate 的通過條件是：
+
+```text
+benchmark success_rate = 1.0
+a2a-report.delta.collective_calls > 0
+a2a-report.observed_payload_bytes > 0
+```
+
+2026-09-25 的 DP2 runtime gate 已通過：benchmark requests `2/2`，p95
+`1149.20 ms`；後續 verifier 對四個 requests 觀察到：
+
+```text
+collective call delta: 512
+input payload delta: 486080 bytes
+output payload delta: 488128 bytes
+total observed payload: 974208 bytes
+internode call delta: 0
+```
+
+這證明 `TP1 x DP2 x EP2` inference 確實走過 patched vLLM 的 real
+dispatch/combine collective boundary。`internode=0` 符合本次 single-host
+環境。這筆結果不是 traffic reduction 證據，因為尚未有相同 workload 的
+baseline/candidate payload 比較。
+
+這只能證明真實 collective traffic 可觀測。對
+`allgather_reducescatter` 而言，總 payload 可能不隨 expert placement 改變；
+因此「traffic reduction」仍必須以相同 workload 的 baseline/candidate counter
+delta 實測，且 candidate bytes 嚴格小於 baseline 才能宣稱。不能用 routing
+histogram 或 estimated remote tokens 代替這個結果。
+
+### 2026-09-26：All-DP-Engine Remap Coordinator
+
+前一版 DP2 remap 只透過單一 EngineCore 進入 expert-transfer collective，另一個
+DP rank 沒有同時進入，因而 deadlock。第一版 all-DP broadcast 仍有另一個 race：
+若一個 EngineCore 有 active request、另一個已 idle，前者會拒絕、後者卻會進入
+transfer collective。2026-09-26 的 `03-34-13` run 正好觸發此情況，event 在
+600 秒後 timeout，requests 為 `0/2`；因此該 run 是失敗結果，不能當作 DP2
+physical remap 證據。
+
+runtime patch 現改為 all-DP-engine 兩階段協議：
+
+```text
+AsyncLLM
+-> enumerate core_engines
+-> concurrently call side-effect-free preflight on every DP EngineCore
+-> if any EngineCore rejects, no EngineCore enters transfer
+-> only if every preflight succeeds, concurrently commit apply
+-> verify on every DP EngineCore
+-> every EngineCore enters its local worker collective
+-> aggregate every DP engine and worker result
+```
+
+placement plan 只有在 `dp_engine_coordinated=true` 且
+`dp_engine_count == runtime data_parallel_size` 時才能通過 DP remap preflight。
+runtime metadata 也改為聚合所有 DP EngineCore，避免 planner 只看到 DP rank 0
+而把其餘 experts 標成 `missing_current_expert`。
+
+新增 `verify_spotserve_dp2_coordinated_remap.py` 作為主要 correctness gate。它不以
+固定 trace timestamp 猜測 request 是否完成，而是依序等待 warmup request 完成、
+router concurrency 歸零，再送 placement event，最後驗證 apply/verify、runtime
+placement 與 post-remap inference。原本的 timed benchmark 仍可作 concurrency
+stress test，但不能單獨證明 quiescent DP2 remap。
+
+2026-09-26 sequential gate 已通過：pre-remap request 與 post-remap request 都
+完成，event 前 router concurrency 為零；runtime 對 2 個 DP EngineCore 完成
+apply/verify，實際搬動 4 個 expert shards、786432 bytes，remap duration 為
+123.13 ms，且 runtime placement verification 成功。因此目前可宣稱同一個
+physical host 上的 `TP1 x DP2 x EP2` coordinated physical expert remap 已驗證。
+這筆結果不代表 cross-host migration、EP resize 或 A2A traffic reduction。
+
+這項 runtime patch 需要 rebuild image，`SPOTSERVE_SYNC_SOURCE=1` 無法更新
+image 內的 `vllm/v1/engine/async_llm.py`。
+
+vLLM 0.11.2 的 elastic-EP resize API 只支援 Ray DP backend。本專案現在以
+`spotserve_vllm_ray_dp_owns_gpus=true` 明確把 GPU placement group ownership 交給
+vLLM Ray-DP actors；ServerlessLLM backend actor 本身不再重複持有 GPU。resize
+前由 router drain requests，vLLM 再讓既有與新增 EngineCore 一起重建 DP/EP
+process group，並由 EPLB 重新分配 physical expert weights。這條路徑目前只允許
+single SLLM replica、TP1、PP1、同一組 worker nodes 的 quiescent scale-up。
+
+三項剩餘驗證的精確狀態：
+
+```text
+dynamic EP size:
+  controlled actor recreate verified; TP2/EP2 -> TP4/EP4 changed 6/8 expert owners
+  in-place Ray-DP EP2 -> EP4 verified for quiescent TP1/PP1 same-host scale-up
+
+cross-node movement:
+  runtime hard gate complete; success requires two distinct physical host IDs
+
+real all-to-all traffic:
+  DP2 inference/measurement and coordinated physical-remap gates passed;
+  same-host sparse dispatch payload reduction passed at 18.98%;
+  internode traffic reduction remains unverified
+```
+
+2026-09-28 執行 `scripts/verify_spotserve_ep_transition.py`，實際完成
+`TP2/EP2 -> TP4/EP4` controlled actor recreate。source 與 target runtime 都回報
+完整的 8-expert placement，target placement verification 成功，其中 6/8 experts
+改變 EP owner。這證明 controller 能以新 process-group size 重建 engine、切換
+traffic 並驗證新 placement。該報告的 `physical_weight_migration=false`，因為
+target actor 重新載入符合 EP4 layout 的 weights，而不是從 source actor live 搬移
+expert tensors；因此它不代表既有 engine 內的 live in-place EP resize。
+
+2026-10-01 執行 `scripts/verify_spotserve_elastic_ep_resize.py`，在同一個
+`Qwen2-MoE-Tiny` SLLM actor 上完成 `TP1 x DP2 x EP2 -> TP1 x DP4 x EP4`：
+
+```text
+actor identity unchanged
+before runtime workers = 2
+after runtime workers = 4
+runtime placement verified = true
+expert coverage unchanged
+changed expert owners = 6
+pre-resize inference = success
+post-resize inference = success
+```
+
+runtime placement inspector 會透過 EPLB `logical_to_physical_map` 將 physical
+slots 映回 logical expert IDs，因此新增 ranks 的 replicated physical slots 不會再被
+誤判成不存在。驗證指令為：
+
+```bash
+podman exec sllm_head bash -lc '
+cd /tmp/spotserve-work &&
+/opt/venvs/head/bin/python benchmarks/spotserve/run_benchmark.py \
+  --config benchmarks/spotserve/benchmark_matrix_elastic_ep_resize_performance.yaml \
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \
+  --trace-event-timeout 600 \
+  --ray-address auto \
+  --ray-namespace sllm
+'
+```
+
+這項結果是 **quiescent in-place process-group resize + EPLB weight
+redistribution**。`--active-request-drain` 會先確認 request concurrency 大於零，再
+送出 resize event，並要求該 request 完整結束後才進入 quiescent resize；這是
+request-safe drain，不是正在執行 GPU step 時改 process group，也不是把 source
+rank 的 tensor 經由 cross-host transport 搬到 target rank。verifier 會在註冊模型
+前透過 worker node 執行 `nvidia-smi`，要求四張 GPU 各至少有 8192 MiB 可用
+記憶體；若有殘留 model process 會直接 fail fast，而不會等新增 EngineCore 在
+`init_device()` 才失敗。benchmark metrics 會另外輸出
+`replanning_elastic_ep_admission_drained_events` 與
+`replanning_elastic_ep_drained_requests`，用來區分 idle resize 與確實等待 active
+request 結束後才執行的 resize。
+
+### A2A Reduction Experiment
+
+`benchmark_matrix_expert_remap_a2a_reduction_performance.yaml` 定義一個有順序
+的 baseline/remap experiment：
+
+```text
+warmup
+-> baseline counter snapshot
+-> replay workload
+-> baseline counter delta
+-> coordinated physical expert remap
+-> candidate counter snapshot
+-> replay the identical workload
+-> candidate counter delta
+-> compare observed payload bytes
+```
+
+為避免把 cache reuse 當成 communication reduction，這個 config 強制關閉
+prefix caching。workload 使用偶數 request 數量，讓 DP round-robin 的起始位置在
+兩個 measurement windows 一致；runner 也要求前後 inference outputs 完全相同、
+runtime apply/verify 成功且兩邊都觀測到真實 collective calls。
+
+`traffic_reduced=true` 且 candidate payload 嚴格小於 baseline 時，才支援 A2A
+reduction claim。runner 另外要求 measurement kind 必須是
+`runtime_sparse_transfer_payload`，避免把固定大小 collective 的估計值誤當成
+destination-aware sparse transfer。若 `allgather_reducescatter` 前後 bytes 相同，
+實驗仍可成功完成，
+但會回報 `payload_invariant_for_allgather_reducescatter` 與
+`claim_supported=false`。這代表 backend 的 collective volume 不受 expert
+ownership 改變，而不是把零改善包裝成成功。
+
+2026-09-26 先以 `allgather_reducescatter` 執行三次重複 median，得到負向
+baseline：
+
+```text
+physical expert shards moved: 4
+baseline collective calls: 1000
+candidate collective calls: 1000
+baseline observed payload: 1801872 bytes
+candidate observed payload: 1801872 bytes
+baseline bytes / collective: 1801.872
+candidate bytes / collective: 1801.872
+payload reduction ratio: 0.0
+traffic_reduced: false
+claim_supported: false
+interpretation: payload_invariant_for_allgather_reducescatter
+```
+
+接著加入 `spotserve_sparse` backend。它從 runtime `topk_ids` 與目前
+`expert_map` 建立每個 token 的 destination ranks，本地 expert 路由不進網路，遠端
+token 則使用 variable-size `all_to_all_single` dispatch/combine。相同 workload、
+相同輸出與三次重複 median 的結果為：
+
+```text
+all-to-all backend: spotserve_sparse
+measurement kind: runtime_sparse_transfer_payload
+physical expert shards moved: 4
+outputs match: true
+baseline collective calls: 992
+candidate collective calls: 1000
+baseline observed payload: 1148928 bytes
+candidate observed payload: 931392 bytes
+payload reduction: 217536 bytes
+payload reduction ratio: 0.189338 (18.93%)
+traffic_reduced: true
+claim_supported: true
+interpretation: measured_collective_payload_reduction
+```
+
+因此目前可以宣稱：在這個 same-host、DP2/EP2、未量化 Qwen2-MoE-Tiny workload
+中，physical expert remap 配合 destination-aware sparse dispatch，使實際送收的
+GPU collective payload median 降低 18.93%。這仍不是跨實體主機或 NIC traffic
+reduction 證據；該次結果的 `internode_calls=0`，跨節點 claim 必須另外驗證。
+
 ### Milestone E: Physical Cross-node Validation
 
 目標：把 same-host simulation 擴展到真正多機 GPU。
@@ -1515,6 +2195,39 @@ It does not execute live physical expert weight migration.
 - source/target 在不同 physical nodes。
 - NIXL 或等價 transport 有正向 restore 結果。
 - `can_restore_cross_node=true` 只在真實跨機驗證通過後開啟。
+
+目前已完成 cross-host **實作與 fail-closed verifier**：scheduler 可將同一個
+Ray-DP model instance 的 GPU reservation 分散到指定 worker nodes；每個 worker
+以 node-local Ray custom resource 回報 hashed physical-host identity；vLLM expert
+remap runtime 會蒐集所有 EP ranks 的 host/node identity，並計算實際跨 host 的
+expert shard 與 tensor bytes。`require_cross_node=true` 時，只要 ranks 位於同一台
+host、host marker 缺漏、沒有 expert 真正跨 host，或 runtime placement 無法驗證，
+整次 remap 都會 fail closed。
+
+專用 gate 為：
+
+```text
+benchmarks/spotserve/benchmark_matrix_cross_host_expert_remap_performance.yaml
+scripts/verify_spotserve_cross_host_expert_remap.py
+```
+
+完成狀態需分開寫：
+
+```text
+single-physical-host, two-failure-domain simulation: implemented and verified
+simulated cross-domain physical expert movement: verified
+simulated inter-container A2A activity: verified
+cross-host scheduling / deployment path: implemented
+node-local physical-host identity: implemented
+cross-host physical expert transfer gate: implemented
+runtime placement / moved-byte verification: implemented
+internode A2A activity gate: implemented
+passing physical multi-host report: pending execution on two GPU hosts
+```
+
+部署與驗證命令見 `docs/spotserve-cross-host-experiment.md`。文件將單機 2+2 GPU
+failure-domain simulation 與 physical multi-host gate 分開；前者已驗證，但不會被
+後者接受，也不能當作實體網路效能結果。
 
 ## Validation Matrix
 

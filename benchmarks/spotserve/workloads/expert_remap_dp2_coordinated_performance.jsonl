@@ -1,0 +1,2 @@
+{"time": 0.0, "request_id": "dp2-remap-before-0001", "messages": [{"role": "user", "content": "Describe mixture-of-experts briefly."}], "max_tokens": 8, "temperature": 0, "benchmark_phase": "before_remap"}
+{"time": 10.0, "request_id": "dp2-remap-after-0002", "messages": [{"role": "user", "content": "Describe expert parallelism briefly."}], "max_tokens": 8, "temperature": 0, "benchmark_phase": "after_remap"}

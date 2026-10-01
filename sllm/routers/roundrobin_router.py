@@ -171,6 +171,7 @@ class RoundRobinRouter(SllmRouter):
         self.reparallelization_executor: Optional[
             ReparallelizationExecutor
         ] = None
+        self._reparallelization_execution_active = False
         workload_window_max_requests = int(
             self.reparallelization_config.get(
                 "workload_window_max_requests", 128
@@ -951,11 +952,11 @@ class RoundRobinRouter(SllmRouter):
             instances.extend(self.ready_inference_instances.values())
             instances.extend(self.starting_inference_instances.values())
         for instance in instances:
+            if instance.backend_instance is None:
+                continue
             if instance.instance_id in seen:
                 continue
             seen.add(instance.instance_id)
-            if instance.backend_instance is None:
-                continue
             try:
                 metadata = await asyncio.wait_for(
                     self._call_backend_method(
@@ -996,6 +997,17 @@ class RoundRobinRouter(SllmRouter):
                 isinstance(expert_plan, Mapping) and bool(expert_plan),
             )
         )
+        live_expert_remap = bool(
+            isinstance(expert_plan, Mapping)
+            and expert_plan.get("live_expert_remap", False)
+        )
+        physical_migration_required = bool(
+            isinstance(expert_plan, Mapping)
+            and expert_plan.get(
+                "expert_placement_physical_migration_required",
+                live_expert_remap,
+            )
+        )
         executed = action == "reparallelize"
         fields: Dict[str, Any] = {
             "reparallelization_execution_model": (
@@ -1007,26 +1019,37 @@ class RoundRobinRouter(SllmRouter):
                 else f"{action or 'unknown'}_without_actor_recreate"
             ),
             "expert_placement_execution_model": (
-                "expert_aware_actor_recreate"
+                "quiescent_fixed_ep_remap"
+                if executed and expert_plan_available and live_expert_remap
+                else "expert_aware_actor_recreate"
                 if executed and expert_plan_available
                 else "no_expert_placement_plan"
                 if executed
                 else "not_executed"
             ),
             "expert_placement_execution_model_reason": (
-                "logical_expert_placement_plan_carried_into_recreated_actor"
+                "opt_in_weight_transfer_after_actor_load"
+                if executed and expert_plan_available and live_expert_remap
+                else "logical_expert_placement_plan_carried_into_recreated_actor"
                 if executed and expert_plan_available
                 else "planner_did_not_emit_expert_placement_plan"
                 if executed
                 else f"{action or 'unknown'}_without_actor_recreate"
             ),
             "expert_placement_runtime_contract_mode": (
-                "observe_only_contract"
+                "quiescent_fixed_ep_remap"
+                if executed and expert_plan_available and live_expert_remap
+                else "observe_only_contract"
                 if executed and expert_plan_available
                 else "unavailable"
             ),
             "expert_placement_live_migration_enabled": False,
-            "expert_placement_physical_migration_required": False,
+            "expert_placement_quiescent_remap_enabled": bool(
+                executed and live_expert_remap
+            ),
+            "expert_placement_physical_migration_required": bool(
+                executed and physical_migration_required
+            ),
         }
         return fields
 
@@ -1126,14 +1149,80 @@ class RoundRobinRouter(SllmRouter):
         )
         decision.update(execution_model)
         selected_plan = decision.get("parallel_plan")
-        active_deployment = self._vllm_active_deployment()
+        adapter_available = False
+        if selected_plan is not None and self.backend == "vllm":
+            adapter_available = self._ensure_vllm_reparallelization_adapter()
+        active_deployment = (
+            self._vllm_active_deployment() if adapter_available else None
+        )
+        selected_parallel_plan = (
+            ParallelPlan.from_dict(selected_plan)
+            if selected_plan is not None
+            else None
+        )
+        elastic_ep_resize = bool(
+            selected_parallel_plan is not None
+            and active_deployment is not None
+            and len(active_deployment.instances) == 1
+            and active_deployment.instances
+            and all(
+                instance.state == InstanceState.READY
+                for instance in active_deployment.instances.values()
+            )
+            and self.backend_config.get(
+                "spotserve_elastic_ep_enabled", False
+            )
+            and self.backend_config.get(
+                "spotserve_vllm_ray_dp_owns_gpus", False
+            )
+            and self.backend_config.get("data_parallel_backend") == "ray"
+            and active_deployment.plan.tensor_parallel_size == 1
+            and selected_parallel_plan.tensor_parallel_size == 1
+            and active_deployment.plan.pipeline_parallel_size == 1
+            and selected_parallel_plan.pipeline_parallel_size == 1
+            and active_deployment.plan.replica_count == 1
+            and selected_parallel_plan.replica_count == 1
+            and active_deployment.plan.enable_expert_parallel
+            and selected_parallel_plan.enable_expert_parallel
+            and active_deployment.plan.data_parallel_size
+            != selected_parallel_plan.data_parallel_size
+            and (
+                not active_deployment.plan.target_nodes
+                or not selected_parallel_plan.target_nodes
+                or sorted(active_deployment.plan.target_nodes)
+                == sorted(selected_parallel_plan.target_nodes)
+            )
+        )
+        live_in_place_remap = bool(
+            selected_parallel_plan is not None
+            and active_deployment is not None
+            and active_deployment.instances
+            and all(
+                instance.state == InstanceState.READY
+                for instance in active_deployment.instances.values()
+            )
+            and self._parallel_shapes_match(
+                active_deployment.plan,
+                selected_parallel_plan,
+            )
+            and isinstance(
+                selected_parallel_plan.expert_placement_plan, Mapping
+            )
+            and selected_parallel_plan.expert_placement_plan.get(
+                "live_expert_remap"
+            )
+            and not self._parallel_plans_match(
+                active_deployment.plan,
+                selected_parallel_plan,
+            )
+        )
         if (
             decision.get("action") == "reparallelize"
-            and selected_plan is not None
+            and selected_parallel_plan is not None
             and active_deployment is not None
             and self._parallel_plans_match(
                 active_deployment.plan,
-                ParallelPlan.from_dict(selected_plan),
+                selected_parallel_plan,
             )
         ):
             # A capacity event does not automatically imply a deployment
@@ -1151,16 +1240,135 @@ class RoundRobinRouter(SllmRouter):
                 "reason": "planner_selected_existing_plan",
             }
         if decision.get("action") == "reparallelize":
-            if self._ensure_vllm_reparallelization_adapter():
+            if adapter_available or self._ensure_vllm_reparallelization_adapter():
                 apply_started_at = time.time()
+                self._reparallelization_execution_active = True
                 try:
-                    plan = ParallelPlan.from_dict(decision["parallel_plan"])
+                    plan = selected_parallel_plan or ParallelPlan.from_dict(
+                        decision["parallel_plan"]
+                    )
                     self.reparallelization_executor.current = (
                         self._vllm_active_deployment()
                     )
-                    deployment = await self.reparallelization_executor.apply(
-                        plan
-                    )
+                    if elastic_ep_resize:
+                        deployment = (
+                            await self.vllm_deployment_adapter
+                            .resize_workers_elastic_ep(
+                                active_deployment,
+                                plan,
+                            )
+                        )
+                        await self._switch_vllm_deployment(deployment, plan)
+                        execution_model.update({
+                            "reparallelization_execution_model": (
+                                "in_place_elastic_ep_resize"
+                            ),
+                            "reparallelization_execution_model_reason": (
+                                "vllm_ray_dp_elastic_ep"
+                            ),
+                            "expert_placement_execution_model": (
+                                "quiescent_elastic_ep_resize"
+                            ),
+                            "expert_placement_execution_model_reason": (
+                                "vllm_reinitialized_ep_process_group"
+                            ),
+                            "expert_placement_runtime_contract_mode": (
+                                "quiescent_elastic_ep_resize"
+                            ),
+                            "source_effective_expert_parallel_size": (
+                                active_deployment.plan
+                                .effective_expert_parallel_size
+                            ),
+                            "target_effective_expert_parallel_size": (
+                                plan.effective_expert_parallel_size
+                            ),
+                            "dynamic_ep_resize": True,
+                            "in_place_ep_resize": True,
+                            "elastic_ep_admission_drained": bool(
+                                deployment.backend_config.get(
+                                    "elastic_ep_admission_drained", False
+                                )
+                            ),
+                            "elastic_ep_drained_request_count": int(
+                                deployment.backend_config.get(
+                                    "elastic_ep_drained_request_count", 0
+                                )
+                                or 0
+                            ),
+                        })
+                    elif live_in_place_remap:
+                        deployment = (
+                            await self.vllm_deployment_adapter.remap_workers_in_place(
+                                active_deployment,
+                                plan,
+                            )
+                        )
+                        await self._switch_vllm_deployment(deployment, plan)
+                        execution_model = (
+                            self._reparallelization_execution_model_fields(
+                                decision
+                            )
+                        )
+                        execution_model.update({
+                            "reparallelization_execution_model": (
+                                "in_place_expert_remap"
+                            ),
+                            "reparallelization_execution_model_reason": (
+                                "fixed_ep_runtime_expert_weight_remap"
+                            ),
+                            "expert_placement_execution_model": (
+                                "active_fixed_ep_remap"
+                                if (
+                                    isinstance(
+                                        plan.expert_placement_plan, Mapping
+                                    )
+                                    and plan.expert_placement_plan.get(
+                                        "allow_active_requests"
+                                    )
+                                )
+                                else "quiescent_fixed_ep_remap"
+                            ),
+                            "expert_placement_execution_model_reason": (
+                                "runtime_apply_on_existing_actor"
+                            ),
+                            "expert_placement_runtime_contract_mode": (
+                                "fixed_ep_runtime_remap"
+                            ),
+                        })
+                    else:
+                        deployment = await self.reparallelization_executor.apply(
+                            plan
+                        )
+                        if (
+                            active_deployment is not None
+                            and active_deployment.plan.effective_expert_parallel_size
+                            != plan.effective_expert_parallel_size
+                        ):
+                            execution_model.update({
+                                "reparallelization_execution_model": (
+                                    "actor_recreate_ep_resize"
+                                ),
+                                "reparallelization_execution_model_reason": (
+                                    "ep_process_group_size_changed"
+                                ),
+                                "expert_placement_execution_model": (
+                                    "expert_aware_actor_recreate_ep_resize"
+                                ),
+                                "expert_placement_execution_model_reason": (
+                                    "vllm_ep_size_requires_engine_recreate"
+                                ),
+                                "expert_placement_runtime_contract_mode": (
+                                    "actor_recreate_ep_resize"
+                                ),
+                                "source_effective_expert_parallel_size": (
+                                    active_deployment.plan
+                                    .effective_expert_parallel_size
+                                ),
+                                "target_effective_expert_parallel_size": (
+                                    plan.effective_expert_parallel_size
+                                ),
+                                "dynamic_ep_resize": True,
+                            })
                     expert_placement_runtime = (
                         await self._deployment_expert_placement_runtime_status(
                             deployment
@@ -1197,6 +1405,8 @@ class RoundRobinRouter(SllmRouter):
                         )
                         * 1000,
                     }
+                finally:
+                    self._reparallelization_execution_active = False
             else:
                 not_executed_model = {
                     "reparallelization_execution_model": "not_executed",
@@ -1247,6 +1457,25 @@ class RoundRobinRouter(SllmRouter):
         )
 
     @classmethod
+    def _parallel_shapes_match(
+        cls,
+        left: ParallelPlan, right: ParallelPlan
+    ) -> bool:
+        return (
+            left.model_name == right.model_name
+            and left.backend == right.backend
+            and left.tensor_parallel_size == right.tensor_parallel_size
+            and left.pipeline_parallel_size == right.pipeline_parallel_size
+            and left.data_parallel_size == right.data_parallel_size
+            and left.enable_expert_parallel == right.enable_expert_parallel
+            and left.effective_expert_parallel_size
+            == right.effective_expert_parallel_size
+            and left.replica_count == right.replica_count
+            and left.num_gpus == right.num_gpus
+            and sorted(left.target_nodes) == sorted(right.target_nodes)
+        )
+
+    @classmethod
     def _parallel_plans_match(
         cls,
         left: ParallelPlan, right: ParallelPlan
@@ -1261,19 +1490,7 @@ class RoundRobinRouter(SllmRouter):
         if left_placement_fingerprint or right_placement_fingerprint:
             if left_placement_fingerprint != right_placement_fingerprint:
                 return False
-        return (
-            left.model_name == right.model_name
-            and left.backend == right.backend
-            and left.tensor_parallel_size == right.tensor_parallel_size
-            and left.pipeline_parallel_size == right.pipeline_parallel_size
-            and left.data_parallel_size == right.data_parallel_size
-            and left.enable_expert_parallel == right.enable_expert_parallel
-            and left.effective_expert_parallel_size
-            == right.effective_expert_parallel_size
-            and left.replica_count == right.replica_count
-            and left.num_gpus == right.num_gpus
-            and sorted(left.target_nodes) == sorted(right.target_nodes)
-        )
+        return cls._parallel_shapes_match(left, right)
 
     async def _set_instance_state(
         self,
@@ -1692,6 +1909,11 @@ class RoundRobinRouter(SllmRouter):
             in {
                 "expert_placement_available",
                 "expert_placement_snapshot",
+                "runtime_expert_placement_available",
+                "runtime_expert_placement_worker_count",
+                "runtime_expert_placement_shard_count",
+                "runtime_expert_placement_shards",
+                "runtime_expert_placement_worker_snapshots",
                 "placement_epoch",
                 "placement_version",
                 "placement_source",
@@ -1712,18 +1934,51 @@ class RoundRobinRouter(SllmRouter):
                 "expert_placement_apply_hook_available",
                 "expert_placement_apply_attempted",
                 "expert_placement_apply_success",
+                "expert_placement_apply_worker_count",
+                "expert_placement_apply_worker_success_count",
                 "expert_placement_apply_duration_ms",
                 "expert_placement_apply_reason",
                 "expert_placement_verify_hook_available",
                 "expert_placement_verify_attempted",
                 "expert_placement_verify_success",
+                "expert_placement_verify_worker_count",
+                "expert_placement_verify_worker_success_count",
                 "expert_placement_verify_reason",
+                "expert_placement_contract_seen_by_runtime",
+                "expert_placement_contract_seen_by_all_workers",
+                "expert_placement_contract_seen_worker_count",
+                "expert_placement_contract_seen_worker_total",
+                "expert_placement_physical_weight_migration",
+                "expert_placement_runtime_moved_expert_shards",
+                "expert_placement_runtime_moved_weight_bytes",
+                "expert_placement_runtime_remap_duration_ms",
+                "expert_placement_runtime_active_request_remap",
+                "expert_placement_runtime_step_boundary_barrier",
+                "expert_placement_runtime_physical_host_ids_observed",
+                "expert_placement_runtime_cross_node_weight_migration",
+                "expert_placement_runtime_cross_node_moved_expert_shards",
+                "expert_placement_runtime_cross_node_moved_weight_bytes",
+                "expert_placement_runtime_verification_level",
+                "expert_placement_runtime_verified_placement",
+                "expert_placement_runtime_can_verify_physical_placement",
+                "expert_placement_runtime_can_remap_live_ep_rank",
+                "expert_placement_runtime_can_measure_all_to_all",
+                "expert_placement_runtime_all_to_all_counters_available",
+                "expert_placement_runtime_all_to_all_collective_calls",
+                "expert_placement_runtime_all_to_all_dispatch_calls",
+                "expert_placement_runtime_all_to_all_combine_calls",
+                "expert_placement_runtime_all_to_all_observed_input_bytes",
+                "expert_placement_runtime_all_to_all_observed_output_bytes",
+                "expert_placement_runtime_all_to_all_internode_calls",
+                "expert_placement_runtime_all_to_all_measurement_kind",
+                "expert_placement_runtime_capability_reason",
                 "reparallelization_execution_model",
                 "reparallelization_execution_model_reason",
                 "expert_placement_execution_model",
                 "expert_placement_execution_model_reason",
                 "expert_placement_runtime_contract_mode",
                 "expert_placement_live_migration_enabled",
+                "expert_placement_quiescent_remap_enabled",
                 "expert_placement_physical_migration_required",
                 "moe_route_histogram_available",
                 "moe_route_histogram_source",
@@ -1760,6 +2015,15 @@ class RoundRobinRouter(SllmRouter):
             )
             return ",".join(values)
 
+        def sum_int(key: str) -> int:
+            return sum(int(row.get(key, 0) or 0) for row in metadata_rows)
+
+        def max_float(key: str) -> float:
+            return max(
+                (float(row.get(key, 0.0) or 0.0) for row in metadata_rows),
+                default=0.0,
+            )
+
         return {
             "metadata_count": len(metadata_rows),
             "apply_hook_available_count": count_truthy(
@@ -1786,6 +2050,101 @@ class RoundRobinRouter(SllmRouter):
             "verify_reasons": compact_values(
                 "expert_placement_verify_reason"
             ),
+            "contract_seen_count": count_truthy(
+                "expert_placement_contract_seen_by_runtime"
+            ),
+            "contract_seen_all_workers_count": count_truthy(
+                "expert_placement_contract_seen_by_all_workers"
+            ),
+            "contract_seen_worker_count": sum(
+                int(row.get("expert_placement_contract_seen_worker_count", 0) or 0)
+                for row in metadata_rows
+            ),
+            "contract_seen_worker_total": sum(
+                int(row.get("expert_placement_contract_seen_worker_total", 0) or 0)
+                for row in metadata_rows
+            ),
+            "physical_weight_migration_count": count_truthy(
+                "expert_placement_physical_weight_migration"
+            ),
+            "runtime_moved_expert_shards": sum_int(
+                "expert_placement_runtime_moved_expert_shards"
+            ),
+            "runtime_moved_weight_bytes": sum_int(
+                "expert_placement_runtime_moved_weight_bytes"
+            ),
+            "runtime_remap_duration_ms": max_float(
+                "expert_placement_runtime_remap_duration_ms"
+            ),
+            "active_request_remap_count": count_truthy(
+                "expert_placement_runtime_active_request_remap"
+            ),
+            "step_boundary_barrier_count": count_truthy(
+                "expert_placement_runtime_step_boundary_barrier"
+            ),
+            "physical_host_ids_observed_count": count_truthy(
+                "expert_placement_runtime_physical_host_ids_observed"
+            ),
+            "cross_node_weight_migration_count": count_truthy(
+                "expert_placement_runtime_cross_node_weight_migration"
+            ),
+            "cross_node_moved_expert_shards": sum_int(
+                "expert_placement_runtime_cross_node_moved_expert_shards"
+            ),
+            "cross_node_moved_weight_bytes": sum_int(
+                "expert_placement_runtime_cross_node_moved_weight_bytes"
+            ),
+            "verification_levels": compact_values(
+                "expert_placement_runtime_verification_level"
+            ),
+            "verified_placement_count": count_truthy(
+                "expert_placement_runtime_verified_placement"
+            ),
+            "can_verify_physical_placement_count": count_truthy(
+                "expert_placement_runtime_can_verify_physical_placement"
+            ),
+            "can_remap_live_ep_rank_count": count_truthy(
+                "expert_placement_runtime_can_remap_live_ep_rank"
+            ),
+            "can_measure_all_to_all_count": count_truthy(
+                "expert_placement_runtime_can_measure_all_to_all"
+            ),
+            "all_to_all_counters_available_count": count_truthy(
+                "expert_placement_runtime_all_to_all_counters_available"
+            ),
+            "all_to_all_collective_calls": sum_int(
+                "expert_placement_runtime_all_to_all_collective_calls"
+            ),
+            "all_to_all_dispatch_calls": sum_int(
+                "expert_placement_runtime_all_to_all_dispatch_calls"
+            ),
+            "all_to_all_combine_calls": sum_int(
+                "expert_placement_runtime_all_to_all_combine_calls"
+            ),
+            "all_to_all_observed_input_bytes": sum_int(
+                "expert_placement_runtime_all_to_all_observed_input_bytes"
+            ),
+            "all_to_all_observed_output_bytes": sum_int(
+                "expert_placement_runtime_all_to_all_observed_output_bytes"
+            ),
+            "all_to_all_internode_calls": sum_int(
+                "expert_placement_runtime_all_to_all_internode_calls"
+            ),
+            "all_to_all_measurement_kinds": compact_values(
+                "expert_placement_runtime_all_to_all_measurement_kind"
+            ),
+            "runtime_expert_placement_available_count": count_truthy(
+                "runtime_expert_placement_available"
+            ),
+            "runtime_expert_placement_worker_count": sum_int(
+                "runtime_expert_placement_worker_count"
+            ),
+            "runtime_expert_placement_shard_count": sum_int(
+                "runtime_expert_placement_shard_count"
+            ),
+            "capability_reasons": compact_values(
+                "expert_placement_runtime_capability_reason"
+            ),
             "plan_applied_count": count_truthy(
                 "expert_placement_plan_applied"
             ),
@@ -1809,6 +2168,9 @@ class RoundRobinRouter(SllmRouter):
             ),
             "expert_placement_live_migration_count": count_truthy(
                 "expert_placement_live_migration_enabled"
+            ),
+            "expert_placement_quiescent_remap_count": count_truthy(
+                "expert_placement_quiescent_remap_enabled"
             ),
             "expert_placement_physical_migration_required_count": (
                 count_truthy("expert_placement_physical_migration_required")
@@ -3669,6 +4031,9 @@ class RoundRobinRouter(SllmRouter):
                 f"{self.model_name}: {num_running_instances} instances,"
                 f"need {desired_instances} instances",
             )
+            if self._reparallelization_execution_active:
+                await asyncio.sleep(self.loop_interval)
+                continue
             if desired_instances > num_running_instances:
                 logger.info("Creating new instance")
                 await self._create_instance()
@@ -3754,11 +4119,61 @@ class RoundRobinRouter(SllmRouter):
                 logger.info(
                     f"Allocating resources for model {self.model_name} on instance {instance_id}"
                 )
-                startup_node = (
-                    await self.model_loading_scheduler.allocate_resource.remote(
-                        self.model_name, instance_id, self.resource_requirements
-                    )
+                distributed_targets = self.backend_config.get(
+                    "spotserve_target_worker_nodes", []
                 )
+                if isinstance(distributed_targets, str):
+                    distributed_targets = [
+                        value.strip()
+                        for value in distributed_targets.split(",")
+                        if value.strip()
+                    ]
+                distributed_allocation = bool(
+                    self.backend == "vllm"
+                    and self.backend_config.get(
+                        "spotserve_distributed_gpu_allocation", False
+                    )
+                    and self.backend_config.get(
+                        "spotserve_vllm_ray_dp_owns_gpus", False
+                    )
+                    and isinstance(distributed_targets, list)
+                    and len(distributed_targets) > 1
+                )
+                if distributed_allocation:
+                    allocation = (
+                        await self.model_loading_scheduler.allocate_distributed_resource.remote(
+                            self.model_name,
+                            instance_id,
+                            self.resource_requirements,
+                            [str(node) for node in distributed_targets],
+                            True,
+                        )
+                    )
+                    if not isinstance(allocation, Mapping):
+                        raise RuntimeError(
+                            "scheduler_distributed_allocation_result_invalid"
+                        )
+                    startup_node = str(allocation.get("node_id") or "")
+                    allocated_nodes = [
+                        str(node)
+                        for node in allocation.get("target_node_ids", [])
+                    ]
+                    if not startup_node or len(allocated_nodes) < 2:
+                        raise RuntimeError(
+                            "scheduler_did_not_reserve_multiple_worker_nodes"
+                        )
+                    self.backend_config[
+                        "spotserve_reserved_worker_nodes"
+                    ] = allocated_nodes
+                    self.backend_config[
+                        "spotserve_distributed_node_allocations"
+                    ] = dict(allocation.get("node_allocations", {}))
+                else:
+                    startup_node = (
+                        await self.model_loading_scheduler.allocate_resource.remote(
+                            self.model_name, instance_id, self.resource_requirements
+                        )
+                    )
                 resources_allocated = True
                 startup_resources = {
                     "worker_node": 0.1,
@@ -3768,7 +4183,16 @@ class RoundRobinRouter(SllmRouter):
                 instance.node_id = startup_node
             startup_config = {
                 "num_cpus": self.resource_requirements["num_cpus"],
-                "num_gpus": self.resource_requirements["num_gpus"],
+                "num_gpus": (
+                    0
+                    if (
+                        self.backend == "vllm"
+                        and self.backend_config.get(
+                            "spotserve_vllm_ray_dp_owns_gpus", False
+                        )
+                    )
+                    else self.resource_requirements["num_gpus"]
+                ),
                 "resources": startup_resources,
             }
             logger.info(

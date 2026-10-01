@@ -3,7 +3,7 @@ new file mode 100644
 index 000000000..5b1bb3f55
 --- /dev/null
 +++ b/vllm/spotserve_moe.py
-@@ -0,0 +1,340 @@
+@@ -0,0 +1,783 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Lightweight SpotServe MoE routing instrumentation.
@@ -99,6 +99,354 @@ index 000000000..5b1bb3f55
 +def _placement_plan_fingerprint(plan: Mapping[str, Any]) -> str:
 +    value = plan.get("placement_fingerprint")
 +    return str(value or "")
++
++
++def _tensor_to_int_list(value: Any) -> list[int]:
++    if value is None:
++        return []
++    try:
++        tensor = value.detach()
++        if tensor.is_cuda:
++            tensor = tensor.cpu()
++        return [int(item) for item in tensor.reshape(-1).tolist()]
++    except Exception:
++        try:
++            return [int(item) for item in value]
++        except Exception:
++            return []
++
++
++def _parameter_nbytes(value: Any) -> int:
++    try:
++        return int(value.numel()) * int(value.element_size())
++    except Exception:
++        return 0
++
++
++def _module_parameter_weight_bytes(module: Any, local_num_experts: int) -> int:
++    if local_num_experts <= 0:
++        return 0
++    total = 0
++    try:
++        parameters = module.named_parameters(recurse=False)
++    except Exception:
++        return 0
++    for name, parameter in parameters:
++        shape = tuple(getattr(parameter, "shape", ()) or ())
++        if not shape:
++            continue
++        if int(shape[0]) == local_num_experts:
++            total += _parameter_nbytes(parameter)
++            continue
++        if str(name) in {"w13_weight", "w2_weight", "w1_weight", "w3_weight"}:
++            total += _parameter_nbytes(parameter)
++    return total
++
++
++def _module_local_expert_ids(module: Any) -> tuple[list[int], str]:
++    global_num_experts = _positive_int(
++        getattr(
++            module,
++            "logical_num_experts",
++            getattr(module, "global_num_experts", getattr(module, "num_experts", 0)),
++        )
++    )
++    if global_num_experts <= 0:
++        return [], "missing_global_num_experts"
++
++    expert_map = getattr(module, "expert_map", None)
++    mapped = _tensor_to_int_list(expert_map)
++    if mapped:
++        local_physical_ids = [
++            physical_id
++            for physical_id, local_index in enumerate(mapped)
++            if int(local_index) >= 0
++        ]
++        logical_to_physical = getattr(
++            module, "logical_to_physical_map", None
++        )
++        try:
++            logical_rows = logical_to_physical.detach()
++            if logical_rows.is_cuda:
++                logical_rows = logical_rows.cpu()
++            logical_rows = logical_rows.tolist()
++        except Exception:
++            logical_rows = []
++        if logical_rows:
++            physical_to_logical = {
++                int(physical_id): logical_id
++                for logical_id, physical_ids in enumerate(logical_rows)
++                for physical_id in physical_ids
++                if int(physical_id) >= 0
++            }
++            local_logical_ids = sorted(
++                {
++                    physical_to_logical[physical_id]
++                    for physical_id in local_physical_ids
++                    if physical_id in physical_to_logical
++                }
++            )
++            if local_logical_ids:
++                return local_logical_ids, "eplb_logical_to_physical_map"
++        return local_physical_ids, "expert_map"
++
++    moe_parallel_config = getattr(module, "moe_parallel_config", None)
++    use_ep = bool(getattr(moe_parallel_config, "use_ep", False))
++    if not use_ep:
++        return list(range(global_num_experts)), "ep_disabled_all_experts_local"
++
++    ep_size = _positive_int(getattr(moe_parallel_config, "ep_size", 0))
++    ep_rank = _positive_int(getattr(moe_parallel_config, "ep_rank", 0))
++    if ep_size <= 1:
++        return list(range(global_num_experts)), "single_ep_rank_all_experts_local"
++
++    return [], "missing_expert_map_for_ep"
++
++
++def _rank_aliases(worker_rank: int | None, ep_rank: int | None) -> list[str]:
++    aliases: list[str] = []
++    if worker_rank is not None:
++        aliases.extend(
++            [
++                str(worker_rank),
++                f"rank:{worker_rank}",
++                f"worker:{worker_rank}",
++                f"worker-rank:{worker_rank}",
++            ]
++        )
++    if ep_rank is not None:
++        aliases.extend(
++            [
++                str(ep_rank),
++                f"ep-rank:{ep_rank}",
++                f"replica:0/ep-rank:{ep_rank}",
++                f"worker:{worker_rank}/ep-rank:{ep_rank}",
++            ]
++        )
++    return sorted({alias for alias in aliases if alias and "None" not in alias})
++
++
++def _expert_rank_matches(
++    expected_rank: Any,
++    actual: Mapping[str, Any],
++) -> bool:
++    expected = str(expected_rank or "")
++    if not expected:
++        return False
++    actual_rank = str(actual.get("rank_id") or "")
++    if expected == actual_rank:
++        return True
++    aliases = {str(alias) for alias in actual.get("rank_aliases", [])}
++    if expected in aliases:
++        return True
++    expected_ep = re.search(r"ep-rank:(\d+)", expected)
++    actual_ep = re.search(r"ep-rank:(\d+)", actual_rank)
++    if expected_ep and actual_ep and expected_ep.group(1) == actual_ep.group(1):
++        return True
++    for alias in aliases:
++        alias_ep = re.search(r"ep-rank:(\d+)", alias)
++        if expected_ep and alias_ep and expected_ep.group(1) == alias_ep.group(1):
++            return True
++    return False
++
++
++def inspect_runtime_expert_placement(
++    model: Any,
++    *,
++    worker_rank: int | None = None,
++    local_rank: int | None = None,
++    device: str | None = None,
++) -> dict[str, Any]:
++    """Inspect loaded MoE expert ownership on this worker.
++
++    This is read-only. It discovers actual resident expert ownership from
++    vLLM FusedMoE modules when their expert map and local expert weights are
++    visible. It does not remap ranks or move weights.
++    """
++    if model is None:
++        return {
++            "available": False,
++            "reason": "model_unavailable",
++            "worker_rank": worker_rank,
++            "local_rank": local_rank,
++            "device": device,
++            "shards": {},
++        }
++    try:
++        modules = model.named_modules()
++    except Exception:
++        return {
++            "available": False,
++            "reason": "model_named_modules_unavailable",
++            "worker_rank": worker_rank,
++            "local_rank": local_rank,
++            "device": device,
++            "shards": {},
++        }
++
++    shards: dict[str, dict[str, Any]] = {}
++    suspected_modules = 0
++    for module_name, module in modules:
++        if not (
++            hasattr(module, "global_num_experts")
++            or hasattr(module, "logical_num_experts")
++            or hasattr(module, "expert_map")
++        ):
++            continue
++        local_expert_ids, source = _module_local_expert_ids(module)
++        if not local_expert_ids:
++            continue
++        suspected_modules += 1
++        layer_id = _layer_id_from_name(str(module_name))
++        moe_parallel_config = getattr(module, "moe_parallel_config", None)
++        ep_rank_value = getattr(moe_parallel_config, "ep_rank", None)
++        ep_size_value = getattr(moe_parallel_config, "ep_size", None)
++        local_num_experts = _positive_int(
++            getattr(module, "local_num_experts", len(local_expert_ids))
++        )
++        module_weight_bytes = _module_parameter_weight_bytes(
++            module, local_num_experts or len(local_expert_ids)
++        )
++        per_expert_bytes = (
++            int(module_weight_bytes / max(1, len(local_expert_ids)))
++            if module_weight_bytes > 0
++            else 0
++        )
++        aliases = _rank_aliases(worker_rank, ep_rank_value)
++        rank_id = (
++            f"worker:{worker_rank}/ep-rank:{ep_rank_value}"
++            if ep_rank_value is not None
++            else f"worker:{worker_rank}"
++        )
++        for expert_id in local_expert_ids:
++            key = (
++                f"layer:{layer_id}/expert:{expert_id}"
++                if layer_id != "unknown"
++                else f"expert:{expert_id}"
++            )
++            shards[key] = {
++                "layer_id": layer_id,
++                "expert_id": int(expert_id),
++                "rank_id": rank_id,
++                "rank_aliases": aliases,
++                "worker_rank": worker_rank,
++                "local_rank": local_rank,
++                "device": device,
++                "ep_rank": ep_rank_value,
++                "ep_size": ep_size_value,
++                "module_name": str(module_name),
++                "placement_source": source,
++                "weight_resident": True,
++                "weight_size_bytes": per_expert_bytes,
++            }
++
++    return {
++        "available": bool(shards),
++        "reason": "runtime_expert_placement_snapshot"
++        if shards
++        else "no_expert_modules_discovered",
++        "worker_rank": worker_rank,
++        "local_rank": local_rank,
++        "device": device,
++        "suspected_moe_module_count": suspected_modules,
++        "shard_count": len(shards),
++        "shards": shards,
++    }
++
++
++def _compare_runtime_expert_placement(
++    plan: Mapping[str, Any],
++    runtime_snapshot: Mapping[str, Any] | None,
++) -> dict[str, Any]:
++    if not isinstance(runtime_snapshot, Mapping) or not runtime_snapshot.get("available"):
++        return {
++            "verified": False,
++            "reason": "runtime_expert_placement_snapshot_unavailable",
++            "actual_expert_placement_available": False,
++            "matched_expert_count": 0,
++            "missing_expert_count": 0,
++            "mismatched_rank_count": 0,
++        }
++    actual_shards = runtime_snapshot.get("shards", {})
++    if not isinstance(actual_shards, Mapping) or not actual_shards:
++        return {
++            "verified": False,
++            "reason": "runtime_expert_placement_snapshot_empty",
++            "actual_expert_placement_available": False,
++            "matched_expert_count": 0,
++            "missing_expert_count": 0,
++            "mismatched_rank_count": 0,
++        }
++    expected_ranks = plan.get("expert_to_target_rank", {})
++    if not isinstance(expected_ranks, Mapping) or not expected_ranks:
++        snapshot = plan.get("expert_placement_snapshot", {})
++        if isinstance(snapshot, Mapping):
++            expected_ranks = {
++                str(key): str(value.get("rank_id") or "")
++                for key, value in snapshot.items()
++                if isinstance(value, Mapping)
++            }
++    if not isinstance(expected_ranks, Mapping) or not expected_ranks:
++        return {
++            "verified": False,
++            "reason": "placement_contract_has_no_expected_expert_ranks",
++            "actual_expert_placement_available": True,
++            "matched_expert_count": 0,
++            "missing_expert_count": 0,
++            "mismatched_rank_count": 0,
++        }
++
++    def rank_is_local(expected_rank: Any) -> bool:
++        return any(
++            isinstance(actual, Mapping)
++            and _expert_rank_matches(expected_rank, actual)
++            for actual in actual_shards.values()
++        )
++
++    local_expected = {
++        str(expert_key): expected_rank
++        for expert_key, expected_rank in expected_ranks.items()
++        if rank_is_local(expected_rank)
++    }
++    unexpected_local = sum(
++        1 for expert_key in actual_shards if str(expert_key) not in local_expected
++    )
++    matched = 0
++    missing = 0
++    mismatched = 0
++    checked = 0
++    for expert_key, expected_rank in local_expected.items():
++        actual = actual_shards.get(str(expert_key))
++        if not isinstance(actual, Mapping):
++            missing += 1
++            continue
++        checked += 1
++        if _expert_rank_matches(expected_rank, actual):
++            matched += 1
++        else:
++            mismatched += 1
++
++    verified = bool(
++        local_expected
++        and matched == len(local_expected)
++        and missing == 0
++        and mismatched == 0
++        and unexpected_local == 0
++    )
++    return {
++        "verified": verified,
++        "reason": "runtime_expert_placement_matches_contract"
++        if verified
++        else "runtime_expert_placement_mismatch",
++        "actual_expert_placement_available": True,
++        "matched_expert_count": matched,
++        "missing_expert_count": missing,
++        "mismatched_rank_count": mismatched,
++        "unexpected_local_expert_count": unexpected_local,
++        "checked_expert_count": checked,
++        "local_expected_expert_count": len(local_expected),
++        "actual_expert_count": len(actual_shards),
++    }
 +
 +
 +def _event_histogram(topk_ids: torch.Tensor, layer_name: str | None) -> dict[str, int]:
@@ -250,6 +598,7 @@ index 000000000..5b1bb3f55
 +
 +def get_moe_runtime_metadata(
 +    *,
++    runtime_expert_placement_snapshot: Mapping[str, Any] | None = None,
 +    worker_rank: int | None = None,
 +) -> dict[str, Any]:
 +    with _LOCK:
@@ -258,7 +607,7 @@ index 000000000..5b1bb3f55
 +            _merge_histogram(recent, event)
 +        global_histogram = dict(_GLOBAL_HISTOGRAM)
 +    available = bool(global_histogram)
-+    return {
++    result = {
 +        "moe_route_tracing_enabled": _enabled(),
 +        "moe_route_histogram_available": available,
 +        "moe_route_histogram_source": (
@@ -271,6 +620,20 @@ index 000000000..5b1bb3f55
 +        "recent_window_expert_hotness": recent,
 +        "worker_rank": worker_rank,
 +    }
++    if isinstance(runtime_expert_placement_snapshot, Mapping):
++        result["runtime_expert_placement_available"] = bool(
++            runtime_expert_placement_snapshot.get("available")
++        )
++        result["runtime_expert_placement_reason"] = str(
++            runtime_expert_placement_snapshot.get("reason") or ""
++        )
++        result["runtime_expert_placement_shard_count"] = int(
++            runtime_expert_placement_snapshot.get("shard_count", 0) or 0
++        )
++        result["runtime_expert_placement_snapshot"] = dict(
++            runtime_expert_placement_snapshot
++        )
++    return result
 +
 +
 +def apply_expert_placement_plan(
@@ -278,6 +641,7 @@ index 000000000..5b1bb3f55
 +    *,
 +    placement_plan: Mapping[str, Any] | None = None,
 +    plan: Mapping[str, Any] | None = None,
++    runtime_expert_placement_snapshot: Mapping[str, Any] | None = None,
 +    worker_rank: int | None = None,
 +    **_: Any,
 +) -> dict[str, Any]:
@@ -296,6 +660,10 @@ index 000000000..5b1bb3f55
 +    with _LOCK:
 +        _LAST_EXPERT_PLACEMENT_PLAN.clear()
 +        _LAST_EXPERT_PLACEMENT_PLAN.update(payload)
++    actual_available = bool(
++        isinstance(runtime_expert_placement_snapshot, Mapping)
++        and runtime_expert_placement_snapshot.get("available")
++    )
 +    return {
 +        "applied": False,
 +        "success": False,
@@ -303,8 +671,29 @@ index 000000000..5b1bb3f55
 +        "reason": "physical_expert_placement_migration_not_supported",
 +        "hook_kind": "spotserve_observation_only",
 +        "physical_weight_migration": False,
++        "runtime_verified_placement": False,
++        "verification_level": "contract_seen_only",
++        "can_verify_physical_placement": actual_available,
++        "can_remap_live_ep_rank": False,
++        "can_measure_all_to_all": False,
++        "capability_reason": (
++            "runtime_expert_placement_observable_but_live_remap_not_supported"
++            if actual_available
++            else "vllm_live_ep_rank_remap_not_supported"
++        ),
++        "actual_expert_placement_available": actual_available,
++        "actual_expert_count": int(
++            runtime_expert_placement_snapshot.get("shard_count", 0)
++            if isinstance(runtime_expert_placement_snapshot, Mapping)
++            else 0
++        ),
 +        "expert_placement_plan_available": bool(payload),
 +        "placement_fingerprint": _placement_plan_fingerprint(payload),
++        "last_seen_placement_fingerprint": _placement_plan_fingerprint(payload),
++        "contract_seen_by_runtime": bool(payload),
++        "contract_seen_by_all_workers": bool(payload),
++        "contract_seen_worker_count": int(bool(payload)),
++        "contract_seen_worker_total": 1,
 +        "worker_rank": worker_rank,
 +    }
 +
@@ -314,27 +703,70 @@ index 000000000..5b1bb3f55
 +    *,
 +    placement_plan: Mapping[str, Any] | None = None,
 +    plan: Mapping[str, Any] | None = None,
++    runtime_expert_placement_snapshot: Mapping[str, Any] | None = None,
 +    worker_rank: int | None = None,
 +    **_: Any,
 +) -> dict[str, Any]:
-+    """Report that real runtime placement verification is not implemented."""
++    """Verify the placement contract against observable local expert weights."""
 +    payload = _placement_plan_payload(
 +        expert_placement_plan=expert_placement_plan,
 +        placement_plan=placement_plan,
 +        plan=plan,
++    )
++    verification = _compare_runtime_expert_placement(
++        payload,
++        runtime_expert_placement_snapshot,
 +    )
 +    requested_fingerprint = _placement_plan_fingerprint(payload)
 +    with _LOCK:
 +        seen_fingerprint = _placement_plan_fingerprint(
 +            _LAST_EXPERT_PLACEMENT_PLAN
 +        )
++    verified = bool(verification.get("verified"))
++    actual_available = bool(
++        verification.get("actual_expert_placement_available")
++    )
 +    return {
-+        "verified": False,
-+        "success": False,
-+        "ok": False,
-+        "reason": "physical_expert_placement_verification_not_supported",
++        "verified": verified,
++        "success": verified,
++        "ok": verified,
++        "reason": str(
++            verification.get("reason")
++            or "physical_expert_placement_verification_not_supported"
++        ),
 +        "hook_kind": "spotserve_observation_only",
 +        "physical_weight_migration": False,
++        "runtime_verified_placement": verified,
++        "verification_level": (
++            "runtime_placement_verified"
++            if verified
++            else "contract_seen_only"
++        ),
++        "can_verify_physical_placement": actual_available,
++        "can_remap_live_ep_rank": False,
++        "can_measure_all_to_all": False,
++        "capability_reason": (
++            "runtime_expert_placement_verified_no_live_remap"
++            if verified
++            else str(
++                verification.get("reason")
++                or "vllm_live_ep_rank_remap_not_supported"
++            )
++        ),
++        "actual_expert_placement_available": actual_available,
++        "matched_expert_count": int(verification.get("matched_expert_count", 0)),
++        "missing_expert_count": int(verification.get("missing_expert_count", 0)),
++        "mismatched_rank_count": int(
++            verification.get("mismatched_rank_count", 0)
++        ),
++        "unexpected_local_expert_count": int(
++            verification.get("unexpected_local_expert_count", 0)
++        ),
++        "checked_expert_count": int(verification.get("checked_expert_count", 0)),
++        "local_expected_expert_count": int(
++            verification.get("local_expected_expert_count", 0)
++        ),
++        "actual_expert_count": int(verification.get("actual_expert_count", 0)),
 +        "expert_placement_plan_available": bool(payload),
 +        "placement_fingerprint": requested_fingerprint,
 +        "last_seen_placement_fingerprint": seen_fingerprint,
@@ -342,6 +774,17 @@ index 000000000..5b1bb3f55
 +            requested_fingerprint
 +            and requested_fingerprint == seen_fingerprint
 +        ),
++        "contract_seen_by_all_workers": bool(
++            requested_fingerprint
++            and requested_fingerprint == seen_fingerprint
++        ),
++        "contract_seen_worker_count": int(
++            bool(
++                requested_fingerprint
++                and requested_fingerprint == seen_fingerprint
++            )
++        ),
++        "contract_seen_worker_total": 1,
 +        "worker_rank": worker_rank,
 +    }
 diff --git a/vllm/model_executor/layers/fused_moe/fused_moe_modular_method.py b/vllm/model_executor/layers/fused_moe/fused_moe_modular_method.py
@@ -351,7 +794,7 @@ index d8f0ec4fd..31e42f653 100644
 @@ -147,6 +147,11 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
              zero_expert_type=zero_expert_type,
          )
- 
+
 +        from vllm.spotserve_moe import record_moe_routing
 +
 +        record_moe_routing(
@@ -367,7 +810,7 @@ index 59c38bc8f..262599c26 100644
 @@ -377,6 +377,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
              num_fused_shared_experts=layer.num_fused_shared_experts,
          )
- 
+
 +        from vllm.spotserve_moe import record_moe_routing
 +
 +        record_moe_routing(
@@ -380,7 +823,7 @@ diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
 index c0c1f913b..ab4269b7e 100644
 --- a/vllm/v1/engine/async_llm.py
 +++ b/vllm/v1/engine/async_llm.py
-@@ -355,6 +355,84 @@ class AsyncLLM(EngineClient):
+@@ -355,6 +355,149 @@ class AsyncLLM(EngineClient):
              "staged": True,
              "expected_blocks": len(params["remote_block_ids"]),
          }
@@ -429,9 +872,20 @@ index c0c1f913b..ab4269b7e 100644
 +        return metadata
 +
 +    async def get_moe_runtime_metadata(self, **_: Any) -> dict[str, Any]:
-+        return await self.engine_core.call_utility_async(
-+            "get_moe_runtime_metadata"
-+        )
++        engine_core = self.engine_core
++        engines = list(getattr(engine_core, "core_engines", ()) or ())
++        call_one = getattr(engine_core, "_call_utility_async", None)
++        if len(engines) <= 1 or not callable(call_one):
++            return await engine_core.call_utility_async(
++                "get_moe_runtime_metadata"
++            )
++        results = await asyncio.gather(*(
++            call_one("get_moe_runtime_metadata", engine=engine)
++            for engine in engines
++        ))
++        from sllm.vllm_expert_remap import aggregate_dp_engine_moe_metadata
++
++        return aggregate_dp_engine_moe_metadata(list(results))
 +
 +    async def apply_expert_placement_plan(
 +        self,
@@ -444,8 +898,8 @@ index c0c1f913b..ab4269b7e 100644
 +            or kwargs.get("plan")
 +            or {}
 +        )
-+        return await self.engine_core.call_utility_async(
-+            "apply_expert_placement_plan", plan
++        return await self._spotserve_call_placement_hook_all_dp_engines(
++            "apply_expert_placement_plan", plan, "applied"
 +        )
 +
 +    async def verify_expert_placement_plan(
@@ -459,10 +913,65 @@ index c0c1f913b..ab4269b7e 100644
 +            or kwargs.get("plan")
 +            or {}
 +        )
-+        return await self.engine_core.call_utility_async(
-+            "verify_expert_placement_plan", plan
++        return await self._spotserve_call_placement_hook_all_dp_engines(
++            "verify_expert_placement_plan", plan, "verified"
 +        )
- 
++
++    async def _spotserve_call_placement_hook_all_dp_engines(
++        self,
++        method: str,
++        plan: dict[str, Any],
++        success_key: str,
++    ) -> dict[str, Any]:
++        """Enter placement collectives on every local DP EngineCore."""
++        engine_core = self.engine_core
++        engines = list(getattr(engine_core, "core_engines", ()) or ())
++        call_one = getattr(engine_core, "_call_utility_async", None)
++        if len(engines) <= 1 or not callable(call_one):
++            return await engine_core.call_utility_async(method, plan)
++
++        coordinated_plan = dict(plan)
++        coordinated_plan["dp_engine_coordinated"] = True
++        coordinated_plan["dp_engine_count"] = len(engines)
++        if method == "apply_expert_placement_plan" and plan.get(
++            "live_expert_remap"
++        ) is True:
++            preflight_results = await asyncio.gather(*(
++                call_one(
++                    "prepare_expert_placement_plan",
++                    coordinated_plan,
++                    engine=engine,
++                )
++                for engine in engines
++            ))
++            from sllm.vllm_expert_remap import aggregate_dp_engine_hook_results
++
++            preflight = aggregate_dp_engine_hook_results(
++                list(preflight_results), "ready"
++            )
++            if not preflight["ready"]:
++                preflight.update({
++                    "applied": False,
++                    "success": False,
++                    "dp_engine_preflight_passed": False,
++                })
++                return preflight
++            coordinated_plan["dp_preflight_coordinated"] = True
++            coordinated_plan["active_requests_at_barrier"] = bool(
++                preflight.get("active_requests_at_barrier")
++            )
++        results = await asyncio.gather(*(
++            call_one(method, coordinated_plan, engine=engine)
++            for engine in engines
++        ))
++        from sllm.vllm_expert_remap import aggregate_dp_engine_hook_results
++
++        result = aggregate_dp_engine_hook_results(list(results), success_key)
++        if method == "apply_expert_placement_plan":
++            result["dp_engine_preflight_passed"] = True
++        return result
+-
++
      async def add_request(
          self,
 diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
@@ -476,7 +985,15 @@ index 5bc564f36..7fbdc4101 100644
  
  import msgspec
  import zmq
-@@ -654,6 +654,186 @@ class EngineCore:
+@@ -338,3 +338,7 @@ class EngineCore:
++        if getattr(self, "_spotserve_expert_remap_failed", False):
++            raise RuntimeError(
++                "expert_weights_inconsistent_after_failed_remap"
++            )
+         # Check for any requests remaining in the scheduler - unfinished,
+         # or finished and not yet removed from the batch.
+         if not self.scheduler.has_requests():
+@@ -654,6 +654,411 @@ class EngineCore:
              for request_id in list(requests)
          ]
  
@@ -562,6 +1079,9 @@ index 5bc564f36..7fbdc4101 100644
 +        )
 +        global_histogram: dict[str, int] = {}
 +        recent_histogram: dict[str, int] = {}
++        runtime_worker_snapshots: dict[str, dict[str, Any]] = {}
++        runtime_placement_shards: dict[str, list[dict[str, Any]]] = {}
++        all_to_all_snapshots: list[dict[str, Any]] = []
 +        enabled = False
 +        for snapshot in snapshots or []:
 +            if not isinstance(snapshot, dict):
@@ -573,6 +1093,20 @@ index 5bc564f36..7fbdc4101 100644
 +            recent = snapshot.get("recent_window_expert_hotness")
 +            if isinstance(recent, dict):
 +                self._merge_int_histogram(recent_histogram, recent)
++            all_to_all = snapshot.get("all_to_all_counters")
++            if isinstance(all_to_all, dict):
++                all_to_all_snapshots.append(all_to_all)
++            placement_snapshot = snapshot.get("runtime_expert_placement_snapshot")
++            if isinstance(placement_snapshot, dict):
++                worker_key = str(snapshot.get("worker_rank", len(runtime_worker_snapshots)))
++                runtime_worker_snapshots[worker_key] = placement_snapshot
++                shards = placement_snapshot.get("shards")
++                if isinstance(shards, dict):
++                    for expert_key, shard in shards.items():
++                        if isinstance(shard, dict):
++                            runtime_placement_shards.setdefault(
++                                str(expert_key), []
++                            ).append(shard)
 +        available = bool(global_histogram)
 +        return {
 +            "moe_route_tracing_enabled": enabled,
@@ -585,6 +1119,43 @@ index 5bc564f36..7fbdc4101 100644
 +            ),
 +            "global_expert_hotness": global_histogram,
 +            "recent_window_expert_hotness": recent_histogram,
++            "runtime_expert_placement_available": bool(runtime_placement_shards),
++            "runtime_expert_placement_worker_count": len(runtime_worker_snapshots),
++            "runtime_expert_placement_shard_count": sum(
++                len(rows) for rows in runtime_placement_shards.values()
++            ),
++            "runtime_expert_placement_shards": runtime_placement_shards,
++            "runtime_expert_placement_worker_snapshots": runtime_worker_snapshots,
++            "all_to_all_counters_available": bool(
++                all_to_all_snapshots
++                and any(row.get("available") for row in all_to_all_snapshots)
++            ),
++            "all_to_all_collective_calls": sum(
++                int(row.get("collective_calls", 0) or 0)
++                for row in all_to_all_snapshots
++            ),
++            "all_to_all_observed_input_bytes": sum(
++                int(row.get("observed_input_bytes", 0) or 0)
++                for row in all_to_all_snapshots
++            ),
++            "all_to_all_observed_output_bytes": sum(
++                int(row.get("observed_output_bytes", 0) or 0)
++                for row in all_to_all_snapshots
++            ),
++            "all_to_all_internode_calls": sum(
++                int(row.get("internode_calls", 0) or 0)
++                for row in all_to_all_snapshots
++            ),
++            "all_to_all_measurement_kind": ",".join(
++                sorted(
++                    {
++                        str(row.get("measurement_kind"))
++                        for row in all_to_all_snapshots
++                        if row.get("measurement_kind")
++                    }
++                )
++            ) or "unavailable",
++            "all_to_all_worker_snapshots": all_to_all_snapshots,
 +        }
 +
 +    @staticmethod
@@ -613,6 +1184,11 @@ index 5bc564f36..7fbdc4101 100644
 +            }
 +        )
 +        success = bool(total and successes == total)
++        contract_seen_count = sum(
++            1
++            for snapshot in worker_results
++            if bool(snapshot.get("contract_seen_by_runtime"))
++        )
 +        return {
 +            success_key: success,
 +            "success": success,
@@ -625,40 +1201,206 @@ index 5bc564f36..7fbdc4101 100644
 +            ),
 +            "worker_count": total,
 +            "worker_success_count": successes,
++            "contract_seen_count": contract_seen_count,
++            "contract_seen_by_runtime": bool(contract_seen_count),
++            "contract_seen_by_all_workers": bool(
++                total and contract_seen_count == total
++            ),
++            "contract_seen_worker_count": sum(
++                int(snapshot.get("contract_seen_worker_count", 0) or 0)
++                for snapshot in worker_results
++            ),
++            "contract_seen_worker_total": sum(
++                int(snapshot.get("contract_seen_worker_total", 0) or 0)
++                for snapshot in worker_results
++            ),
 +            "physical_weight_migration": any(
 +                bool(snapshot.get("physical_weight_migration"))
 +                for snapshot in worker_results
 +            ),
++            "moved_local_expert_shards": sum(
++                int(snapshot.get("moved_local_expert_shards", 0) or 0)
++                for snapshot in worker_results
++            ),
++            "moved_local_weight_bytes": sum(
++                int(snapshot.get("moved_local_weight_bytes", 0) or 0)
++                for snapshot in worker_results
++            ),
++            "physical_host_ids_observed": bool(
++                total and all(snapshot.get("physical_host_ids_observed")
++                              for snapshot in worker_results)
++            ),
++            "cross_node_weight_migration": any(
++                bool(snapshot.get("cross_node_weight_migration"))
++                for snapshot in worker_results
++            ),
++            "cross_node_moved_local_expert_shards": sum(
++                int(snapshot.get("cross_node_moved_local_expert_shards", 0) or 0)
++                for snapshot in worker_results
++            ),
++            "cross_node_moved_local_weight_bytes": sum(
++                int(snapshot.get("cross_node_moved_local_weight_bytes", 0) or 0)
++                for snapshot in worker_results
++            ),
++            "remap_duration_ms": max(
++                (float(snapshot.get("remap_duration_ms", 0.0) or 0.0)
++                 for snapshot in worker_results),
++                default=0.0,
++            ),
++            "runtime_verified_placement": bool(
++                total
++                and all(
++                    bool(snapshot.get("runtime_verified_placement"))
++                    for snapshot in worker_results
++                )
++            ),
++            "verification_levels": ",".join(
++                sorted(
++                    {
++                        str(snapshot.get("verification_level"))
++                        for snapshot in worker_results
++                        if snapshot.get("verification_level")
++                    }
++                )
++            ),
++            "verified_placement_count": sum(
++                1
++                for snapshot in worker_results
++                if bool(snapshot.get("runtime_verified_placement"))
++            ),
++            "can_verify_physical_placement": any(
++                bool(snapshot.get("can_verify_physical_placement"))
++                for snapshot in worker_results
++            ),
++            "can_remap_live_ep_rank": any(
++                bool(snapshot.get("can_remap_live_ep_rank"))
++                for snapshot in worker_results
++            ),
++            "can_measure_all_to_all": any(
++                bool(snapshot.get("can_measure_all_to_all"))
++                for snapshot in worker_results
++            ),
++            "capability_reasons": ",".join(
++                sorted(
++                    {
++                        str(snapshot.get("capability_reason"))
++                        for snapshot in worker_results
++                        if snapshot.get("capability_reason")
++                    }
++                )
++            ),
 +            "worker_results": worker_results,
 +        }
++
++    def prepare_expert_placement_plan(
++        self,
++        expert_placement_plan: Mapping[str, Any] | None = None,
++    ) -> dict[str, Any]:
++        plan = dict(expert_placement_plan or {})
++        active_requests = self.scheduler.has_unfinished_requests()
++        if active_requests and not plan.get("allow_active_requests") is True:
++            return {
++                "ready": False,
++                "success": False,
++                "reason": "active_requests_must_be_drained_before_expert_remap",
++                "worker_count": 0,
++                "active_requests_at_barrier": True,
++                "step_boundary_barrier": True,
++            }
++        if active_requests and os.environ.get(
++            "VLLM_SPOTSERVE_ACTIVE_REQUEST_REMAP"
++        ) != "1":
++            return {
++                "ready": False,
++                "success": False,
++                "reason": "active_request_remap_not_enabled",
++                "worker_count": 0,
++                "active_requests_at_barrier": True,
++                "step_boundary_barrier": True,
++            }
++        if active_requests and (
++            self.batch_queue is not None or self.async_scheduling
++        ):
++            return {
++                "ready": False,
++                "success": False,
++                "reason": "active_request_remap_requires_sync_step_boundary",
++                "worker_count": 0,
++                "active_requests_at_barrier": True,
++                "step_boundary_barrier": False,
++            }
++        preflights = self.model_executor.collective_rpc(
++            "prepare_expert_placement_plan", args=(plan,),
++        )
++        result = self._aggregate_expert_placement_hook_results(
++            preflights,
++            "ready",
++            "expert_remap_preflight_failed",
++        )
++        result["active_requests_at_barrier"] = bool(active_requests)
++        result["step_boundary_barrier"] = True
++        return result
 +
 +    def apply_expert_placement_plan(
 +        self,
 +        expert_placement_plan: Mapping[str, Any] | None = None,
 +    ) -> dict[str, Any]:
-+        snapshots = self.model_executor.collective_rpc(
-+            "apply_expert_placement_plan",
-+            args=(dict(expert_placement_plan or {}),),
-+        )
-+        return self._aggregate_expert_placement_hook_results(
++        plan = dict(expert_placement_plan or {})
++        active_requests = False
++        if plan.get("live_expert_remap") is True:
++            if plan.get("dp_preflight_coordinated") is True:
++                active_requests = bool(plan.get("active_requests_at_barrier"))
++            else:
++                preflight = self.prepare_expert_placement_plan(plan)
++                if not preflight["ready"]:
++                    preflight["applied"] = False
++                    return preflight
++                active_requests = bool(
++                    preflight.get("active_requests_at_barrier")
++                )
++        try:
++            snapshots = self.model_executor.collective_rpc(
++                "apply_expert_placement_plan",
++                args=(plan,),
++            )
++        except Exception:
++            if plan.get("live_expert_remap") is True:
++                self._spotserve_expert_remap_failed = True
++            raise
++        result = self._aggregate_expert_placement_hook_results(
 +            snapshots,
 +            "applied",
 +            "physical_expert_placement_migration_not_supported",
 +        )
++        if plan.get("live_expert_remap") is True:
++            result["active_requests_at_barrier"] = bool(active_requests)
++            result["step_boundary_barrier"] = True
++            if not result["applied"]:
++                self._spotserve_expert_remap_failed = True
++        return result
 +
 +    def verify_expert_placement_plan(
 +        self,
 +        expert_placement_plan: Mapping[str, Any] | None = None,
 +    ) -> dict[str, Any]:
-+        snapshots = self.model_executor.collective_rpc(
-+            "verify_expert_placement_plan",
-+            args=(dict(expert_placement_plan or {}),),
-+        )
-+        return self._aggregate_expert_placement_hook_results(
++        plan = dict(expert_placement_plan or {})
++        try:
++            snapshots = self.model_executor.collective_rpc(
++                "verify_expert_placement_plan",
++                args=(plan,),
++            )
++        except Exception:
++            if plan.get("live_expert_remap") is True:
++                self._spotserve_expert_remap_failed = True
++            raise
++        result = self._aggregate_expert_placement_hook_results(
 +            snapshots,
 +            "verified",
 +            "physical_expert_placement_verification_not_supported",
 +        )
++        if plan.get("live_expert_remap") is True and not result["verified"]:
++            self._spotserve_expert_remap_failed = True
++        return result
 +
      def supports_state_restore(self) -> bool:
          connector = self.scheduler.get_kv_connector()
@@ -697,7 +1439,7 @@ diff --git a/vllm/v1/worker/worker_base.py b/vllm/v1/worker/worker_base.py
 index 3fc13c233..46849bb1e 100644
 --- a/vllm/v1/worker/worker_base.py
 +++ b/vllm/v1/worker/worker_base.py
-@@ -109,6 +109,45 @@ class WorkerBase:
+@@ -109,6 +109,134 @@ class WorkerBase:
              ),
          }
  
@@ -714,18 +1456,77 @@ index 3fc13c233..46849bb1e 100644
 +        """Return aggregate MoE routing metadata observed by this worker."""
 +        from vllm.spotserve_moe import get_moe_runtime_metadata
 +
-+        return get_moe_runtime_metadata(worker_rank=self.rank)
++        metadata = get_moe_runtime_metadata(
++            runtime_expert_placement_snapshot=(
++                self._spotserve_runtime_expert_placement_snapshot()
++            ),
++            worker_rank=self.rank,
++        )
++        from sllm.vllm_expert_remap import get_all_to_all_counters
++
++        metadata["all_to_all_counters"] = get_all_to_all_counters()
++        return metadata
++
++    def _spotserve_runtime_expert_placement_snapshot(self) -> dict[str, Any]:
++        """Inspect the loaded model's resident MoE experts, if visible."""
++        from vllm.spotserve_moe import inspect_runtime_expert_placement
++
++        model = None
++        model_runner = getattr(self, "model_runner", None)
++        if model_runner is not None:
++            get_model = getattr(model_runner, "get_model", None)
++            if callable(get_model):
++                try:
++                    model = get_model()
++                except Exception:
++                    model = getattr(model_runner, "model", None)
++            else:
++                model = getattr(model_runner, "model", None)
++        return inspect_runtime_expert_placement(
++            model,
++            worker_rank=self.rank,
++            local_rank=self.local_rank,
++            device=str(getattr(self, "device", "")),
++        )
 +
 +    def apply_expert_placement_plan(
 +        self,
 +        expert_placement_plan: dict[str, Any] | None = None,
 +    ) -> dict[str, Any]:
-+        """Accept a SpotServe placement contract without moving weights."""
++        """Apply an opt-in fixed-EP remap, or observe the contract."""
 +        from vllm.spotserve_moe import apply_expert_placement_plan
++        plan = expert_placement_plan or {}
++        if plan.get("live_expert_remap") is True:
++            from sllm.vllm_expert_remap import remap_expert_weights
++            return remap_expert_weights(self._spotserve_loaded_model(), plan)
 +
 +        return apply_expert_placement_plan(
-+            expert_placement_plan,
++            plan,
++            runtime_expert_placement_snapshot=(
++                self._spotserve_runtime_expert_placement_snapshot()
++            ),
 +            worker_rank=self.rank,
++        )
++
++    def _spotserve_loaded_model(self) -> Any:
++        model_runner = getattr(self, "model_runner", None)
++        if model_runner is None:
++            return None
++        get_model = getattr(model_runner, "get_model", None)
++        if callable(get_model):
++            try:
++                return get_model()
++            except Exception:
++                pass
++        return getattr(model_runner, "model", None)
++
++    def prepare_expert_placement_plan(
++        self,
++        expert_placement_plan: dict[str, Any] | None = None,
++    ) -> dict[str, Any]:
++        from sllm.vllm_expert_remap import prepare_expert_remap
++        return prepare_expert_remap(
++            self._spotserve_loaded_model(), expert_placement_plan or {},
 +        )
 +
 +    def verify_expert_placement_plan(
@@ -734,12 +1535,80 @@ index 3fc13c233..46849bb1e 100644
 +    ) -> dict[str, Any]:
 +        """Report whether a SpotServe placement contract is runtime-applied."""
 +        from vllm.spotserve_moe import verify_expert_placement_plan
++        from sllm.vllm_expert_remap import last_remap_status
 +
-+        return verify_expert_placement_plan(
-+            expert_placement_plan,
++        plan = expert_placement_plan or {}
++        result = verify_expert_placement_plan(
++            plan,
++            runtime_expert_placement_snapshot=(
++                self._spotserve_runtime_expert_placement_snapshot()
++            ),
 +            worker_rank=self.rank,
 +        )
++        remap = last_remap_status(plan)
++        if remap and result.get("verified"):
++            result.update({
++                "hook_kind": remap["hook_kind"],
++                "physical_weight_migration": remap["physical_weight_migration"],
++                "verification_level": remap["verification_level"],
++                "moved_local_expert_shards": remap["moved_local_expert_shards"],
++                "moved_local_weight_bytes": remap["moved_local_weight_bytes"],
++                "physical_host_ids_observed": remap["physical_host_ids_observed"],
++                "cross_node_weight_migration": remap["cross_node_weight_migration"],
++                "cross_node_moved_local_expert_shards": (
++                    remap["cross_node_moved_local_expert_shards"]
++                ),
++                "cross_node_moved_local_weight_bytes": (
++                    remap["cross_node_moved_local_weight_bytes"]
++                ),
++                "remap_duration_ms": remap["remap_duration_ms"],
++                "capability_reason": "quiescent_fixed_ep_remap_verified",
++                "contract_seen_by_runtime": True,
++                "contract_seen_by_all_workers": True,
++                "contract_seen_worker_count": 1,
++                "contract_seen_worker_total": 1,
++                "last_seen_placement_fingerprint": remap["placement_fingerprint"],
++            })
++        return result
 +
      def compile_or_warm_up_model(self) -> None:
          """Prepare model for execution through compilation/warmup."""
          raise NotImplementedError
+diff --git a/vllm/distributed/device_communicators/cuda_communicator.py b/vllm/distributed/device_communicators/cuda_communicator.py
+index 40eb947a1..61fb5eb42 100644
+--- a/vllm/distributed/device_communicators/cuda_communicator.py
++++ b/vllm/distributed/device_communicators/cuda_communicator.py
+@@ -325,16 +325,31 @@ class CudaCommunicator(DeviceCommunicatorBase):
+         is_sequence_parallel: bool = False,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+         assert self.all2all_manager is not None
+-        hidden_states, router_logits = self.all2all_manager.dispatch(
++        input_payload = (hidden_states, router_logits)
++        hidden_states, router_logits = self.all2all_manager.dispatch(
+             hidden_states, router_logits, is_sequence_parallel
+         )
++        from sllm.vllm_expert_remap import record_all_to_all_collective
++
++        record_all_to_all_collective(
++            "dispatch",
++            input_payload,
++            (hidden_states, router_logits),
++            self.all2all_manager,
++        )
+         return hidden_states, router_logits
+-
++
+     def combine(
+         self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False
+     ) -> torch.Tensor:
+         assert self.all2all_manager is not None
++        input_payload = hidden_states
+         hidden_states = self.all2all_manager.combine(
+             hidden_states, is_sequence_parallel
+         )
++        from sllm.vllm_expert_remap import record_all_to_all_collective
++
++        record_all_to_all_collective(
++            "combine", input_payload, hidden_states, self.all2all_manager
++        )
+         return hidden_states

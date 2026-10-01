@@ -100,6 +100,7 @@ class VllmDeploymentAdapter:
         config["expert_parallel_size_verified"] = False
         config["enable_expert_parallel"] = plan.enable_expert_parallel
         config["placement_epoch"] = plan.placement_epoch
+        config["spotserve_target_worker_nodes"] = list(plan.target_nodes)
         config["reparallelization_execution_model"] = "actor_recreate"
         config["reparallelization_execution_model_reason"] = (
             "vllm_actor_recreate"
@@ -110,18 +111,50 @@ class VllmDeploymentAdapter:
             else {}
         )
         if expert_placement_plan:
+            live_expert_remap = bool(
+                expert_placement_plan.get("live_expert_remap", False)
+            )
+            physical_migration_required = bool(
+                expert_placement_plan.get(
+                    "expert_placement_physical_migration_required",
+                    live_expert_remap,
+                )
+            )
             config["expert_placement_plan"] = expert_placement_plan
             config["expert_placement_execution_model"] = (
-                "expert_aware_actor_recreate"
+                "quiescent_fixed_ep_remap"
+                if live_expert_remap
+                else "expert_aware_actor_recreate"
             )
             config["expert_placement_execution_model_reason"] = (
-                "logical_expert_placement_plan_carried_into_recreated_actor"
+                "opt_in_weight_transfer_after_actor_load"
+                if live_expert_remap
+                else "logical_expert_placement_plan_carried_into_recreated_actor"
             )
             config["expert_placement_runtime_contract_mode"] = (
-                "observe_only_contract"
+                "quiescent_fixed_ep_remap"
+                if live_expert_remap
+                else "observe_only_contract"
             )
             config["expert_placement_live_migration_enabled"] = False
-            config["expert_placement_physical_migration_required"] = False
+            config["expert_placement_quiescent_remap_enabled"] = (
+                live_expert_remap
+            )
+            config["expert_placement_physical_migration_required"] = (
+                physical_migration_required
+            )
+            config["expert_placement_runtime_verification_level"] = (
+                "unavailable"
+            )
+            config["expert_placement_runtime_verified_placement"] = False
+            config[
+                "expert_placement_runtime_can_verify_physical_placement"
+            ] = False
+            config["expert_placement_runtime_can_remap_live_ep_rank"] = False
+            config["expert_placement_runtime_can_measure_all_to_all"] = False
+            config["expert_placement_runtime_capability_reason"] = (
+                "awaiting_runtime_expert_placement_hook"
+            )
             config["placement_source"] = str(
                 expert_placement_plan.get(
                     "placement_source",
@@ -206,6 +239,11 @@ class VllmDeploymentAdapter:
             "num_cpus": max(0, int(self.resource_requirements.get("num_cpus", 1))),
             "num_gpus": replica_gpus,
         }
+        outer_actor_num_gpus = (
+            0
+            if backend_config.get("spotserve_vllm_ray_dp_owns_gpus", False)
+            else replica_gpus
+        )
         deployment = VllmDeployment(
             plan=plan,
             backend_config=backend_config,
@@ -213,6 +251,15 @@ class VllmDeploymentAdapter:
         )
         target_nodes = list(plan.target_nodes)
         known_scheduler_node_ids = await self._known_scheduler_node_ids()
+        distributed_allocation = bool(
+            backend_config.get("spotserve_distributed_gpu_allocation", False)
+            and backend_config.get("spotserve_vllm_ray_dp_owns_gpus", False)
+            and len(target_nodes) > 1
+        )
+        if distributed_allocation and plan.replica_count != 1:
+            raise RuntimeError(
+                "distributed_vllm_allocation_requires_single_sllm_replica"
+            )
 
         try:
             for replica in range(max(plan.replica_count, 1)):
@@ -233,23 +280,65 @@ class VllmDeploymentAdapter:
                         "target_worker_node_not_in_scheduler_snapshot: "
                         f"{target_node_id}"
                     )
-                allocation_kwargs = {
-                    "model_name": self.model_name,
-                    "instance_id": instance_id,
-                    "resources": resource_requirements,
-                }
-                if target_node_id is not None:
-                    allocation_kwargs["target_node_id"] = target_node_id
-                startup_node = await _call(
-                    self.scheduler.allocate_resource.remote,
-                    **allocation_kwargs,
-                )
+                if distributed_allocation:
+                    allocate_distributed = getattr(
+                        self.scheduler,
+                        "allocate_distributed_resource",
+                        None,
+                    )
+                    allocate_distributed_remote = getattr(
+                        allocate_distributed, "remote", None
+                    )
+                    if allocate_distributed_remote is None:
+                        raise RuntimeError(
+                            "scheduler_distributed_allocation_unavailable"
+                        )
+                    allocation = await _call(
+                        allocate_distributed_remote,
+                        model_name=self.model_name,
+                        instance_id=instance_id,
+                        resources=resource_requirements,
+                        target_node_ids=target_nodes,
+                        require_all_target_nodes=True,
+                    )
+                    if not isinstance(allocation, Mapping):
+                        raise RuntimeError(
+                            "scheduler_distributed_allocation_result_invalid"
+                        )
+                    startup_node = str(allocation.get("node_id") or "")
+                    allocated_nodes = [
+                        str(node)
+                        for node in allocation.get("target_node_ids", [])
+                    ]
+                    if not startup_node or len(allocated_nodes) < 2:
+                        raise RuntimeError(
+                            "scheduler_did_not_reserve_multiple_worker_nodes"
+                        )
+                    backend_config["spotserve_reserved_worker_nodes"] = (
+                        allocated_nodes
+                    )
+                    backend_config["spotserve_distributed_node_allocations"] = dict(
+                        allocation.get("node_allocations", {})
+                    )
+                else:
+                    allocation_kwargs = {
+                        "model_name": self.model_name,
+                        "instance_id": instance_id,
+                        "resources": resource_requirements,
+                    }
+                    if target_node_id is not None:
+                        allocation_kwargs["target_node_id"] = target_node_id
+                    startup_node = await _call(
+                        self.scheduler.allocate_resource.remote,
+                        **allocation_kwargs,
+                    )
                 startup_resources = {
                     "worker_node": 0.1,
                     f"worker_id_{startup_node}": 0.1,
                 }
                 startup_config = {
                     **resource_requirements,
+                    "num_gpus": outer_actor_num_gpus,
                     "resources": startup_resources,
                 }
                 actor = await _call(
@@ -312,6 +401,244 @@ class VllmDeploymentAdapter:
         if deployment.plan != plan:
             raise ValueError("deployment plan changed before traffic switch")
         return await _call(self.traffic_switcher, deployment, plan)
+
+    async def remap_workers_in_place(
+        self,
+        deployment: VllmDeployment,
+        plan: ParallelPlan,
+    ) -> VllmDeployment:
+        expert_placement_plan = (
+            dict(plan.expert_placement_plan)
+            if isinstance(plan.expert_placement_plan, Mapping)
+            else {}
+        )
+        if not expert_placement_plan:
+            raise ValueError("expert_placement_plan_required")
+        results: Dict[str, Any] = {}
+        for instance_id, handle in deployment.instances.items():
+            actor = handle.backend_instance
+            if actor is None:
+                raise RuntimeError(f"missing_backend_actor:{instance_id}")
+            apply_rpc = getattr(actor, "apply_expert_placement_plan", None)
+            if apply_rpc is None:
+                raise RuntimeError(
+                    f"runtime_apply_hook_unavailable:{instance_id}"
+                )
+            result = await _call(
+                apply_rpc.remote,
+                expert_placement_plan=expert_placement_plan,
+            )
+            results[instance_id] = result
+            if not isinstance(result, Mapping) or not result.get("success"):
+                raise RuntimeError(
+                    "in_place_expert_remap_failed:"
+                    f"{instance_id}:{result}"
+                )
+        backend_config = self._plan_backend_config(plan)
+        backend_config["reparallelization_execution_model"] = (
+            "in_place_expert_remap"
+        )
+        backend_config["reparallelization_execution_model_reason"] = (
+            "fixed_ep_runtime_expert_weight_remap"
+        )
+        backend_config["expert_placement_execution_model"] = (
+            "active_fixed_ep_remap"
+            if expert_placement_plan.get("allow_active_requests")
+            else "quiescent_fixed_ep_remap"
+        )
+        backend_config["expert_placement_execution_model_reason"] = (
+            "runtime_apply_on_existing_actor"
+        )
+        self.backend_config = dict(backend_config)
+        return VllmDeployment(
+            plan=plan,
+            instances=dict(deployment.instances),
+            backend_config=backend_config,
+            resource_requirements=dict(deployment.resource_requirements),
+        )
+
+    async def resize_workers_elastic_ep(
+        self,
+        deployment: VllmDeployment,
+        plan: ParallelPlan,
+    ) -> VllmDeployment:
+        """Resize a single vLLM Ray-DP deployment without recreating it."""
+        if len(deployment.instances) != 1 or plan.replica_count != 1:
+            raise RuntimeError("elastic_ep_requires_single_sllm_replica")
+        source = deployment.plan
+        if (
+            source.tensor_parallel_size != 1
+            or plan.tensor_parallel_size != 1
+            or source.pipeline_parallel_size != 1
+            or plan.pipeline_parallel_size != 1
+        ):
+            raise RuntimeError("elastic_ep_currently_requires_tp1_pp1")
+        if not source.enable_expert_parallel or not plan.enable_expert_parallel:
+            raise RuntimeError("elastic_ep_requires_expert_parallel")
+        if (
+            source.target_nodes
+            and plan.target_nodes
+            and sorted(source.target_nodes) != sorted(plan.target_nodes)
+        ):
+            raise RuntimeError("elastic_ep_cannot_change_worker_node")
+        if not self.backend_config.get("spotserve_elastic_ep_enabled", False):
+            raise RuntimeError("spotserve_elastic_ep_not_enabled")
+        if not self.backend_config.get(
+            "spotserve_vllm_ray_dp_owns_gpus", False
+        ):
+            raise RuntimeError("vllm_ray_dp_gpu_ownership_not_enabled")
+        if self.backend_config.get("data_parallel_backend") != "ray":
+            raise RuntimeError("elastic_ep_requires_ray_dp_backend")
+
+        instance_id, handle = next(iter(deployment.instances.items()))
+        actor = handle.backend_instance
+        if actor is None:
+            raise RuntimeError(f"missing_backend_actor:{instance_id}")
+        resize_rpc = getattr(actor, "scale_elastic_ep", None)
+        if resize_rpc is None:
+            raise RuntimeError("vllm_scale_elastic_ep_hook_unavailable")
+        scheduler_resize = getattr(self.scheduler, "resize_resource", None)
+        scheduler_resize_remote = getattr(scheduler_resize, "remote", None)
+        if scheduler_resize_remote is None:
+            raise RuntimeError("scheduler_resource_resize_unavailable")
+
+        old_gpus = self._replica_gpu_count(source)
+        new_gpus = self._replica_gpu_count(plan)
+        old_resources = {
+            **deployment.resource_requirements,
+            "num_gpus": old_gpus,
+        }
+        new_resources = {
+            **deployment.resource_requirements,
+            "num_gpus": new_gpus,
+        }
+
+        # Close router admission before asking vLLM to rebuild its DP/EP
+        # process group. Existing requests retain their handle reference and
+        # decrement concurrency when they finish; no new request may enter.
+        async with handle.lock:
+            initial_active_requests = max(0, int(handle.concurrency))
+        await handle.mark_draining()
+        deadline = asyncio.get_running_loop().time() + self.drain_timeout_s
+        while asyncio.get_running_loop().time() < deadline:
+            async with handle.lock:
+                active_requests = int(handle.concurrency)
+            if active_requests <= 0:
+                break
+            await asyncio.sleep(0.05)
+        else:
+            await handle.mark_ready_after_drain()
+            raise RuntimeError(
+                "elastic_ep_admission_drain_timeout:"
+                f"active_requests={active_requests}"
+            )
+
+        reserved_scale_up = False
+        if new_gpus > old_gpus:
+            try:
+                await _call(
+                    scheduler_resize_remote,
+                    self.model_name,
+                    instance_id,
+                    new_resources,
+                )
+            except Exception:
+                await handle.mark_ready_after_drain()
+                raise
+            reserved_scale_up = True
+
+        try:
+            result = await _call(
+                resize_rpc.remote,
+                new_data_parallel_size=plan.data_parallel_size,
+                drain_timeout_s=self.drain_timeout_s,
+                expert_placement_plan=(
+                    dict(plan.expert_placement_plan)
+                    if isinstance(plan.expert_placement_plan, Mapping)
+                    else None
+                ),
+            )
+            if not isinstance(result, Mapping):
+                raise RuntimeError(
+                    f"elastic_ep_runtime_result_invalid:{result!r}"
+                )
+            if not result.get("resized") and result.get("reason") != (
+                "already_at_target_size"
+            ):
+                raise RuntimeError(f"elastic_ep_runtime_resize_failed:{result}")
+        except Exception:
+            if reserved_scale_up:
+                try:
+                    await _call(
+                        scheduler_resize_remote,
+                        self.model_name,
+                        instance_id,
+                        old_resources,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed rolling back scheduler allocation after "
+                        "elastic EP resize failure"
+                    )
+            raise
+
+        if new_gpus < old_gpus:
+            try:
+                await _call(
+                    scheduler_resize_remote,
+                    self.model_name,
+                    instance_id,
+                    new_resources,
+                )
+            except Exception:
+                # Restore the engine shape when scheduler accounting cannot
+                # commit the scale-down. A failed restore propagates and the
+                # controller will replace the deployment.
+                await _call(
+                    resize_rpc.remote,
+                    new_data_parallel_size=source.data_parallel_size,
+                    drain_timeout_s=self.drain_timeout_s,
+                )
+                await handle.mark_ready_after_drain()
+                raise
+
+        backend_config = self._plan_backend_config(plan)
+        backend_config.update(
+            {
+                "reparallelization_execution_model": (
+                    "in_place_elastic_ep_resize"
+                ),
+                "reparallelization_execution_model_reason": (
+                    "vllm_ray_dp_elastic_ep"
+                ),
+                "expert_placement_execution_model": (
+                    "quiescent_elastic_ep_resize"
+                ),
+                "expert_placement_execution_model_reason": (
+                    "vllm_reinitialized_ep_process_group"
+                ),
+                "expert_placement_runtime_contract_mode": (
+                    "quiescent_elastic_ep_resize"
+                ),
+                "expert_placement_live_migration_enabled": False,
+                "expert_placement_quiescent_remap_enabled": True,
+                "elastic_ep_admission_drained": True,
+                "elastic_ep_drained_request_count": initial_active_requests,
+            }
+        )
+        if not await handle.mark_ready_after_drain(num_gpu=new_gpus):
+            raise RuntimeError(
+                "elastic_ep_instance_state_changed_during_resize:"
+                f"state={handle.state.value}"
+            )
+        self.backend_config = dict(backend_config)
+        self.resource_requirements = dict(new_resources)
+        return VllmDeployment(
+            plan=plan,
+            instances=dict(deployment.instances),
+            backend_config=backend_config,
+            resource_requirements=new_resources,
+        )
 
     async def drain_workers(self, deployment: Optional[VllmDeployment]) -> None:
         if deployment is None:

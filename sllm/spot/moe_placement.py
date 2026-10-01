@@ -14,7 +14,7 @@ class ExpertShard:
     node_id: str
     gpu_id: str
     physical_expert_id: Optional[int] = None
-    weight_size_bytes: int = 0
+    weight_size_bytes: Optional[int] = None
     weight_resident: bool = True
     routed_tokens: int = 0
     recent_execution_count: int = 0
@@ -95,6 +95,10 @@ class ExpertPlacementPlan:
     expert_physical_replication_factor: int = 1
     sllm_replica_count: int = 1
     physical_weight_migration: bool = False
+    live_expert_remap: bool = False
+    allow_active_requests: bool = False
+    require_cross_node: bool = False
+    physical_migration_required: bool = False
     expert_placement_snapshot: Mapping[str, Mapping[str, Any]] = field(
         default_factory=dict
     )
@@ -104,8 +108,8 @@ class ExpertPlacementPlan:
     moved_expert_count: int = 0
     stationary_expert_count: int = 0
     unknown_movement_expert_count: int = 0
-    moved_weight_bytes: int = 0
-    estimated_expert_weight_movement_cost_ms: float = 0.0
+    moved_weight_bytes: Optional[int] = None
+    estimated_expert_weight_movement_cost_ms: Optional[float] = None
     expert_movement_diff: Mapping[str, Mapping[str, Any]] = field(
         default_factory=dict
     )
@@ -141,6 +145,12 @@ class ExpertPlacementPlan:
             ),
             "sllm_replica_count": self.sllm_replica_count,
             "physical_weight_migration": self.physical_weight_migration,
+            "live_expert_remap": self.live_expert_remap,
+            "allow_active_requests": self.allow_active_requests,
+            "require_cross_node": self.require_cross_node,
+            "expert_placement_physical_migration_required": (
+                self.physical_migration_required
+            ),
             "expert_placement_snapshot": {
                 str(key): dict(value)
                 for key, value in self.expert_placement_snapshot.items()
@@ -250,12 +260,18 @@ def _infer_topology_from_placement_snapshot(
     snapshot = config.get("expert_placement_snapshot")
     if not isinstance(snapshot, Mapping) or not snapshot:
         snapshot = config.get("expert_placement")
-    if not isinstance(snapshot, Mapping) or not snapshot:
+    runtime_shards = config.get("runtime_expert_placement_shards")
+    if (
+        (not isinstance(snapshot, Mapping) or not snapshot)
+        and not isinstance(runtime_shards, Mapping)
+    ):
         return 0, 0
 
     max_layer_id = -1
     max_expert_id = -1
-    for key, value in snapshot.items():
+
+    def observe_entry(key: Any, value: Any) -> None:
+        nonlocal max_layer_id, max_expert_id
         layer_id = -1
         expert_id = -1
         if isinstance(value, Mapping):
@@ -274,6 +290,23 @@ def _infer_topology_from_placement_snapshot(
         if expert_id >= 0:
             max_expert_id = max(max_expert_id, expert_id)
 
+    if isinstance(runtime_shards, Mapping):
+        for key, rows in runtime_shards.items():
+            observe_entry(key, {})
+            if isinstance(rows, Mapping):
+                observe_entry(key, rows)
+            elif isinstance(rows, (list, tuple)):
+                for row in rows:
+                    observe_entry(key, row)
+
+    if not isinstance(snapshot, Mapping) or not snapshot:
+        if max_layer_id < 0 or max_expert_id < 0:
+            return 0, 0
+        return max_layer_id + 1, max_expert_id + 1
+
+    for key, value in snapshot.items():
+        observe_entry(key, value)
+
     if max_layer_id < 0 or max_expert_id < 0:
         return 0, 0
     return max_layer_id + 1, max_expert_id + 1
@@ -283,7 +316,8 @@ def infer_moe_topology(
     model_config: Mapping[str, Any],
 ) -> tuple[int, int]:
     """Return logical MoE topology as (num_layers, experts_per_layer)."""
-    for config in _model_config_sources(model_config):
+    sources = _model_config_sources(model_config)
+    for config in sources:
         num_layers = _first_positive_config_int(
             config,
             "num_hidden_layers",
@@ -299,6 +333,7 @@ def infer_moe_topology(
         )
         if num_layers > 0 and num_experts > 0:
             return num_layers, num_experts
+    for config in sources:
         num_layers, num_experts = _infer_topology_from_placement_snapshot(
             config
         )
@@ -434,25 +469,74 @@ def _normalize_expert_placement_snapshot(
     return normalized
 
 
+def _observed_runtime_expert_placement(
+    metadata: Mapping[str, Any],
+) -> Dict[str, Dict[str, Any]]:
+    profile = metadata.get("model_resource_profile")
+    sources = (metadata, profile) if isinstance(profile, Mapping) else (metadata,)
+    for source in sources:
+        if not source.get("runtime_expert_placement_available"):
+            continue
+        shards = source.get("runtime_expert_placement_shards")
+        if not isinstance(shards, Mapping):
+            continue
+        observed: Dict[str, Dict[str, Any]] = {}
+        for key, rows in shards.items():
+            # A duplicated expert needs replica-aware comparison; do not guess
+            # which copy corresponds to the single-rank logical plan.
+            if not isinstance(rows, (list, tuple)) or len(rows) != 1:
+                continue
+            row = rows[0]
+            if not isinstance(row, Mapping) or row.get("weight_resident") is not True:
+                continue
+            ep_rank = _as_non_negative_int(row.get("ep_rank"), -1)
+            if ep_rank < 0:
+                continue
+            expert_key = _expert_key_from_entry(key, row)
+            observed[expert_key] = {
+                "rank_id": f"replica:0/ep-rank:{ep_rank}",
+                "weight_size_bytes": _entry_weight_size_bytes(row),
+                "weight_resident": True,
+            }
+        if observed:
+            return observed
+    return {}
+
+
 def _current_expert_placement_snapshot(
     model_config: Mapping[str, Any],
     planner_config: Mapping[str, Any],
 ) -> tuple[Dict[str, Dict[str, Any]], str]:
+    runtime_metadata = model_config.get("runtime_metadata")
+    if isinstance(runtime_metadata, Mapping):
+        observed = _observed_runtime_expert_placement(runtime_metadata)
+        if observed:
+            return observed, "runtime_expert_placement_shards"
+
     planner_snapshot = planner_config.get("current_expert_placement_snapshot")
     normalized = _normalize_expert_placement_snapshot(planner_snapshot)
     if normalized:
         return normalized, "planner_current_expert_placement_snapshot"
 
-    runtime_metadata = model_config.get("runtime_metadata")
     if isinstance(runtime_metadata, Mapping):
+        profile = runtime_metadata.get("model_resource_profile")
+        if (
+            "runtime_expert_placement_available" in runtime_metadata
+            or isinstance(profile, Mapping)
+            and "runtime_expert_placement_available" in profile
+        ):
+            return {}, "runtime_placement_unavailable"
+        if runtime_metadata.get("placement_source") == "derived_from_model_config":
+            return {}, "runtime_placement_unavailable"
         normalized = _normalize_expert_placement_snapshot(
             runtime_metadata.get("expert_placement_snapshot")
             or runtime_metadata.get("expert_placement")
         )
         if normalized:
             return normalized, "runtime_metadata"
-        profile = runtime_metadata.get("model_resource_profile")
         if isinstance(profile, Mapping):
+            if profile.get("placement_source") == "derived_from_model_config":
+                return {}, "runtime_placement_unavailable"
             normalized = _normalize_expert_placement_snapshot(
                 profile.get("expert_placement_snapshot")
                 or profile.get("expert_placement")
@@ -464,14 +548,27 @@ def _current_expert_placement_snapshot(
     if isinstance(backend_config, Mapping):
         backend_runtime = backend_config.get("runtime_metadata")
         if isinstance(backend_runtime, Mapping):
+            observed = _observed_runtime_expert_placement(backend_runtime)
+            if observed:
+                return observed, "runtime_expert_placement_shards"
+            profile = backend_runtime.get("model_resource_profile")
+            if (
+                "runtime_expert_placement_available" in backend_runtime
+                or isinstance(profile, Mapping)
+                and "runtime_expert_placement_available" in profile
+            ):
+                return {}, "runtime_placement_unavailable"
+            if backend_runtime.get("placement_source") == "derived_from_model_config":
+                return {}, "runtime_placement_unavailable"
             normalized = _normalize_expert_placement_snapshot(
                 backend_runtime.get("expert_placement_snapshot")
                 or backend_runtime.get("expert_placement")
             )
             if normalized:
                 return normalized, "backend_config.runtime_metadata"
-            profile = backend_runtime.get("model_resource_profile")
             if isinstance(profile, Mapping):
+                if profile.get("placement_source") == "derived_from_model_config":
+                    return {}, "runtime_placement_unavailable"
                 normalized = _normalize_expert_placement_snapshot(
                     profile.get("expert_placement_snapshot")
                     or profile.get("expert_placement")
@@ -482,6 +579,8 @@ def _current_expert_placement_snapshot(
                         "backend_config.runtime_metadata.model_resource_profile",
                     )
 
+        if backend_config.get("placement_source") == "derived_from_model_config":
+            return {}, "runtime_placement_unavailable"
         normalized = _normalize_expert_placement_snapshot(
             backend_config.get("expert_placement_snapshot")
             or backend_config.get("expert_placement")
@@ -489,6 +588,8 @@ def _current_expert_placement_snapshot(
         if normalized:
             return normalized, "backend_config"
 
+    if model_config.get("placement_source") == "derived_from_model_config":
+        return {}, "runtime_placement_unavailable"
     normalized = _normalize_expert_placement_snapshot(
         model_config.get("expert_placement_snapshot")
         or model_config.get("expert_placement")
@@ -521,20 +622,20 @@ def _location_value(entry: Mapping[str, Any], key: str) -> str:
 
 def _entry_weight_size_bytes(
     *entries: Mapping[str, Any],
-    default: int = 0,
-) -> int:
+    default: Optional[int] = None,
+) -> Optional[int]:
     for entry in entries:
         for key in ("weight_size_bytes", "expert_weight_size_bytes"):
             parsed = _as_positive_int(entry.get(key), 0)
             if parsed > 0:
                 return parsed
-    return max(0, int(default or 0))
+    return default if default and default > 0 else None
 
 
 def _default_expert_weight_size_bytes(
     model_config: Mapping[str, Any],
     planner_config: Mapping[str, Any],
-) -> int:
+) -> Optional[int]:
     sources = _config_sources(planner_config, model_config)
     value = _first_config_value(
         sources,
@@ -542,15 +643,15 @@ def _default_expert_weight_size_bytes(
         "default_expert_weight_size_bytes",
         "moe_expert_weight_size_bytes",
     )
-    return _as_positive_int(value, 0)
+    return _as_positive_int(value, 0) or None
 
 
 def _estimate_expert_weight_movement_cost_ms(
-    moved_weight_bytes: int,
+    moved_weight_bytes: Optional[int],
     moved_expert_count: int,
     model_config: Mapping[str, Any],
     planner_config: Mapping[str, Any],
-) -> float:
+) -> Optional[float]:
     if moved_expert_count <= 0:
         return 0.0
 
@@ -576,6 +677,23 @@ def _estimate_expert_weight_movement_cost_ms(
         "expert_weight_movement_bandwidth_bytes_per_s",
         default=0.0,
     )
+    if not any(
+        value > 0.0
+        for value in (
+            cost_ms,
+            cost_ms_per_gib,
+            cost_ms_per_expert,
+            bandwidth_bytes_per_s,
+        )
+    ):
+        return None
+
+    if moved_weight_bytes is None:
+        if cost_ms_per_gib > 0.0 or bandwidth_bytes_per_s > 0.0:
+            return None
+        if cost_ms <= 0.0 and cost_ms_per_expert <= 0.0:
+            return None
+        return float(cost_ms + moved_expert_count * cost_ms_per_expert)
 
     gib = moved_weight_bytes / float(1024**3)
     if cost_ms_per_gib > 0.0:
@@ -628,8 +746,8 @@ def _build_expert_movement_diff(
             "moved_expert_count": 0,
             "stationary_expert_count": 0,
             "unknown_movement_expert_count": len(planned_snapshot),
-            "moved_weight_bytes": 0,
-            "estimated_expert_weight_movement_cost_ms": 0.0,
+            "moved_weight_bytes": None,
+            "estimated_expert_weight_movement_cost_ms": None,
             "expert_movement_diff": {},
         }
 
@@ -640,6 +758,7 @@ def _build_expert_movement_diff(
     stationary_experts = 0
     unknown_experts = 0
     moved_weight_bytes = 0
+    moved_weight_size_known = True
     movement_diff: Dict[str, Dict[str, Any]] = {}
 
     for expert_key, planned_entry in planned_snapshot.items():
@@ -674,7 +793,10 @@ def _build_expert_movement_diff(
         )
         if changed:
             moved_experts += 1
-            moved_weight_bytes += weight_size
+            if weight_size is None:
+                moved_weight_size_known = False
+            else:
+                moved_weight_bytes += weight_size
             movement_diff[expert_key] = {
                 "status": "moved",
                 "reason": reason,
@@ -689,18 +811,25 @@ def _build_expert_movement_diff(
         else:
             stationary_experts += 1
 
-    movement_cost_ms = _estimate_expert_weight_movement_cost_ms(
-        moved_weight_bytes,
-        moved_experts,
-        model_config,
-        planner_config,
+    complete_moved_weight_bytes = (
+        moved_weight_bytes if moved_weight_size_known and not unknown_experts else None
+    )
+    movement_cost_ms = (
+        _estimate_expert_weight_movement_cost_ms(
+            complete_moved_weight_bytes,
+            moved_experts,
+            model_config,
+            planner_config,
+        )
+        if not unknown_experts
+        else None
     )
     return {
         "movement_observation_available": True,
         "moved_expert_count": moved_experts,
         "stationary_expert_count": stationary_experts,
         "unknown_movement_expert_count": unknown_experts,
-        "moved_weight_bytes": moved_weight_bytes,
+        "moved_weight_bytes": complete_moved_weight_bytes,
         "estimated_expert_weight_movement_cost_ms": movement_cost_ms,
         "expert_movement_diff": movement_diff,
     }
@@ -759,6 +888,61 @@ def build_logical_expert_placement_plan(
         target_rank_count = 1
     target_rank_count = max(1, target_rank_count)
 
+    backend_config = model_config.get("backend_config", {})
+    if not isinstance(backend_config, Mapping):
+        backend_config = {}
+    backend = str(
+        target_parallel_plan.get("backend", model_config.get("backend", ""))
+    ).lower()
+    placement_strategy = str(
+        planner_config.get("target_expert_placement_strategy")
+        or backend_config.get("expert_placement_strategy")
+        or ("linear" if backend == "vllm" else "round_robin")
+    ).strip().lower()
+    live_expert_remap_value = planner_config.get(
+        "enable_live_expert_remap", False
+    )
+    live_expert_remap = (
+        live_expert_remap_value.strip().lower() in {"1", "true", "yes", "on"}
+        if isinstance(live_expert_remap_value, str)
+        else bool(live_expert_remap_value)
+    )
+    active_remap_value = planner_config.get(
+        "allow_active_expert_remap_requests", False
+    )
+    allow_active_requests = (
+        active_remap_value.strip().lower() in {"1", "true", "yes", "on"}
+        if isinstance(active_remap_value, str)
+        else bool(active_remap_value)
+    )
+    require_cross_node_value = planner_config.get(
+        "require_cross_node_expert_migration", False
+    )
+    require_cross_node = (
+        require_cross_node_value.strip().lower() in {"1", "true", "yes", "on"}
+        if isinstance(require_cross_node_value, str)
+        else bool(require_cross_node_value)
+    )
+    if placement_strategy == "linear":
+        base_experts, remainder = divmod(num_experts, target_rank_count)
+        expert_rank_indices = [
+            rank_index
+            for rank_index in range(target_rank_count)
+            for _ in range(base_experts + int(rank_index < remainder))
+        ]
+    elif placement_strategy == "round_robin":
+        expert_rank_indices = [
+            expert_id % target_rank_count for expert_id in range(num_experts)
+        ]
+    else:
+        return ExpertPlacementPlan(
+            model_name=model_name,
+            target_parallel_plan=dict(target_parallel_plan),
+            placement_epoch=max(0, int(placement_epoch or 0)),
+            placement_source="unavailable",
+            reason="unsupported_expert_placement_strategy",
+        )
+
     expert_to_target_rank: Dict[str, str] = {}
     expert_to_target_ranks: Dict[str, tuple[str, ...]] = {}
     expert_placement_snapshot: Dict[str, Dict[str, Any]] = {}
@@ -769,7 +953,7 @@ def build_logical_expert_placement_plan(
     for layer_id in range(num_layers):
         for expert_id in range(num_experts):
             expert_key = f"layer:{layer_id}/expert:{expert_id}"
-            rank_index = expert_id % target_rank_count
+            rank_index = expert_rank_indices[expert_id]
             ranks: list[str] = []
             for replica_id in range(replica_count):
                 rank_id = f"replica:{replica_id}/ep-rank:{rank_index}"
@@ -834,6 +1018,10 @@ def build_logical_expert_placement_plan(
         expert_physical_replication_factor=1,
         sllm_replica_count=replica_count,
         physical_weight_migration=False,
+        live_expert_remap=live_expert_remap,
+        allow_active_requests=live_expert_remap and allow_active_requests,
+        require_cross_node=live_expert_remap and require_cross_node,
+        physical_migration_required=live_expert_remap,
         expert_placement_snapshot=expert_placement_snapshot,
         shards=tuple(shards),
         movement_observation_available=bool(
@@ -845,8 +1033,8 @@ def build_logical_expert_placement_plan(
         unknown_movement_expert_count=int(
             movement["unknown_movement_expert_count"]
         ),
-        moved_weight_bytes=int(movement["moved_weight_bytes"]),
-        estimated_expert_weight_movement_cost_ms=float(
+        moved_weight_bytes=movement["moved_weight_bytes"],
+        estimated_expert_weight_movement_cost_ms=(
             movement["estimated_expert_weight_movement_cost_ms"]
         ),
         expert_movement_diff=movement["expert_movement_diff"],

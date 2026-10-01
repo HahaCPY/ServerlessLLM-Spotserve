@@ -558,8 +558,67 @@ If old results contain `{"error": "timed out"}` or
 `{"error": "Internal Server Error"}`, treat those runs as invalid setup
 failures, not as recovery-policy results.
 
-The target models must already be deployed with the intended router config, for
-example `recovery_policy=none`, `naive_retry`, or `generated_token_replay`.
+## Expert Remap A2A Reduction
+
+After preparing the expert-remap runtime, run the paired baseline/remap
+experiment with:
+
+```bash
+podman exec sllm_head bash -lc '
+cd /tmp/spotserve-work &&
+/opt/venvs/head/bin/python benchmarks/spotserve/run_benchmark.py \
+  --config benchmarks/spotserve/benchmark_matrix_expert_remap_a2a_reduction_performance.yaml \
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \
+  --request-timeout 240 \
+  --trace-event-timeout 600 \
+  --ray-address auto \
+  --ray-namespace sllm
+'
+```
+
+The runner warms up the model, measures repeated baseline windows, applies and
+verifies the physical expert remap, then replays the same workload and measures
+the candidate windows. It writes the report to:
+
+```text
+results/spotserve_expert_remap_a2a_reduction_performance/report.json
+```
+
+An exit code of zero means the paired measurement completed. A traffic
+reduction is supported only when `traffic_reduced` and `claim_supported` are
+both true. Inspect `payload_reduction_ratio`, `baseline`, and `candidate` for
+the measured counters. With the current `allgather_reducescatter` backend, the
+collective payload can remain placement-invariant even when physical remap is
+successfully applied and verified.
+
+## Elastic EP Resize
+
+The elastic-EP matrix runs the fail-closed, active-request-drain EP2-to-EP4
+gate through the standard benchmark entry point:
+
+```bash
+podman exec sllm_head bash -lc '
+cd /tmp/spotserve-work &&
+/opt/venvs/head/bin/python benchmarks/spotserve/run_benchmark.py \
+  --config benchmarks/spotserve/benchmark_matrix_elastic_ep_resize_performance.yaml \
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \
+  --trace-event-timeout 600 \
+  --ray-address auto \
+  --ray-namespace sllm
+'
+```
+
+Before registration, the gate requires four Ray GPUs and at least 8192 MiB of
+physical free memory on each GPU. It then observes a live request, closes
+router admission, waits for tracked concurrency to reach zero, resizes the
+same SLLM actor from Ray-DP EP2 to EP4, verifies runtime expert placement, and
+runs post-resize inference. This validates a request-safe quiescent boundary,
+not process-group mutation during an executing GPU step.
+
+For ordinary workload matrices, target models must already be deployed with
+the intended router config, for example `recovery_policy=none`, `naive_retry`,
+or `generated_token_replay`. The elastic-EP and paired A2A special runners
+register and delete their own temporary model.
 
 Important: the `policy` field in `benchmark_matrix.yaml` is metadata for the
 report. The actual policy is selected when the model is deployed through
@@ -581,3 +640,24 @@ Each run writes:
 - `report.html`
 - `report.md`
 - `router_request_metrics.jsonl` when matching router metrics are available
+
+## Physical Cross-host Expert Remap
+
+The cross-host matrix is a fail-closed physical-host gate:
+
+```bash
+python benchmarks/spotserve/run_benchmark.py \
+  --config benchmarks/spotserve/benchmark_matrix_cross_host_expert_remap_performance.yaml \
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \
+  --request-timeout 240 \
+  --trace-event-timeout 600 \
+  --ray-address auto \
+  --ray-namespace sllm
+```
+
+It requires Ray workers `0` and `1` to reside on distinct Ray nodes with
+distinct node-local physical-host markers. Success additionally requires
+runtime-verified expert ownership changes, positive cross-host moved bytes,
+successful post-remap inference, and a post-remap internode A2A call. A
+same-host multi-container deployment is expected to fail this gate. See
+`docs/spotserve-cross-host-experiment.md` for the three-node deployment.

@@ -24,6 +24,10 @@ def apply_expert_placement_plan():
 def verify_expert_placement_plan():
     return {"reason": "physical_expert_placement_verification_not_supported",
             "hook_kind": "spotserve_observation_only"}
+def inspect_runtime_expert_placement():
+    pass
+def _compare_runtime_expert_placement():
+    pass
 """,
     )
     write(
@@ -50,6 +54,7 @@ clear_moe_request_metadata([])
         """
 def get_request_moe_metadata(): pass
 def get_moe_runtime_metadata(): pass
+def _spotserve_runtime_expert_placement_snapshot(): pass
 def apply_expert_placement_plan(): pass
 def verify_expert_placement_plan(): pass
 """,
@@ -79,6 +84,7 @@ async def verify_expert_placement_plan(): pass
     assert source_checks["forward_path_has_moe_request_context"] is True
     assert source_checks["route_recording_hooks"] == 2
     assert source_checks["apply_verify_boundary_present"] is True
+    assert source_checks["runtime_layout_inspector_present"] is True
     assert source_checks["observe_only_markers_present"] is True
 
 
@@ -102,12 +108,20 @@ def test_vllm_ep_runtime_audit_classifies_observe_only_contract():
                     "physical_expert_placement_verification_not_supported"
                 ),
                 "hook_kind": "spotserve_observation_only",
+                "contract_seen_by_runtime": True,
             },
         },
     })
 
     assert gate["classification"] == "observe_only_expert_placement_contract"
+    assert gate["runtime_verification_level"] == "contract_seen_only"
     assert gate["can_claim_physical_expert_migration"] is False
+    assert gate["runtime_verified_placement"] is False
+    assert gate["runtime_can_verify_physical_placement"] is False
+    assert gate["runtime_can_remap_live_ep_rank"] is False
+    assert gate["runtime_can_measure_all_to_all"] is False
+    assert gate["runtime_contract_seen_by_runtime"] is True
+    assert gate["runtime_physical_weight_migration"] is False
     assert gate["recommended_execution_model"] == "expert_aware_actor_recreate"
 
 
@@ -132,5 +146,12 @@ def test_vllm_ep_runtime_audit_classifies_physical_migration_support():
     })
 
     assert gate["classification"] == "physical_expert_migration_supported"
+    assert gate["runtime_verification_level"] == "physical_migration_verified"
     assert gate["can_claim_physical_expert_migration"] is True
+    assert gate["runtime_verified_placement"] is True
+    assert gate["runtime_can_verify_physical_placement"] is True
+    assert gate["runtime_can_remap_live_ep_rank"] is False
+    assert gate["runtime_can_measure_all_to_all"] is False
+    assert gate["runtime_contract_seen_by_runtime"] is False
+    assert gate["runtime_physical_weight_migration"] is True
     assert gate["recommended_execution_model"] == "live_expert_weight_migration"

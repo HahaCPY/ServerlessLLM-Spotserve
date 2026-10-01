@@ -1,0 +1,13 @@
+{
+  "experiment_type": "cross_host_expert_remap",
+  "name": "vllm-cross-host-expert-remap-performance",
+  "deploy_config": "examples/spotserve/config-vllm-cross-host-expert-remap-performance.json",
+  "model_path": "/models/Qwen2-MoE-Tiny",
+  "endpoint": "http://127.0.0.1:8343",
+  "target_worker_ids": ["0", "1"],
+  "ready_timeout_s": 600,
+  "event_timeout_s": 600,
+  "request_timeout_s": 240,
+  "require_internode_a2a": true,
+  "output": "results/spotserve_cross_host_expert_remap_performance/report.json"
+}

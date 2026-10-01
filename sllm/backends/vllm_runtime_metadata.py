@@ -86,6 +86,24 @@ def _has_payload(value: Any) -> bool:
     return True
 
 
+def _expert_placement_runtime_verification_level(
+    *,
+    contract_seen_by_runtime: bool,
+    hook_available: bool,
+    physical_weight_migration: bool,
+    runtime_verified_placement: bool,
+) -> str:
+    if physical_weight_migration and runtime_verified_placement:
+        return "physical_migration_verified"
+    if runtime_verified_placement:
+        return "runtime_placement_verified"
+    if contract_seen_by_runtime:
+        return "contract_seen_only"
+    if hook_available:
+        return "runtime_boundary_observe_only"
+    return "unavailable"
+
+
 def get_vllm_model_resource_profile(
     model_name: str,
     backend_config: Optional[Mapping[str, Any]] = None,
@@ -340,6 +358,22 @@ def get_vllm_model_resource_profile(
         )
         or ""
     )
+    apply_worker_count = _optional_non_negative_int(
+        _first_present(
+            runtime_metadata.get("expert_placement_apply_worker_count"),
+            backend_config.get("expert_placement_apply_worker_count"),
+        )
+    ) or 0
+    apply_worker_success_count = _optional_non_negative_int(
+        _first_present(
+            runtime_metadata.get(
+                "expert_placement_apply_worker_success_count"
+            ),
+            backend_config.get(
+                "expert_placement_apply_worker_success_count"
+            ),
+        )
+    ) or 0
     verify_hook_available = _to_bool(
         _first_present(
             runtime_metadata.get("expert_placement_verify_hook_available"),
@@ -364,6 +398,221 @@ def get_vllm_model_resource_profile(
         _first_present(
             runtime_metadata.get("expert_placement_verify_reason"),
             backend_config.get("expert_placement_verify_reason"),
+            "",
+        )
+        or ""
+    )
+    verify_worker_count = _optional_non_negative_int(
+        _first_present(
+            runtime_metadata.get("expert_placement_verify_worker_count"),
+            backend_config.get("expert_placement_verify_worker_count"),
+        )
+    ) or 0
+    verify_worker_success_count = _optional_non_negative_int(
+        _first_present(
+            runtime_metadata.get(
+                "expert_placement_verify_worker_success_count"
+            ),
+            backend_config.get(
+                "expert_placement_verify_worker_success_count"
+            ),
+        )
+    ) or 0
+    contract_seen_by_runtime = _to_bool(
+        _first_present(
+            runtime_metadata.get("expert_placement_contract_seen_by_runtime"),
+            backend_config.get("expert_placement_contract_seen_by_runtime"),
+        ),
+        default=False,
+    )
+    contract_seen_by_all_workers = _to_bool(
+        _first_present(
+            runtime_metadata.get(
+                "expert_placement_contract_seen_by_all_workers"
+            ),
+            backend_config.get(
+                "expert_placement_contract_seen_by_all_workers"
+            ),
+        ),
+        default=False,
+    )
+    contract_seen_worker_count = _optional_non_negative_int(
+        _first_present(
+            runtime_metadata.get(
+                "expert_placement_contract_seen_worker_count"
+            ),
+            backend_config.get("expert_placement_contract_seen_worker_count"),
+        )
+    ) or 0
+    contract_seen_worker_total = _optional_non_negative_int(
+        _first_present(
+            runtime_metadata.get(
+                "expert_placement_contract_seen_worker_total"
+            ),
+            backend_config.get("expert_placement_contract_seen_worker_total"),
+        )
+    ) or 0
+    physical_weight_migration = _to_bool(
+        _first_present(
+            runtime_metadata.get(
+                "expert_placement_physical_weight_migration"
+            ),
+            backend_config.get("expert_placement_physical_weight_migration"),
+        ),
+        default=False,
+    )
+    runtime_moved_expert_shards = _optional_non_negative_int(
+        runtime_metadata.get("expert_placement_runtime_moved_expert_shards")
+    ) or 0
+    runtime_moved_weight_bytes = _optional_non_negative_int(
+        runtime_metadata.get("expert_placement_runtime_moved_weight_bytes")
+    ) or 0
+    runtime_remap_duration_ms = _non_negative_float(
+        runtime_metadata.get("expert_placement_runtime_remap_duration_ms"), 0.0
+    )
+    runtime_active_request_remap = _to_bool(
+        runtime_metadata.get("expert_placement_runtime_active_request_remap"),
+        default=False,
+    )
+    runtime_step_boundary_barrier = _to_bool(
+        runtime_metadata.get("expert_placement_runtime_step_boundary_barrier"),
+        default=False,
+    )
+    runtime_physical_host_ids_observed = _to_bool(
+        runtime_metadata.get("expert_placement_runtime_physical_host_ids_observed"),
+        default=False,
+    )
+    runtime_physical_host_count = _optional_non_negative_int(
+        runtime_metadata.get("expert_placement_runtime_physical_host_count")
+    ) or 0
+    runtime_physical_host_ids = runtime_metadata.get(
+        "expert_placement_runtime_physical_host_ids", []
+    )
+    if not isinstance(runtime_physical_host_ids, (list, tuple)):
+        runtime_physical_host_ids = []
+    runtime_ray_node_count = _optional_non_negative_int(
+        runtime_metadata.get("expert_placement_runtime_ray_node_count")
+    ) or 0
+    runtime_ray_node_ids = runtime_metadata.get(
+        "expert_placement_runtime_ray_node_ids", []
+    )
+    if not isinstance(runtime_ray_node_ids, (list, tuple)):
+        runtime_ray_node_ids = []
+    runtime_failure_domain_count = _optional_non_negative_int(
+        runtime_metadata.get(
+            "expert_placement_runtime_failure_domain_count"
+        )
+    ) or 0
+    runtime_failure_domain_ids = runtime_metadata.get(
+        "expert_placement_runtime_failure_domain_ids", []
+    )
+    if not isinstance(runtime_failure_domain_ids, (list, tuple)):
+        runtime_failure_domain_ids = []
+    runtime_host_mode = str(
+        runtime_metadata.get(
+            "expert_placement_runtime_host_mode", "single_host"
+        )
+        or "single_host"
+    )
+    runtime_cross_failure_domain_weight_migration = _to_bool(
+        runtime_metadata.get(
+            "expert_placement_runtime_cross_failure_domain_weight_migration"
+        ),
+        default=False,
+    )
+    runtime_cross_failure_domain_moved_expert_shards = (
+        _optional_non_negative_int(
+            runtime_metadata.get(
+                "expert_placement_runtime_cross_failure_domain_moved_expert_shards"
+            )
+        )
+        or 0
+    )
+    runtime_cross_failure_domain_moved_weight_bytes = (
+        _optional_non_negative_int(
+            runtime_metadata.get(
+                "expert_placement_runtime_cross_failure_domain_moved_weight_bytes"
+            )
+        )
+        or 0
+    )
+    runtime_cross_node_weight_migration = _to_bool(
+        runtime_metadata.get("expert_placement_runtime_cross_node_weight_migration"),
+        default=False,
+    )
+    runtime_cross_node_moved_expert_shards = _optional_non_negative_int(
+        runtime_metadata.get(
+            "expert_placement_runtime_cross_node_moved_expert_shards"
+        )
+    ) or 0
+    runtime_cross_node_moved_weight_bytes = _optional_non_negative_int(
+        runtime_metadata.get(
+            "expert_placement_runtime_cross_node_moved_weight_bytes"
+        )
+    ) or 0
+    runtime_verified_placement = _to_bool(
+        _first_present(
+            runtime_metadata.get("expert_placement_runtime_verified_placement"),
+            backend_config.get("expert_placement_runtime_verified_placement"),
+        ),
+        default=plan_verified,
+    )
+    can_verify_physical_placement = _to_bool(
+        _first_present(
+            runtime_metadata.get(
+                "expert_placement_runtime_can_verify_physical_placement"
+            ),
+            backend_config.get(
+                "expert_placement_runtime_can_verify_physical_placement"
+            ),
+        ),
+        default=physical_weight_migration and plan_verified,
+    )
+    can_remap_live_ep_rank = _to_bool(
+        _first_present(
+            runtime_metadata.get(
+                "expert_placement_runtime_can_remap_live_ep_rank"
+            ),
+            backend_config.get("expert_placement_runtime_can_remap_live_ep_rank"),
+        ),
+        default=False,
+    )
+    can_measure_all_to_all = _to_bool(
+        _first_present(
+            runtime_metadata.get(
+                "expert_placement_runtime_can_measure_all_to_all"
+            ),
+            backend_config.get("expert_placement_runtime_can_measure_all_to_all"),
+        ),
+        default=False,
+    )
+    derived_runtime_verification_level = (
+        _expert_placement_runtime_verification_level(
+            contract_seen_by_runtime=contract_seen_by_runtime,
+            hook_available=(
+                apply_hook_available
+                or verify_hook_available
+                or apply_attempted
+                or verify_attempted
+            ),
+            physical_weight_migration=physical_weight_migration,
+            runtime_verified_placement=runtime_verified_placement,
+        )
+    )
+    runtime_verification_level = str(
+        _first_present(
+            runtime_metadata.get(
+                "expert_placement_runtime_verification_level"
+            ),
+            backend_config.get("expert_placement_runtime_verification_level"),
+            derived_runtime_verification_level,
+        )
+        or derived_runtime_verification_level
+    )
+    runtime_capability_reason = str(
+        _first_present(
+            runtime_metadata.get("expert_placement_runtime_capability_reason"),
+            backend_config.get("expert_placement_runtime_capability_reason"),
             "",
         )
         or ""
@@ -454,6 +703,13 @@ def get_vllm_model_resource_profile(
         ),
         default=False,
     )
+    expert_quiescent_remap_enabled = _to_bool(
+        _first_present(
+            runtime_metadata.get("expert_placement_quiescent_remap_enabled"),
+            backend_config.get("expert_placement_quiescent_remap_enabled"),
+        ),
+        default=False,
+    )
     expert_physical_migration_required = _to_bool(
         _first_present(
             runtime_metadata.get(
@@ -462,6 +718,54 @@ def get_vllm_model_resource_profile(
             backend_config.get("expert_placement_physical_migration_required"),
         ),
         default=False,
+    )
+    runtime_expert_placement_shards = runtime_metadata.get(
+        "runtime_expert_placement_shards"
+    )
+    if not isinstance(runtime_expert_placement_shards, Mapping):
+        runtime_expert_placement_shards = {}
+    runtime_expert_placement_worker_snapshots = runtime_metadata.get(
+        "runtime_expert_placement_worker_snapshots"
+    )
+    if not isinstance(runtime_expert_placement_worker_snapshots, Mapping):
+        runtime_expert_placement_worker_snapshots = {}
+    runtime_expert_placement_available = _to_bool(
+        runtime_metadata.get("runtime_expert_placement_available"),
+        default=_has_payload(runtime_expert_placement_shards),
+    )
+    runtime_expert_placement_worker_count = (
+        _optional_non_negative_int(
+            runtime_metadata.get("runtime_expert_placement_worker_count")
+        )
+        or len(runtime_expert_placement_worker_snapshots)
+    )
+    runtime_expert_placement_shard_count = (
+        _optional_non_negative_int(
+            runtime_metadata.get("runtime_expert_placement_shard_count")
+        )
+        or sum(
+            len(value) if isinstance(value, list) else 1
+            for value in runtime_expert_placement_shards.values()
+        )
+    )
+    all_to_all_counters_available = _to_bool(
+        runtime_metadata.get("all_to_all_counters_available"),
+        default=False,
+    )
+    all_to_all_collective_calls = _optional_non_negative_int(
+        runtime_metadata.get("all_to_all_collective_calls")
+    ) or 0
+    all_to_all_observed_input_bytes = _optional_non_negative_int(
+        runtime_metadata.get("all_to_all_observed_input_bytes")
+    ) or 0
+    all_to_all_observed_output_bytes = _optional_non_negative_int(
+        runtime_metadata.get("all_to_all_observed_output_bytes")
+    ) or 0
+    all_to_all_internode_calls = _optional_non_negative_int(
+        runtime_metadata.get("all_to_all_internode_calls")
+    ) or 0
+    all_to_all_measurement_kind = str(
+        runtime_metadata.get("all_to_all_measurement_kind") or "unavailable"
     )
 
     profile = {
@@ -526,18 +830,138 @@ def get_vllm_model_resource_profile(
         "expert_placement_live_migration_enabled": (
             expert_live_migration_enabled
         ),
+        "expert_placement_quiescent_remap_enabled": (
+            expert_quiescent_remap_enabled
+        ),
         "expert_placement_physical_migration_required": (
             expert_physical_migration_required
         ),
         "expert_placement_apply_hook_available": apply_hook_available,
         "expert_placement_apply_attempted": apply_attempted,
         "expert_placement_apply_success": apply_success,
+        "expert_placement_apply_worker_count": apply_worker_count,
+        "expert_placement_apply_worker_success_count": (
+            apply_worker_success_count
+        ),
         "expert_placement_apply_duration_ms": apply_duration_ms,
         "expert_placement_apply_reason": apply_reason,
         "expert_placement_verify_hook_available": verify_hook_available,
         "expert_placement_verify_attempted": verify_attempted,
         "expert_placement_verify_success": verify_success,
+        "expert_placement_verify_worker_count": verify_worker_count,
+        "expert_placement_verify_worker_success_count": (
+            verify_worker_success_count
+        ),
         "expert_placement_verify_reason": verify_reason,
+        "expert_placement_contract_seen_by_runtime": (
+            contract_seen_by_runtime
+        ),
+        "expert_placement_contract_seen_by_all_workers": (
+            contract_seen_by_all_workers
+        ),
+        "expert_placement_contract_seen_worker_count": (
+            contract_seen_worker_count
+        ),
+        "expert_placement_contract_seen_worker_total": (
+            contract_seen_worker_total
+        ),
+        "expert_placement_physical_weight_migration": (
+            physical_weight_migration
+        ),
+        "expert_placement_runtime_moved_expert_shards": (
+            runtime_moved_expert_shards
+        ),
+        "expert_placement_runtime_moved_weight_bytes": (
+            runtime_moved_weight_bytes
+        ),
+        "expert_placement_runtime_remap_duration_ms": (
+            runtime_remap_duration_ms
+        ),
+        "expert_placement_runtime_active_request_remap": (
+            runtime_active_request_remap
+        ),
+        "expert_placement_runtime_step_boundary_barrier": (
+            runtime_step_boundary_barrier
+        ),
+        "expert_placement_runtime_physical_host_ids_observed": (
+            runtime_physical_host_ids_observed
+        ),
+        "expert_placement_runtime_physical_host_count": (
+            runtime_physical_host_count
+        ),
+        "expert_placement_runtime_physical_host_ids": [
+            str(value) for value in runtime_physical_host_ids if value
+        ],
+        "expert_placement_runtime_ray_node_count": runtime_ray_node_count,
+        "expert_placement_runtime_ray_node_ids": [
+            str(value) for value in runtime_ray_node_ids if value
+        ],
+        "expert_placement_runtime_failure_domain_count": (
+            runtime_failure_domain_count
+        ),
+        "expert_placement_runtime_failure_domain_ids": [
+            str(value) for value in runtime_failure_domain_ids if value
+        ],
+        "expert_placement_runtime_host_mode": runtime_host_mode,
+        "expert_placement_runtime_cross_failure_domain_weight_migration": (
+            runtime_cross_failure_domain_weight_migration
+        ),
+        "expert_placement_runtime_cross_failure_domain_moved_expert_shards": (
+            runtime_cross_failure_domain_moved_expert_shards
+        ),
+        "expert_placement_runtime_cross_failure_domain_moved_weight_bytes": (
+            runtime_cross_failure_domain_moved_weight_bytes
+        ),
+        "expert_placement_runtime_cross_node_weight_migration": (
+            runtime_cross_node_weight_migration
+        ),
+        "expert_placement_runtime_cross_node_moved_expert_shards": (
+            runtime_cross_node_moved_expert_shards
+        ),
+        "expert_placement_runtime_cross_node_moved_weight_bytes": (
+            runtime_cross_node_moved_weight_bytes
+        ),
+        "expert_placement_runtime_verification_level": (
+            runtime_verification_level
+        ),
+        "expert_placement_runtime_verified_placement": (
+            runtime_verified_placement
+        ),
+        "expert_placement_runtime_can_verify_physical_placement": (
+            can_verify_physical_placement
+        ),
+        "expert_placement_runtime_can_remap_live_ep_rank": (
+            can_remap_live_ep_rank
+        ),
+        "expert_placement_runtime_can_measure_all_to_all": (
+            can_measure_all_to_all
+        ),
+        "all_to_all_counters_available": all_to_all_counters_available,
+        "all_to_all_collective_calls": all_to_all_collective_calls,
+        "all_to_all_observed_input_bytes": all_to_all_observed_input_bytes,
+        "all_to_all_observed_output_bytes": all_to_all_observed_output_bytes,
+        "all_to_all_internode_calls": all_to_all_internode_calls,
+        "all_to_all_measurement_kind": all_to_all_measurement_kind,
+        "expert_placement_runtime_capability_reason": (
+            runtime_capability_reason
+        ),
+        "runtime_expert_placement_available": (
+            runtime_expert_placement_available
+        ),
+        "runtime_expert_placement_worker_count": (
+            runtime_expert_placement_worker_count
+        ),
+        "runtime_expert_placement_shard_count": (
+            runtime_expert_placement_shard_count
+        ),
+        "runtime_expert_placement_shards": {
+            str(key): value
+            for key, value in runtime_expert_placement_shards.items()
+        },
+        "runtime_expert_placement_worker_snapshots": {
+            str(key): value
+            for key, value in runtime_expert_placement_worker_snapshots.items()
+        },
         "moe_route_histogram_available": route_histogram_available,
         "moe_route_histogram_source": route_histogram_source,
         "moe_route_histogram_kind": route_histogram_kind,
@@ -674,6 +1098,9 @@ def get_vllm_runtime_metadata(
         "expert_placement_live_migration_enabled": (
             profile["expert_placement_live_migration_enabled"]
         ),
+        "expert_placement_quiescent_remap_enabled": (
+            profile["expert_placement_quiescent_remap_enabled"]
+        ),
         "expert_placement_physical_migration_required": (
             profile["expert_placement_physical_migration_required"]
         ),
@@ -685,6 +1112,12 @@ def get_vllm_runtime_metadata(
         ),
         "expert_placement_apply_success": (
             profile["expert_placement_apply_success"]
+        ),
+        "expert_placement_apply_worker_count": (
+            profile["expert_placement_apply_worker_count"]
+        ),
+        "expert_placement_apply_worker_success_count": (
+            profile["expert_placement_apply_worker_success_count"]
         ),
         "expert_placement_apply_duration_ms": (
             profile["expert_placement_apply_duration_ms"]
@@ -701,8 +1134,130 @@ def get_vllm_runtime_metadata(
         "expert_placement_verify_success": (
             profile["expert_placement_verify_success"]
         ),
+        "expert_placement_verify_worker_count": (
+            profile["expert_placement_verify_worker_count"]
+        ),
+        "expert_placement_verify_worker_success_count": (
+            profile["expert_placement_verify_worker_success_count"]
+        ),
         "expert_placement_verify_reason": (
             profile["expert_placement_verify_reason"]
+        ),
+        "expert_placement_contract_seen_by_runtime": (
+            profile["expert_placement_contract_seen_by_runtime"]
+        ),
+        "expert_placement_contract_seen_by_all_workers": (
+            profile["expert_placement_contract_seen_by_all_workers"]
+        ),
+        "expert_placement_contract_seen_worker_count": (
+            profile["expert_placement_contract_seen_worker_count"]
+        ),
+        "expert_placement_contract_seen_worker_total": (
+            profile["expert_placement_contract_seen_worker_total"]
+        ),
+        "expert_placement_physical_weight_migration": (
+            profile["expert_placement_physical_weight_migration"]
+        ),
+        "expert_placement_runtime_moved_expert_shards": (
+            profile["expert_placement_runtime_moved_expert_shards"]
+        ),
+        "expert_placement_runtime_moved_weight_bytes": (
+            profile["expert_placement_runtime_moved_weight_bytes"]
+        ),
+        "expert_placement_runtime_remap_duration_ms": (
+            profile["expert_placement_runtime_remap_duration_ms"]
+        ),
+        "expert_placement_runtime_active_request_remap": (
+            profile["expert_placement_runtime_active_request_remap"]
+        ),
+        "expert_placement_runtime_step_boundary_barrier": (
+            profile["expert_placement_runtime_step_boundary_barrier"]
+        ),
+        "expert_placement_runtime_physical_host_ids_observed": (
+            profile["expert_placement_runtime_physical_host_ids_observed"]
+        ),
+        "expert_placement_runtime_physical_host_count": (
+            profile["expert_placement_runtime_physical_host_count"]
+        ),
+        "expert_placement_runtime_physical_host_ids": (
+            profile["expert_placement_runtime_physical_host_ids"]
+        ),
+        "expert_placement_runtime_ray_node_count": (
+            profile["expert_placement_runtime_ray_node_count"]
+        ),
+        "expert_placement_runtime_ray_node_ids": (
+            profile["expert_placement_runtime_ray_node_ids"]
+        ),
+        "expert_placement_runtime_failure_domain_count": (
+            profile["expert_placement_runtime_failure_domain_count"]
+        ),
+        "expert_placement_runtime_failure_domain_ids": (
+            profile["expert_placement_runtime_failure_domain_ids"]
+        ),
+        "expert_placement_runtime_host_mode": (
+            profile["expert_placement_runtime_host_mode"]
+        ),
+        "expert_placement_runtime_cross_failure_domain_weight_migration": (
+            profile[
+                "expert_placement_runtime_cross_failure_domain_weight_migration"
+            ]
+        ),
+        "expert_placement_runtime_cross_failure_domain_moved_expert_shards": (
+            profile[
+                "expert_placement_runtime_cross_failure_domain_moved_expert_shards"
+            ]
+        ),
+        "expert_placement_runtime_cross_failure_domain_moved_weight_bytes": (
+            profile[
+                "expert_placement_runtime_cross_failure_domain_moved_weight_bytes"
+            ]
+        ),
+        "expert_placement_runtime_cross_node_weight_migration": (
+            profile["expert_placement_runtime_cross_node_weight_migration"]
+        ),
+        "expert_placement_runtime_cross_node_moved_expert_shards": (
+            profile["expert_placement_runtime_cross_node_moved_expert_shards"]
+        ),
+        "expert_placement_runtime_cross_node_moved_weight_bytes": (
+            profile["expert_placement_runtime_cross_node_moved_weight_bytes"]
+        ),
+        "expert_placement_runtime_verification_level": (
+            profile["expert_placement_runtime_verification_level"]
+        ),
+        "expert_placement_runtime_verified_placement": (
+            profile["expert_placement_runtime_verified_placement"]
+        ),
+        "expert_placement_runtime_can_verify_physical_placement": (
+            profile[
+                "expert_placement_runtime_can_verify_physical_placement"
+            ]
+        ),
+        "expert_placement_runtime_can_remap_live_ep_rank": (
+            profile["expert_placement_runtime_can_remap_live_ep_rank"]
+        ),
+        "expert_placement_runtime_can_measure_all_to_all": (
+            profile["expert_placement_runtime_can_measure_all_to_all"]
+        ),
+        "all_to_all_counters_available": profile[
+            "all_to_all_counters_available"
+        ],
+        "all_to_all_collective_calls": profile[
+            "all_to_all_collective_calls"
+        ],
+        "all_to_all_observed_input_bytes": profile[
+            "all_to_all_observed_input_bytes"
+        ],
+        "all_to_all_observed_output_bytes": profile[
+            "all_to_all_observed_output_bytes"
+        ],
+        "all_to_all_internode_calls": profile[
+            "all_to_all_internode_calls"
+        ],
+        "all_to_all_measurement_kind": profile[
+            "all_to_all_measurement_kind"
+        ],
+        "expert_placement_runtime_capability_reason": (
+            profile["expert_placement_runtime_capability_reason"]
         ),
         "moe_route_histogram_available": (
             profile["moe_route_histogram_available"]

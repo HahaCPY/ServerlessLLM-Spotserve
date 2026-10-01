@@ -1,0 +1,12 @@
+{
+  "experiment_type": "elastic_ep_resize",
+  "name": "vllm-elastic-ep2-to-ep4-active-drain",
+  "deploy_config": "examples/spotserve/config-vllm-elastic-ep-resize-performance.json",
+  "model_path": "/models/Qwen2-MoE-Tiny",
+  "endpoint": "http://127.0.0.1:8343",
+  "output": "results/spotserve_elastic_ep_resize_performance/report.json",
+  "ready_timeout_s": 600,
+  "event_timeout_s": 600,
+  "minimum_free_gpu_memory_mib": 8192,
+  "active_request_drain": true
+}

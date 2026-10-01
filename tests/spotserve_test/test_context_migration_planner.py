@@ -280,6 +280,18 @@ def test_expert_locality_cost_prefers_target_with_hot_experts():
     )
     assert decision.plans[0].target_expert_placement_plan_applied is False
     assert decision.plans[0].target_expert_placement_plan_verified is False
+    assert (
+        decision.plans[
+            0
+        ].target_expert_placement_contract_seen_by_runtime
+        is False
+    )
+    assert (
+        decision.plans[
+            0
+        ].target_expert_placement_contract_seen_by_all_workers
+        is False
+    )
     assert decision.plans[0].target_expert_placement_contract_reason == (
         "runtime_not_applied"
     )
@@ -430,6 +442,52 @@ def test_expert_dispatch_cost_uses_routing_weighted_locality():
     assert result["cost"] == 0.8
     assert result["route_histogram_source"] == "runtime_hook"
     assert result["route_histogram_kind"] == "runtime_observed_topk"
+
+
+def test_expert_dispatch_cost_prefers_runtime_actual_placement():
+    result = estimate_expert_dispatch_cost(
+        ContextMetadata(
+            request_id="req-runtime-placement",
+            instance_id="old-a",
+            node_id="node-0",
+            metadata={
+                "moe_route_histogram_available": True,
+                "per_request_expert_route_histogram": {
+                    "req-runtime-placement": {
+                        "layer:0/expert:1": 10,
+                    }
+                },
+            },
+        ),
+        MigrationTarget(
+            instance_id="new-a",
+            node_id="node-1",
+            metadata={
+                "expert_placement_available": True,
+                "expert_placement_snapshot": {
+                    "layer:0/expert:1": {"rank_id": "logical-rank"}
+                },
+                "runtime_expert_placement_available": True,
+                "runtime_expert_placement_shards": {
+                    "layer:0/expert:2": [
+                        {
+                            "rank_id": "worker:0/ep-rank:0",
+                            "weight_resident": True,
+                        }
+                    ]
+                },
+            },
+        ),
+        planner_config={"enable_moe_expert_locality": True},
+    )
+
+    assert result["available"] is True
+    assert result["locality_ratio"] == 0.0
+    assert result["estimated_remote_routing_ratio"] == 1.0
+    assert result["estimated_remote_routed_tokens"] == 10
+    assert result["remote_routed_tokens_by_expert"] == {
+        "layer:0/expert:1": 10
+    }
 
 
 def test_queue_penalty_prefers_less_loaded_target():
@@ -607,7 +665,31 @@ def test_context_migration_metric_contains_summary_fields():
         "selected_plan_target_expert_placement_plan_verified_count"
     ] == 0
     assert event[
+        "selected_plan_target_expert_placement_contract_seen_count"
+    ] == 0
+    assert event[
+        "selected_plan_target_expert_placement_contract_seen_all_workers_count"
+    ] == 0
+    assert event[
         "selected_plan_target_expert_placement_contract_reasons"
+    ] == []
+    assert event[
+        "selected_plan_target_expert_placement_runtime_verification_levels"
+    ] == []
+    assert event[
+        "selected_plan_target_expert_placement_runtime_verified_count"
+    ] == 0
+    assert event[
+        "selected_plan_target_expert_placement_runtime_can_verify_physical_count"
+    ] == 0
+    assert event[
+        "selected_plan_target_expert_placement_runtime_can_remap_ep_count"
+    ] == 0
+    assert event[
+        "selected_plan_target_expert_placement_runtime_can_measure_a2a_count"
+    ] == 0
+    assert event[
+        "selected_plan_target_expert_placement_runtime_capability_reasons"
     ] == []
     assert (
         event[
