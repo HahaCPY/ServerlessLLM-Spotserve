@@ -153,9 +153,13 @@ class ExpertRemapPreflightTests(unittest.TestCase):
                             "physical_host_ids_observed": True,
                             "physical_host_ids": ["host-a", "host-b"],
                             "ray_node_ids": ["ray-a", "ray-b"],
+                            "failure_domain_ids": ["domain-a", "domain-b"],
                             "cross_node_weight_migration": True,
                             "cross_node_moved_local_expert_shards": 2,
                             "cross_node_moved_local_weight_bytes": 128,
+                            "cross_failure_domain_weight_migration": True,
+                            "cross_failure_domain_moved_local_expert_shards": 2,
+                            "cross_failure_domain_moved_local_weight_bytes": 128,
                         },
                     ],
                     "step_boundary_barrier": True,
@@ -172,9 +176,13 @@ class ExpertRemapPreflightTests(unittest.TestCase):
                             "physical_host_ids_observed": True,
                             "physical_host_ids": ["host-a", "host-b"],
                             "ray_node_ids": ["ray-a", "ray-b"],
+                            "failure_domain_ids": ["domain-a", "domain-b"],
                             "cross_node_weight_migration": True,
                             "cross_node_moved_local_expert_shards": 2,
                             "cross_node_moved_local_weight_bytes": 128,
+                            "cross_failure_domain_weight_migration": True,
+                            "cross_failure_domain_moved_local_expert_shards": 2,
+                            "cross_failure_domain_moved_local_weight_bytes": 128,
                         },
                     ],
                     "step_boundary_barrier": True,
@@ -192,9 +200,20 @@ class ExpertRemapPreflightTests(unittest.TestCase):
         self.assertEqual(result["physical_host_count"], 2)
         self.assertEqual(result["physical_host_ids"], ["host-a", "host-b"])
         self.assertEqual(result["ray_node_count"], 2)
+        self.assertEqual(result["failure_domain_count"], 2)
+        self.assertEqual(
+            result["failure_domain_ids"], ["domain-a", "domain-b"]
+        )
         self.assertTrue(result["cross_node_weight_migration"])
         self.assertEqual(result["cross_node_moved_local_expert_shards"], 4)
         self.assertEqual(result["cross_node_moved_local_weight_bytes"], 256)
+        self.assertTrue(result["cross_failure_domain_weight_migration"])
+        self.assertEqual(
+            result["cross_failure_domain_moved_local_expert_shards"], 4
+        )
+        self.assertEqual(
+            result["cross_failure_domain_moved_local_weight_bytes"], 256
+        )
 
     def test_dp_preflight_failure_is_global(self):
         result = aggregate_dp_engine_hook_results(

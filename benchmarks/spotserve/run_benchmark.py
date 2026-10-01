@@ -1772,6 +1772,45 @@ def main():
         if completed.returncode:
             sys.exit(completed.returncode)
         return
+    if config.get("experiment_type") == "simulated_cross_host_expert_remap":
+        script = (
+            Path(__file__).resolve().parents[2]
+            / "scripts/verify_spotserve_simulated_cross_host_remap.py"
+        )
+        endpoint = args.endpoint or config.get(
+            "endpoint", "http://127.0.0.1:8343"
+        )
+        endpoint = str(endpoint).removesuffix("/v1/chat/completions")
+        command = [
+            sys.executable,
+            str(script),
+            "--config",
+            str(config["deploy_config"]),
+            "--model-path",
+            str(config.get("model_path", "/models/Qwen2-MoE-Tiny")),
+            "--endpoint",
+            endpoint,
+            "--ready-timeout",
+            str(config.get("ready_timeout_s", 600)),
+            "--event-timeout",
+            str(
+                args.trace_event_timeout
+                if args.trace_event_timeout is not None
+                else config.get("event_timeout_s", 600)
+            ),
+            "--request-timeout",
+            str(args.request_timeout),
+            "--output",
+            str(config["output"]),
+        ]
+        for worker_id in config.get("target_worker_ids", ["0", "1"]):
+            command.extend(["--target-worker-id", str(worker_id)])
+        if config.get("require_internode_a2a", True):
+            command.append("--require-internode-a2a")
+        completed = subprocess.run(command, check=False)
+        if completed.returncode:
+            sys.exit(completed.returncode)
+        return
     try:
         asyncio.run(main_async(args))
     except RuntimeError as exc:

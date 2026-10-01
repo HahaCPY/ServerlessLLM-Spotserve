@@ -1,0 +1,46 @@
+{
+  "model": "vllm-simulated-cross-host-expert-remap-perf",
+  "backend": "vllm",
+  "router_num_cpus": 0,
+  "num_cpus": 1,
+  "num_gpus": 4,
+  "auto_scaling_config": {
+    "metric": "concurrency",
+    "target": 1,
+    "min_instances": 1,
+    "max_instances": 1,
+    "keep_alive": 60
+  },
+  "backend_config": {
+    "pretrained_model_name_or_path": "/models/Qwen2-MoE-Tiny",
+    "load_format": "auto",
+    "torch_dtype": "float16",
+    "gpu_memory_utilization": 0.45,
+    "max_model_len": 512,
+    "max_num_seqs": 2,
+    "tensor_parallel_size": 1,
+    "pipeline_parallel_size": 1,
+    "data_parallel_size": 4,
+    "data_parallel_size_local": 2,
+    "data_parallel_backend": "ray",
+    "enable_expert_parallel": true,
+    "model_config": {
+      "num_hidden_layers": 2,
+      "num_experts": 4
+    },
+    "all2all_backend": "allgather_reducescatter",
+    "expert_placement_strategy": "linear",
+    "enable_prefix_caching": true,
+    "enforce_eager": true,
+    "trust_remote_code": true,
+    "ray_dp_pack_strategy": "fill",
+    "spotserve_vllm_ray_dp_owns_gpus": true,
+    "spotserve_distributed_gpu_allocation": true,
+    "spotserve_target_worker_nodes": ["0", "1"]
+  },
+  "router_config": {
+    "count_preempting_toward_capacity": true,
+    "enable_reparallelization": false,
+    "metrics_path": "/tmp/spotserve-simulated-cross-host-results/router.jsonl"
+  }
+}

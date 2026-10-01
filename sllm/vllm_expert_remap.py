@@ -21,6 +21,7 @@ _TRUTHY = {"1", "true", "yes", "on"}
 _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 _EP_RANK_RE = re.compile(r"^(?:replica:0/)?ep-rank:(\d+)$")
 _PHYSICAL_HOST_RESOURCE_PREFIX = "spotserve_physical_host_"
+_FAILURE_DOMAIN_RESOURCE_PREFIX = "spotserve_failure_domain_"
 _LAST_REMAP: dict[str, Any] = {}
 _ALL_TO_ALL_LOCK = threading.Lock()
 _ALL_TO_ALL_COUNTERS: dict[str, Any] = {
@@ -147,7 +148,7 @@ def reset_all_to_all_counters() -> None:
 
 
 def physical_host_identity() -> dict[str, str]:
-    """Return node-local host identity without trusting copied driver env."""
+    """Return node-local physical and simulated failure-domain identities."""
     try:
         import ray
 
@@ -167,6 +168,12 @@ def physical_host_identity() -> dict[str, str]:
                 if key.startswith(_PHYSICAL_HOST_RESOURCE_PREFIX)
                 and float(value or 0) > 0
             )
+            failure_domains = sorted(
+                key
+                for key, value in (node.get("Resources") or {}).items()
+                if key.startswith(_FAILURE_DOMAIN_RESOURCE_PREFIX)
+                and float(value or 0) > 0
+            )
             if len(markers) == 1:
                 return {
                     "physical_host_id": markers[0][
@@ -176,6 +183,20 @@ def physical_host_identity() -> dict[str, str]:
                     "ray_node_id": node_id,
                     "ray_node_address": str(
                         node.get("NodeManagerAddress", "") or ""
+                    ),
+                    "failure_domain_id": (
+                        failure_domains[0][len(_FAILURE_DOMAIN_RESOURCE_PREFIX) :]
+                        if len(failure_domains) == 1
+                        else ""
+                    ),
+                    "failure_domain_identity_source": (
+                        "ray_node_resource"
+                        if len(failure_domains) == 1
+                        else (
+                            "ambiguous_ray_node_resources"
+                            if len(failure_domains) > 1
+                            else "unavailable"
+                        )
                     ),
                 }
             if len(markers) > 1:
@@ -188,6 +209,8 @@ def physical_host_identity() -> dict[str, str]:
                     "ray_node_address": str(
                         node.get("NodeManagerAddress", "") or ""
                     ),
+                    "failure_domain_id": "",
+                    "failure_domain_identity_source": "unavailable",
                 }
     except Exception:
         pass
@@ -199,6 +222,10 @@ def physical_host_identity() -> dict[str, str]:
         "physical_host_identity_source": "environment_fallback",
         "ray_node_id": "",
         "ray_node_address": "",
+        "failure_domain_id": os.environ.get(
+            "SPOTSERVE_FAILURE_DOMAIN_ID", ""
+        ).strip(),
+        "failure_domain_identity_source": "environment_fallback",
     }
 
 
@@ -249,6 +276,14 @@ def aggregate_dp_engine_hook_results(
             if node_id
         }
     )
+    failure_domain_ids = sorted(
+        {
+            str(domain_id)
+            for row in worker_results
+            for domain_id in row.get("failure_domain_ids", [])
+            if domain_id
+        }
+    )
     return {
         success_key: succeeded,
         "success": succeeded,
@@ -297,6 +332,46 @@ def aggregate_dp_engine_hook_results(
         "physical_host_ids": physical_host_ids,
         "ray_node_count": len(ray_node_ids),
         "ray_node_ids": ray_node_ids,
+        "failure_domain_count": len(failure_domain_ids),
+        "failure_domain_ids": failure_domain_ids,
+        "failure_domain_ids_observed": bool(
+            worker_results
+            and all(
+                row.get("failure_domain_ids_observed")
+                for row in worker_results
+            )
+        ),
+        "host_mode": (
+            "physical_multi_host"
+            if len(physical_host_ids) >= 2
+            else (
+                "simulated_failure_domain"
+                if len(failure_domain_ids) >= 2
+                else "single_host"
+            )
+        ),
+        "cross_failure_domain_weight_migration": any(
+            bool(row.get("cross_failure_domain_weight_migration"))
+            for row in worker_results
+        ),
+        "cross_failure_domain_moved_local_expert_shards": sum(
+            int(
+                row.get(
+                    "cross_failure_domain_moved_local_expert_shards", 0
+                )
+                or 0
+            )
+            for row in worker_results
+        ),
+        "cross_failure_domain_moved_local_weight_bytes": sum(
+            int(
+                row.get(
+                    "cross_failure_domain_moved_local_weight_bytes", 0
+                )
+                or 0
+            )
+            for row in worker_results
+        ),
         "cross_node_weight_migration": any(
             bool(row.get("cross_node_weight_migration"))
             for row in worker_results
@@ -721,12 +796,30 @@ def remap_expert_weights(model: Any, plan: Mapping[str, Any]) -> dict[str, Any]:
         str((row or {}).get("physical_host_identity_source") or "")
         for row in host_identity_rows
     ]
+    failure_domain_ids = [
+        str((row or {}).get("failure_domain_id") or "").strip()
+        for row in host_identity_rows
+    ]
+    failure_domain_sources = [
+        str((row or {}).get("failure_domain_identity_source") or "")
+        for row in host_identity_rows
+    ]
     if plan.get("require_cross_node") is True and (
         not all(host_ids)
         or len(set(host_ids)) < 2
         or not all(source == "ray_node_resource" for source in host_identity_sources)
     ):
         raise ValueError("cross_node_requires_distinct_physical_host_ids")
+    if plan.get("require_cross_failure_domain") is True and (
+        not all(failure_domain_ids)
+        or len(set(failure_domain_ids)) < 2
+        or not all(
+            source == "ray_node_resource" for source in failure_domain_sources
+        )
+    ):
+        raise ValueError(
+            "cross_failure_domain_requires_distinct_failure_domain_ids"
+        )
     new_indices = torch.tensor(
         [
             [
@@ -751,6 +844,14 @@ def remap_expert_weights(model: Any, plan: Mapping[str, Any]) -> dict[str, Any]:
     cross_node_moved, cross_node_bytes = _cross_node_movement(
         layers, old_indices.tolist(), host_ids, group.rank()
     )
+    cross_failure_domain_moved, cross_failure_domain_bytes = (
+        _cross_node_movement(
+            layers,
+            old_indices.tolist(),
+            failure_domain_ids,
+            group.rank(),
+        )
+    )
     if plan.get("require_cross_node") is True:
         global_cross_node_moved = torch.tensor(
             [cross_node_moved], device=device, dtype=torch.int64
@@ -758,6 +859,15 @@ def remap_expert_weights(model: Any, plan: Mapping[str, Any]) -> dict[str, Any]:
         dist.all_reduce(global_cross_node_moved, group=group)
         if not int(global_cross_node_moved.item()):
             raise ValueError("plan_does_not_move_experts_across_physical_hosts")
+    if plan.get("require_cross_failure_domain") is True:
+        global_failure_domain_moved = torch.tensor(
+            [cross_failure_domain_moved], device=device, dtype=torch.int64
+        )
+        dist.all_reduce(global_failure_domain_moved, group=group)
+        if not int(global_failure_domain_moved.item()):
+            raise ValueError(
+                "plan_does_not_move_experts_across_failure_domains"
+            )
     before = _gather_digests(_weight_digests(layers, new=False), group)
     if len(before) != len(plan["expert_to_target_rank"]):
         raise RuntimeError("current_weight_coverage_invalid")
@@ -817,6 +927,30 @@ def remap_expert_weights(model: Any, plan: Mapping[str, Any]) -> dict[str, Any]:
             str((row or {}).get("ray_node_address") or "")
             for row in host_identity_rows
         ],
+        "failure_domain_ids_observed": bool(all(failure_domain_ids)),
+        "failure_domain_count": (
+            len(set(failure_domain_ids)) if all(failure_domain_ids) else 0
+        ),
+        "failure_domain_ids": failure_domain_ids,
+        "failure_domain_identity_sources": failure_domain_sources,
+        "cross_failure_domain_weight_migration": bool(
+            cross_failure_domain_moved
+        ),
+        "cross_failure_domain_moved_local_expert_shards": (
+            cross_failure_domain_moved
+        ),
+        "cross_failure_domain_moved_local_weight_bytes": (
+            cross_failure_domain_bytes
+        ),
+        "host_mode": (
+            "physical_multi_host"
+            if len(set(host_ids)) >= 2
+            else (
+                "simulated_failure_domain"
+                if len(set(failure_domain_ids)) >= 2
+                else "single_host"
+            )
+        ),
         "cross_node_weight_migration": bool(cross_node_moved),
         "cross_node_moved_local_expert_shards": cross_node_moved,
         "cross_node_moved_local_weight_bytes": cross_node_bytes,

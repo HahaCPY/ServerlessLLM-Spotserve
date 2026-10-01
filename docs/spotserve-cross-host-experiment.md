@@ -1,8 +1,110 @@
 # SpotServe MoE Cross-host Experiment
 
-This guide validates physical expert-weight movement between two distinct GPU
-hosts. It is deliberately stricter than the same-host Podman setup: two
-containers on one machine do not pass the cross-host gate.
+This guide contains two separate validation modes:
+
+1. **Physical multi-host:** two distinct GPU machines. This is the strict
+   cross-host gate.
+2. **Simulated failure domains:** one physical four-GPU machine split into two
+   two-GPU containers and two Ray worker nodes. This validates scheduling,
+   expert transfer and inter-container collectives, but not physical network or
+   host failure isolation.
+
+Never report the second mode as a physical multi-host deployment. Use the term
+`single-physical-host, two-failure-domain simulation`.
+
+## Single-host Two-domain Simulation
+
+The local simulation uses this topology:
+
+```text
+sllm_sim_head       sllm_sim_host_a       sllm_sim_host_b
+0 GPUs              GPUs 0,1              GPUs 2,3
+Ray control node    worker_id_0           worker_id_1
+                    failure domain A      failure domain B
+                    physical host X       physical host X
+```
+
+`SPOTSERVE_PHYSICAL_HOST_ID` is identical on both workers, while
+`SPOTSERVE_FAILURE_DOMAIN_ID` is different. The runtime therefore reports
+`host_mode=simulated_failure_domain` and cannot accidentally satisfy the
+physical multi-host gate.
+
+Start the isolated stack without rebuilding the image:
+
+```bash
+SPOTSERVE_REPO_ROOT=/work/containers/cpy/ServerlessLLM-Spotserve \
+MODEL_FOLDER=/work/spotserve-models \
+podman-compose \
+  -f "$PWD/examples/spotserve/docker-compose.simulated-cross-host.yml" \
+  up -d
+```
+
+This stack uses host ports 6383 and 8353 and container names beginning with
+`sllm_sim_`, so it does not replace the regular `sllm_head` deployment.
+
+Run the end-to-end gate:
+
+```bash
+podman exec sllm_sim_head bash -lc '
+cd /workspace/spotserve &&
+/opt/venvs/head/bin/python benchmarks/spotserve/run_benchmark.py \
+  --config benchmarks/spotserve/benchmark_matrix_simulated_cross_host_expert_remap_performance.yaml \
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \
+  --request-timeout 240 \
+  --trace-event-timeout 600 \
+  --ray-address auto \
+  --ray-namespace sllm
+'
+```
+
+The config explicitly sets global DP size 4 and local DP size 2. This is
+required for vLLM Ray-DP `fill` placement to allocate two ranks on each
+simulated worker node.
+
+A passing run writes:
+
+```text
+results/spotserve_simulated_cross_host_expert_remap_performance/report.json
+```
+
+Do not accept the run unless the report satisfies all of these conditions:
+
+```text
+host_mode == simulated_failure_domain
+physical_cross_host_verified == false
+simulated_cross_host_verified == true
+runtime.physical_host_count == 1
+runtime.failure_domain_count == 2
+runtime.ray_node_count >= 2
+runtime.verified_placement == true
+runtime.physical_weight_migration == true
+runtime.cross_physical_host_migration == false
+runtime.cross_failure_domain_migration == true
+runtime.cross_failure_domain_moved_shards > 0
+runtime.cross_failure_domain_moved_bytes > 0
+inter_container_a2a_observed == true
+```
+
+The verified local run on 2026-10-01 moved eight expert shards (1,572,864
+bytes) across the simulated domains and observed 512 additional
+inter-container A2A calls. These numbers are a mechanism check, not a physical
+network performance result.
+
+Stop only the isolated stack with:
+
+```bash
+SPOTSERVE_REPO_ROOT=/work/containers/cpy/ServerlessLLM-Spotserve \
+MODEL_FOLDER=/work/spotserve-models \
+podman-compose \
+  -f "$PWD/examples/spotserve/docker-compose.simulated-cross-host.yml" \
+  down
+```
+
+## Physical Multi-host Gate
+
+The remaining sections validate physical expert-weight movement between two
+distinct GPU hosts. This gate is deliberately stricter: two containers on one
+machine do not pass it.
 
 ## Topology
 

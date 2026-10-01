@@ -498,6 +498,44 @@ def get_vllm_model_resource_profile(
     )
     if not isinstance(runtime_ray_node_ids, (list, tuple)):
         runtime_ray_node_ids = []
+    runtime_failure_domain_count = _optional_non_negative_int(
+        runtime_metadata.get(
+            "expert_placement_runtime_failure_domain_count"
+        )
+    ) or 0
+    runtime_failure_domain_ids = runtime_metadata.get(
+        "expert_placement_runtime_failure_domain_ids", []
+    )
+    if not isinstance(runtime_failure_domain_ids, (list, tuple)):
+        runtime_failure_domain_ids = []
+    runtime_host_mode = str(
+        runtime_metadata.get(
+            "expert_placement_runtime_host_mode", "single_host"
+        )
+        or "single_host"
+    )
+    runtime_cross_failure_domain_weight_migration = _to_bool(
+        runtime_metadata.get(
+            "expert_placement_runtime_cross_failure_domain_weight_migration"
+        ),
+        default=False,
+    )
+    runtime_cross_failure_domain_moved_expert_shards = (
+        _optional_non_negative_int(
+            runtime_metadata.get(
+                "expert_placement_runtime_cross_failure_domain_moved_expert_shards"
+            )
+        )
+        or 0
+    )
+    runtime_cross_failure_domain_moved_weight_bytes = (
+        _optional_non_negative_int(
+            runtime_metadata.get(
+                "expert_placement_runtime_cross_failure_domain_moved_weight_bytes"
+            )
+        )
+        or 0
+    )
     runtime_cross_node_weight_migration = _to_bool(
         runtime_metadata.get("expert_placement_runtime_cross_node_weight_migration"),
         default=False,
@@ -858,6 +896,22 @@ def get_vllm_model_resource_profile(
         "expert_placement_runtime_ray_node_ids": [
             str(value) for value in runtime_ray_node_ids if value
         ],
+        "expert_placement_runtime_failure_domain_count": (
+            runtime_failure_domain_count
+        ),
+        "expert_placement_runtime_failure_domain_ids": [
+            str(value) for value in runtime_failure_domain_ids if value
+        ],
+        "expert_placement_runtime_host_mode": runtime_host_mode,
+        "expert_placement_runtime_cross_failure_domain_weight_migration": (
+            runtime_cross_failure_domain_weight_migration
+        ),
+        "expert_placement_runtime_cross_failure_domain_moved_expert_shards": (
+            runtime_cross_failure_domain_moved_expert_shards
+        ),
+        "expert_placement_runtime_cross_failure_domain_moved_weight_bytes": (
+            runtime_cross_failure_domain_moved_weight_bytes
+        ),
         "expert_placement_runtime_cross_node_weight_migration": (
             runtime_cross_node_weight_migration
         ),
@@ -1133,6 +1187,30 @@ def get_vllm_runtime_metadata(
         ),
         "expert_placement_runtime_ray_node_ids": (
             profile["expert_placement_runtime_ray_node_ids"]
+        ),
+        "expert_placement_runtime_failure_domain_count": (
+            profile["expert_placement_runtime_failure_domain_count"]
+        ),
+        "expert_placement_runtime_failure_domain_ids": (
+            profile["expert_placement_runtime_failure_domain_ids"]
+        ),
+        "expert_placement_runtime_host_mode": (
+            profile["expert_placement_runtime_host_mode"]
+        ),
+        "expert_placement_runtime_cross_failure_domain_weight_migration": (
+            profile[
+                "expert_placement_runtime_cross_failure_domain_weight_migration"
+            ]
+        ),
+        "expert_placement_runtime_cross_failure_domain_moved_expert_shards": (
+            profile[
+                "expert_placement_runtime_cross_failure_domain_moved_expert_shards"
+            ]
+        ),
+        "expert_placement_runtime_cross_failure_domain_moved_weight_bytes": (
+            profile[
+                "expert_placement_runtime_cross_failure_domain_moved_weight_bytes"
+            ]
         ),
         "expert_placement_runtime_cross_node_weight_migration": (
             profile["expert_placement_runtime_cross_node_weight_migration"]

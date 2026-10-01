@@ -4,6 +4,9 @@
 相同 workload 與相同 preemption trace 下，比較 SpotServe-style baseline 與本專案的
 MoE-aware 實作。
 
+需要直接交給執行實驗的組員時，使用精簡的操作手冊：
+`docs/spotserve-performance-runbook.md`。
+
 ## Claim Boundary
 
 目前實驗環境是 single-host、multi-GPU：
@@ -441,7 +444,22 @@ EP transition, changed experts, and actor identity preservation
 single-host, 4 x RTX 5070 Ti, trace-driven preemption simulation
 ```
 
-## Optional Cross-host Gate
+## Failure-domain And Cross-host Gates
+
+只有一台 4 GPU 主機時，可先執行已提供的 2+2 GPU failure-domain simulation：
+
+```text
+benchmarks/spotserve/benchmark_matrix_simulated_cross_host_expert_remap_performance.yaml
+```
+
+它驗證兩個 Ray worker nodes、兩個 failure domains、跨 domain 的 physical expert
+movement，以及 inter-container A2A activity。報告標題必須註明：
+
+```text
+single-physical-host, two-failure-domain simulation
+```
+
+這個結果不等於 physical multi-host，也不能用來代表實體 NIC latency/bandwidth。
 
 single-host 主實驗完成後，若另有兩台可互通的 GPU hosts，再執行 physical
 cross-host expert remap gate。部署拓樸、映像同步、完整命令與成功條件見：

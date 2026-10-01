@@ -106,7 +106,10 @@ initialize_worker_node() {
 
   PHYSICAL_HOST_ID="${SPOTSERVE_PHYSICAL_HOST_ID:-}"
   RAY_RESOURCES="$(
-    WORKER_ID="$WORKER_ID" PHYSICAL_HOST_ID="$PHYSICAL_HOST_ID" python - <<'PY'
+    WORKER_ID="$WORKER_ID" \
+      PHYSICAL_HOST_ID="$PHYSICAL_HOST_ID" \
+      FAILURE_DOMAIN_ID="${SPOTSERVE_FAILURE_DOMAIN_ID:-}" \
+      python - <<'PY'
 import hashlib
 import json
 import os
@@ -119,11 +122,18 @@ physical_host_id = os.environ.get("PHYSICAL_HOST_ID", "").strip()
 if physical_host_id:
     digest = hashlib.sha256(physical_host_id.encode("utf-8")).hexdigest()[:16]
     resources[f"spotserve_physical_host_{digest}"] = 1
+failure_domain_id = os.environ.get("FAILURE_DOMAIN_ID", "").strip()
+if failure_domain_id:
+    digest = hashlib.sha256(failure_domain_id.encode("utf-8")).hexdigest()[:16]
+    resources[f"spotserve_failure_domain_{digest}"] = 1
 print(json.dumps(resources, separators=(",", ":")))
 PY
   )"
   if [ ! -z "$PHYSICAL_HOST_ID" ]; then
     echo "Registering SpotServe physical host identity: $PHYSICAL_HOST_ID"
+  fi
+  if [ ! -z "${SPOTSERVE_FAILURE_DOMAIN_ID:-}" ]; then
+    echo "Registering SpotServe failure domain: $SPOTSERVE_FAILURE_DOMAIN_ID"
   fi
 
   # Construct the command

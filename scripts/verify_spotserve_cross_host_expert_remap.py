@@ -176,6 +176,56 @@ def swapped_plan(model_name, owners):
     }
 
 
+def shifted_plan(
+    model_name,
+    owners,
+    *,
+    rank_count,
+    rank_shift,
+    require_cross_node=False,
+    require_cross_failure_domain=False,
+):
+    observed_ranks = set(owners.values())
+    if observed_ranks != set(range(rank_count)):
+        raise RuntimeError(
+            f"Expected EP{rank_count} owners, observed={owners}"
+        )
+    target = {
+        key: f"replica:0/ep-rank:{(rank + rank_shift) % rank_count}"
+        for key, rank in sorted(owners.items())
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(target, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:16]
+    return {
+        "model_name": model_name,
+        "placement_epoch": 1,
+        "placement_source": "failure_domain_validation",
+        "placement_fingerprint": fingerprint,
+        "expert_to_target_rank": target,
+        "expert_to_target_ranks": {key: [value] for key, value in target.items()},
+        "required_expert_count": len(target),
+        "covered_expert_count": len(target),
+        "planned_shard_count": len(target),
+        "target_rank_count": rank_count,
+        "expert_physical_replication_factor": 1,
+        "sllm_replica_count": 1,
+        "live_expert_remap": True,
+        "allow_active_requests": False,
+        "require_cross_node": bool(require_cross_node),
+        "require_cross_failure_domain": bool(require_cross_failure_domain),
+        "physical_migration_required": True,
+        "expert_placement_physical_migration_required": True,
+        "target_parallel_plan": {
+            "tensor_parallel_size": 1,
+            "pipeline_parallel_size": 1,
+            "data_parallel_size": rank_count,
+            "enable_expert_parallel": True,
+            "effective_expert_parallel_size": rank_count,
+        },
+    }
+
+
 def infer(endpoint, model_name, timeout):
     response = post_json(
         endpoint,
@@ -266,7 +316,9 @@ def main():
 
         actor = ray.get_actor(instance_id, namespace="sllm")
         apply_result = ray.get(
-            actor.apply_expert_placement_plan.remote(plan),
+            actor.apply_expert_placement_plan.remote(
+                expert_placement_plan=plan
+            ),
             timeout=args.event_timeout,
         )
         if not (

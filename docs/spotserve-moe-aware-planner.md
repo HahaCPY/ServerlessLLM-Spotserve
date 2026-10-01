@@ -2214,6 +2214,9 @@ scripts/verify_spotserve_cross_host_expert_remap.py
 完成狀態需分開寫：
 
 ```text
+single-physical-host, two-failure-domain simulation: implemented and verified
+simulated cross-domain physical expert movement: verified
+simulated inter-container A2A activity: verified
 cross-host scheduling / deployment path: implemented
 node-local physical-host identity: implemented
 cross-host physical expert transfer gate: implemented
@@ -2222,8 +2225,9 @@ internode A2A activity gate: implemented
 passing physical multi-host report: pending execution on two GPU hosts
 ```
 
-部署與驗證命令見 `docs/spotserve-cross-host-experiment.md`。在同一台 host 上建立
-多個 container 不會被這個 gate 接受。
+部署與驗證命令見 `docs/spotserve-cross-host-experiment.md`。文件將單機 2+2 GPU
+failure-domain simulation 與 physical multi-host gate 分開；前者已驗證，但不會被
+後者接受，也不能當作實體網路效能結果。
 
 ## Validation Matrix
 

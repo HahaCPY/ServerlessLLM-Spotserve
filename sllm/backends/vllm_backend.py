@@ -1129,6 +1129,44 @@ class VllmBackend(SllmBackend):
                 runtime_status.get("expert_placement_runtime_ray_node_ids", [])
                 or []
             ),
+            "expert_placement_runtime_failure_domain_count": int(
+                runtime_status.get(
+                    "expert_placement_runtime_failure_domain_count", 0
+                )
+                or 0
+            ),
+            "expert_placement_runtime_failure_domain_ids": list(
+                runtime_status.get(
+                    "expert_placement_runtime_failure_domain_ids", []
+                )
+                or []
+            ),
+            "expert_placement_runtime_host_mode": str(
+                runtime_status.get(
+                    "expert_placement_runtime_host_mode", "single_host"
+                )
+                or "single_host"
+            ),
+            "expert_placement_runtime_cross_failure_domain_weight_migration": bool(
+                runtime_status.get(
+                    "expert_placement_runtime_cross_failure_domain_weight_migration",
+                    False,
+                )
+            ),
+            "expert_placement_runtime_cross_failure_domain_moved_expert_shards": int(
+                runtime_status.get(
+                    "expert_placement_runtime_cross_failure_domain_moved_expert_shards",
+                    0,
+                )
+                or 0
+            ),
+            "expert_placement_runtime_cross_failure_domain_moved_weight_bytes": int(
+                runtime_status.get(
+                    "expert_placement_runtime_cross_failure_domain_moved_weight_bytes",
+                    0,
+                )
+                or 0
+            ),
             "expert_placement_runtime_cross_node_weight_migration": bool(
                 runtime_status.get(
                     "expert_placement_runtime_cross_node_weight_migration", False
@@ -1671,6 +1709,12 @@ class VllmBackend(SllmBackend):
             "expert_placement_runtime_physical_host_ids": [],
             "expert_placement_runtime_ray_node_count": 0,
             "expert_placement_runtime_ray_node_ids": [],
+            "expert_placement_runtime_failure_domain_count": 0,
+            "expert_placement_runtime_failure_domain_ids": [],
+            "expert_placement_runtime_host_mode": "single_host",
+            "expert_placement_runtime_cross_failure_domain_weight_migration": False,
+            "expert_placement_runtime_cross_failure_domain_moved_expert_shards": 0,
+            "expert_placement_runtime_cross_failure_domain_moved_weight_bytes": 0,
             "expert_placement_runtime_cross_node_weight_migration": False,
             "expert_placement_runtime_cross_node_moved_expert_shards": 0,
             "expert_placement_runtime_cross_node_moved_weight_bytes": 0,
@@ -1865,6 +1909,43 @@ class VllmBackend(SllmBackend):
                         for value in apply_result.get("ray_node_ids", [])
                         if value
                     ]
+                    status[
+                        "expert_placement_runtime_failure_domain_count"
+                    ] = _runtime_hook_int(
+                        apply_result, "failure_domain_count", 0
+                    )
+                    status[
+                        "expert_placement_runtime_failure_domain_ids"
+                    ] = [
+                        str(value)
+                        for value in apply_result.get(
+                            "failure_domain_ids", []
+                        )
+                        if value
+                    ]
+                    status["expert_placement_runtime_host_mode"] = str(
+                        apply_result.get("host_mode", "single_host")
+                        or "single_host"
+                    )
+                status[
+                    "expert_placement_runtime_cross_failure_domain_weight_migration"
+                ] = _runtime_hook_bool(
+                    apply_result,
+                    "cross_failure_domain_weight_migration",
+                    default=False,
+                )
+                status[
+                    "expert_placement_runtime_cross_failure_domain_moved_expert_shards"
+                ] = _runtime_hook_worker_int_sum(
+                    apply_result,
+                    "cross_failure_domain_moved_local_expert_shards",
+                )
+                status[
+                    "expert_placement_runtime_cross_failure_domain_moved_weight_bytes"
+                ] = _runtime_hook_worker_int_sum(
+                    apply_result,
+                    "cross_failure_domain_moved_local_weight_bytes",
+                )
                 status["expert_placement_runtime_cross_node_weight_migration"] = (
                     _runtime_hook_bool(
                         apply_result, "cross_node_weight_migration", default=False

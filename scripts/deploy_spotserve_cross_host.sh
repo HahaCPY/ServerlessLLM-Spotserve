@@ -104,6 +104,7 @@ case "$ROLE" in
       -e MODE=WORKER \
       -e WORKER_ID="$WORKER_ID" \
       -e SPOTSERVE_PHYSICAL_HOST_ID="$PHYSICAL_HOST_ID" \
+      -e SPOTSERVE_FAILURE_DOMAIN_ID="physical-host-${WORKER_ID}" \
       -e RAY_HEAD_ADDRESS="$HEAD_ADDRESS" \
       -e RAY_NODE_IP="$NODE_IP" \
       -e RAY_TEMP_DIR=/raytmp/worker \
