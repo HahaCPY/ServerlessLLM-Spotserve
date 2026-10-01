@@ -1397,6 +1397,12 @@ async def main_async(args):
                     f"{summary.get('replanning_execution_failed', 0)}, "
                     f"ep_resize="
                     f"{summary.get('replanning_dynamic_ep_resize_events', 0)}, "
+                    f"in_place_ep_resize="
+                    f"{summary.get('replanning_in_place_ep_resize_events', 0)}, "
+                    f"ep_admission_drained="
+                    f"{summary.get('replanning_elastic_ep_admission_drained_events', 0)}, "
+                    f"ep_drained_requests="
+                    f"{summary.get('replanning_elastic_ep_drained_requests', 0)}, "
                     f"ep_transition="
                     f"{summary.get('replanning_source_effective_expert_parallel_sizes', '') or 'n/a'}->"
                     f"{summary.get('replanning_target_effective_expert_parallel_sizes', '') or 'n/a'}, "
@@ -1677,6 +1683,46 @@ def main():
         ]
         if args.endpoint:
             command.extend(["--endpoint", args.endpoint])
+        completed = subprocess.run(command, check=False)
+        if completed.returncode:
+            sys.exit(completed.returncode)
+        return
+    if config.get("experiment_type") == "elastic_ep_resize":
+        script = (
+            Path(__file__).resolve().parents[2]
+            / "scripts/verify_spotserve_elastic_ep_resize.py"
+        )
+        endpoint = args.endpoint or config.get(
+            "endpoint", "http://127.0.0.1:8343"
+        )
+        endpoint = str(endpoint).removesuffix("/v1/chat/completions")
+        command = [
+            sys.executable,
+            str(script),
+            "--config",
+            str(config["deploy_config"]),
+            "--model-path",
+            str(config.get("model_path", "/models/Qwen2-MoE-Tiny")),
+            "--endpoint",
+            endpoint,
+            "--ready-timeout",
+            str(config.get("ready_timeout_s", 600)),
+            "--event-timeout",
+            str(
+                args.trace_event_timeout
+                if args.trace_event_timeout is not None
+                else config.get("event_timeout_s", 600)
+            ),
+            "--minimum-free-gpu-memory-mib",
+            str(config.get("minimum_free_gpu_memory_mib", 8192)),
+            "--output",
+            str(config.get(
+                "output",
+                "results/spotserve_elastic_ep_resize_performance/report.json",
+            )),
+        ]
+        if config.get("active_request_drain", False):
+            command.append("--active-request-drain")
         completed = subprocess.run(command, check=False)
         if completed.returncode:
             sys.exit(completed.returncode)

@@ -1081,8 +1081,9 @@ prefix warmup，recovery 會退回 token replay fallback。這讓 V7/V8 的 loca
 完成條件：
 
 - `ExpertPlacementPlan` 可序列化到 metrics。（已完成 logical plan）
-- preempted GPU 上的 experts 可被重新配置到 ready GPUs。（尚未完成
-  physical weight movement）
+- preempted GPU 上的 experts 可被重新配置到 ready GPUs。fixed-EP physical
+  remap 與 quiescent same-host EP2 -> EP4 已完成；active-request EP resize 與
+  cross-host tensor transport 尚未完成。
 - planner cost 同時考慮 GPU capacity、expert movement、dispatch cost。
 - 明確定義 SpotServe planner 與 vLLM EPLB 的責任邊界：SpotServe 負責
   resource-change / preemption-aware topology planning，vLLM EPLB 負責
@@ -2037,26 +2038,78 @@ physical host 上的 `TP1 x DP2 x EP2` coordinated physical expert remap 已驗�
 這項 runtime patch 需要 rebuild image，`SPOTSERVE_SYNC_SOURCE=1` 無法更新
 image 內的 `vllm/v1/engine/async_llm.py`。
 
-vLLM 0.11.2 本身有 elastic-EP resize API，但只支援 Ray DP backend。目前
-ServerlessLLM backend actor 已先向 Ray 持有整組 GPU，若直接啟用 vLLM nested
-Ray DP actors，會形成兩層 GPU resource ownership。完成 allocation ownership
-整合以前，live in-place EP resize 仍不可安全啟用；EP2 -> EP4 繼續使用
-controlled actor recreate，不把它誤稱為 live resize。
+vLLM 0.11.2 的 elastic-EP resize API 只支援 Ray DP backend。本專案現在以
+`spotserve_vllm_ray_dp_owns_gpus=true` 明確把 GPU placement group ownership 交給
+vLLM Ray-DP actors；ServerlessLLM backend actor 本身不再重複持有 GPU。resize
+前由 router drain requests，vLLM 再讓既有與新增 EngineCore 一起重建 DP/EP
+process group，並由 EPLB 重新分配 physical expert weights。這條路徑目前只允許
+single SLLM replica、TP1、PP1、同一組 worker nodes 的 quiescent scale-up。
 
 三項剩餘驗證的精確狀態：
 
 ```text
 dynamic EP size:
-  coding complete as controlled actor recreate; TP2/EP2 -> TP4/EP4 verifier pending
+  controlled actor recreate verified; TP2/EP2 -> TP4/EP4 changed 6/8 expert owners
+  in-place Ray-DP EP2 -> EP4 verified for quiescent TP1/PP1 same-host scale-up
 
 cross-node movement:
   runtime hard gate complete; success requires two distinct physical host IDs
 
 real all-to-all traffic:
   DP2 inference/measurement and coordinated physical-remap gates passed;
-  same-host sparse dispatch payload reduction passed;
+  same-host sparse dispatch payload reduction passed at 18.98%;
   internode traffic reduction remains unverified
 ```
+
+2026-09-28 執行 `scripts/verify_spotserve_ep_transition.py`，實際完成
+`TP2/EP2 -> TP4/EP4` controlled actor recreate。source 與 target runtime 都回報
+完整的 8-expert placement，target placement verification 成功，其中 6/8 experts
+改變 EP owner。這證明 controller 能以新 process-group size 重建 engine、切換
+traffic 並驗證新 placement。該報告的 `physical_weight_migration=false`，因為
+target actor 重新載入符合 EP4 layout 的 weights，而不是從 source actor live 搬移
+expert tensors；因此它不代表既有 engine 內的 live in-place EP resize。
+
+2026-10-01 執行 `scripts/verify_spotserve_elastic_ep_resize.py`，在同一個
+`Qwen2-MoE-Tiny` SLLM actor 上完成 `TP1 x DP2 x EP2 -> TP1 x DP4 x EP4`：
+
+```text
+actor identity unchanged
+before runtime workers = 2
+after runtime workers = 4
+runtime placement verified = true
+expert coverage unchanged
+changed expert owners = 6
+pre-resize inference = success
+post-resize inference = success
+```
+
+runtime placement inspector 會透過 EPLB `logical_to_physical_map` 將 physical
+slots 映回 logical expert IDs，因此新增 ranks 的 replicated physical slots 不會再被
+誤判成不存在。驗證指令為：
+
+```bash
+podman exec sllm_head bash -lc '
+cd /tmp/spotserve-work &&
+/opt/venvs/head/bin/python benchmarks/spotserve/run_benchmark.py \
+  --config benchmarks/spotserve/benchmark_matrix_elastic_ep_resize_performance.yaml \
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \
+  --trace-event-timeout 600 \
+  --ray-address auto \
+  --ray-namespace sllm
+'
+```
+
+這項結果是 **quiescent in-place process-group resize + EPLB weight
+redistribution**。`--active-request-drain` 會先確認 request concurrency 大於零，再
+送出 resize event，並要求該 request 完整結束後才進入 quiescent resize；這是
+request-safe drain，不是正在執行 GPU step 時改 process group，也不是把 source
+rank 的 tensor 經由 cross-host transport 搬到 target rank。verifier 會在註冊模型
+前透過 worker node 執行 `nvidia-smi`，要求四張 GPU 各至少有 8192 MiB 可用
+記憶體；若有殘留 model process 會直接 fail fast，而不會等新增 EngineCore 在
+`init_device()` 才失敗。benchmark metrics 會另外輸出
+`replanning_elastic_ep_admission_drained_events` 與
+`replanning_elastic_ep_drained_requests`，用來區分 idle resize 與確實等待 active
+request 結束後才執行的 resize。
 
 ### A2A Reduction Experiment
 

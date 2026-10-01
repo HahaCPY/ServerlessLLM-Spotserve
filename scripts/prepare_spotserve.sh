@@ -775,6 +775,7 @@ for relative_path in (
     "examples/spotserve/config-vllm-expert-remap-dp2-a2a-performance.json",
     "examples/spotserve/config-vllm-expert-remap-dp2-coordinated-performance.json",
     "examples/spotserve/config-vllm-expert-remap-a2a-reduction-performance.json",
+    "examples/spotserve/config-vllm-elastic-ep-resize-performance.json",
     "examples/spotserve/config-vllm-reparallelization-applied-multi-worker-performance.json",
     "examples/spotserve/config-vllm-reparallelization-baseline-multi-worker-performance.json",
     "examples/spotserve/config-vllm-reparallelization-baseline-gpu-smoke.json",
@@ -1079,6 +1080,18 @@ ${HEAD_PYTHON} benchmarks/spotserve/run_benchmark.py \\
   --config benchmarks/spotserve/benchmark_matrix_expert_remap_performance.yaml \\
   --endpoint http://127.0.0.1:8343/v1/chat/completions \\
   --request-timeout 180 \\
+  --trace-event-timeout 600 \\
+  --ray-address auto \\
+  --ray-namespace sllm
+'
+
+Run the in-place EP2-to-EP4 active-drain validation with:
+
+podman exec ${CONTAINER} bash -lc '
+cd ${WORKDIR_IN_CONTAINER} &&
+${HEAD_PYTHON} benchmarks/spotserve/run_benchmark.py \\
+  --config benchmarks/spotserve/benchmark_matrix_elastic_ep_resize_performance.yaml \\
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \\
   --trace-event-timeout 600 \\
   --ray-address auto \\
   --ray-namespace sllm

@@ -51,3 +51,12 @@ class SllmScheduler(ABC):
         self, model_name: str, instance_id: str, resources: Mapping
     ):
         pass
+
+    async def resize_resource(
+        self,
+        model_name: str,
+        instance_id: str,
+        resources: Mapping,
+    ):
+        """Resize an existing allocation without changing its worker node."""
+        raise NotImplementedError("scheduler does not support resource resize")

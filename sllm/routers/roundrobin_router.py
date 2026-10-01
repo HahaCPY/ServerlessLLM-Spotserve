@@ -1160,6 +1160,39 @@ class RoundRobinRouter(SllmRouter):
             if selected_plan is not None
             else None
         )
+        elastic_ep_resize = bool(
+            selected_parallel_plan is not None
+            and active_deployment is not None
+            and len(active_deployment.instances) == 1
+            and active_deployment.instances
+            and all(
+                instance.state == InstanceState.READY
+                for instance in active_deployment.instances.values()
+            )
+            and self.backend_config.get(
+                "spotserve_elastic_ep_enabled", False
+            )
+            and self.backend_config.get(
+                "spotserve_vllm_ray_dp_owns_gpus", False
+            )
+            and self.backend_config.get("data_parallel_backend") == "ray"
+            and active_deployment.plan.tensor_parallel_size == 1
+            and selected_parallel_plan.tensor_parallel_size == 1
+            and active_deployment.plan.pipeline_parallel_size == 1
+            and selected_parallel_plan.pipeline_parallel_size == 1
+            and active_deployment.plan.replica_count == 1
+            and selected_parallel_plan.replica_count == 1
+            and active_deployment.plan.enable_expert_parallel
+            and selected_parallel_plan.enable_expert_parallel
+            and active_deployment.plan.data_parallel_size
+            != selected_parallel_plan.data_parallel_size
+            and (
+                not active_deployment.plan.target_nodes
+                or not selected_parallel_plan.target_nodes
+                or sorted(active_deployment.plan.target_nodes)
+                == sorted(selected_parallel_plan.target_nodes)
+            )
+        )
         live_in_place_remap = bool(
             selected_parallel_plan is not None
             and active_deployment is not None
@@ -1217,7 +1250,53 @@ class RoundRobinRouter(SllmRouter):
                     self.reparallelization_executor.current = (
                         self._vllm_active_deployment()
                     )
-                    if live_in_place_remap:
+                    if elastic_ep_resize:
+                        deployment = (
+                            await self.vllm_deployment_adapter
+                            .resize_workers_elastic_ep(
+                                active_deployment,
+                                plan,
+                            )
+                        )
+                        await self._switch_vllm_deployment(deployment, plan)
+                        execution_model.update({
+                            "reparallelization_execution_model": (
+                                "in_place_elastic_ep_resize"
+                            ),
+                            "reparallelization_execution_model_reason": (
+                                "vllm_ray_dp_elastic_ep"
+                            ),
+                            "expert_placement_execution_model": (
+                                "quiescent_elastic_ep_resize"
+                            ),
+                            "expert_placement_execution_model_reason": (
+                                "vllm_reinitialized_ep_process_group"
+                            ),
+                            "expert_placement_runtime_contract_mode": (
+                                "quiescent_elastic_ep_resize"
+                            ),
+                            "source_effective_expert_parallel_size": (
+                                active_deployment.plan
+                                .effective_expert_parallel_size
+                            ),
+                            "target_effective_expert_parallel_size": (
+                                plan.effective_expert_parallel_size
+                            ),
+                            "dynamic_ep_resize": True,
+                            "in_place_ep_resize": True,
+                            "elastic_ep_admission_drained": bool(
+                                deployment.backend_config.get(
+                                    "elastic_ep_admission_drained", False
+                                )
+                            ),
+                            "elastic_ep_drained_request_count": int(
+                                deployment.backend_config.get(
+                                    "elastic_ep_drained_request_count", 0
+                                )
+                                or 0
+                            ),
+                        })
+                    elif live_in_place_remap:
                         deployment = (
                             await self.vllm_deployment_adapter.remap_workers_in_place(
                                 active_deployment,
@@ -4054,7 +4133,16 @@ class RoundRobinRouter(SllmRouter):
                 instance.node_id = startup_node
             startup_config = {
                 "num_cpus": self.resource_requirements["num_cpus"],
-                "num_gpus": self.resource_requirements["num_gpus"],
+                "num_gpus": (
+                    0
+                    if (
+                        self.backend == "vllm"
+                        and self.backend_config.get(
+                            "spotserve_vllm_ray_dp_owns_gpus", False
+                        )
+                    )
+                    else self.resource_requirements["num_gpus"]
+                ),
                 "resources": startup_resources,
             }
             logger.info(

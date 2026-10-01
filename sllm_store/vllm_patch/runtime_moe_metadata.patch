@@ -3,7 +3,7 @@ new file mode 100644
 index 000000000..5b1bb3f55
 --- /dev/null
 +++ b/vllm/spotserve_moe.py
-@@ -0,0 +1,757 @@
+@@ -0,0 +1,783 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Lightweight SpotServe MoE routing instrumentation.
@@ -157,12 +157,38 @@ index 000000000..5b1bb3f55
 +    expert_map = getattr(module, "expert_map", None)
 +    mapped = _tensor_to_int_list(expert_map)
 +    if mapped:
-+        local_ids = [
-+            expert_id
-+            for expert_id, local_index in enumerate(mapped[:global_num_experts])
++        local_physical_ids = [
++            physical_id
++            for physical_id, local_index in enumerate(mapped)
 +            if int(local_index) >= 0
 +        ]
-+        return local_ids, "expert_map"
++        logical_to_physical = getattr(
++            module, "logical_to_physical_map", None
++        )
++        try:
++            logical_rows = logical_to_physical.detach()
++            if logical_rows.is_cuda:
++                logical_rows = logical_rows.cpu()
++            logical_rows = logical_rows.tolist()
++        except Exception:
++            logical_rows = []
++        if logical_rows:
++            physical_to_logical = {
++                int(physical_id): logical_id
++                for logical_id, physical_ids in enumerate(logical_rows)
++                for physical_id in physical_ids
++                if int(physical_id) >= 0
++            }
++            local_logical_ids = sorted(
++                {
++                    physical_to_logical[physical_id]
++                    for physical_id in local_physical_ids
++                    if physical_id in physical_to_logical
++                }
++            )
++            if local_logical_ids:
++                return local_logical_ids, "eplb_logical_to_physical_map"
++        return local_physical_ids, "expert_map"
 +
 +    moe_parallel_config = getattr(module, "moe_parallel_config", None)
 +    use_ep = bool(getattr(moe_parallel_config, "use_ep", False))

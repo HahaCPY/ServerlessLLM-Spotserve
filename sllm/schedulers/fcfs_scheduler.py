@@ -750,6 +750,61 @@ class FcfsScheduler(SllmScheduler):
             self.worker_nodes[node_id]["free_gpu"] += num_gpus
         logger.info(f"Model {model_name} instance {instance_id} deallocated")
 
+    async def resize_resource(
+        self,
+        model_name: str,
+        instance_id: str,
+        resources: Mapping,
+    ):
+        """Atomically resize a model allocation on its current worker node."""
+        try:
+            requested_gpus = float(resources.get("num_gpus", 0) or 0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("num_gpus must be numeric") from exc
+        if requested_gpus < 0:
+            raise ValueError("num_gpus must be non-negative")
+
+        async with self.metadata_lock:
+            allocation = self.model_instance_resources.get(
+                model_name, {}
+            ).get(instance_id)
+            if allocation is None:
+                raise ValueError(
+                    f"Allocation {model_name}/{instance_id} not found"
+                )
+            node_id = allocation["node_id"]
+            node = self.worker_nodes.get(node_id)
+            if node is None:
+                raise ValueError(f"Node {node_id} not found")
+            current_gpus = float(allocation.get("num_gpus", 0) or 0)
+            delta = requested_gpus - current_gpus
+            available_gpus = float(node.get("free_gpu", 0) or 0)
+            if delta > available_gpus:
+                raise RuntimeError(
+                    "insufficient_capacity_for_resource_resize: "
+                    f"requested_delta={delta}, available={available_gpus}, "
+                    f"node={node_id}"
+                )
+            node["free_gpu"] = available_gpus - delta
+            allocation["num_gpus"] = requested_gpus
+            logger.info(
+                "Resized model %s instance %s on node %s from %s to %s GPUs",
+                model_name,
+                instance_id,
+                node_id,
+                current_gpus,
+                requested_gpus,
+            )
+            return {
+                "model_name": model_name,
+                "instance_id": instance_id,
+                "node_id": str(node_id),
+                "previous_num_gpus": current_gpus,
+                "num_gpus": requested_gpus,
+                "delta_num_gpus": delta,
+                "free_gpu": node["free_gpu"],
+            }
+
     async def clear_model(self, model_name: str):
         logger.info(f"Clearing scheduler state for model {model_name}")
         cleared_pending = 0

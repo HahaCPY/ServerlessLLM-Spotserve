@@ -591,8 +591,34 @@ the measured counters. With the current `allgather_reducescatter` backend, the
 collective payload can remain placement-invariant even when physical remap is
 successfully applied and verified.
 
-The target models must already be deployed with the intended router config, for
-example `recovery_policy=none`, `naive_retry`, or `generated_token_replay`.
+## Elastic EP Resize
+
+The elastic-EP matrix runs the fail-closed, active-request-drain EP2-to-EP4
+gate through the standard benchmark entry point:
+
+```bash
+podman exec sllm_head bash -lc '
+cd /tmp/spotserve-work &&
+/opt/venvs/head/bin/python benchmarks/spotserve/run_benchmark.py \
+  --config benchmarks/spotserve/benchmark_matrix_elastic_ep_resize_performance.yaml \
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \
+  --trace-event-timeout 600 \
+  --ray-address auto \
+  --ray-namespace sllm
+'
+```
+
+Before registration, the gate requires four Ray GPUs and at least 8192 MiB of
+physical free memory on each GPU. It then observes a live request, closes
+router admission, waits for tracked concurrency to reach zero, resizes the
+same SLLM actor from Ray-DP EP2 to EP4, verifies runtime expert placement, and
+runs post-resize inference. This validates a request-safe quiescent boundary,
+not process-group mutation during an executing GPU step.
+
+For ordinary workload matrices, target models must already be deployed with
+the intended router config, for example `recovery_policy=none`, `naive_retry`,
+or `generated_token_replay`. The elastic-EP and paired A2A special runners
+register and delete their own temporary model.
 
 Important: the `policy` field in `benchmark_matrix.yaml` is metadata for the
 report. The actual policy is selected when the model is deployed through

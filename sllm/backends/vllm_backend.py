@@ -632,6 +632,38 @@ class VllmBackend(SllmBackend):
         self.engine_args = AsyncEngineArgs(**filtered_engine_config)
         self._async_engine_fields = async_engine_fields
 
+        self.elastic_ep_enabled = bool(
+            backend_config.get("spotserve_elastic_ep_enabled", False)
+        )
+        self.ray_dp_owns_gpus = bool(
+            backend_config.get("spotserve_vllm_ray_dp_owns_gpus", False)
+        )
+        if self.elastic_ep_enabled or self.ray_dp_owns_gpus:
+            if backend_config.get("data_parallel_backend") != "ray":
+                raise ValueError(
+                    "SpotServe elastic EP requires data_parallel_backend='ray'"
+                )
+            if not self.elastic_ep_enabled or not self.ray_dp_owns_gpus:
+                raise ValueError(
+                    "SpotServe elastic EP requires both "
+                    "spotserve_elastic_ep_enabled and "
+                    "spotserve_vllm_ray_dp_owns_gpus"
+                )
+            if int(backend_config.get("tensor_parallel_size", 1) or 1) != 1:
+                raise ValueError("SpotServe elastic EP currently requires TP=1")
+            if int(backend_config.get("pipeline_parallel_size", 1) or 1) != 1:
+                raise ValueError("SpotServe elastic EP currently requires PP=1")
+            if not backend_config.get("enable_expert_parallel", False):
+                raise ValueError(
+                    "SpotServe elastic EP requires enable_expert_parallel=true"
+                )
+            if not backend_config.get("enable_eplb", False):
+                raise ValueError(
+                    "SpotServe elastic EP requires enable_eplb=true so vLLM "
+                    "can redistribute expert weights during EP resize"
+                )
+            os.environ.setdefault("SPOTSERVE_ELASTIC_EP_DEBUG_STACKS", "1")
+
         self.engine = None
         self.model_load_time_s = 0.0
 
@@ -2086,6 +2118,84 @@ class VllmBackend(SllmBackend):
         )
         return dict(extra) if isinstance(extra, dict) else {}
 
+    def _verify_elastic_ep_runtime_placement(
+        self,
+        runtime_metadata: Mapping[str, Any],
+        expected_dp_size: int,
+    ) -> Dict[str, Any]:
+        """Verify an EPLB resize from the runtime's physical placement.
+
+        Elastic EPLB may replicate logical experts, so its physical layout
+        cannot be checked against the single-owner fixed-EP remap contract.
+        Instead, require every resized DP rank to expose resident weights,
+        the observed EP size to match the target, and complete logical expert
+        coverage across the aggregate runtime snapshot.
+        """
+        snapshots = runtime_metadata.get(
+            "runtime_expert_placement_worker_snapshots", {}
+        )
+        shards = runtime_metadata.get("runtime_expert_placement_shards", {})
+        if not isinstance(snapshots, Mapping):
+            snapshots = {}
+        if not isinstance(shards, Mapping):
+            shards = {}
+
+        expected_snapshot = self._instrumented_expert_placement_snapshot(
+            effective_ep_size=expected_dp_size,
+        ) or {}
+        expected_keys = set(expected_snapshot)
+        observed_keys = set(str(key) for key in shards)
+        unavailable_workers = sorted(
+            str(worker)
+            for worker, snapshot in snapshots.items()
+            if not isinstance(snapshot, Mapping)
+            or not snapshot.get("available")
+        )
+        observed_ep_sizes = {
+            int(row.get("ep_size"))
+            for rows in shards.values()
+            if isinstance(rows, Sequence)
+            and not isinstance(rows, (str, bytes))
+            for row in rows
+            if isinstance(row, Mapping) and row.get("ep_size") is not None
+        }
+        worker_count = int(
+            runtime_metadata.get(
+                "runtime_expert_placement_worker_count", len(snapshots)
+            )
+            or 0
+        )
+        missing_experts = sorted(expected_keys - observed_keys)
+        verified = bool(
+            worker_count == expected_dp_size
+            and len(snapshots) == expected_dp_size
+            and not unavailable_workers
+            and bool(observed_keys)
+            and not missing_experts
+            and observed_ep_sizes == {expected_dp_size}
+        )
+        if worker_count != expected_dp_size or len(snapshots) != expected_dp_size:
+            reason = "elastic_ep_runtime_worker_count_mismatch"
+        elif unavailable_workers:
+            reason = "elastic_ep_runtime_worker_placement_unavailable"
+        elif missing_experts:
+            reason = "elastic_ep_runtime_expert_coverage_incomplete"
+        elif observed_ep_sizes != {expected_dp_size}:
+            reason = "elastic_ep_runtime_ep_size_mismatch"
+        else:
+            reason = "elastic_ep_runtime_placement_verified"
+        return {
+            "verified": verified,
+            "reason": reason,
+            "worker_count": worker_count,
+            "worker_snapshot_count": len(snapshots),
+            "unavailable_workers": unavailable_workers,
+            "observed_ep_sizes": sorted(observed_ep_sizes),
+            "expected_expert_count": len(expected_keys),
+            "observed_expert_count": len(observed_keys),
+            "missing_experts": missing_experts,
+        }
+
     async def _request_runtime_metadata(
         self, result: RequestOutput
     ) -> Dict[str, Any]:
@@ -2119,6 +2229,162 @@ class VllmBackend(SllmBackend):
             self.model_load_time_s = time.monotonic() - started_at
             await self._apply_configured_expert_placement_plan()
             self.status = BackendStatus.RUNNING
+
+    async def scale_elastic_ep(
+        self,
+        new_data_parallel_size: int,
+        drain_timeout_s: float = 300.0,
+        expert_placement_plan: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Resize vLLM Ray-DP expert parallelism on the existing engine."""
+        new_dp = int(new_data_parallel_size)
+        if new_dp < 1:
+            raise ValueError("new_data_parallel_size must be positive")
+        async with self.status_lock:
+            if self.status != BackendStatus.RUNNING or self.engine is None:
+                raise RuntimeError("vLLM engine is not running")
+            if not self.elastic_ep_enabled or not self.ray_dp_owns_gpus:
+                raise RuntimeError("spotserve_elastic_ep_not_enabled")
+            scale = getattr(self.engine, "scale_elastic_ep", None)
+            if not callable(scale):
+                raise RuntimeError("vllm_scale_elastic_ep_not_available")
+            current_dp = int(
+                self.backend_config.get("data_parallel_size", 1) or 1
+            )
+            if current_dp == new_dp:
+                return {
+                    "resized": False,
+                    "previous_data_parallel_size": current_dp,
+                    "data_parallel_size": new_dp,
+                    "effective_expert_parallel_size": new_dp,
+                    "reason": "already_at_target_size",
+                }
+
+        started_at = time.monotonic()
+        resize_applied = False
+        try:
+            await scale(
+                new_dp,
+                drain_timeout=max(1, int(drain_timeout_s)),
+            )
+            resize_applied = True
+            runtime_metadata = await self._runtime_moe_metadata()
+            verification = self._verify_elastic_ep_runtime_placement(
+                runtime_metadata,
+                new_dp,
+            )
+            if not verification["verified"]:
+                raise RuntimeError(
+                    "elastic_ep_runtime_placement_verification_failed:"
+                    f"{verification}"
+                )
+        except Exception as resize_error:
+            if resize_applied:
+                try:
+                    await scale(
+                        current_dp,
+                        drain_timeout=max(1, int(drain_timeout_s)),
+                    )
+                except Exception as rollback_error:
+                    async with self.status_lock:
+                        self.status = BackendStatus.STOPPING
+                    raise RuntimeError(
+                        "elastic_ep_resize_rollback_failed:"
+                        f"resize_error={resize_error!r}; "
+                        f"rollback_error={rollback_error!r}"
+                    ) from resize_error
+                raise
+            # A failed process-group reconfiguration may leave only a subset
+            # of ranks usable. Stop accepting requests until the controller
+            # replaces this deployment.
+            async with self.status_lock:
+                self.status = BackendStatus.STOPPING
+            raise
+
+        self.backend_config["data_parallel_size"] = new_dp
+        self.backend_config["vllm_data_parallel_size"] = new_dp
+        self.backend_config["planned_effective_expert_parallel_size"] = new_dp
+        self.backend_config["planned_expert_parallel_size"] = new_dp
+        self.backend_config["expert_parallel_size_verified"] = True
+        self.backend_config["reparallelization_execution_model"] = (
+            "in_place_elastic_ep_resize"
+        )
+        self.backend_config["reparallelization_execution_model_reason"] = (
+            "vllm_ray_dp_elastic_ep"
+        )
+        # AsyncLLM updates its live vLLM config internally. Keep the retained
+        # construction args in sync because runtime metadata reads them first.
+        if getattr(self, "engine_args", None) is not None:
+            self.engine_args.data_parallel_size = new_dp
+        if expert_placement_plan:
+            # Preserve the planner contract for audit only. EPLB owns the
+            # physical replicated layout after an elastic resize.
+            self.backend_config["expert_placement_plan"] = dict(
+                expert_placement_plan
+            )
+        self.expert_placement_runtime_status = {
+            "reparallelization_execution_model": (
+                "in_place_elastic_ep_resize"
+            ),
+            "reparallelization_execution_model_reason": (
+                "vllm_ray_dp_elastic_ep"
+            ),
+            "expert_placement_execution_model": (
+                "quiescent_elastic_ep_resize"
+            ),
+            "expert_placement_execution_model_reason": (
+                "vllm_eplb_runtime_placement"
+            ),
+            "expert_placement_runtime_contract_mode": (
+                "runtime_observed_elastic_ep"
+            ),
+            "expert_placement_apply_hook_available": True,
+            "expert_placement_apply_attempted": True,
+            "expert_placement_apply_success": verification["verified"],
+            "expert_placement_apply_reason": verification["reason"],
+            "expert_placement_apply_worker_count": verification[
+                "worker_count"
+            ],
+            "expert_placement_apply_worker_success_count": (
+                verification["worker_count"]
+                - len(verification["unavailable_workers"])
+            ),
+            "expert_placement_verify_hook_available": True,
+            "expert_placement_verify_attempted": True,
+            "expert_placement_verify_success": verification["verified"],
+            "expert_placement_verify_reason": verification["reason"],
+            "expert_placement_verify_worker_count": verification[
+                "worker_count"
+            ],
+            "expert_placement_verify_worker_success_count": (
+                verification["worker_count"]
+                - len(verification["unavailable_workers"])
+            ),
+            "expert_placement_plan_applied": verification["verified"],
+            "expert_placement_plan_verified": verification["verified"],
+            "expert_placement_physical_weight_migration": verification[
+                "verified"
+            ],
+            "expert_placement_runtime_verified_placement": verification[
+                "verified"
+            ],
+            "expert_placement_runtime_can_verify_physical_placement": True,
+            "expert_placement_runtime_verification_level": (
+                "physical_migration_verified"
+                if verification["verified"]
+                else "runtime_placement_unverified"
+            ),
+            "elastic_ep_runtime_verification": verification,
+        }
+        return {
+            "resized": True,
+            "previous_data_parallel_size": current_dp,
+            "data_parallel_size": new_dp,
+            "effective_expert_parallel_size": new_dp,
+            "duration_ms": (time.monotonic() - started_at) * 1000,
+            "reason": "vllm_ray_dp_elastic_ep",
+            "runtime_placement_verification": verification,
+        }
 
     def _spotserve_runtime_identity(self) -> str:
         try:

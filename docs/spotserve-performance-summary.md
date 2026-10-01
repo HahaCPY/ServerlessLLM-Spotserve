@@ -597,9 +597,9 @@ Notes:
   `require_cross_node_expert_migration` and fails unless distinct physical host
   IDs and actual cross-host moved shards are observed. The vLLM CUDA
   communicator patch records real dispatch/combine invocations and observed
-  tensor payload bytes when `VLLM_SPOTSERVE_A2A_TRACE=1`. A rebuild and new
-  runtime runs are still required before recording EP2-to-EP4, cross-node, or
-  all-to-all reduction as experimental results.
+  tensor payload bytes when `VLLM_SPOTSERVE_A2A_TRACE=1`. EP2-to-EP4 and
+  same-host sparse A2A reduction now have runtime results below; cross-host
+  migration and internode traffic reduction still require a multi-host run.
 - The 2026-09-25 `11-01-35` active-request run passed fixed-EP physical remap
   (`2/2`, trace `1/1`, four moved shards, runtime apply/verify `1/1`, active
   remap and step barrier both `1`). Its A2A instrumentation was enabled, but
@@ -648,6 +648,42 @@ Notes:
   reduction ratio was zero. This confirms that changing ownership alone does
   not reduce payload for the current `allgather_reducescatter` backend; a
   destination-aware variable-size backend or local-token bypass is required.
+- The destination-aware `spotserve_sparse` backend implements that missing
+  path: locally owned token/expert rows bypass the network and only remote rows
+  enter variable-size collectives. The 2026-09-27 post-rebuild paired run used
+  the same workload and matching outputs. Baseline payload was 1157376 bytes,
+  candidate payload was 937728 bytes, and the measured reduction was 18.98%.
+  This validates same-host DP2/EP2 collective-payload reduction; it does not
+  establish internode NIC traffic reduction.
+- The 2026-09-28 `verify_spotserve_ep_transition.py` run completed a controlled
+  `TP2/EP2 -> TP4/EP4` actor recreation. Both runtimes returned full placement
+  snapshots, target placement verification passed, and 6 of 8 experts changed
+  EP owner. The report correctly retained `physical_weight_migration=false`:
+  the target actor loaded its EP4 layout instead of receiving live tensors from
+  the EP2 actor. This validates dynamic EP-size transition by engine
+  recreation, not live in-place process-group resizing or weight migration.
+- The 2026-10-01 `verify_spotserve_elastic_ep_resize.py` gate passed a
+  quiescent in-place `TP1 x DP2 x EP2 -> TP1 x DP4 x EP4` resize on four GPUs.
+  The SLLM actor identity remained unchanged, runtime worker count changed from
+  two to four, placement verification passed with unchanged expert coverage,
+  six expert owners changed, and inference succeeded before and after resize.
+  The runtime inspector now maps EPLB physical slots back to logical experts
+  through `logical_to_physical_map`, so new ranks are included in the verified
+  placement. This result is limited to same-host Ray DP, TP1/PP1, one SLLM
+  replica, and a quiescent resize boundary. The optional
+  `--active-request-drain` gate emits the resize event only after observing
+  nonzero request concurrency, then requires that request to finish before
+  resize; it does not mutate the process group during an executing GPU step.
+  This is not zero-pause active-request resizing or cross-host expert-tensor
+  transfer. The verifier now probes physical GPU
+  memory on the worker node before registration and fails fast unless all four
+  GPUs have at least 8192 MiB free, preventing stale model processes from
+  causing a partial resize during new EngineCore initialization. Benchmark
+  output reports `ep_admission_drained` and `ep_drained_requests`, so an
+  active-request drain can be distinguished from an idle resize.
+  `benchmark_matrix_elastic_ep_resize_performance.yaml` exposes the same gate
+  through the standard benchmark runner and enables active-request drain by
+  default.
 - For the placement ordering guard, require
   `context_migration_placement_handshake_stale = 0` and
   `state_recovery_placement_handshake_stale = 0` before claiming that migration

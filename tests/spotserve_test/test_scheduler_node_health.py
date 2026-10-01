@@ -25,6 +25,58 @@ class FakeRuntimeMetadataActor:
 
 
 @pytest.mark.asyncio
+async def test_scheduler_resizes_existing_gpu_allocation():
+    scheduler = FcfsScheduler({})
+    scheduler.worker_nodes = {
+        "node-0": {
+            "free_gpu": 2,
+            "total_gpu": 4,
+            "state": NodeState.READY.value,
+        }
+    }
+    scheduler.model_instance = {"m": {"i-0": "node-0"}}
+    scheduler.model_instance_resources = {
+        "m": {"i-0": {"node_id": "node-0", "num_gpus": 2}}
+    }
+
+    scaled_up = await scheduler.resize_resource(
+        "m", "i-0", {"num_gpus": 4}
+    )
+    assert scaled_up["delta_num_gpus"] == 2
+    assert scheduler.worker_nodes["node-0"]["free_gpu"] == 0
+
+    scaled_down = await scheduler.resize_resource(
+        "m", "i-0", {"num_gpus": 1}
+    )
+    assert scaled_down["delta_num_gpus"] == -3
+    assert scheduler.worker_nodes["node-0"]["free_gpu"] == 3
+    assert scheduler.model_instance_resources["m"]["i-0"]["num_gpus"] == 1
+
+
+@pytest.mark.asyncio
+async def test_scheduler_rejects_resize_without_capacity():
+    scheduler = FcfsScheduler({})
+    scheduler.worker_nodes = {
+        "node-0": {
+            "free_gpu": 1,
+            "total_gpu": 4,
+            "state": NodeState.READY.value,
+        }
+    }
+    scheduler.model_instance = {"m": {"i-0": "node-0"}}
+    scheduler.model_instance_resources = {
+        "m": {"i-0": {"node_id": "node-0", "num_gpus": 2}}
+    }
+
+    with pytest.raises(
+        RuntimeError, match="insufficient_capacity_for_resource_resize"
+    ):
+        await scheduler.resize_resource("m", "i-0", {"num_gpus": 4})
+    assert scheduler.worker_nodes["node-0"]["free_gpu"] == 1
+    assert scheduler.model_instance_resources["m"]["i-0"]["num_gpus"] == 2
+
+
+@pytest.mark.asyncio
 async def test_scheduler_marks_node_health_states():
     scheduler = FcfsScheduler({})
 

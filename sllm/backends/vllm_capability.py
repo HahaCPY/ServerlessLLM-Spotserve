@@ -64,6 +64,13 @@ VLLM_MOE_SUPPORTED_SHAPES = (
         "enable_expert_parallel": True,
     },
     {
+        "tensor_parallel_size": 1,
+        "data_parallel_size": 4,
+        "replica_count": 1,
+        "pipeline_parallel_size": 1,
+        "enable_expert_parallel": True,
+    },
+    {
         "tensor_parallel_size": 2,
         "data_parallel_size": 2,
         "replica_count": 1,

@@ -780,6 +780,24 @@ def summarize_replanning_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             for row in replanning_rows
             if row.get("reparallelization_dynamic_ep_resize")
         ),
+        "replanning_in_place_ep_resize_events": sum(
+            1
+            for row in replanning_rows
+            if row.get("reparallelization_in_place_ep_resize")
+        ),
+        "replanning_elastic_ep_admission_drained_events": sum(
+            1
+            for row in replanning_rows
+            if row.get("reparallelization_elastic_ep_admission_drained")
+        ),
+        "replanning_elastic_ep_drained_requests": sum(
+            safe_int(
+                row.get(
+                    "reparallelization_elastic_ep_drained_request_count"
+                )
+            )
+            for row in replanning_rows
+        ),
         "replanning_source_effective_expert_parallel_sizes": ",".join(
             sorted({
                 str(row.get(

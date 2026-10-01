@@ -485,6 +485,15 @@ def make_replanning_event(
         "reparallelization_dynamic_ep_resize": bool(
             execution.get("dynamic_ep_resize", False)
         ),
+        "reparallelization_in_place_ep_resize": bool(
+            execution.get("in_place_ep_resize", False)
+        ),
+        "reparallelization_elastic_ep_admission_drained": bool(
+            execution.get("elastic_ep_admission_drained", False)
+        ),
+        "reparallelization_elastic_ep_drained_request_count": int(
+            execution.get("elastic_ep_drained_request_count", 0) or 0
+        ),
         "reparallelization_source_effective_expert_parallel_size": execution.get(
             "source_effective_expert_parallel_size", 0
         ),

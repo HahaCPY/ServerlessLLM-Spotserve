@@ -1,8 +1,11 @@
+import asyncio
+
 import pytest
 
 import sllm.spot.vllm_deployment_adapter as adapter_module
 from sllm.spot.reparallelization import ParallelPlan
 from sllm.spot.vllm_deployment_adapter import VllmDeploymentAdapter
+from sllm.utils import InstanceState
 
 
 class _Remote:
@@ -13,6 +16,8 @@ class _Remote:
 class _Actor:
     def __init__(self):
         self.applied_expert_plans = []
+        self.elastic_ep_resizes = []
+        self.elastic_ep_error = None
 
         async def init_backend():
             return None
@@ -27,12 +32,33 @@ class _Actor:
         async def stop():
             return None
 
+        async def scale_elastic_ep(
+            *,
+            new_data_parallel_size,
+            drain_timeout_s,
+            expert_placement_plan=None,
+        ):
+            self.elastic_ep_resizes.append(
+                (
+                    new_data_parallel_size,
+                    drain_timeout_s,
+                    dict(expert_placement_plan or {}),
+                )
+            )
+            if self.elastic_ep_error is not None:
+                raise self.elastic_ep_error
+            return {
+                "resized": True,
+                "data_parallel_size": new_data_parallel_size,
+            }
+
         self.init_backend = _Remote(init_backend)
         self.get_runtime_metadata = _Remote(get_runtime_metadata)
         self.apply_expert_placement_plan = _Remote(
             apply_expert_placement_plan
         )
         self.stop = _Remote(stop)
+        self.scale_elastic_ep = _Remote(scale_elastic_ep)
 
 
 class _StartInstance:
@@ -45,14 +71,170 @@ class _StartInstance:
 
 class _Scheduler:
     def __init__(self):
+        self.resizes = []
+
         async def allocate_resource(**kwargs):
             return kwargs.get("target_node_id", "node-0")
 
         async def deallocate_resource(*args):
             return None
 
+        async def resize_resource(model_name, instance_id, resources):
+            self.resizes.append(
+                (model_name, instance_id, dict(resources))
+            )
+            return {"num_gpus": resources["num_gpus"]}
+
         self.allocate_resource = _Remote(allocate_resource)
         self.deallocate_resource = _Remote(deallocate_resource)
+        self.resize_resource = _Remote(resize_resource)
+
+
+def _elastic_ep_deployment(actor, scheduler):
+    adapter = VllmDeploymentAdapter(
+        model_name="m",
+        backend_config={
+            "tensor_parallel_size": 1,
+            "pipeline_parallel_size": 1,
+            "data_parallel_size": 2,
+            "enable_expert_parallel": True,
+            "data_parallel_backend": "ray",
+            "spotserve_elastic_ep_enabled": True,
+            "spotserve_vllm_ray_dp_owns_gpus": True,
+        },
+        resource_requirements={"num_cpus": 1, "num_gpus": 2},
+        scheduler=scheduler,
+        traffic_switcher=lambda *_: None,
+    )
+    source_plan = ParallelPlan(
+        model_name="m",
+        backend="vllm",
+        tensor_parallel_size=1,
+        data_parallel_size=2,
+        enable_expert_parallel=True,
+        num_gpus=2,
+        target_nodes=["node-0"],
+    )
+    handle = adapter_module.InstanceHandle(
+        instance_id="i-0",
+        max_queue_length=1,
+        num_gpu=2,
+        node_id="node-0",
+        backend_instance=actor,
+    )
+    return adapter, adapter_module.VllmDeployment(
+        plan=source_plan,
+        instances={"i-0": handle},
+        backend_config=dict(adapter.backend_config),
+        resource_requirements={"num_cpus": 1, "num_gpus": 2},
+    )
+
+
+@pytest.mark.asyncio
+async def test_vllm_adapter_live_elastic_ep_scale_up():
+    actor = _Actor()
+    scheduler = _Scheduler()
+    adapter, deployment = _elastic_ep_deployment(actor, scheduler)
+    target = ParallelPlan(
+        model_name="m",
+        backend="vllm",
+        tensor_parallel_size=1,
+        data_parallel_size=4,
+        enable_expert_parallel=True,
+        num_gpus=4,
+        target_nodes=["node-0"],
+        expert_placement_plan={
+            "expert_placement_available": True,
+            "placement_fingerprint": "ep4",
+        },
+    )
+
+    resized = await adapter.resize_workers_elastic_ep(deployment, target)
+
+    assert scheduler.resizes == [("m", "i-0", {"num_cpus": 1, "num_gpus": 4})]
+    assert actor.elastic_ep_resizes == [
+        (
+            4,
+            adapter.drain_timeout_s,
+            {
+                "expert_placement_available": True,
+                "placement_fingerprint": "ep4",
+            },
+        )
+    ]
+    assert actor.applied_expert_plans == []
+    assert resized.plan == target
+    assert resized.instances["i-0"].num_gpu == 4
+    assert resized.instances["i-0"].ready is True
+    assert resized.instances["i-0"].state == InstanceState.READY
+    assert resized.backend_config["reparallelization_execution_model"] == (
+        "in_place_elastic_ep_resize"
+    )
+    assert resized.backend_config["elastic_ep_admission_drained"] is True
+    assert resized.backend_config["elastic_ep_drained_request_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_vllm_adapter_rolls_back_scale_up_reservation_on_failure():
+    actor = _Actor()
+    actor.elastic_ep_error = RuntimeError("scale failed")
+    scheduler = _Scheduler()
+    adapter, deployment = _elastic_ep_deployment(actor, scheduler)
+    target = ParallelPlan(
+        model_name="m",
+        backend="vllm",
+        tensor_parallel_size=1,
+        data_parallel_size=4,
+        enable_expert_parallel=True,
+        num_gpus=4,
+        target_nodes=["node-0"],
+    )
+
+    with pytest.raises(RuntimeError, match="scale failed"):
+        await adapter.resize_workers_elastic_ep(deployment, target)
+
+    assert [row[2]["num_gpus"] for row in scheduler.resizes] == [4, 2]
+    assert deployment.instances["i-0"].num_gpu == 2
+    assert deployment.instances["i-0"].ready is False
+    assert deployment.instances["i-0"].state == InstanceState.DRAINING
+
+
+@pytest.mark.asyncio
+async def test_vllm_adapter_drains_admission_before_elastic_ep_resize():
+    actor = _Actor()
+    scheduler = _Scheduler()
+    adapter, deployment = _elastic_ep_deployment(actor, scheduler)
+    handle = deployment.instances["i-0"]
+    handle.ready = True
+    handle.state = InstanceState.READY
+    handle.concurrency = 1
+    target = ParallelPlan(
+        model_name="m",
+        backend="vllm",
+        tensor_parallel_size=1,
+        data_parallel_size=4,
+        enable_expert_parallel=True,
+        num_gpus=4,
+        target_nodes=["node-0"],
+    )
+
+    resize = asyncio.create_task(
+        adapter.resize_workers_elastic_ep(deployment, target)
+    )
+    await asyncio.sleep(0.1)
+
+    assert handle.state == InstanceState.DRAINING
+    assert handle.ready is False
+    assert actor.elastic_ep_resizes == []
+    async with handle.lock:
+        handle.concurrency = 0
+
+    resized = await resize
+    assert actor.elastic_ep_resizes
+    assert resized.instances["i-0"].state == InstanceState.READY
+    assert resized.instances["i-0"].ready is True
+    assert resized.backend_config["elastic_ep_admission_drained"] is True
+    assert resized.backend_config["elastic_ep_drained_request_count"] == 1
 
 
 class _SnapshotScheduler(_Scheduler):

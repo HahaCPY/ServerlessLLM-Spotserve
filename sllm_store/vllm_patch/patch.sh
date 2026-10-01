@@ -25,6 +25,7 @@ PATCH_FILES=(
     "$SCRIPT_DIR/runtime_kv_restore.patch"
     "$SCRIPT_DIR/runtime_moe_metadata.patch"
     "$SCRIPT_DIR/runtime_sparse_a2a.patch"
+    "$SCRIPT_DIR/runtime_elastic_ep.patch"
 )
 
 for PATCH_FILE in "${PATCH_FILES[@]}"; do
@@ -105,6 +106,10 @@ if ! grep -q '"spotserve_sparse"' "$VLLM_PATH/envs.py" ||
     ! grep -q "SpotServeSparsePrepareAndFinalize" \
         "$VLLM_PATH/model_executor/layers/fused_moe/all2all_utils.py"; then
     MISSING_MOE_MARKERS+=("spotserve_sparse.all2all_backend")
+fi
+if ! grep -q "falling back to ray.nodes()" \
+    "$VLLM_PATH/v1/engine/utils.py"; then
+    MISSING_MOE_MARKERS+=("elastic_ep.ray_nodes_fallback")
 fi
 if [[ "${#MISSING_MOE_MARKERS[@]}" -gt 0 ]]; then
     echo "Missing patched vLLM MoE/placement markers: ${MISSING_MOE_MARKERS[*]}" >&2
