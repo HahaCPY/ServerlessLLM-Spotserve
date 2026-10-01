@@ -1,0 +1,8 @@
+# Tiny pilot trace deliberately avoids GPU2, which is occupied by another user.
+# Source starts on node-0; node-1 and node-3 are available target slots.
+{"time_ms": 0, "event": "add", "nodes": ["node-0", "node-1", "node-3"]}
+{"time_ms": 60000, "event": "remove", "nodes": ["node-0"]}
+{"time_ms": 120000, "event": "add", "nodes": ["node-0"]}
+{"time_ms": 180000, "event": "remove", "nodes": ["node-1"]}
+{"time_ms": 240000, "event": "add", "nodes": ["node-1"]}
+{"time_ms": 300000, "event": "DONE", "nodes": []}

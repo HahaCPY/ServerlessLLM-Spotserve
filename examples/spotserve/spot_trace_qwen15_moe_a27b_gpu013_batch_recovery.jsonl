@@ -1,0 +1,10 @@
+# GPU2 is reserved by an unrelated shared job in this run.  The trace keeps
+# the TP2 floor on GPU0+GPU1, adds GPU3 as the replacement slot, then removes
+# GPU1 so the TP2 source becomes invalid and the planner can select GPU0+GPU3.
+{"time_ms": 0, "event": "add", "nodes": ["node-0", "node-1"]}
+{"time_ms": 30000, "event": "add", "nodes": ["node-3"]}
+{"time_ms": 90000, "event": "remove", "nodes": ["node-1"]}
+{"time_ms": 150000, "event": "add", "nodes": ["node-1"]}
+{"time_ms": 210000, "event": "remove", "nodes": ["node-0"]}
+{"time_ms": 270000, "event": "add", "nodes": ["node-0"]}
+{"time_ms": 330000, "event": "DONE", "nodes": []}

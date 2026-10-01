@@ -7,7 +7,11 @@ import pytest
 pytest.importorskip("vllm")
 
 from sllm.backends.backend_utils import BackendStatus
-from sllm.backends.vllm_backend import LLMEngineStatusDict, VllmBackend
+from sllm.backends.vllm_backend import (
+    LLMEngineStatusDict,
+    VllmBackend,
+    _histogram_from_routed_expert_chunks,
+)
 
 
 class FakeStatefulEngine:
@@ -148,6 +152,22 @@ def make_backend(engine=None, **backend_config):
     backend.status = BackendStatus.RUNNING
     backend.status_lock = asyncio.Lock()
     return backend
+
+
+def test_runtime_routed_expert_chunks_are_aggregated_by_layer_and_expert():
+    chunks = [
+        [
+            [[1, 2], [3, 4]],
+            [[1, 2], [4, 4]],
+        ]
+    ]
+
+    assert _histogram_from_routed_expert_chunks(chunks) == {
+        "layer:0/expert:1": 2,
+        "layer:0/expert:2": 2,
+        "layer:1/expert:3": 1,
+        "layer:1/expert:4": 3,
+    }
 
 
 def test_spotserve_request_controls_are_removed_before_sampling_params():

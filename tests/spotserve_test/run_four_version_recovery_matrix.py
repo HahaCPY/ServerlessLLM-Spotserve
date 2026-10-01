@@ -30,6 +30,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-model-len", type=int, default=512)
     parser.add_argument("--trace-speedup", type=float, default=1000.0)
     parser.add_argument("--token-delay-s", type=float, default=0.05)
+    parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument("--preempt-after-new-tokens", type=int, default=1)
+    parser.add_argument(
+        "--dynamic-planner",
+        action="store_true",
+        help="Use planner-selected target configuration for Modified cells.",
+    )
     parser.add_argument("--cpu-offload-gb", type=float, default=0.0)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.08)
     parser.add_argument("--timeout-s", type=float, default=360.0)
@@ -64,11 +71,16 @@ def run_cell(args: argparse.Namespace, mode: str, prompt_tokens: int,
         "--max-model-len", str(args.max_model_len),
         "--trace-speedup", str(args.trace_speedup),
         "--token-delay-s", str(args.token_delay_s),
+        "--max-new-tokens", str(max(int(args.max_new_tokens), 1)),
+        "--preempt-after-new-tokens",
+        str(max(int(args.preempt_after_new_tokens), 0)),
         "--cpu-offload-gb", str(args.cpu_offload_gb),
         "--gpu-memory-utilization", str(args.gpu_memory_utilization),
         "--timeout-s", str(args.timeout_s),
         "--output", str(cell_path),
     ]
+    if args.dynamic_planner:
+        command.append("--dynamic-planner")
     started = time.monotonic()
     try:
         result = subprocess.run(
@@ -103,6 +115,13 @@ def run_cell(args: argparse.Namespace, mode: str, prompt_tokens: int,
         "source_blocks": report.get("source_blocks", 0),
         "source_computed_tokens": report.get("source_computed_tokens", 0),
         "source_config": report.get("source_config", {}),
+        "preempt_after_new_tokens": report.get(
+            "preempt_after_new_tokens", 0
+        ),
+        "source_generated_before_preemption": report.get(
+            "source_generated_before_preemption", 0
+        ),
+        "planner_decision": report.get("planner_decision"),
         "report": str(cell_path),
     }
 
@@ -131,6 +150,13 @@ def load_existing_cell(mode: str, prompt_tokens: int, repeat: int,
         "source_blocks": report.get("source_blocks", 0),
         "source_computed_tokens": report.get("source_computed_tokens", 0),
         "source_config": report.get("source_config", {}),
+        "preempt_after_new_tokens": report.get(
+            "preempt_after_new_tokens", 0
+        ),
+        "source_generated_before_preemption": report.get(
+            "source_generated_before_preemption", 0
+        ),
+        "planner_decision": report.get("planner_decision"),
         "report": str(cell_path),
     }
 
@@ -200,6 +226,16 @@ def main() -> None:
         raise SystemExit("--gpus must contain four distinct GPU indices")
     if args.repeats < 1:
         raise SystemExit("--repeats must be positive")
+    if args.preempt_after_new_tokens < 0:
+        raise SystemExit("--preempt-after-new-tokens must be non-negative")
+    if (
+        args.preempt_after_new_tokens > 0
+        and args.preempt_after_new_tokens >= args.max_new_tokens
+    ):
+        raise SystemExit(
+            "--preempt-after-new-tokens must be smaller than "
+            "--max-new-tokens"
+        )
     if any(prompt < 1 or prompt > args.max_model_len for prompt in args.prompt_tokens):
         raise SystemExit("every prompt length must fit --max-model-len")
     output = Path(args.output)
@@ -241,6 +277,9 @@ def main() -> None:
         "prompt_tokens": args.prompt_tokens,
         "repeats": args.repeats,
         "max_model_len": args.max_model_len,
+        "max_new_tokens": args.max_new_tokens,
+        "preempt_after_new_tokens": args.preempt_after_new_tokens,
+        "dynamic_planner": bool(args.dynamic_planner),
         "cells": cells,
         "by_mode_and_prompt": summarize(cells),
     }

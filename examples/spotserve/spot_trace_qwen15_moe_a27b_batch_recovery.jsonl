@@ -1,0 +1,17 @@
+# Batch recovery trace for Qwen1.5-MoE-A2.7B on four local GPUs.
+# capacity(t)=clip(round(2.2 + 0.9*sin(2*pi*t/240s)
+#   + 0.6*sin(2*pi*t/95s) + burst(t)), 2, 4).
+# The first 4 events create a realistic capacity ramp from the TP2 floor to
+# four GPUs.  The source pair is then removed while a batch of long requests
+# is in flight; later events model capacity recovery and another pressure drop.
+# No event names a GPU outside node-0..node-3.
+{"time_ms": 0, "event": "add", "nodes": ["node-0", "node-1"]}
+{"time_ms": 30000, "event": "add", "nodes": ["node-2"]}
+{"time_ms": 60000, "event": "add", "nodes": ["node-3"]}
+{"time_ms": 180000, "event": "remove", "nodes": ["node-0", "node-1"]}
+{"time_ms": 240000, "event": "add", "nodes": ["node-0"]}
+{"time_ms": 300000, "event": "remove", "nodes": ["node-2"]}
+{"time_ms": 360000, "event": "add", "nodes": ["node-1", "node-2"]}
+{"time_ms": 420000, "event": "remove", "nodes": ["node-3"]}
+{"time_ms": 480000, "event": "add", "nodes": ["node-3"]}
+{"time_ms": 540000, "event": "DONE", "nodes": []}

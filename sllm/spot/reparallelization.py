@@ -943,6 +943,9 @@ def _supported_config_candidates(
     min_tensor_parallel_size = _positive_int(
         planner_config, "min_tensor_parallel_size", 1
     )
+    max_tensor_parallel_size = _positive_int(
+        planner_config, "max_tensor_parallel_size", available_gpus
+    )
     candidates: List[ParallelConfig] = []
     for plan in supported_configs:
         if isinstance(plan, Mapping):
@@ -1021,7 +1024,11 @@ def _supported_config_candidates(
                 )
             )
 
-        if tensor_parallel_size < min_tensor_parallel_size:
+        if not (
+            min_tensor_parallel_size
+            <= tensor_parallel_size
+            <= max_tensor_parallel_size
+        ):
             continue
 
         if total_gpus > available_gpus:
@@ -1135,7 +1142,9 @@ def _attach_expert_placement_movement_estimates(
     placement_epoch: int,
     event: Optional[str],
 ) -> List[ParallelConfig]:
-    if not candidates:
+    # Whole-engine recreation already accounts for weight loading in its
+    # measured startup cost. Do not add an observe-only placement estimate.
+    if not candidates or planner_config.get("disable_logical_expert_placement") is True:
         return candidates
 
     enriched: List[ParallelConfig] = []
@@ -1278,7 +1287,8 @@ def plan_dynamic_reparallelization(
         else None
     )
     expert_placement_plan = None
-    if parallel_plan is not None:
+    if (parallel_plan is not None
+            and planner_config.get("disable_logical_expert_placement") is not True):
         expert_placement_plan = build_logical_expert_placement_plan(
             model_name=model_name,
             target_parallel_plan=parallel_plan.to_dict(),

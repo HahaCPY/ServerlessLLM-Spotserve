@@ -690,9 +690,10 @@ def estimate_expert_dispatch_cost(
             "remote_routed_tokens_by_expert": {},
             "local_routed_tokens_by_layer": {},
             "remote_routed_tokens_by_layer": {},
-            "locality_definition": MOE_LOCALITY_DEFINITION,
-            "locality_granularity": MOE_LOCALITY_GRANULARITY,
-            "remote_routing_definition": MOE_REMOTE_ROUTING_DEFINITION,
+            # No observation is not evidence of target placement coverage.
+            "locality_definition": "unavailable",
+            "locality_granularity": "unavailable",
+            "remote_routing_definition": "unavailable",
             "rank_locality_available": False,
             "physical_dispatch_traffic_available": False,
             "cost": 0.0,

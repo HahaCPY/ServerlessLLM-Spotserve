@@ -28,8 +28,9 @@ class ReparallelizationExecutor:
     health check.  The old handle is only stopped after the target is ready,
     so a failed replan leaves serving traffic untouched.
 
-    Set ``stop_current_before_create`` only for deployments where the planned
-    target must reuse the exact GPU resources currently held by ``current``.
+    Set ``stop_current_before_create`` when the target must reuse current GPUs,
+    or for forced revocation after a recoverable host snapshot has been saved.
+    These paths cannot promise that old serving survives target creation failure.
     """
 
     create_workers: MaybeAsync
@@ -41,6 +42,9 @@ class ReparallelizationExecutor:
     stop_current_before_create: bool = False
     wait_for_migration: Optional[MaybeAsync] = None
     migrate_before_create: bool = False
+    # Optional actual-runtime evidence check, not another planner assertion.
+    # Failure cleans up only the newly created target before traffic switches.
+    verify_runtime: Optional[MaybeAsync] = None
 
     async def apply(self, plan: ParallelPlan) -> Any:
         prepared_old = None
@@ -57,6 +61,9 @@ class ReparallelizationExecutor:
         try:
             if not await _call(self.ready, target, plan):
                 raise RuntimeError("target_workers_not_ready")
+            if (self.verify_runtime is not None
+                    and not await _call(self.verify_runtime, target, plan)):
+                raise RuntimeError("target_runtime_not_verified")
         except Exception:
             await _call(self.stop, target)
             raise

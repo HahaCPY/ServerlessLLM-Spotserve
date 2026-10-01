@@ -275,6 +275,40 @@ def _normalize_per_request_expert_route_histogram(
     return result
 
 
+def _histogram_from_routed_expert_chunks(chunks: Any) -> Dict[str, int]:
+    """Aggregate vLLM's observed ``[token, layer, top-k]`` route tensors.
+
+    Recent vLLM builds expose routed experts on the frontend output processor
+    when ``enable_return_routed_experts`` is enabled.  Reading that existing
+    buffer is observability wiring only: it does not alter routing or expert
+    placement decisions.
+    """
+    histogram: Dict[str, int] = {}
+    if chunks is None:
+        return histogram
+    if not isinstance(chunks, (list, tuple)):
+        chunks = [chunks]
+    for chunk in chunks:
+        if chunk is None:
+            continue
+        payload = chunk.tolist() if hasattr(chunk, "tolist") else chunk
+        if not isinstance(payload, (list, tuple)):
+            continue
+        for token_routes in payload:
+            if not isinstance(token_routes, (list, tuple)):
+                continue
+            for layer_id, expert_ids in enumerate(token_routes):
+                if not isinstance(expert_ids, (list, tuple)):
+                    continue
+                for expert_id in expert_ids:
+                    parsed = _as_non_negative_int(expert_id)
+                    if parsed is None:
+                        continue
+                    key = f"layer:{layer_id}/expert:{parsed}"
+                    histogram[key] = histogram.get(key, 0) + 1
+    return histogram
+
+
 def _merge_int_histogram(
     target: Dict[str, int],
     source: Mapping[str, int],
@@ -405,6 +439,20 @@ class VllmBackend(SllmBackend):
         filtered_engine_config = {
             k: v for k, v in backend_config.items() if k in async_engine_fields
         }
+        kv_transfer_config = filtered_engine_config.get("kv_transfer_config")
+        if isinstance(kv_transfer_config, Mapping):
+            kv_connector = kv_transfer_config.get("kv_connector")
+        else:
+            kv_connector = getattr(kv_transfer_config, "kv_connector", None)
+        if (
+            _as_bool(backend_config.get("enable_moe_route_instrumentation"))
+            and "enable_return_routed_experts" in async_engine_fields
+            # Upstream vLLM rejects routed-expert capture with all KV
+            # connectors. Keep NIXL initialization valid and report routing
+            # unavailable rather than bypassing the runtime safety check.
+            and not kv_connector
+        ):
+            filtered_engine_config["enable_return_routed_experts"] = True
 
         load_format = backend_config.get("load_format")
         torch_dtype = backend_config.get("torch_dtype")
@@ -1285,7 +1333,45 @@ class VllmBackend(SllmBackend):
             ),
             request_id=str(request_id),
         )
-        return dict(extra) if isinstance(extra, dict) else {}
+        if isinstance(extra, dict) and _normalize_expert_route_histogram(
+            extra.get("per_request_expert_route_histogram"),
+            request_id=str(request_id),
+        ):
+            return dict(extra)
+
+        # Upstream vLLM exposes routed-expert observations through the
+        # frontend output processor rather than an EngineCore utility hook.
+        # Consume that public-runtime buffer when available so SpotServe's
+        # planner sees real top-k decisions instead of request fixtures.
+        output_processor = getattr(self.engine, "output_processor", None)
+        if output_processor is None:
+            return dict(extra) if isinstance(extra, dict) else {}
+        internal_ids = list(
+            getattr(output_processor, "external_req_ids", {}).get(
+                str(request_id), []
+            )
+        )
+        if not internal_ids and str(request_id) in getattr(
+            output_processor, "request_states", {}
+        ):
+            internal_ids = [str(request_id)]
+        histogram: Dict[str, int] = {}
+        for internal_id in internal_ids:
+            state = getattr(output_processor, "request_states", {}).get(
+                internal_id
+            )
+            observed = _histogram_from_routed_expert_chunks(
+                getattr(state, "routed_experts_chunks", None)
+            )
+            _merge_int_histogram(histogram, observed)
+        if not histogram:
+            return dict(extra) if isinstance(extra, dict) else {}
+        return {
+            "per_request_expert_route_histogram": histogram,
+            "moe_route_histogram_available": True,
+            "moe_route_histogram_source": "vllm_runtime_topk",
+            "moe_route_histogram_kind": "runtime_observed_topk",
+        }
 
     async def _runtime_moe_metadata(
         self,
@@ -2423,7 +2509,7 @@ class VllmBackend(SllmBackend):
             instance_id=instance_id,
             node_id=node_id,
             runtime_metadata={
-                "load_time_s": self.model_load_time_s,
+                "load_time_s": getattr(self, "model_load_time_s", 0.0),
                 **gpu_metadata,
                 **self._engine_parallel_metadata(
                     instance_id=instance_id,

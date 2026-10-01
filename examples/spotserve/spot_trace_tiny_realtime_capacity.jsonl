@@ -1,0 +1,20 @@
+# Tiny capacity trace for a realistic four-slot local cluster.
+# capacity(t)=clip(round(1.5 + 1.1*sin(2*pi*t/240s)
+#   + 0.5*sin(2*pi*t/95s) + burst(t)), 1, 4).
+# The trace starts at the minimum one-worker floor, ramps to four workers,
+# removes the source during a pressure drop, then alternates recovery adds and
+# removals without ever naming a slot outside node-0..node-3.
+{"time_ms": 0, "event": "add", "nodes": ["node-0"]}
+{"time_ms": 30000, "event": "add", "nodes": ["node-1"]}
+{"time_ms": 60000, "event": "add", "nodes": ["node-2"]}
+{"time_ms": 90000, "event": "add", "nodes": ["node-3"]}
+{"time_ms": 180000, "event": "remove", "nodes": ["node-0", "node-1"]}
+{"time_ms": 240000, "event": "add", "nodes": ["node-0"]}
+{"time_ms": 300000, "event": "remove", "nodes": ["node-3"]}
+{"time_ms": 360000, "event": "add", "nodes": ["node-1", "node-3"]}
+{"time_ms": 420000, "event": "remove", "nodes": ["node-2"]}
+{"time_ms": 480000, "event": "add", "nodes": ["node-2"]}
+{"time_ms": 540000, "event": "remove", "nodes": ["node-0", "node-1"]}
+{"time_ms": 600000, "event": "add", "nodes": ["node-0", "node-1"]}
+{"time_ms": 660000, "event": "remove", "nodes": ["node-3"]}
+{"time_ms": 720000, "event": "DONE", "nodes": []}

@@ -1,5 +1,47 @@
+import json
+
+import pytest
+
 from sllm.backends.capability import get_backend_capability
 from sllm.backends.vllm_capability import get_vllm_capability
+
+
+def test_granite_moe_is_detected_from_config_not_directory_name(tmp_path):
+    model = tmp_path / "granite-3.1-3b-a800m-instruct"
+    model.mkdir()
+    (model / "config.json").write_text(json.dumps({
+        "architectures": ["GraniteMoeForCausalLM"], "model_type": "granitemoe",
+        "num_local_experts": 40, "num_experts_per_tok": 8,
+    }))
+    cap = get_vllm_capability({"model": model.name, "num_gpus": 4,
+        "backend_config": {"pretrained_model_name_or_path": str(model),
+                           "tensor_parallel_size": 1}})
+    assert {plan.tensor_parallel_size for plan in cap.supported_configs} == {1, 2, 4}
+    assert any(plan.num_gpus == 1 for plan in cap.supported_configs)
+
+
+def test_local_dense_config_overrides_a_misleading_moe_name(tmp_path):
+    model = tmp_path / "not-actually-moe"
+    model.mkdir()
+    (model / "config.json").write_text(json.dumps({
+        "architectures": ["Qwen2ForCausalLM"], "model_type": "qwen2",
+    }))
+    cap = get_vllm_capability({"model": model.name, "num_gpus": 1,
+        "backend_config": {"pretrained_model_name_or_path": str(model),
+                           "tensor_parallel_size": 1}})
+    assert len(cap.supported_configs) == 1
+    assert cap.supports_ep is False
+
+
+@pytest.mark.parametrize("content", ["{broken-json", "[]", None])
+def test_invalid_local_config_is_not_silently_classified_by_name(tmp_path, content):
+    model = tmp_path / "moe-checkpoint"
+    model.mkdir()
+    if content is not None:
+        (model / "config.json").write_text(content)
+    with pytest.raises(ValueError, match="config"):
+        get_vllm_capability({"model": model.name, "num_gpus": 1,
+            "backend_config": {"pretrained_model_name_or_path": str(model)}})
 
 
 def test_vllm_capability_advertises_current_tp_shape_only():
@@ -71,18 +113,18 @@ def test_vllm_moe_capability_advertises_verified_shapes():
     assert capability.supports_ep is True
     assert capability.max_num_gpus == 4
     assert configs == {
-        (4, 1, 1, 1, False, 1, 4, 1, "verified_vllm_moe_config"),
-        (4, 1, 1, 1, True, 4, 4, 1, "verified_vllm_moe_config"),
-        (2, 1, 1, 1, False, 1, 2, 1, "verified_vllm_moe_config"),
-        (2, 1, 1, 2, False, 1, 4, 2, "verified_vllm_moe_config"),
-        (2, 1, 1, 1, True, 2, 2, 1, "verified_vllm_moe_config"),
-        (2, 1, 1, 2, True, 2, 4, 2, "verified_vllm_moe_config"),
-        (1, 1, 1, 1, False, 1, 1, 1, "verified_vllm_moe_config"),
-        (1, 1, 1, 2, False, 1, 2, 2, "verified_vllm_moe_config"),
-        (1, 1, 1, 3, False, 1, 3, 3, "verified_vllm_moe_config"),
-        (1, 1, 1, 4, False, 1, 4, 4, "verified_vllm_moe_config"),
-        (2, 1, 2, 1, False, 1, 4, 1, "verified_vllm_moe_config"),
-        (2, 1, 2, 1, True, 2, 4, 1, "verified_vllm_moe_config"),
+        (4, 1, 1, 1, False, 1, 4, 1, "static_vllm_moe_catalogue"),
+        (4, 1, 1, 1, True, 4, 4, 1, "static_vllm_moe_catalogue"),
+        (2, 1, 1, 1, False, 1, 2, 1, "static_vllm_moe_catalogue"),
+        (2, 1, 1, 2, False, 1, 4, 2, "static_vllm_moe_catalogue"),
+        (2, 1, 1, 1, True, 2, 2, 1, "static_vllm_moe_catalogue"),
+        (2, 1, 1, 2, True, 2, 4, 2, "static_vllm_moe_catalogue"),
+        (1, 1, 1, 1, False, 1, 1, 1, "static_vllm_moe_catalogue"),
+        (1, 1, 1, 2, False, 1, 2, 2, "static_vllm_moe_catalogue"),
+        (1, 1, 1, 3, False, 1, 3, 3, "static_vllm_moe_catalogue"),
+        (1, 1, 1, 4, False, 1, 4, 4, "static_vllm_moe_catalogue"),
+        (2, 1, 2, 1, False, 1, 4, 1, "static_vllm_moe_catalogue"),
+        (2, 1, 2, 1, True, 2, 4, 1, "static_vllm_moe_catalogue"),
     }
 
 

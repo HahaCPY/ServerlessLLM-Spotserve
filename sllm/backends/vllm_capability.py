@@ -14,6 +14,8 @@
 #  see the license for the specific language governing permissions and         #
 #  limitations under the license.                                              #
 # ---------------------------------------------------------------------------- #
+import json
+from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from sllm.backends.capability import BackendCapability
@@ -122,6 +124,28 @@ def _is_moe_config(model_name: str, backend_config: Mapping[str, Any]) -> bool:
         or backend_config.get("model")
         or model_name
     )
+    config_path = Path(model_id) / "config.json"
+    if config_path.is_file():
+        # A local checkpoint is authoritative. Granite's official model ID
+        # does not contain "moe"; conversely a dense directory may contain it.
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise ValueError(f"cannot inspect local model config: {config_path}") from error
+        if not isinstance(config, Mapping):
+            raise ValueError(f"local model config must be an object: {config_path}")
+        names = [str(config.get("model_type", "")),
+                 *[str(value) for value in config.get("architectures", []) or []]]
+        expert_count = max(
+            (_positive_int(config.get(key), 1)
+             for key in ("num_local_experts", "num_experts", "n_routed_experts")),
+            default=1,
+        )
+        return expert_count > 1 or any("moe" in value.lower() for value in names)
+    if Path(model_id).is_dir():
+        raise ValueError(f"local checkpoint has no config.json: {model_id}")
+    # Preserve the legacy catalogue for remote IDs; this is not a runtime
+    # model/kernel verification and does not authorize every advertised shape.
     return "moe" in model_name.lower() or "moe" in model_id.lower()
 
 
@@ -174,7 +198,8 @@ def get_vllm_capability(
                 replica_count=shape["replica_count"],
                 pipeline_parallel_size=shape["pipeline_parallel_size"],
                 enable_expert_parallel=shape["enable_expert_parallel"],
-                reason="verified_vllm_moe_config",
+                # A static catalogue is not model-specific GPU validation.
+                reason="static_vllm_moe_catalogue",
             )
             for shape in VLLM_MOE_SUPPORTED_SHAPES
         ]

@@ -42,6 +42,10 @@ from run_cross_container_nixl_smoke import (
 )
 from run_four_container_fleet_churn_smoke import load_fleet_trace
 from run_four_container_fleet_churn_smoke import trace_slot
+from sllm.spot.reparallelization import (
+    ParallelPlan,
+    plan_dynamic_reparallelization,
+)
 
 
 MODES = ("no_recovery", "rerouting", "reparallelization", "modified")
@@ -57,6 +61,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-model-len", type=int, default=512)
     parser.add_argument("--trace-speedup", type=float, default=1000.0)
     parser.add_argument("--token-delay-s", type=float, default=0.05)
+    parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument(
+        "--preempt-after-new-tokens",
+        type=int,
+        default=1,
+        help=(
+            "Number of generated output tokens to produce before the source "
+            "is paused/preempted."
+        ),
+    )
+    parser.add_argument(
+        "--dynamic-planner",
+        action="store_true",
+        help=(
+            "For Modified, invoke the live ParallelPlan planner after the "
+            "trace event and create the selected target configuration before "
+            "restoring KV state."
+        ),
+    )
     parser.add_argument(
         "--cpu-offload-gb",
         type=float,
@@ -105,6 +128,16 @@ def main() -> None:
         raise SystemExit("--gpus must contain four distinct GPU indices")
     if args.prompt_tokens < 1 or args.prompt_tokens > args.max_model_len:
         raise SystemExit("--prompt-tokens must fit within --max-model-len")
+    if args.preempt_after_new_tokens < 0:
+        raise SystemExit("--preempt-after-new-tokens must be non-negative")
+    if (
+        args.preempt_after_new_tokens > 0
+        and args.preempt_after_new_tokens >= args.max_new_tokens
+    ):
+        raise SystemExit(
+            "--preempt-after-new-tokens must be smaller than "
+            "--max-new-tokens so the request is still live at preemption"
+        )
     if not os.path.isfile(os.path.join(args.model, "config.json")):
         raise SystemExit(f"model config not found: {args.model}")
     tensor_parallel_size = infer_tensor_parallel_size(args.model)
@@ -212,6 +245,10 @@ def main() -> None:
             str(port),
             "--token-delay-s",
             str(args.token_delay_s),
+            "--max-new-tokens",
+            str(max(int(args.max_new_tokens), 1)),
+            "--pause-after-new-tokens",
+            str(max(int(args.preempt_after_new_tokens), 0)),
             "--cpu-offload-gb",
             str(max(float(args.cpu_offload_gb), 0.0)),
             "--gpu-memory-utilization",
@@ -299,7 +336,12 @@ def main() -> None:
         except OSError:
             pass
 
-    def target_generate(target: dict, request_id: str, token_ids: list[int]) -> dict:
+    def target_generate(
+        target: dict,
+        request_id: str,
+        token_ids: list[int],
+        remaining_new_tokens: int | None = None,
+    ) -> dict:
         phase_started = time.monotonic()
         print(
             f"[four-version] target generate label={target['label']} "
@@ -308,7 +350,23 @@ def main() -> None:
         )
         send(
             target["conn"],
-            {"op": "generate", "request_id": request_id, "token_ids": token_ids},
+            {
+                "op": "generate",
+                "request_id": request_id,
+                "token_ids": token_ids,
+                "max_new_tokens": max(
+                    int(
+                        remaining_new_tokens
+                        if remaining_new_tokens is not None
+                        else args.max_new_tokens
+                    ),
+                    1,
+                ),
+                # The target is allowed to produce one output before the
+                # harness resumes it and measures continuation.  The source
+                # pause threshold is controlled separately below.
+                "pause_after_new_tokens": 1,
+            },
         )
         wait_event(target["conn"], "generate_started", args.timeout_s)
         print("[four-version] target generate_started", flush=True)
@@ -354,17 +412,119 @@ def main() -> None:
         "tp": tensor_parallel_size,
         "port": 5700,
     }
-    # Spare workers are useful for Tiny's churn trace, but Qwen's TP2 source
-    # and target replicas already cover all four cards.  They are not needed
-    # to define the recovery policy, so the trace can mark those slots ready
-    # without starting extra engines.
+    # A controlled Modified run may keep a compatible target READY, but the
+    # dynamic Modified path intentionally creates the target only after the
+    # planner sees the post-preemption capacity.  Rerouting never receives a
+    # prewarmed backup engine: it starts a same-shape replacement after the
+    # source is removed, so its baseline includes target startup cost.
     request_id = f"four-version-request-{os.getpid()}"
     prompt = [100 + index for index in range(args.prompt_tokens)]
     metadata: dict = {}
     source_computed: list[int] = []
     exported: dict | None = None
+    planner_decision: dict | None = None
+    source_generated_before_preemption = 0
+    trace_history: list[dict] = []
     outcome = "failed"
     recovery: dict = {}
+
+    def dynamic_plan(active_slots: set[int], event: str) -> dict:
+        """Run the same capacity-aware planner used by the SpotServe router.
+
+        The four visible cards are represented as one-GPU logical nodes.  The
+        resulting target node list is then converted back into explicit GPU
+        devices for the container deployment below.  This keeps planner
+        selection and the actual target configuration in one test path.
+        """
+        model_name = Path(args.model).name
+        worker_nodes = {
+            f"node-{gpu}": {
+                "ray_node_id": f"node-{gpu}",
+                "address": f"node-{gpu}",
+                "free_gpu": 1 if gpu in active_slots else 0,
+                "total_gpu": 1,
+                "state": "ready" if gpu in active_slots else "dead",
+            }
+            for gpu in args.gpus
+        }
+        # NIXL KV layout must remain compatible across the migration.  The
+        # backend advertises EP variants, but this request starts on EP=1;
+        # filter the capability allowlist to the verified EP=1 shapes so the
+        # planner cannot select an incompatible target just because it scores
+        # higher on raw GPU utilisation.
+        from sllm.backends.vllm_capability import get_vllm_capability
+
+        capability = get_vllm_capability(
+            {
+                "model": model_name,
+                "num_gpus": len(args.gpus),
+                "backend_config": {
+                    "pretrained_model_name_or_path": args.model,
+                    "tensor_parallel_size": tensor_parallel_size,
+                },
+            }
+        ).to_dict()
+        capability["supported_configs"] = [
+            config
+            for config in capability["supported_configs"]
+            if int(config.get("expert_parallel_size", 1) or 1) == 1
+        ]
+        return plan_dynamic_reparallelization(
+            model_name=model_name,
+            worker_nodes=worker_nodes,
+            model_config={
+                "model": model_name,
+                "backend": "vllm",
+                "num_gpus": len(args.gpus),
+                "backend_config": {
+                    "pretrained_model_name_or_path": args.model,
+                    "tensor_parallel_size": tensor_parallel_size,
+                },
+                "backend_capability": capability,
+            },
+            planner_config={
+                "model_gpu_requirement": tensor_parallel_size,
+                "target_replica_gpus": tensor_parallel_size,
+                "min_tensor_parallel_size": 1,
+                "max_tensor_parallel_size": len(active_slots),
+                "max_pipeline_parallel_size": 1,
+                "min_data_parallel_size": 1,
+            },
+            event=event,
+            node_id=event,
+            backend="vllm",
+        )
+
+    def plan_target_groups(
+        decision: dict,
+    ) -> tuple[ParallelPlan, list[list[int]]]:
+        selected = decision.get("parallel_plan")
+        if not selected:
+            raise AssertionError(
+                f"planner returned no usable target: {json.dumps(decision)}"
+            )
+        plan = ParallelPlan.from_dict(selected)
+        target_gpus = [trace_slot(node) for node in plan.target_nodes]
+        if len(target_gpus) < plan.num_gpus:
+            raise AssertionError(
+                f"planner target {plan.target_nodes} has fewer devices than "
+                f"selected plan requires: {plan.to_dict()}"
+            )
+        replica_gpu_count = plan.tensor_parallel_size * plan.pipeline_parallel_size
+        groups = [
+            target_gpus[index : index + replica_gpu_count]
+            for index in range(
+                0, replica_gpu_count * plan.num_replicas, replica_gpu_count
+            )
+        ]
+        if len(groups) != plan.num_replicas or any(
+            len(group) != replica_gpu_count for group in groups
+        ):
+            raise AssertionError(
+                f"planner target nodes cannot realize all replicas: "
+                f"{plan.to_dict()}"
+            )
+        return plan, groups
 
     def follow_trace_to_preemption() -> set[int]:
         """Apply the bounded four-slot trace until source preemption.
@@ -375,13 +535,11 @@ def main() -> None:
         """
         source_set = set(source_gpus)
         target_set = set(target_gpus)
-        # Source and (when required by the policy) the recovery target are
-        # already provisioned before the trace starts.  The trace controls
-        # which slots remain available after each event; starting from all
-        # four slots keeps the four-version comparison's READY-target
-        # contract independent of whether a capacity trace adds a target
-        # node at an earlier timestamp.
-        active_slots = set(args.gpus)
+        # Start with no logical capacity and let the trace add the source and
+        # target slots.  The containers are provisioned by the harness before
+        # the trace because vLLM startup is separate from capacity admission;
+        # the planner, however, must see the trace's actual active set.
+        active_slots: set[int] = set()
         previous_time_ms = 0.0
         for event in trace_events:
             delay_s = (
@@ -412,6 +570,14 @@ def main() -> None:
                 raise AssertionError(
                     f"four-version trace only supports add/remove/DONE: {event}"
                 )
+            trace_history.append(
+                {
+                    "time_ms": event["time_ms"],
+                    "event": action,
+                    "nodes": list(event["nodes"]),
+                    "active_slots": sorted(active_slots),
+                }
+            )
             if action == "remove" and target_set & changed_slots and not (
                 source_set & changed_slots
             ):
@@ -427,7 +593,7 @@ def main() -> None:
         run_podman(["network", "create", network])
         launch(source_spec)
         startup_specs = [source_spec]
-        if args.mode in {"rerouting", "modified"}:
+        if args.mode == "modified" and not args.dynamic_planner:
             launch(reroute_spec)
             startup_specs.append(reroute_spec)
         register(startup_specs)
@@ -439,11 +605,46 @@ def main() -> None:
         source = workers["source"]
         send(
             source["conn"],
-            {"op": "generate", "request_id": request_id, "token_ids": prompt},
+            {
+                "op": "generate",
+                "request_id": request_id,
+                "token_ids": prompt,
+                "max_new_tokens": max(int(args.max_new_tokens), 1),
+                "pause_after_new_tokens": max(
+                    int(args.preempt_after_new_tokens), 0
+                ),
+            },
         )
         wait_event(source["conn"], "generate_started", args.timeout_s)
-        wait_event(source["conn"], "paused", args.timeout_s)
-        print("[four-version] source paused", flush=True)
+        if args.preempt_after_new_tokens > 0:
+            source_pause = wait_event(source["conn"], "paused", args.timeout_s)
+            if source_pause.get("finished"):
+                raise AssertionError(
+                    "source request finished before preemption; increase "
+                    "--max-new-tokens or lower "
+                    "--preempt-after-new-tokens"
+                )
+            source_generated_before_preemption = int(
+                source_pause.get("generated_tokens", 0)
+                or len(source_pause.get("token_ids", []))
+            )
+            print(
+                "[four-version] source paused after "
+                f"{source_generated_before_preemption} generated tokens",
+                flush=True,
+            )
+        else:
+            print(
+                "[four-version] source remains live while trace advances",
+                flush=True,
+            )
+
+        active_slots = follow_trace_to_preemption()
+        preempt_started = time.monotonic()
+        print(
+            f"[four-version] source preempted active={sorted(active_slots)}",
+            flush=True,
+        )
 
         if args.mode != "no_recovery":
             send(source["conn"], {"op": "metadata", "request_id": request_id})
@@ -453,13 +654,18 @@ def main() -> None:
                 or 0
             )
             source_computed = list(metadata.get("tokens", prompt))[:computed_tokens]
+            if args.preempt_after_new_tokens == 0:
+                source_generated_before_preemption = max(
+                    0, len(source_computed) - len(prompt)
+                )
             print(
                 f"[four-version] source metadata computed={computed_tokens}",
                 flush=True,
             )
-        active_slots = follow_trace_to_preemption()
-        print(f"[four-version] source preempted active={sorted(active_slots)}", flush=True)
-        preempt_started = time.monotonic()
+        remaining_new_tokens = max(
+            int(args.max_new_tokens) - source_generated_before_preemption,
+            1,
+        )
 
         if args.mode == "no_recovery":
             stop("source")
@@ -482,19 +688,46 @@ def main() -> None:
             outcome = "failed"
         elif args.mode == "rerouting":
             stop("source")
-            print("[four-version] source stopped; rerouting", flush=True)
-            target = workers["reroute_replica"]
-            target_result = target_generate(target, request_id, source_computed)
+            print(
+                "[four-version] source stopped; creating same-shape "
+                "rerouting target",
+                flush=True,
+            )
+            available_gpus = [gpu for gpu in args.gpus if gpu in active_slots]
+            if len(available_gpus) < tensor_parallel_size:
+                raise AssertionError(
+                    f"trace leaves {available_gpus}, cannot create TP="
+                    f"{tensor_parallel_size} rerouting target"
+                )
+            new_target_gpus = available_gpus[:tensor_parallel_size]
+            new_target_spec = {
+                "label": "reroute_target",
+                "node_id": "four-version-reroute-target",
+                "role": "observer",
+                "gpus": new_target_gpus,
+                "tp": tensor_parallel_size,
+                "port": 5700,
+            }
+            launch(new_target_spec)
+            register([new_target_spec])
+            target = workers["reroute_target"]
+            target_result = target_generate(
+                target,
+                request_id,
+                source_computed,
+                remaining_new_tokens,
+            )
             recovery = {
                 "request_outcome": "continued",
                 "target_continued": target_result["continued"],
                 "recomputed_tokens": len(source_computed),
                 "restored_blocks": 0,
-                "target_preexisting": True,
-                "engine_created": False,
-                "placement_changed": False,
+                "target_preexisting": False,
+                "engine_created": True,
+                "placement_changed": True,
                 "old_tensor_parallel_size": tensor_parallel_size,
                 "new_tensor_parallel_size": tensor_parallel_size,
+                "new_target_gpus": new_target_gpus,
                 **target_result,
                 "recovery_s": round(time.monotonic() - preempt_started, 3),
             }
@@ -521,7 +754,10 @@ def main() -> None:
             launch(new_target_spec)
             register([new_target_spec])
             target_result = target_generate(
-                workers["reparallelized_target"], request_id, source_computed
+                workers["reparallelized_target"],
+                request_id,
+                source_computed,
+                remaining_new_tokens,
             )
             recovery = {
                 "request_outcome": "continued",
@@ -539,12 +775,53 @@ def main() -> None:
             }
             outcome = "continued"
         else:
-            target = workers["reroute_replica"]
-            print("[four-version] exporting source state", flush=True)
+            if args.dynamic_planner:
+                planner_decision = dynamic_plan(active_slots, "remove")
+                plan, planned_target_groups = plan_target_groups(
+                    planner_decision
+                )
+                print(
+                    "[four-version] planner selected "
+                    f"TP={plan.tensor_parallel_size} "
+                    f"target_groups={planned_target_groups} "
+                    f"DP={plan.data_parallel_size}",
+                    flush=True,
+                )
+                # Export while the source request is still live.  The target
+                # engine is then created from the selected ParallelPlan, so
+                # this path tests configuration re-selection and KV restore
+                # together rather than using a fixed READY target.
+                print(
+                    "[four-version] exporting source state before dynamic "
+                    "target startup",
+                    flush=True,
+                )
+            else:
+                plan = None
+                planned_target_gpus = []
+                target = workers["reroute_replica"]
+                print("[four-version] exporting source state", flush=True)
             send(source["conn"], {"op": "export", "request_id": request_id})
             exported = wait_event(source["conn"], "export", args.timeout_s)["result"]
             if not exported.get("supports_restore"):
                 raise AssertionError(f"source export failed: {exported}")
+            if args.dynamic_planner:
+                dynamic_target_specs = []
+                for replica, replica_gpus in enumerate(planned_target_groups):
+                    dynamic_target_specs.append(
+                        {
+                            "label": f"planned_target_{replica}",
+                            "node_id": f"four-version-planned-target-{replica}",
+                            "role": "observer",
+                            "gpus": replica_gpus,
+                            "tp": plan.tensor_parallel_size,
+                            "port": 5700 + replica,
+                        }
+                    )
+                for dynamic_target_spec in dynamic_target_specs:
+                    launch(dynamic_target_spec)
+                register(dynamic_target_specs)
+                target = workers["planned_target_0"]
             send(source["conn"], {"op": "abort", "request_id": request_id})
             wait_event(source["conn"], "aborted", args.timeout_s)
             send(
@@ -554,22 +831,39 @@ def main() -> None:
             staged = wait_event(target["conn"], "restore", args.timeout_s)["result"]
             if not staged.get("staged"):
                 raise AssertionError(f"target restore failed: {staged}")
-            target_result = target_generate(target, request_id, source_computed)
+            target_result = target_generate(
+                target,
+                request_id,
+                source_computed,
+                remaining_new_tokens,
+            )
             stop("source")
             recovery = {
                 "request_outcome": "continued",
                 "target_continued": target_result["continued"],
                 "recomputed_tokens": 0,
                 "restored_blocks": int(staged.get("expected_blocks", 0) or 0),
-                "target_preexisting": True,
-                "engine_created": False,
-                "placement_changed": False,
+                "target_preexisting": not args.dynamic_planner,
+                "engine_created": bool(args.dynamic_planner),
+                "placement_changed": bool(args.dynamic_planner),
                 "old_tensor_parallel_size": tensor_parallel_size,
-                "new_tensor_parallel_size": tensor_parallel_size,
+                "new_tensor_parallel_size": (
+                    plan.tensor_parallel_size
+                    if plan is not None
+                    else tensor_parallel_size
+                ),
                 "restore_success": True,
                 **target_result,
                 "recovery_s": round(time.monotonic() - preempt_started, 3),
             }
+            if planner_decision is not None:
+                recovery["planner_action"] = planner_decision.get("action")
+                recovery["planner_selected_plan"] = planner_decision.get(
+                    "parallel_plan"
+                )
+                recovery["target_replicas"] = plan.num_replicas
+                recovery["target_groups"] = planned_target_groups
+                recovery["configuration_applied"] = True
             outcome = "continued"
 
         source_blocks = len(metadata.get("block_ids", []))
@@ -579,6 +873,14 @@ def main() -> None:
             "model": args.model,
             "trace": args.trace,
             "prompt_tokens": args.prompt_tokens,
+            "max_new_tokens": args.max_new_tokens,
+            "preempt_after_new_tokens": args.preempt_after_new_tokens,
+            "source_generated_before_preemption": (
+                source_generated_before_preemption
+            ),
+            "dynamic_planner": bool(args.dynamic_planner),
+            "planner_decision": planner_decision,
+            "trace_events_applied": trace_history,
             "source_computed_tokens": len(source_computed),
             "source_blocks": source_blocks,
             "source_config": {
