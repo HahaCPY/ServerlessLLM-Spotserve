@@ -629,6 +629,15 @@ class VllmBackend(SllmBackend):
             f"Creating new VLLM engine with config: {filtered_engine_config}"
         )
 
+        ray_dp_pack_strategy = backend_config.get("ray_dp_pack_strategy")
+        if ray_dp_pack_strategy is not None:
+            normalized_pack_strategy = str(ray_dp_pack_strategy).strip().lower()
+            if normalized_pack_strategy not in {"strict", "fill", "span"}:
+                raise ValueError(
+                    "ray_dp_pack_strategy must be strict, fill, or span"
+                )
+            os.environ["VLLM_RAY_DP_PACK_STRATEGY"] = normalized_pack_strategy
+
         self.engine_args = AsyncEngineArgs(**filtered_engine_config)
         self._async_engine_fields = async_engine_fields
 
@@ -638,24 +647,26 @@ class VllmBackend(SllmBackend):
         self.ray_dp_owns_gpus = bool(
             backend_config.get("spotserve_vllm_ray_dp_owns_gpus", False)
         )
-        if self.elastic_ep_enabled or self.ray_dp_owns_gpus:
+        if self.ray_dp_owns_gpus:
             if backend_config.get("data_parallel_backend") != "ray":
                 raise ValueError(
-                    "SpotServe elastic EP requires data_parallel_backend='ray'"
-                )
-            if not self.elastic_ep_enabled or not self.ray_dp_owns_gpus:
-                raise ValueError(
-                    "SpotServe elastic EP requires both "
-                    "spotserve_elastic_ep_enabled and "
-                    "spotserve_vllm_ray_dp_owns_gpus"
+                    "SpotServe Ray-DP GPU ownership requires "
+                    "data_parallel_backend='ray'"
                 )
             if int(backend_config.get("tensor_parallel_size", 1) or 1) != 1:
-                raise ValueError("SpotServe elastic EP currently requires TP=1")
+                raise ValueError("SpotServe Ray-DP GPU ownership requires TP=1")
             if int(backend_config.get("pipeline_parallel_size", 1) or 1) != 1:
-                raise ValueError("SpotServe elastic EP currently requires PP=1")
+                raise ValueError("SpotServe Ray-DP GPU ownership requires PP=1")
             if not backend_config.get("enable_expert_parallel", False):
                 raise ValueError(
-                    "SpotServe elastic EP requires enable_expert_parallel=true"
+                    "SpotServe Ray-DP GPU ownership requires "
+                    "enable_expert_parallel=true"
+                )
+        if self.elastic_ep_enabled:
+            if not self.ray_dp_owns_gpus:
+                raise ValueError(
+                    "SpotServe elastic EP requires "
+                    "spotserve_vllm_ray_dp_owns_gpus=true"
                 )
             if not backend_config.get("enable_eplb", False):
                 raise ValueError(
@@ -1097,6 +1108,26 @@ class VllmBackend(SllmBackend):
                 runtime_status.get(
                     "expert_placement_runtime_physical_host_ids_observed", False
                 )
+            ),
+            "expert_placement_runtime_physical_host_count": int(
+                runtime_status.get(
+                    "expert_placement_runtime_physical_host_count", 0
+                )
+                or 0
+            ),
+            "expert_placement_runtime_physical_host_ids": list(
+                runtime_status.get(
+                    "expert_placement_runtime_physical_host_ids", []
+                )
+                or []
+            ),
+            "expert_placement_runtime_ray_node_count": int(
+                runtime_status.get("expert_placement_runtime_ray_node_count", 0)
+                or 0
+            ),
+            "expert_placement_runtime_ray_node_ids": list(
+                runtime_status.get("expert_placement_runtime_ray_node_ids", [])
+                or []
             ),
             "expert_placement_runtime_cross_node_weight_migration": bool(
                 runtime_status.get(
@@ -1636,6 +1667,10 @@ class VllmBackend(SllmBackend):
             "expert_placement_runtime_active_request_remap": False,
             "expert_placement_runtime_step_boundary_barrier": False,
             "expert_placement_runtime_physical_host_ids_observed": False,
+            "expert_placement_runtime_physical_host_count": 0,
+            "expert_placement_runtime_physical_host_ids": [],
+            "expert_placement_runtime_ray_node_count": 0,
+            "expert_placement_runtime_ray_node_ids": [],
             "expert_placement_runtime_cross_node_weight_migration": False,
             "expert_placement_runtime_cross_node_moved_expert_shards": 0,
             "expert_placement_runtime_cross_node_moved_weight_bytes": 0,
@@ -1813,6 +1848,23 @@ class VllmBackend(SllmBackend):
                         apply_result, "physical_host_ids_observed", default=False
                     )
                 )
+                status["expert_placement_runtime_physical_host_count"] = (
+                    _runtime_hook_int(apply_result, "physical_host_count", 0)
+                )
+                if isinstance(apply_result, Mapping):
+                    status["expert_placement_runtime_physical_host_ids"] = [
+                        str(value)
+                        for value in apply_result.get("physical_host_ids", [])
+                        if value
+                    ]
+                    status["expert_placement_runtime_ray_node_count"] = (
+                        _runtime_hook_int(apply_result, "ray_node_count", 0)
+                    )
+                    status["expert_placement_runtime_ray_node_ids"] = [
+                        str(value)
+                        for value in apply_result.get("ray_node_ids", [])
+                        if value
+                    ]
                 status["expert_placement_runtime_cross_node_weight_migration"] = (
                     _runtime_hook_bool(
                         apply_result, "cross_node_weight_migration", default=False

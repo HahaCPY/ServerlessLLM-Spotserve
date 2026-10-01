@@ -100,6 +100,7 @@ class VllmDeploymentAdapter:
         config["expert_parallel_size_verified"] = False
         config["enable_expert_parallel"] = plan.enable_expert_parallel
         config["placement_epoch"] = plan.placement_epoch
+        config["spotserve_target_worker_nodes"] = list(plan.target_nodes)
         config["reparallelization_execution_model"] = "actor_recreate"
         config["reparallelization_execution_model_reason"] = (
             "vllm_actor_recreate"
@@ -250,6 +251,15 @@ class VllmDeploymentAdapter:
         )
         target_nodes = list(plan.target_nodes)
         known_scheduler_node_ids = await self._known_scheduler_node_ids()
+        distributed_allocation = bool(
+            backend_config.get("spotserve_distributed_gpu_allocation", False)
+            and backend_config.get("spotserve_vllm_ray_dp_owns_gpus", False)
+            and len(target_nodes) > 1
+        )
+        if distributed_allocation and plan.replica_count != 1:
+            raise RuntimeError(
+                "distributed_vllm_allocation_requires_single_sllm_replica"
+            )
 
         try:
             for replica in range(max(plan.replica_count, 1)):
@@ -270,17 +280,58 @@ class VllmDeploymentAdapter:
                         "target_worker_node_not_in_scheduler_snapshot: "
                         f"{target_node_id}"
                     )
-                allocation_kwargs = {
-                    "model_name": self.model_name,
-                    "instance_id": instance_id,
-                    "resources": resource_requirements,
-                }
-                if target_node_id is not None:
-                    allocation_kwargs["target_node_id"] = target_node_id
-                startup_node = await _call(
-                    self.scheduler.allocate_resource.remote,
-                    **allocation_kwargs,
-                )
+                if distributed_allocation:
+                    allocate_distributed = getattr(
+                        self.scheduler,
+                        "allocate_distributed_resource",
+                        None,
+                    )
+                    allocate_distributed_remote = getattr(
+                        allocate_distributed, "remote", None
+                    )
+                    if allocate_distributed_remote is None:
+                        raise RuntimeError(
+                            "scheduler_distributed_allocation_unavailable"
+                        )
+                    allocation = await _call(
+                        allocate_distributed_remote,
+                        model_name=self.model_name,
+                        instance_id=instance_id,
+                        resources=resource_requirements,
+                        target_node_ids=target_nodes,
+                        require_all_target_nodes=True,
+                    )
+                    if not isinstance(allocation, Mapping):
+                        raise RuntimeError(
+                            "scheduler_distributed_allocation_result_invalid"
+                        )
+                    startup_node = str(allocation.get("node_id") or "")
+                    allocated_nodes = [
+                        str(node)
+                        for node in allocation.get("target_node_ids", [])
+                    ]
+                    if not startup_node or len(allocated_nodes) < 2:
+                        raise RuntimeError(
+                            "scheduler_did_not_reserve_multiple_worker_nodes"
+                        )
+                    backend_config["spotserve_reserved_worker_nodes"] = (
+                        allocated_nodes
+                    )
+                    backend_config["spotserve_distributed_node_allocations"] = dict(
+                        allocation.get("node_allocations", {})
+                    )
+                else:
+                    allocation_kwargs = {
+                        "model_name": self.model_name,
+                        "instance_id": instance_id,
+                        "resources": resource_requirements,
+                    }
+                    if target_node_id is not None:
+                        allocation_kwargs["target_node_id"] = target_node_id
+                    startup_node = await _call(
+                        self.scheduler.allocate_resource.remote,
+                        **allocation_kwargs,
+                    )
                 startup_resources = {
                     "worker_node": 0.1,
                     f"worker_id_{startup_node}": 0.1,

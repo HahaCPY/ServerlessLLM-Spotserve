@@ -4119,11 +4119,61 @@ class RoundRobinRouter(SllmRouter):
                 logger.info(
                     f"Allocating resources for model {self.model_name} on instance {instance_id}"
                 )
-                startup_node = (
-                    await self.model_loading_scheduler.allocate_resource.remote(
-                        self.model_name, instance_id, self.resource_requirements
-                    )
+                distributed_targets = self.backend_config.get(
+                    "spotserve_target_worker_nodes", []
                 )
+                if isinstance(distributed_targets, str):
+                    distributed_targets = [
+                        value.strip()
+                        for value in distributed_targets.split(",")
+                        if value.strip()
+                    ]
+                distributed_allocation = bool(
+                    self.backend == "vllm"
+                    and self.backend_config.get(
+                        "spotserve_distributed_gpu_allocation", False
+                    )
+                    and self.backend_config.get(
+                        "spotserve_vllm_ray_dp_owns_gpus", False
+                    )
+                    and isinstance(distributed_targets, list)
+                    and len(distributed_targets) > 1
+                )
+                if distributed_allocation:
+                    allocation = (
+                        await self.model_loading_scheduler.allocate_distributed_resource.remote(
+                            self.model_name,
+                            instance_id,
+                            self.resource_requirements,
+                            [str(node) for node in distributed_targets],
+                            True,
+                        )
+                    )
+                    if not isinstance(allocation, Mapping):
+                        raise RuntimeError(
+                            "scheduler_distributed_allocation_result_invalid"
+                        )
+                    startup_node = str(allocation.get("node_id") or "")
+                    allocated_nodes = [
+                        str(node)
+                        for node in allocation.get("target_node_ids", [])
+                    ]
+                    if not startup_node or len(allocated_nodes) < 2:
+                        raise RuntimeError(
+                            "scheduler_did_not_reserve_multiple_worker_nodes"
+                        )
+                    self.backend_config[
+                        "spotserve_reserved_worker_nodes"
+                    ] = allocated_nodes
+                    self.backend_config[
+                        "spotserve_distributed_node_allocations"
+                    ] = dict(allocation.get("node_allocations", {}))
+                else:
+                    startup_node = (
+                        await self.model_loading_scheduler.allocate_resource.remote(
+                            self.model_name, instance_id, self.resource_requirements
+                        )
+                    )
                 resources_allocated = True
                 startup_resources = {
                     "worker_node": 0.1,

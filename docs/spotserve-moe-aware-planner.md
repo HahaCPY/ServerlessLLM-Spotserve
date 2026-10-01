@@ -1082,8 +1082,9 @@ prefix warmup，recovery 會退回 token replay fallback。這讓 V7/V8 的 loca
 
 - `ExpertPlacementPlan` 可序列化到 metrics。（已完成 logical plan）
 - preempted GPU 上的 experts 可被重新配置到 ready GPUs。fixed-EP physical
-  remap 與 quiescent same-host EP2 -> EP4 已完成；active-request EP resize 與
-  cross-host tensor transport 尚未完成。
+  remap 與 quiescent same-host EP2 -> EP4 已完成；cross-host transport、
+  distributed reservation 與 fail-closed runtime gate 已實作，但仍需在兩台
+  實體 GPU hosts 產生通過報告。active-request in-place EP resize 仍未完成。
 - planner cost 同時考慮 GPU capacity、expert movement、dispatch cost。
 - 明確定義 SpotServe planner 與 vLLM EPLB 的責任邊界：SpotServe 負責
   resource-change / preemption-aware topology planning，vLLM EPLB 負責
@@ -2194,6 +2195,35 @@ reduction 證據；該次結果的 `internode_calls=0`，跨節點 claim 必須�
 - source/target 在不同 physical nodes。
 - NIXL 或等價 transport 有正向 restore 結果。
 - `can_restore_cross_node=true` 只在真實跨機驗證通過後開啟。
+
+目前已完成 cross-host **實作與 fail-closed verifier**：scheduler 可將同一個
+Ray-DP model instance 的 GPU reservation 分散到指定 worker nodes；每個 worker
+以 node-local Ray custom resource 回報 hashed physical-host identity；vLLM expert
+remap runtime 會蒐集所有 EP ranks 的 host/node identity，並計算實際跨 host 的
+expert shard 與 tensor bytes。`require_cross_node=true` 時，只要 ranks 位於同一台
+host、host marker 缺漏、沒有 expert 真正跨 host，或 runtime placement 無法驗證，
+整次 remap 都會 fail closed。
+
+專用 gate 為：
+
+```text
+benchmarks/spotserve/benchmark_matrix_cross_host_expert_remap_performance.yaml
+scripts/verify_spotserve_cross_host_expert_remap.py
+```
+
+完成狀態需分開寫：
+
+```text
+cross-host scheduling / deployment path: implemented
+node-local physical-host identity: implemented
+cross-host physical expert transfer gate: implemented
+runtime placement / moved-byte verification: implemented
+internode A2A activity gate: implemented
+passing physical multi-host report: pending execution on two GPU hosts
+```
+
+部署與驗證命令見 `docs/spotserve-cross-host-experiment.md`。在同一台 host 上建立
+多個 container 不會被這個 gate 接受。
 
 ## Validation Matrix
 

@@ -76,6 +76,67 @@ async def test_scheduler_rejects_resize_without_capacity():
     assert scheduler.model_instance_resources["m"]["i-0"]["num_gpus"] == 2
 
 
+def test_scheduler_builds_distributed_gpu_allocation_across_required_nodes():
+    allocation = FcfsScheduler._distributed_gpu_allocation(
+        {
+            "0": {"free_gpu": 1, "state": NodeState.READY.value},
+            "1": {"free_gpu": 1, "state": NodeState.READY.value},
+        },
+        ["0", "1"],
+        requested_gpus=2,
+        require_all_target_nodes=True,
+    )
+
+    assert allocation == {"0": 1, "1": 1}
+
+
+def test_scheduler_rejects_distributed_allocation_on_same_available_node():
+    with pytest.raises(RuntimeError, match="distributed_target_nodes_have_no_gpu"):
+        FcfsScheduler._distributed_gpu_allocation(
+            {
+                "0": {"free_gpu": 2, "state": NodeState.READY.value},
+                "1": {"free_gpu": 0, "state": NodeState.READY.value},
+            },
+            ["0", "1"],
+            requested_gpus=2,
+            require_all_target_nodes=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_scheduler_releases_distributed_gpu_reservation(monkeypatch):
+    scheduler = FcfsScheduler({})
+    scheduler.worker_nodes = {
+        "0": {
+            "free_gpu": 1,
+            "total_gpu": 1,
+            "state": NodeState.READY.value,
+        },
+        "1": {
+            "free_gpu": 1,
+            "total_gpu": 1,
+            "state": NodeState.READY.value,
+        },
+    }
+
+    async def keep_worker_snapshot():
+        return scheduler.worker_nodes
+
+    monkeypatch.setattr(scheduler, "_get_worker_nodes", keep_worker_snapshot)
+    allocation = await scheduler.allocate_distributed_resource(
+        "m", "i-0", {"num_gpus": 2}, ["0", "1"]
+    )
+
+    assert allocation["node_allocations"] == {"0": 1, "1": 1}
+    assert scheduler.worker_nodes["0"]["free_gpu"] == 0
+    assert scheduler.worker_nodes["1"]["free_gpu"] == 0
+
+    await scheduler.deallocate_resource("m", "i-0", {"num_gpus": 2})
+
+    assert scheduler.worker_nodes["0"]["free_gpu"] == 1
+    assert scheduler.worker_nodes["1"]["free_gpu"] == 1
+
+
 @pytest.mark.asyncio
 async def test_scheduler_marks_node_health_states():
     scheduler = FcfsScheduler({})

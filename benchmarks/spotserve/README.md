@@ -640,3 +640,24 @@ Each run writes:
 - `report.html`
 - `report.md`
 - `router_request_metrics.jsonl` when matching router metrics are available
+
+## Physical Cross-host Expert Remap
+
+The cross-host matrix is a fail-closed physical-host gate:
+
+```bash
+python benchmarks/spotserve/run_benchmark.py \
+  --config benchmarks/spotserve/benchmark_matrix_cross_host_expert_remap_performance.yaml \
+  --endpoint http://127.0.0.1:8343/v1/chat/completions \
+  --request-timeout 240 \
+  --trace-event-timeout 600 \
+  --ray-address auto \
+  --ray-namespace sllm
+```
+
+It requires Ray workers `0` and `1` to reside on distinct Ray nodes with
+distinct node-local physical-host markers. Success additionally requires
+runtime-verified expert ownership changes, positive cross-host moved bytes,
+successful post-remap inference, and a post-remap internode A2A call. A
+same-host multi-container deployment is expected to fail this gate. See
+`docs/spotserve-cross-host-experiment.md` for the three-node deployment.

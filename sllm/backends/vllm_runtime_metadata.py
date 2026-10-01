@@ -482,6 +482,22 @@ def get_vllm_model_resource_profile(
         runtime_metadata.get("expert_placement_runtime_physical_host_ids_observed"),
         default=False,
     )
+    runtime_physical_host_count = _optional_non_negative_int(
+        runtime_metadata.get("expert_placement_runtime_physical_host_count")
+    ) or 0
+    runtime_physical_host_ids = runtime_metadata.get(
+        "expert_placement_runtime_physical_host_ids", []
+    )
+    if not isinstance(runtime_physical_host_ids, (list, tuple)):
+        runtime_physical_host_ids = []
+    runtime_ray_node_count = _optional_non_negative_int(
+        runtime_metadata.get("expert_placement_runtime_ray_node_count")
+    ) or 0
+    runtime_ray_node_ids = runtime_metadata.get(
+        "expert_placement_runtime_ray_node_ids", []
+    )
+    if not isinstance(runtime_ray_node_ids, (list, tuple)):
+        runtime_ray_node_ids = []
     runtime_cross_node_weight_migration = _to_bool(
         runtime_metadata.get("expert_placement_runtime_cross_node_weight_migration"),
         default=False,
@@ -832,6 +848,16 @@ def get_vllm_model_resource_profile(
         "expert_placement_runtime_physical_host_ids_observed": (
             runtime_physical_host_ids_observed
         ),
+        "expert_placement_runtime_physical_host_count": (
+            runtime_physical_host_count
+        ),
+        "expert_placement_runtime_physical_host_ids": [
+            str(value) for value in runtime_physical_host_ids if value
+        ],
+        "expert_placement_runtime_ray_node_count": runtime_ray_node_count,
+        "expert_placement_runtime_ray_node_ids": [
+            str(value) for value in runtime_ray_node_ids if value
+        ],
         "expert_placement_runtime_cross_node_weight_migration": (
             runtime_cross_node_weight_migration
         ),
@@ -1095,6 +1121,18 @@ def get_vllm_runtime_metadata(
         ),
         "expert_placement_runtime_physical_host_ids_observed": (
             profile["expert_placement_runtime_physical_host_ids_observed"]
+        ),
+        "expert_placement_runtime_physical_host_count": (
+            profile["expert_placement_runtime_physical_host_count"]
+        ),
+        "expert_placement_runtime_physical_host_ids": (
+            profile["expert_placement_runtime_physical_host_ids"]
+        ),
+        "expert_placement_runtime_ray_node_count": (
+            profile["expert_placement_runtime_ray_node_count"]
+        ),
+        "expert_placement_runtime_ray_node_ids": (
+            profile["expert_placement_runtime_ray_node_ids"]
         ),
         "expert_placement_runtime_cross_node_weight_migration": (
             profile["expert_placement_runtime_cross_node_weight_migration"]

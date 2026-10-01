@@ -440,3 +440,14 @@ EP transition, changed experts, and actor identity preservation
 ```text
 single-host, 4 x RTX 5070 Ti, trace-driven preemption simulation
 ```
+
+## Optional Cross-host Gate
+
+single-host 主實驗完成後，若另有兩台可互通的 GPU hosts，再執行 physical
+cross-host expert remap gate。部署拓樸、映像同步、完整命令與成功條件見：
+
+```text
+docs/spotserve-cross-host-experiment.md
+```
+
+這是獨立的機制驗證，不可把尚未執行的 cross-host gate 混入 single-host 主表。

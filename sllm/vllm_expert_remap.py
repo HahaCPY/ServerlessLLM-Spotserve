@@ -20,6 +20,7 @@ import torch.distributed as dist
 _TRUTHY = {"1", "true", "yes", "on"}
 _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 _EP_RANK_RE = re.compile(r"^(?:replica:0/)?ep-rank:(\d+)$")
+_PHYSICAL_HOST_RESOURCE_PREFIX = "spotserve_physical_host_"
 _LAST_REMAP: dict[str, Any] = {}
 _ALL_TO_ALL_LOCK = threading.Lock()
 _ALL_TO_ALL_COUNTERS: dict[str, Any] = {
@@ -145,6 +146,62 @@ def reset_all_to_all_counters() -> None:
             _ALL_TO_ALL_COUNTERS[key] = {} if key == "backends" else 0
 
 
+def physical_host_identity() -> dict[str, str]:
+    """Return node-local host identity without trusting copied driver env."""
+    try:
+        import ray
+
+        context = ray.get_runtime_context()
+        node_id_value = context.get_node_id()
+        node_id = (
+            node_id_value.hex()
+            if callable(getattr(node_id_value, "hex", None))
+            else str(node_id_value)
+        )
+        for node in ray.nodes():
+            if str(node.get("NodeID", "")) != node_id:
+                continue
+            markers = sorted(
+                key
+                for key, value in (node.get("Resources") or {}).items()
+                if key.startswith(_PHYSICAL_HOST_RESOURCE_PREFIX)
+                and float(value or 0) > 0
+            )
+            if len(markers) == 1:
+                return {
+                    "physical_host_id": markers[0][
+                        len(_PHYSICAL_HOST_RESOURCE_PREFIX) :
+                    ],
+                    "physical_host_identity_source": "ray_node_resource",
+                    "ray_node_id": node_id,
+                    "ray_node_address": str(
+                        node.get("NodeManagerAddress", "") or ""
+                    ),
+                }
+            if len(markers) > 1:
+                return {
+                    "physical_host_id": "",
+                    "physical_host_identity_source": (
+                        "ambiguous_ray_node_resources"
+                    ),
+                    "ray_node_id": node_id,
+                    "ray_node_address": str(
+                        node.get("NodeManagerAddress", "") or ""
+                    ),
+                }
+    except Exception:
+        pass
+
+    return {
+        "physical_host_id": os.environ.get(
+            "SPOTSERVE_PHYSICAL_HOST_ID", ""
+        ).strip(),
+        "physical_host_identity_source": "environment_fallback",
+        "ray_node_id": "",
+        "ray_node_address": "",
+    }
+
+
 def aggregate_dp_engine_hook_results(
     engine_results: list[Any],
     success_key: str,
@@ -175,6 +232,22 @@ def aggregate_dp_engine_hook_results(
         )
     contract_seen_count = sum(
         bool(row.get("contract_seen_by_runtime")) for row in worker_results
+    )
+    physical_host_ids = sorted(
+        {
+            str(host_id)
+            for row in worker_results
+            for host_id in row.get("physical_host_ids", [])
+            if host_id
+        }
+    )
+    ray_node_ids = sorted(
+        {
+            str(node_id)
+            for row in worker_results
+            for node_id in row.get("ray_node_ids", [])
+            if node_id
+        }
     )
     return {
         success_key: succeeded,
@@ -220,6 +293,10 @@ def aggregate_dp_engine_hook_results(
             worker_results
             and all(row.get("physical_host_ids_observed") for row in worker_results)
         ),
+        "physical_host_count": len(physical_host_ids),
+        "physical_host_ids": physical_host_ids,
+        "ray_node_count": len(ray_node_ids),
+        "ray_node_ids": ray_node_ids,
         "cross_node_weight_migration": any(
             bool(row.get("cross_node_weight_migration"))
             for row in worker_results
@@ -629,15 +706,25 @@ def remap_expert_weights(model: Any, plan: Mapping[str, Any]) -> dict[str, Any]:
     gathered = [torch.empty_like(old_local) for _ in range(group.size())]
     dist.all_gather(gathered, old_local, group=group)
     old_indices = torch.cat(gathered, dim=1)
-    host_ids: list[str] = [""] * group.size()
+    host_identity = physical_host_identity()
+    host_identity_rows: list[Any] = [None] * group.size()
     dist.all_gather_object(
-        host_ids,
-        os.environ.get("SPOTSERVE_PHYSICAL_HOST_ID", "").strip(),
+        host_identity_rows,
+        host_identity,
         group=group,
     )
-    host_ids = [str(host_id or "").strip() for host_id in host_ids]
+    host_ids = [
+        str((row or {}).get("physical_host_id") or "").strip()
+        for row in host_identity_rows
+    ]
+    host_identity_sources = [
+        str((row or {}).get("physical_host_identity_source") or "")
+        for row in host_identity_rows
+    ]
     if plan.get("require_cross_node") is True and (
-        not all(host_ids) or len(set(host_ids)) < 2
+        not all(host_ids)
+        or len(set(host_ids)) < 2
+        or not all(source == "ray_node_resource" for source in host_identity_sources)
     ):
         raise ValueError("cross_node_requires_distinct_physical_host_ids")
     new_indices = torch.tensor(
@@ -719,6 +806,17 @@ def remap_expert_weights(model: Any, plan: Mapping[str, Any]) -> dict[str, Any]:
         "moved_local_expert_shards": moved,
         "moved_local_weight_bytes": local_bytes,
         "physical_host_ids_observed": bool(all(host_ids)),
+        "physical_host_count": len(set(host_ids)) if all(host_ids) else 0,
+        "physical_host_ids": host_ids,
+        "physical_host_identity_sources": host_identity_sources,
+        "ray_node_ids": [
+            str((row or {}).get("ray_node_id") or "")
+            for row in host_identity_rows
+        ],
+        "ray_node_addresses": [
+            str((row or {}).get("ray_node_address") or "")
+            for row in host_identity_rows
+        ],
         "cross_node_weight_migration": bool(cross_node_moved),
         "cross_node_moved_local_expert_shards": cross_node_moved,
         "cross_node_moved_local_weight_bytes": cross_node_bytes,

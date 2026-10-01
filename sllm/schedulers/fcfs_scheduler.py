@@ -243,6 +243,20 @@ class FcfsScheduler(SllmScheduler):
             )
             for instance_id, node_id in instances.items():
                 resource_entry = resource_entries.get(instance_id, {})
+                node_allocations = resource_entry.get("node_allocations")
+                if isinstance(node_allocations, Mapping) and node_allocations:
+                    for allocated_node_id, allocated_gpus in (
+                        node_allocations.items()
+                    ):
+                        try:
+                            parsed_gpus = max(0.0, float(allocated_gpus))
+                        except (TypeError, ValueError):
+                            continue
+                        allocated[str(allocated_node_id)] = (
+                            allocated.get(str(allocated_node_id), 0.0)
+                            + parsed_gpus
+                        )
+                    continue
                 try:
                     num_gpus = float(resource_entry.get("num_gpus", 1.0))
                 except (TypeError, ValueError):
@@ -251,6 +265,75 @@ class FcfsScheduler(SllmScheduler):
                     allocated.get(str(node_id), 0.0) + max(0.0, num_gpus)
                 )
         return allocated
+
+    @staticmethod
+    def _distributed_gpu_allocation(
+        worker_nodes: Mapping[str, Mapping[str, Any]],
+        target_node_ids: List[str],
+        requested_gpus: int,
+        require_all_target_nodes: bool,
+    ) -> Dict[str, int]:
+        if requested_gpus <= 0:
+            raise ValueError("distributed allocation requires at least one GPU")
+        normalized_targets = list(
+            dict.fromkeys(str(node) for node in target_node_ids)
+        )
+        if not normalized_targets:
+            raise ValueError("distributed allocation requires target_node_ids")
+        if require_all_target_nodes and requested_gpus < len(normalized_targets):
+            raise ValueError(
+                "distributed allocation has fewer GPUs than target nodes"
+            )
+
+        capacities: Dict[str, int] = {}
+        for node_id in normalized_targets:
+            node = worker_nodes.get(node_id)
+            if node is None:
+                raise RuntimeError(f"distributed_target_node_not_found:{node_id}")
+            if node.get("state", NodeState.READY.value) != NodeState.READY.value:
+                raise RuntimeError(f"distributed_target_node_not_ready:{node_id}")
+            capacities[node_id] = max(
+                0, int(float(node.get("free_gpu", 0) or 0))
+            )
+
+        allocations = {node_id: 0 for node_id in normalized_targets}
+        remaining = requested_gpus
+        if require_all_target_nodes:
+            unavailable = [
+                node_id for node_id, capacity in capacities.items() if capacity < 1
+            ]
+            if unavailable:
+                raise RuntimeError(
+                    "distributed_target_nodes_have_no_gpu:"
+                    + ",".join(unavailable)
+                )
+            for node_id in normalized_targets:
+                allocations[node_id] = 1
+                remaining -= 1
+
+        for node_id in sorted(
+            normalized_targets,
+            key=lambda value: (
+                -(capacities[value] - allocations[value]),
+                value,
+            ),
+        ):
+            if remaining <= 0:
+                break
+            available = capacities[node_id] - allocations[node_id]
+            assigned = min(available, remaining)
+            allocations[node_id] += assigned
+            remaining -= assigned
+
+        if remaining:
+            raise RuntimeError(
+                "insufficient_distributed_gpu_capacity:"
+                f"requested={requested_gpus},available={sum(capacities.values())},"
+                f"targets={normalized_targets}"
+            )
+        return {
+            node_id: count for node_id, count in allocations.items() if count > 0
+        }
 
     async def _collect_provider_risk_metadata(
         self, worker_nodes: Mapping[str, Mapping[str, Any]]
@@ -718,6 +801,61 @@ class FcfsScheduler(SllmScheduler):
             }
         return node_id
 
+    async def allocate_distributed_resource(
+        self,
+        model_name: str,
+        instance_id: str,
+        resources: Mapping,
+        target_node_ids: List[str],
+        require_all_target_nodes: bool = True,
+    ) -> Dict[str, Any]:
+        """Reserve one logical model instance across several Ray workers."""
+        try:
+            requested_gpus = int(resources.get("num_gpus", 0) or 0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("num_gpus must be an integer") from exc
+
+        await self._get_worker_nodes()
+        async with self.metadata_lock:
+            allocations = self._distributed_gpu_allocation(
+                self.worker_nodes,
+                target_node_ids,
+                requested_gpus,
+                require_all_target_nodes,
+            )
+            for node_id, gpu_count in allocations.items():
+                self.worker_nodes[node_id]["free_gpu"] = max(
+                    0.0,
+                    float(self.worker_nodes[node_id].get("free_gpu", 0) or 0)
+                    - gpu_count,
+                )
+            primary_node_id = next(iter(allocations))
+            self.model_instance.setdefault(model_name, {})[instance_id] = (
+                primary_node_id
+            )
+            self.model_instance_resources.setdefault(model_name, {})[
+                instance_id
+            ] = {
+                "node_id": primary_node_id,
+                "num_gpus": requested_gpus,
+                "node_allocations": dict(allocations),
+                "distributed": True,
+            }
+        logger.info(
+            "Distributed allocation for model %s instance %s: %s",
+            model_name,
+            instance_id,
+            allocations,
+        )
+        return {
+            "model_name": model_name,
+            "instance_id": instance_id,
+            "node_id": primary_node_id,
+            "target_node_ids": list(allocations),
+            "node_allocations": dict(allocations),
+            "num_gpus": requested_gpus,
+        }
+
     async def deallocate_resource(
         self, model_name: str, instance_id: str, resources: Mapping
     ):
@@ -743,6 +881,25 @@ class FcfsScheduler(SllmScheduler):
                 num_gpus = float(resource_entry.get("num_gpus", num_gpus))
             except (TypeError, ValueError):
                 pass
+            node_allocations = resource_entry.get("node_allocations")
+            if isinstance(node_allocations, Mapping) and node_allocations:
+                for allocated_node_id, allocated_gpus in node_allocations.items():
+                    node = self.worker_nodes.get(str(allocated_node_id))
+                    if node is None:
+                        logger.error("Node %s not found", allocated_node_id)
+                        continue
+                    node["free_gpu"] = min(
+                        float(node.get("total_gpu", 0) or 0),
+                        float(node.get("free_gpu", 0) or 0)
+                        + float(allocated_gpus or 0),
+                    )
+                logger.info(
+                    "Distributed nodes %s deallocated for %s/%s",
+                    node_allocations,
+                    model_name,
+                    instance_id,
+                )
+                return
             logger.info(f"Node {node_id} deallocated {num_gpus} GPUs")
             if node_id not in self.worker_nodes:
                 logger.error(f"Node {node_id} not found")
@@ -832,6 +989,21 @@ class FcfsScheduler(SllmScheduler):
             )
             for instance_id, node_id in instances.items():
                 resource_entry = resource_entries.get(instance_id, {})
+                node_allocations = resource_entry.get("node_allocations")
+                if isinstance(node_allocations, Mapping) and node_allocations:
+                    for allocated_node_id, allocated_gpus in (
+                        node_allocations.items()
+                    ):
+                        node = self.worker_nodes.get(str(allocated_node_id))
+                        if node is None:
+                            continue
+                        node["free_gpu"] = min(
+                            float(node.get("total_gpu", 0) or 0),
+                            float(node.get("free_gpu", 0) or 0)
+                            + float(allocated_gpus or 0),
+                        )
+                    released_allocations += 1
+                    continue
                 try:
                     num_gpus = float(resource_entry.get("num_gpus", 1.0))
                 except (TypeError, ValueError):

@@ -60,3 +60,16 @@ class SllmScheduler(ABC):
     ):
         """Resize an existing allocation without changing its worker node."""
         raise NotImplementedError("scheduler does not support resource resize")
+
+    async def allocate_distributed_resource(
+        self,
+        model_name: str,
+        instance_id: str,
+        resources: Mapping,
+        target_node_ids: list[str],
+        require_all_target_nodes: bool = True,
+    ):
+        """Atomically reserve one model instance across worker nodes."""
+        raise NotImplementedError(
+            "scheduler does not support distributed resource allocation"
+        )

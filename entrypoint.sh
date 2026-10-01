@@ -75,6 +75,9 @@ initialize_head_node() {
   else
     echo "No node IP specified. Ray will attempt to determine the best IP automatically."
   fi
+  if [ ! -z "$RAY_START_EXTRA_ARGS" ]; then
+    CMD="$CMD $RAY_START_EXTRA_ARGS"
+  fi
 
   # Display and execute the command
   echo "Executing: $CMD"
@@ -101,7 +104,27 @@ initialize_worker_node() {
     exit 1
   fi
 
-  RAY_RESOURCES='{"worker_node": 1, "worker_id_'$WORKER_ID'": 1}'
+  PHYSICAL_HOST_ID="${SPOTSERVE_PHYSICAL_HOST_ID:-}"
+  RAY_RESOURCES="$(
+    WORKER_ID="$WORKER_ID" PHYSICAL_HOST_ID="$PHYSICAL_HOST_ID" python - <<'PY'
+import hashlib
+import json
+import os
+
+resources = {
+    "worker_node": 1,
+    f"worker_id_{os.environ['WORKER_ID']}": 1,
+}
+physical_host_id = os.environ.get("PHYSICAL_HOST_ID", "").strip()
+if physical_host_id:
+    digest = hashlib.sha256(physical_host_id.encode("utf-8")).hexdigest()[:16]
+    resources[f"spotserve_physical_host_{digest}"] = 1
+print(json.dumps(resources, separators=(",", ":")))
+PY
+  )"
+  if [ ! -z "$PHYSICAL_HOST_ID" ]; then
+    echo "Registering SpotServe physical host identity: $PHYSICAL_HOST_ID"
+  fi
 
   # Construct the command
   CMD="ray start --address=$RAY_HEAD_ADDRESS --resources='$RAY_RESOURCES'"
@@ -115,6 +138,9 @@ initialize_worker_node() {
     CMD="$CMD --node-ip-address=$RAY_NODE_IP"
   else
     echo "No node IP specified. Ray will attempt to determine the best IP automatically."
+  fi
+  if [ ! -z "$RAY_START_EXTRA_ARGS" ]; then
+    CMD="$CMD $RAY_START_EXTRA_ARGS"
   fi
 
   # Display and execute the command

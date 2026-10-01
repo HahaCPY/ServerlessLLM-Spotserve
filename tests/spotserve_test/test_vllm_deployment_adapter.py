@@ -72,12 +72,23 @@ class _StartInstance:
 class _Scheduler:
     def __init__(self):
         self.resizes = []
+        self.distributed_allocations = []
 
         async def allocate_resource(**kwargs):
             return kwargs.get("target_node_id", "node-0")
 
         async def deallocate_resource(*args):
             return None
+
+        async def allocate_distributed_resource(**kwargs):
+            self.distributed_allocations.append(dict(kwargs))
+            target_nodes = list(kwargs["target_node_ids"])
+            return {
+                "node_id": target_nodes[0],
+                "target_node_ids": target_nodes,
+                "node_allocations": {node_id: 1 for node_id in target_nodes},
+                "num_gpus": kwargs["resources"]["num_gpus"],
+            }
 
         async def resize_resource(model_name, instance_id, resources):
             self.resizes.append(
@@ -86,6 +97,9 @@ class _Scheduler:
             return {"num_gpus": resources["num_gpus"]}
 
         self.allocate_resource = _Remote(allocate_resource)
+        self.allocate_distributed_resource = _Remote(
+            allocate_distributed_resource
+        )
         self.deallocate_resource = _Remote(deallocate_resource)
         self.resize_resource = _Remote(resize_resource)
 
@@ -497,3 +511,51 @@ async def test_vllm_adapter_rejects_unknown_target_node(monkeypatch):
 
     with pytest.raises(RuntimeError, match="target_worker_node_not_in_scheduler"):
         await adapter.create_workers(plan)
+
+
+@pytest.mark.asyncio
+async def test_vllm_adapter_reserves_cross_host_ray_dp_workers(monkeypatch):
+    monkeypatch.setattr(adapter_module, "start_instance", _StartInstance())
+    scheduler = _SnapshotScheduler(
+        {"0": {"free_gpu": 1}, "1": {"free_gpu": 1}}
+    )
+    adapter = VllmDeploymentAdapter(
+        model_name="m",
+        backend_config={
+            "tensor_parallel_size": 1,
+            "pipeline_parallel_size": 1,
+            "data_parallel_size": 2,
+            "data_parallel_backend": "ray",
+            "enable_expert_parallel": True,
+            "spotserve_vllm_ray_dp_owns_gpus": True,
+            "spotserve_distributed_gpu_allocation": True,
+        },
+        resource_requirements={"num_cpus": 1, "num_gpus": 2},
+        scheduler=scheduler,
+        traffic_switcher=lambda *_: None,
+    )
+    plan = ParallelPlan(
+        model_name="m",
+        backend="vllm",
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
+        data_parallel_size=2,
+        replica_count=1,
+        enable_expert_parallel=True,
+        num_gpus=2,
+        target_nodes=["0", "1"],
+    )
+
+    deployment = await adapter.create_workers(plan)
+
+    assert len(deployment.instances) == 1
+    assert next(iter(deployment.instances.values())).node_id == "0"
+    assert scheduler.distributed_allocations[0]["target_node_ids"] == ["0", "1"]
+    assert deployment.backend_config["spotserve_reserved_worker_nodes"] == [
+        "0",
+        "1",
+    ]
+    assert deployment.backend_config["spotserve_distributed_node_allocations"] == {
+        "0": 1,
+        "1": 1,
+    }
