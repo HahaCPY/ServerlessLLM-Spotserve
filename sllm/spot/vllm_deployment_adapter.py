@@ -89,6 +89,8 @@ class VllmDeploymentAdapter:
         config["vllm_data_parallel_size"] = plan.data_parallel_size
         config["replica_count"] = plan.replica_count
         config["sllm_replica_count"] = plan.replica_count
+        if plan.batch_size > 0:
+            config["max_num_seqs"] = plan.batch_size
         planned_ep_size = plan.effective_expert_parallel_size
         config["planned_effective_expert_parallel_size"] = planned_ep_size
         config["planned_expert_parallel_size"] = planned_ep_size
@@ -256,11 +258,6 @@ class VllmDeploymentAdapter:
             and backend_config.get("spotserve_vllm_ray_dp_owns_gpus", False)
             and len(target_nodes) > 1
         )
-        if distributed_allocation and plan.replica_count != 1:
-            raise RuntimeError(
-                "distributed_vllm_allocation_requires_single_sllm_replica"
-            )
-
         try:
             for replica in range(max(plan.replica_count, 1)):
                 instance_id = (
@@ -299,7 +296,7 @@ class VllmDeploymentAdapter:
                         instance_id=instance_id,
                         resources=resource_requirements,
                         target_node_ids=target_nodes,
-                        require_all_target_nodes=True,
+                        require_all_target_nodes=False,
                     )
                     if not isinstance(allocation, Mapping):
                         raise RuntimeError(
@@ -310,16 +307,19 @@ class VllmDeploymentAdapter:
                         str(node)
                         for node in allocation.get("target_node_ids", [])
                     ]
-                    if not startup_node or len(allocated_nodes) < 2:
+                    if not startup_node or not allocated_nodes:
                         raise RuntimeError(
-                            "scheduler_did_not_reserve_multiple_worker_nodes"
+                            "scheduler_did_not_reserve_worker_nodes"
                         )
-                    backend_config["spotserve_reserved_worker_nodes"] = (
+                    instance_config = dict(backend_config)
+                    instance_config["spotserve_reserved_worker_nodes"] = (
                         allocated_nodes
                     )
-                    backend_config["spotserve_distributed_node_allocations"] = dict(
+                    instance_config["spotserve_distributed_node_allocations"] = dict(
                         allocation.get("node_allocations", {})
                     )
+                    if plan.replica_count == 1:
+                        deployment.backend_config.update(instance_config)
                 else:
                     allocation_kwargs = {
                         "model_name": self.model_name,
@@ -332,6 +332,23 @@ class VllmDeploymentAdapter:
                         self.scheduler.allocate_resource.remote,
                         **allocation_kwargs,
                     )
+                    allocated_nodes = [str(startup_node)]
+                    instance_config = dict(backend_config)
+                # Track the reservation before actor construction/init so all
+                # failure paths release it, including failure on replica 2.
+                handle = InstanceHandle(
+                    instance_id=instance_id,
+                    max_queue_length=self.max_queue_length,
+                    num_gpu=replica_gpus,
+                    node_id=str(startup_node),
+                    member_node_ids=allocated_nodes,
+                    node_allocations=(
+                        dict(allocation.get("node_allocations", {}))
+                        if distributed_allocation
+                        else {str(startup_node): replica_gpus}
+                    ),
+                )
+                deployment.instances[instance_id] = handle
                 startup_resources = {
                     "worker_node": 0.1,
                     f"worker_id_{startup_node}": 0.1,
@@ -346,16 +363,10 @@ class VllmDeploymentAdapter:
                     instance_id,
                     "vllm",
                     self.model_name,
-                    backend_config,
+                    instance_config,
                     startup_config,
                 )
-                handle = InstanceHandle(
-                    instance_id=instance_id,
-                    max_queue_length=self.max_queue_length,
-                    num_gpu=replica_gpus,
-                    node_id=str(startup_node),
-                    backend_instance=actor,
-                )
+                handle.backend_instance = actor
                 await _call(actor.init_backend.remote)
                 await handle.mark_ready(node_id=str(startup_node))
                 deployment.instances[instance_id] = handle
@@ -666,6 +677,7 @@ class VllmDeploymentAdapter:
         if deployment is None:
             return
         for instance_id, handle in list(deployment.instances.items()):
+            await handle.mark_dead()
             actor = handle.backend_instance
             try:
                 if actor is not None:
@@ -711,9 +723,9 @@ class VllmDeploymentAdapter:
             ),
             num_gpus=sum(int(handle.num_gpu or 0) for handle in instances.values()),
             target_nodes=[
-                str(handle.node_id)
+                node
                 for handle in instances.values()
-                if handle.node_id is not None
+                for node in handle.worker_node_ids()
             ],
             placement_epoch=max(
                 0, int(self.backend_config.get("placement_epoch", 0) or 0)

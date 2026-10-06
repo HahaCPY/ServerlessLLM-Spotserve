@@ -33,6 +33,7 @@ class BenchmarkSpotEvent(NamedTuple):
     instance_index: Optional[int]
     instance_selector: Optional[str]
     node_info: Optional[Dict[str, Any]] = None
+    grace_period_s: Optional[float] = None
 
 
 BENCHMARK_ONLY_WORKLOAD_KEYS = {
@@ -98,6 +99,9 @@ def load_spot_trace_events(
         if event in {"add", "remove"} and row.get("node_id") is None:
             raise ValueError(f"{path}: {event} event requires node_id")
         node_info = row.get("node_info")
+        grace = row.get("grace_period_s")
+        if grace is not None and (event != "preempt" or float(grace) < 0):
+            raise ValueError(f"{path}: grace_period_s requires preempt and must be non-negative")
         if node_info is not None and not isinstance(node_info, Mapping):
             raise ValueError(f"{path}: node_info must be an object")
         model_name = row.get("model_name") or default_model_name
@@ -117,6 +121,7 @@ def load_spot_trace_events(
                 instance_index=instance_index,
                 instance_selector=instance_selector,
                 node_info=dict(node_info) if node_info is not None else None,
+                grace_period_s=float(grace) if grace is not None else None,
             )
         )
     return events
@@ -426,7 +431,7 @@ def deploy_config_over_http(
     config_path: str,
     timeout_s: float,
     router_metrics_path: Optional[str] = None,
-) -> None:
+) -> Dict[str, Any]:
     base_url = base_url_from_chat_endpoint(endpoint)
     payload = load_config(Path(config_path))
     if router_metrics_path:
@@ -438,6 +443,7 @@ def deploy_config_over_http(
         raise RuntimeError(
             f"Deploy failed for {config_path}: {result.get('response')}"
         )
+    return result
 
 
 def clear_metrics_file(path_value: Any) -> None:
@@ -482,6 +488,50 @@ async def apply_scheduler_config(
         replace=replace,
     )
     return await asyncio.to_thread(ray.get, result_ref)
+
+
+async def set_scheduler_worker_availability(
+    node_ids: List[str],
+    available: bool,
+    ray_address: str,
+    ray_namespace: str,
+) -> List[Dict[str, Any]]:
+    """Change logical GPU availability before deployment or during cleanup.
+
+    The Ray workers remain allocated. This models provider capacity at the
+    SpotServe scheduler boundary and lets later trace `add` events perform
+    real model loading on a previously idle GPU worker.
+    """
+    if not node_ids:
+        return []
+    try:
+        import ray
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "Ray is required to set initial worker availability."
+        ) from exc
+    if not ray.is_initialized():
+        ray.init(
+            address=ray_address,
+            namespace=ray_namespace,
+            ignore_reinit_error=True,
+        )
+    scheduler = ray.get_actor("model_loading_scheduler")
+    refs = []
+    for node_id in node_ids:
+        if available:
+            refs.append(scheduler.add_worker_node.remote(str(node_id), {}))
+        else:
+            refs.append(scheduler.remove_worker_node.remote(str(node_id)))
+    results = await asyncio.to_thread(ray.get, refs)
+    return [
+        {
+            "node_id": str(node_id),
+            "available": available,
+            "result": result,
+        }
+        for node_id, result in zip(node_ids, results)
+    ]
 
 
 def delete_model_over_http(
@@ -758,6 +808,31 @@ async def get_model_instance_states(
     )
 
 
+async def get_model_runtime_ep_audit(
+    model_name: str,
+    expected_ep_size: int,
+    ray_address: str,
+    ray_namespace: str,
+) -> Dict[str, Any]:
+    try:
+        import ray
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "Ray is required for the mandatory runtime EP audit."
+        ) from exc
+    if not ray.is_initialized():
+        ray.init(
+            address=ray_address,
+            namespace=ray_namespace,
+            ignore_reinit_error=True,
+        )
+    router = ray.get_actor(model_name, namespace="models")
+    return await asyncio.to_thread(
+        ray.get,
+        router.get_runtime_ep_audit.remote(expected_ep_size),
+    )
+
+
 async def wait_for_ready_instances(
     model_name: str,
     min_ready_instances: int,
@@ -977,7 +1052,8 @@ async def replay_trace_over_http(
     )
     spot_endpoint = f"{base_url_from_chat_endpoint(endpoint)}/spot/event"
     replay_started_at = time.monotonic()
-    last_event_time = 0.0
+    tasks = []
+    pending_deadlines = {}
 
     with log_path.open("w", encoding="utf-8") as log_file:
         log_file.write(
@@ -986,8 +1062,19 @@ async def replay_trace_over_http(
             f"endpoint={spot_endpoint}, event_timeout_s={timeout_s}\n"
         )
         log_file.flush()
+        async def send(payload, delay=0.0):
+            if delay:
+                await asyncio.sleep(delay)
+            log_file.write(f"Replaying spot event: {payload}\n")
+            log_file.flush()
+            result = await asyncio.to_thread(post_json, spot_endpoint, payload, timeout_s)
+            log_file.write(f"Spot event result: {json.dumps(result)}\n")
+            log_file.flush()
+            if not result.get("success"):
+                raise RuntimeError(f"Spot event replay failed for {payload}: {result.get('response')}")
+
         for event in events:
-            sleep_time = max(event.time - last_event_time, 0.0) / speedup
+            sleep_time = max(replay_started_at + event.time / speedup - time.monotonic(), 0.0)
             if sleep_time > 0:
                 await asyncio.sleep(sleep_time)
             instance_id = await resolve_trace_instance_id(
@@ -1003,19 +1090,32 @@ async def replay_trace_over_http(
             }
             if event.event == "add":
                 payload["node_info"] = event.node_info or {}
-            log_file.write(f"Replaying spot event: {payload}\n")
-            log_file.flush()
-            result = await asyncio.to_thread(
-                post_json, spot_endpoint, payload, timeout_s
-            )
-            log_file.write(f"Spot event result: {json.dumps(result)}\n")
-            log_file.flush()
-            if not result.get("success"):
-                raise RuntimeError(
-                    f"Spot event replay failed for {payload}: "
-                    f"{result.get('response')}"
-                )
-            last_event_time = event.time
+            target_key = (event.model_name, event.node_id, instance_id)
+            if event.event in {"recover", "remove", "dead"}:
+                pending = pending_deadlines.pop(target_key, None)
+                if pending is not None:
+                    pending.cancel()
+            if event.event == "preempt" and event.grace_period_s is not None:
+                notice = time.time()
+                grace = event.grace_period_s / speedup
+                payload.update({"notice_time_s": notice, "deadline_time_s": notice + grace,
+                                "trace_event_time_s": event.time,
+                                "trace_deadline_time_s": event.time + event.grace_period_s,
+                                "grace_period_s": event.grace_period_s})
+                dead_payload = {**payload, "event": "dead", "auto_deadline": True,
+                                "trace_event_time_s": event.time + event.grace_period_s}
+                previous = pending_deadlines.get(target_key)
+                if previous is not None:
+                    previous.cancel()
+                dead_task = asyncio.create_task(send(dead_payload, grace))
+                pending_deadlines[target_key] = dead_task
+                tasks.append(dead_task)
+            tasks.append(asyncio.create_task(send(payload)))
+            await asyncio.sleep(0)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+                raise result
         log_file.write(
             "HTTP trace replay finished: "
             f"elapsed_s={time.monotonic() - replay_started_at:.3f}\n"
@@ -1210,18 +1310,69 @@ async def run_one(
     if deleted_before_run:
         await asyncio.sleep(float(run_config.get("delete_settle_s", 0.0) or 0.0))
 
-    deploy_config = run_config.get("deploy_config")
-    if deploy_config:
-        deploy_config_over_http(
-            endpoint,
-            deploy_config,
-            run_request_timeout_s,
-            router_metrics_path=run_config.get("router_metrics_path"),
+    initial_unavailable_nodes = [
+        str(value)
+        for value in run_config.get("initial_unavailable_worker_nodes", [])
+    ]
+    restore_worker_nodes = [
+        str(value)
+        for value in run_config.get(
+            "restore_worker_nodes_after_run", initial_unavailable_nodes
         )
+    ]
+    initial_availability_applied = False
+    if initial_unavailable_nodes:
+        initial_availability_applied = True
+        try:
+            initial_result = await set_scheduler_worker_availability(
+                initial_unavailable_nodes,
+                False,
+                ray_address,
+                ray_namespace,
+            )
+        except BaseException:
+            await set_scheduler_worker_availability(
+                initial_unavailable_nodes,
+                True,
+                ray_address,
+                ray_namespace,
+            )
+            raise
+        (run_dir / "initial_worker_availability.json").write_text(
+            json.dumps(initial_result, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+    deploy_config = run_config.get("deploy_config")
+    try:
+        if deploy_config:
+            deployment_started_at = time.monotonic()
+            deployment_result = deploy_config_over_http(
+                endpoint,
+                deploy_config,
+                run_request_timeout_s,
+                router_metrics_path=run_config.get("router_metrics_path"),
+            )
+            metadata["deployment_registration_latency_ms"] = (
+                time.monotonic() - deployment_started_at
+            ) * 1000
+            metadata["deployment_registration_response"] = deployment_result.get(
+                "response", {}
+            )
+    except BaseException:
+        if initial_availability_applied:
+            await set_scheduler_worker_availability(
+                initial_unavailable_nodes,
+                True,
+                ray_address,
+                ray_namespace,
+            )
+        raise
 
     trace_replayer = None
     rows: List[Dict[str, Any]] = []
     try:
+        ready_wait_started_at = time.monotonic()
         await wait_for_ready_instances(
             run_config["model"],
             int(run_config.get("min_ready_instances", 0) or 0),
@@ -1229,6 +1380,47 @@ async def run_one(
             ray_address,
             ray_namespace,
         )
+        metadata["deployment_ready_wait_latency_ms"] = (
+            time.monotonic() - ready_wait_started_at
+        ) * 1000
+        metadata["deployment_ready_latency_ms"] = (
+            metadata.get("deployment_registration_latency_ms", 0.0)
+            + metadata["deployment_ready_wait_latency_ms"]
+        )
+        if run_config.get("require_runtime_ep_audit"):
+            runtime_ep_audit = await get_model_runtime_ep_audit(
+                run_config["model"],
+                int(run_config["runtime_ep_audit_expected_size"]),
+                ray_address,
+                ray_namespace,
+            )
+            metadata["runtime_ep_audit"] = runtime_ep_audit
+            metadata["runtime_ep_audit_verified"] = bool(
+                runtime_ep_audit.get("verified", False)
+            )
+            metadata["runtime_ep_audit_expected_size"] = int(
+                run_config["runtime_ep_audit_expected_size"]
+            )
+        (run_dir / "run_metadata.json").write_text(
+            json.dumps(metadata, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        if run_config.get("require_runtime_ep_audit") and not metadata[
+            "runtime_ep_audit_verified"
+        ]:
+            raise RuntimeError(
+                "Runtime EP audit failed: "
+                + json.dumps(metadata["runtime_ep_audit"], sort_keys=True)
+            )
+
+        if run_config.get("capture_instance_states"):
+            instance_states = await get_model_instance_states(
+                run_config["model"], ray_address, ray_namespace
+            )
+            (run_dir / "instance_states.json").write_text(
+                json.dumps(instance_states, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
 
         workload = load_jsonl(Path(run_config["workload"]))
         if not skip_trace:
@@ -1256,30 +1448,51 @@ async def run_one(
         rows = await send_workload(
             endpoint, run_config["model"], workload, run_request_timeout_s
         )
+        if run_config.get("capture_instance_states_after_workload"):
+            final_states = await get_model_instance_states(
+                run_config["model"], ray_address, ray_namespace
+            )
+            (run_dir / "final_instance_states.json").write_text(
+                json.dumps(final_states, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
     finally:
-        trace_status = await wait_trace_replayer(trace_replayer)
-        (run_dir / "trace_status.json").write_text(
-            json.dumps(trace_status, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-        metadata.update(trace_status)
-        (run_dir / "run_metadata.json").write_text(
-            json.dumps(metadata, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-        if run_config.get("delete_after_run"):
-            delete_model_over_http(
-                endpoint, run_config["model"], run_request_timeout_s
+        try:
+            trace_status = await wait_trace_replayer(trace_replayer)
+            (run_dir / "trace_status.json").write_text(
+                json.dumps(trace_status, indent=2, sort_keys=True),
+                encoding="utf-8",
             )
-            await record_actor_cleanup_after_delete(
-                run_dir,
-                actor_cleanup_records,
-                "after_run",
-                run_config["model"],
-                run_config,
-                ray_address,
-                ray_namespace,
+            metadata.update(trace_status)
+            (run_dir / "run_metadata.json").write_text(
+                json.dumps(metadata, indent=2, sort_keys=True),
+                encoding="utf-8",
             )
+            if run_config.get("delete_after_run"):
+                delete_model_over_http(
+                    endpoint, run_config["model"], run_request_timeout_s
+                )
+                await record_actor_cleanup_after_delete(
+                    run_dir,
+                    actor_cleanup_records,
+                    "after_run",
+                    run_config["model"],
+                    run_config,
+                    ray_address,
+                    ray_namespace,
+                )
+        finally:
+            if initial_availability_applied:
+                restored = await set_scheduler_worker_availability(
+                    restore_worker_nodes,
+                    True,
+                    ray_address,
+                    ray_namespace,
+                )
+                (run_dir / "restored_worker_availability.json").write_text(
+                    json.dumps(restored, indent=2, sort_keys=True),
+                    encoding="utf-8",
+                )
 
     for row in rows:
         row["policy"] = run_config.get("policy", "none")

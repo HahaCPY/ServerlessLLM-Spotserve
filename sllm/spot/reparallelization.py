@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field, replace
+import math
 from typing import Any, Dict, List, Mapping, Optional
 
 from .moe_placement import build_logical_expert_placement_plan
@@ -72,6 +73,7 @@ class ParallelPlan:
     placement_epoch: int = 0
     expert_placement_plan: Optional[Mapping[str, Any]] = None
     reason: str = "replan"
+    batch_size: int = 0
 
     def __init__(
         self,
@@ -89,6 +91,7 @@ class ParallelPlan:
         reason: str = "replan",
         num_replicas: Optional[int] = None,
         expert_parallel_size: Optional[int] = None,
+        batch_size: int = 0,
     ) -> None:
         runtime_dp = max(1, int(data_parallel_size or 1))
         replicas = max(
@@ -137,6 +140,7 @@ class ParallelPlan:
             else None,
         )
         object.__setattr__(self, "reason", str(reason))
+        object.__setattr__(self, "batch_size", max(0, int(batch_size)))
 
     @property
     def effective_expert_parallel_size(self) -> int:
@@ -223,6 +227,7 @@ class ParallelPlan:
                 else None
             ),
             reason=str(payload.get("reason", "replan")),
+            batch_size=int(payload.get("batch_size", 0) or 0),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -258,6 +263,7 @@ class ParallelPlan:
             ),
             "num_replicas": self.num_replicas,
             "num_gpus": self.num_gpus,
+            "batch_size": self.batch_size,
             "target_nodes": list(self.target_nodes),
             "placement_epoch": self.placement_epoch,
             "placement_version": self.placement_epoch,
@@ -390,6 +396,10 @@ class ParallelConfig:
 
 def _gpu_count(node_info: Mapping[str, Any]) -> int:
     return int(node_info.get("total_gpu", node_info.get("GPU", 0)) or 0)
+
+
+def _free_gpu_count(node_info: Mapping[str, Any]) -> int:
+    return max(0, int(node_info.get("free_gpu", 0) or 0))
 
 
 def apply_spot_event_to_worker_nodes(
@@ -599,6 +609,8 @@ def generate_parallel_candidates(
 def select_target_nodes(
     worker_nodes: Mapping[str, Mapping[str, Any]],
     required_gpus: int,
+    *,
+    free_only: bool = False,
 ) -> List[str]:
     if required_gpus <= 0:
         return []
@@ -609,7 +621,12 @@ def select_target_nodes(
     for node_id, node_info in worker_nodes.items():
         if node_info.get("state", READY) != READY:
             continue
-        ready_nodes.append((str(node_id), _gpu_count(node_info)))
+        node_gpus = (
+            _free_gpu_count(node_info)
+            if free_only
+            else _gpu_count(node_info)
+        )
+        ready_nodes.append((str(node_id), node_gpus))
 
     ready_nodes.sort(key=lambda item: (-item[1], item[0]))
     for node_id, node_gpus in ready_nodes:
@@ -785,12 +802,78 @@ def _workload_cost_model_snapshot(
     }
 
 
+def _select_profiled_candidates(
+    candidates: List[ParallelConfig],
+    snapshot: Dict[str, Any],
+    planner_config: Mapping[str, Any],
+) -> tuple[List[ParallelConfig], Dict[str, Any]]:
+    """Algorithm 1 within an existing pool (no cloud acquisition authority).
+
+    Profile throughput is for the whole configuration, not per GPU. ``none``
+    uses the profiled request latency directly. ``md1_aggregate`` is an explicit
+    Poisson/constant-service single-queue approximation, not a vLLM simulator.
+    Missing profiles are rejected rather than synthesized from GPU counts.
+    """
+    queue_model = str(planner_config.get("queue_model", "none"))
+    if queue_model not in {"none", "md1_aggregate"}:
+        raise ValueError(f"unsupported_paper_queue_model:{queue_model}")
+    alpha = float(snapshot["arrival_rate_req_s"])
+    if not math.isfinite(alpha) or alpha < 0:
+        raise ValueError("invalid_arrival_rate_for_algorithm1")
+    profiled = [c for c in candidates if (
+        math.isfinite(c.throughput_estimate_req_s)
+        and c.throughput_estimate_req_s > 0
+        and math.isfinite(c.latency_estimate_ms)
+        and c.latency_estimate_ms > 0
+    )]
+    feasible = [c for c in profiled if c.throughput_estimate_req_s >= alpha]
+
+    def latency(c: ParallelConfig) -> float:
+        if queue_model == "none":
+            return c.latency_estimate_ms
+        rho = alpha / c.throughput_estimate_req_s
+        return (c.latency_estimate_ms +
+                1000 * rho / (2 * c.throughput_estimate_req_s * (1 - rho))
+                if rho < 1 else math.inf)
+
+    def stable_shape(c: ParallelConfig) -> tuple:
+        return (c.total_gpus, c.replica_count, c.pipeline_parallel_size,
+                c.tensor_parallel_size, c.data_parallel_size, c.batch_size)
+
+    if feasible:
+        ranked = sorted(feasible, key=lambda c: (latency(c), stable_shape(c)))
+        ranked += sorted((c for c in profiled if c not in feasible),
+                         key=lambda c: (-c.throughput_estimate_req_s, stable_shape(c)))
+        branch = "min_latency_meeting_arrival_rate"
+    else:
+        ranked = sorted(profiled, key=lambda c: (
+            -c.throughput_estimate_req_s, c.latency_estimate_ms, stable_shape(c)))
+        branch = "max_throughput" if ranked else "no_valid_profile"
+    ranked = [replace(c, arrival_rate_req_s=alpha,
+                      queue_penalty_ms=(latency(c) - c.latency_estimate_ms
+                                        if math.isfinite(latency(c)) else 0.0))
+              for c in ranked]
+    return ranked, {
+        **snapshot, "enabled": True, "selection_policy": "spotserve_algorithm1",
+        "selection_branch": branch, "queue_model": queue_model,
+        "profiled_candidate_count": len(profiled),
+        "rejected_unprofiled_candidate_count": len(candidates) - len(profiled),
+        "scope": "bounded_gpu_pool_no_cloud_acquisition",
+        "queue_stable": bool(ranked and ranked[0].throughput_estimate_req_s > alpha),
+    }
+
+
 def _score_parallel_candidates_for_workload(
     candidates: List[ParallelConfig],
     planner_config: Mapping[str, Any],
     model_config: Mapping[str, Any],
 ) -> tuple[List[ParallelConfig], Dict[str, Any]]:
     snapshot = _workload_cost_model_snapshot(planner_config, model_config)
+    policy = str(planner_config.get("selection_policy", "weighted_score"))
+    if policy == "spotserve_algorithm1":
+        return _select_profiled_candidates(candidates, snapshot, planner_config)
+    if policy != "weighted_score":
+        raise ValueError(f"unsupported_parallel_selection_policy:{policy}")
     if not snapshot["enabled"] or not candidates:
         return candidates, snapshot
 
@@ -969,6 +1052,9 @@ def _supported_config_candidates(
     max_replica_count = _positive_int(
         planner_config, "max_replica_count", available_gpus
     )
+    require_free_gpu_overlap = bool(
+        planner_config.get("require_free_gpu_overlap", False)
+    )
     candidates: List[ParallelConfig] = []
     for plan in supported_configs:
         if isinstance(plan, Mapping):
@@ -1070,7 +1156,15 @@ def _supported_config_candidates(
 
         if total_gpus > available_gpus:
             continue
-        if not select_target_nodes(worker_nodes, total_gpus):
+        if (planner_config.get("selection_policy") == "spotserve_algorithm1"
+                and total_gpus != (tensor_parallel_size * pipeline_parallel_size
+                                  * data_parallel_size * replica_count)):
+            raise ValueError("profile_gpu_count_does_not_match_parallel_shape")
+        if not select_target_nodes(
+            worker_nodes,
+            total_gpus,
+            free_only=require_free_gpu_overlap,
+        ):
             continue
         replica_gpus = (
             tensor_parallel_size * pipeline_parallel_size * data_parallel_size
@@ -1093,6 +1187,9 @@ def _supported_config_candidates(
                     unused_gpus=unused_gpus,
                 ),
                 latency_estimate_ms=latency_estimate_ms,
+                batch_size=max(0, _safe_int(
+                    plan.get("batch_size", 0) if isinstance(plan, Mapping)
+                    else getattr(plan, "batch_size", 0))),
                 throughput_estimate_req_s=throughput_estimate_req_s,
                 load_time_estimate_ms=load_time_estimate_ms,
                 migration_cost_estimate_ms=migration_cost_estimate_ms,
@@ -1150,6 +1247,7 @@ def build_parallel_plan(
     placement_epoch: int = 0,
     expert_placement_plan: Optional[Mapping[str, Any]] = None,
     reason: str = "replan",
+    require_free_gpu_overlap: bool = False,
 ) -> ParallelPlan:
     return ParallelPlan(
         model_name=model_name,
@@ -1160,8 +1258,11 @@ def build_parallel_plan(
         replica_count=parallel_config.replica_count,
         enable_expert_parallel=parallel_config.enable_expert_parallel,
         num_gpus=parallel_config.total_gpus,
+        batch_size=parallel_config.batch_size,
         target_nodes=select_target_nodes(
-            worker_nodes, parallel_config.total_gpus
+            worker_nodes,
+            parallel_config.total_gpus,
+            free_only=require_free_gpu_overlap,
         ),
         placement_epoch=placement_epoch,
         expert_placement_plan=expert_placement_plan,
@@ -1300,19 +1401,32 @@ def plan_dynamic_reparallelization(
         )
 
     availability = summarize_gpu_availability(worker_nodes)
+    require_free_gpu_overlap = bool(
+        planner_config.get("require_free_gpu_overlap", False)
+    )
+    overlap_available_gpus = sum(
+        _free_gpu_count(node_info)
+        for node_info in worker_nodes.values()
+        if node_info.get("state", READY) == READY
+    )
+    candidate_available_gpus = (
+        min(availability.available_gpus, overlap_available_gpus)
+        if require_free_gpu_overlap
+        else availability.available_gpus
+    )
     backend_capability = _get_backend_capability(model_config)
     has_backend_capability_configs = _has_supported_configs(
         backend_capability
     )
     candidates = _supported_config_candidates(
         backend_capability=backend_capability,
-        available_gpus=availability.available_gpus,
+        available_gpus=candidate_available_gpus,
         worker_nodes=worker_nodes,
         planner_config=planner_config,
     )
     if not candidates and not has_backend_capability_configs:
         candidates = generate_parallel_candidates(
-            availability.available_gpus, planner_config
+            candidate_available_gpus, planner_config
         )
     placement_epoch = _next_placement_epoch(model_config, planner_config)
     candidates = _attach_expert_placement_movement_estimates(
@@ -1339,6 +1453,7 @@ def plan_dynamic_reparallelization(
             worker_nodes=worker_nodes,
             placement_epoch=placement_epoch,
             reason=f"{event or 'manual'}_replan",
+            require_free_gpu_overlap=require_free_gpu_overlap,
         )
         if selected
         else None
@@ -1362,6 +1477,7 @@ def plan_dynamic_reparallelization(
                 placement_epoch=parallel_plan.placement_epoch,
                 expert_placement_plan=expert_placement_plan.to_dict(),
                 reason=f"{event or 'manual'}_replan",
+                require_free_gpu_overlap=require_free_gpu_overlap,
             )
     action = "reparallelize" if selected is not None else "no_capacity"
     synthetic_worker_node_count = sum(
@@ -1383,6 +1499,13 @@ def plan_dynamic_reparallelization(
         "action": action,
         "candidate_count": len(candidates),
         "availability": availability.to_dict(),
+        "transition_capacity_mode": (
+            "free_gpu_overlap"
+            if require_free_gpu_overlap
+            else "final_ready_gpu_capacity"
+        ),
+        "transition_available_gpus": candidate_available_gpus,
+        "ready_free_gpus": overlap_available_gpus,
         "worker_node_count": len(worker_nodes),
         "ready_worker_node_count": len(availability.ready_nodes),
         "synthetic_worker_node_count": synthetic_worker_node_count,

@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "model": {
+    "path": "/models/Qwen1.5-MoE-A2.7B-Chat",
+    "architectures": [
+      "Qwen2MoeForCausalLM"
+    ],
+    "dtype": "bfloat16",
+    "load_format": "auto",
+    "gpu_memory_utilization": 0.9,
+    "enforce_eager": true,
+    "enable_prefix_caching": false,
+    "all2all_backend": "allgather_reducescatter"
+  },
+  "cluster": {
+    "endpoint": "http://127.0.0.1:8343/v1/chat/completions",
+    "required_gpus": 8,
+    "require_single_control_head": true,
+    "require_exact_gpu_count": true,
+    "minimum_migration_headroom_gpus": 2,
+    "minimum_gpu_nodes": 8,
+    "gpus_per_worker": 1,
+    "minimum_physical_hosts": 1,
+    "require_physical_host_markers": false,
+    "require_homogeneous_gpu_model": true,
+    "maximum_initial_gpu_memory_used_mib": 1024,
+    "probe_timeout_s": 3600,
+    "network_probe_bytes": 33554432,
+    "image_digest_env": "IMAGE_DIGEST",
+    "require_image_digest": true,
+    "ray_dp_pack_strategy": "fill"
+  },
+  "initial_parallel": {
+    "tensor_parallel_size": 1,
+    "pipeline_parallel_size": 1,
+    "data_parallel_size": 2,
+    "replica_count": 1,
+    "enable_expert_parallel": true,
+    "num_gpus": 2,
+    "sllm_instances": 2
+  },
+  "candidate_shapes": [
+    {
+      "tensor_parallel_size": 1,
+      "pipeline_parallel_size": 1,
+      "data_parallel_size": 2,
+      "replica_count": 1,
+      "enable_expert_parallel": true,
+      "num_gpus": 2
+    },
+    {
+      "tensor_parallel_size": 1,
+      "pipeline_parallel_size": 1,
+      "data_parallel_size": 3,
+      "replica_count": 1,
+      "enable_expert_parallel": true,
+      "num_gpus": 3
+    },
+    {
+      "tensor_parallel_size": 1,
+      "pipeline_parallel_size": 1,
+      "data_parallel_size": 4,
+      "replica_count": 1,
+      "enable_expert_parallel": true,
+      "num_gpus": 4
+    }
+  ],
+  "trace": {
+    "plan": "benchmarks/spotserve/formal/k8s_qwen15_moe_a27b_8gpu_trace_plan.json"
+  },
+  "workload": {
+    "prompt_tokens": 8192,
+    "output_tokens": 2048,
+    "max_model_len": 16384,
+    "max_num_seqs": 16,
+    "max_num_batched_tokens": 16384,
+    "request_count": 24,
+    "profile_request_count": 8,
+    "calibration_output_tokens": 256,
+    "warmup_requests": 4,
+    "warmup_output_tokens": 32,
+    "burst_size": 4,
+    "measured_start_s": 20.0,
+    "burst_gap_s": 5.0,
+    "preemption_time_s": 570.0,
+    "preempt_after_output_tokens": 512,
+    "preemption_progress_min_tokens": 384,
+    "preemption_progress_max_tokens": 640
+  },
+  "experiment": {
+    "profile_repeats": 2,
+    "formal_repeats": 1,
+    "grace_period_s": 30.0,
+    "order_seed": 20261002,
+    "ready_timeout_s": 1800,
+    "request_timeout_s": 1800,
+    "trace_event_timeout_s": 1800
+  }
+}

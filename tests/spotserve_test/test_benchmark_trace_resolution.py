@@ -11,6 +11,92 @@ from benchmarks.spotserve.run_benchmark import (
 )
 
 
+@pytest.mark.asyncio
+async def test_instance_membership_is_saved_before_model_cleanup(monkeypatch, tmp_path):
+    states = {"a": {"pool": "ready", "state": "ready", "member_node_ids": ["0", "1"]}}
+    async def snapshot(*args):
+        return dict(states)
+    async def noop(*args, **kwargs):
+        return None
+    async def requests(*args):
+        return []
+    monkeypatch.setattr(run_benchmark, "git_commit", lambda: "mock")
+    monkeypatch.setattr(run_benchmark, "apply_scheduler_config", noop)
+    monkeypatch.setattr(run_benchmark, "wait_for_ready_instances", noop)
+    monkeypatch.setattr(run_benchmark, "get_model_instance_states", snapshot)
+    monkeypatch.setattr(run_benchmark, "send_workload", requests)
+    monkeypatch.setattr(run_benchmark, "delete_model_over_http", lambda *args: states.clear())
+    monkeypatch.setattr(run_benchmark, "record_actor_cleanup_after_delete", noop)
+    workload = tmp_path / "workload.jsonl"
+    workload.write_text("{}\n")
+    run_dir = await run_benchmark.run_one(
+        {"name": "smoke", "model": "probe-model", "workload": str(workload),
+         "capture_instance_states": True, "capture_instance_states_after_workload": True,
+         "delete_after_run": True},
+        "endpoint", tmp_path, 1, 1, skip_trace=True)
+    assert not states
+    assert json.loads((run_dir / "instance_states.json").read_text())["a"]["member_node_ids"] == ["0", "1"]
+    assert json.loads((run_dir / "final_instance_states.json").read_text())["a"]["member_node_ids"] == ["0", "1"]
+
+
+@pytest.mark.asyncio
+async def test_initial_capacity_is_applied_before_deploy_and_restored_after_run(
+    monkeypatch, tmp_path
+):
+    order = []
+
+    async def noop(*args, **kwargs):
+        return None
+
+    async def availability(nodes, available, *args):
+        order.append(("availability", list(nodes), available))
+        return [
+            {"node_id": node, "available": available} for node in nodes
+        ]
+
+    def deploy(*args, **kwargs):
+        order.append(("deploy",))
+        return {"success": True, "response": {}}
+
+    async def requests(*args):
+        return []
+
+    monkeypatch.setattr(run_benchmark, "git_commit", lambda: "mock")
+    monkeypatch.setattr(run_benchmark, "apply_scheduler_config", noop)
+    monkeypatch.setattr(
+        run_benchmark, "set_scheduler_worker_availability", availability
+    )
+    monkeypatch.setattr(run_benchmark, "deploy_config_over_http", deploy)
+    monkeypatch.setattr(run_benchmark, "wait_for_ready_instances", noop)
+    monkeypatch.setattr(run_benchmark, "send_workload", requests)
+    workload = tmp_path / "workload.jsonl"
+    workload.write_text("{}\n")
+
+    run_dir = await run_benchmark.run_one(
+        {
+            "name": "capacity-trace",
+            "model": "probe-model",
+            "workload": str(workload),
+            "deploy_config": str(tmp_path / "deploy.json"),
+            "initial_unavailable_worker_nodes": ["5", "6", "7"],
+            "restore_worker_nodes_after_run": ["3", "5", "6", "7"],
+        },
+        "endpoint",
+        tmp_path,
+        1,
+        1,
+        skip_trace=True,
+    )
+
+    assert order == [
+        ("availability", ["5", "6", "7"], False),
+        ("deploy",),
+        ("availability", ["3", "5", "6", "7"], True),
+    ]
+    assert (run_dir / "initial_worker_availability.json").is_file()
+    assert (run_dir / "restored_worker_availability.json").is_file()
+
+
 def test_alive_model_actor_names_from_actor_table_matches_backend_prefix():
     actor_table = {
         "router": {
@@ -104,6 +190,10 @@ async def test_http_add_trace_sends_node_info_to_controller(monkeypatch, tmp_pat
         return {"success": True, "response": {"event": "add"}}
 
     monkeypatch.setattr(run_benchmark, "post_json", fake_post_json)
+    async def inline_thread_call(fn, *args):
+        # The transport is already mocked; no real thread/network is needed.
+        return fn(*args)
+    monkeypatch.setattr(run_benchmark.asyncio, "to_thread", inline_thread_call)
     await run_benchmark.replay_trace_over_http(
         trace_path=str(trace_path),
         speedup=1.0,

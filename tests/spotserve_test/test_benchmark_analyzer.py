@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from pathlib import Path
 
 
@@ -11,6 +12,45 @@ def load_analyzer():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_analyze_run_excludes_declared_warmup_from_overall(tmp_path):
+    import json
+
+    analyzer = load_analyzer()
+    (tmp_path / "run_metadata.json").write_text(json.dumps({
+        "name": "warmup-filter",
+        "exclude_phases_from_overall": ["warmup"],
+    }))
+    rows = [
+        {
+            "request_id": "warmup",
+            "benchmark_phase": "warmup",
+            "success": True,
+            "latency_ms": 10000,
+            "sent_at": 1,
+            "completed_at": 11,
+        },
+        {
+            "request_id": "measured",
+            "benchmark_phase": "measured",
+            "success": True,
+            "latency_ms": 100,
+            "sent_at": 20,
+            "completed_at": 20.1,
+        },
+    ]
+    (tmp_path / "raw_requests.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows)
+    )
+
+    summary = analyzer.analyze_run(tmp_path)
+
+    assert summary["requests"] == 1
+    assert summary["latency_avg_ms"] == 100
+    assert summary["overall_excluded_phases"] == "warmup"
+    assert summary["overall_excluded_request_count"] == 1
+    assert summary["phase_warmup_requests"] == 1
 
 
 def test_router_summary_exposes_state_restore_evidence():
@@ -44,6 +84,56 @@ def test_router_summary_exposes_state_restore_evidence():
     assert summary["true_kv_restore_successes_total"] == 1
     assert summary["state_kinds"] == "vllm_kv_snapshot"
     assert summary["state_restore_reasons"] == "nixl_kv_attach_completed"
+
+
+def test_instance_state_summary_exposes_preemption_decode_progress():
+    analyzer = load_analyzer()
+    summary = analyzer.summarize_instance_state_metrics([
+        {
+            "type": "instance_state",
+            "to": "preempting",
+            "preemption_progress_observed": True,
+            "preemption_inflight_request_count": 2,
+            "preemption_generated_tokens_per_request": [500, 520],
+            "preemption_requests_in_progress_window": 2,
+        }
+    ])
+
+    assert summary["preemption_progress_observed_events"] == 1
+    assert summary["preemption_inflight_request_count"] == 2
+    assert summary["preemption_generated_tokens_min"] == 500
+    assert summary["preemption_generated_tokens_max"] == 520
+    assert summary["preemption_requests_in_progress_window"] == 2
+
+
+def test_context_migration_summary_normalizes_away_instance_ids():
+    analyzer = load_analyzer()
+    summary = analyzer.summarize_context_migration_metrics([
+        {
+            "type": "context_migration",
+            "plans": [{
+                "request_id": "run-specific-request",
+                "old_instance_id": "model-a-random-id",
+                "new_instance_id": "model-b-random-id",
+                "old_node_id": "node-a",
+                "new_node_id": "node-b",
+                "reusable_tokens": 8192,
+                "reusable_context_blocks": 512,
+                "reason": "low_cost_mapping",
+            }],
+        }
+    ])
+    normalized = json.loads(
+        summary["context_migration_latest_normalized_plan"]
+    )
+
+    assert normalized == [{
+        "source_node": "node-a",
+        "target_node": "node-b",
+        "reusable_tokens": 8192,
+        "reusable_context_blocks": 512,
+        "reason": "low_cost_mapping",
+    }]
 
 
 def test_state_recovery_summary_exposes_phase3_moe_metrics():
@@ -1196,6 +1286,28 @@ def test_quiescent_remap_summary_counts_underlying_actor_recreate():
 
     assert summary["replanning_expert_placement_actor_recreate_events"] == 1
     assert summary["replanning_expert_placement_quiescent_remap_events"] == 1
+
+
+def test_replanning_summary_audits_add_event_separately():
+    analyzer = load_analyzer()
+    summary = analyzer.summarize_replanning_metrics([{
+        "type": "reparallelization",
+        "event": "add",
+        "spot_event_id": "spot-add-1",
+        "planner_invocation_id": "planner-add-1",
+        "planner_input_snapshot_hash": "snapshot-add-1",
+        "event_state_marked_at_s": 10.0,
+        "planner_started_at_s": 10.1,
+        "planner_finished_at_s": 10.2,
+        "execution_status": "applied",
+    }])
+
+    assert summary["replanning_add_events"] == 1
+    assert summary["replanning_unique_add_event_ids"] == 1
+    assert summary["replanning_unique_add_planner_invocation_ids"] == 1
+    assert summary["replanning_add_planner_audit_complete_events"] == 1
+    assert summary["replanning_add_execution_applied"] == 1
+    assert summary["replanning_add_execution_failed"] == 0
 
 
 def test_cross_node_weight_movement_requires_runtime_evidence():

@@ -218,6 +218,67 @@ def test_reparallelization_does_not_fallback_when_capability_has_no_capacity():
     assert decision["candidate_count"] == 0
 
 
+def test_live_source_transition_uses_free_overlap_capacity_not_pool_maximum():
+    worker_nodes = {
+        str(index): {
+            "ray_node_id": f"node-{index}",
+            "address": f"10.0.0.{index + 1}",
+            "free_gpu": 0 if index < 4 else 1,
+            "total_gpu": 1,
+            "state": "ready",
+        }
+        for index in range(8)
+    }
+    decision = plan_dynamic_reparallelization(
+        model_name="overlap-aware-vllm",
+        worker_nodes=worker_nodes,
+        model_config={
+            "model": "overlap-aware-vllm",
+            "backend": "vllm",
+            "num_gpus": 8,
+            "backend_capability": {
+                "supported_configs": [
+                    {
+                        "tensor_parallel_size": 1,
+                        "pipeline_parallel_size": 1,
+                        "data_parallel_size": 6,
+                        "replica_count": 1,
+                        "enable_expert_parallel": True,
+                        "num_gpus": 6,
+                    },
+                    {
+                        "tensor_parallel_size": 1,
+                        "pipeline_parallel_size": 1,
+                        "data_parallel_size": 4,
+                        "replica_count": 1,
+                        "enable_expert_parallel": True,
+                        "num_gpus": 4,
+                    },
+                ]
+            },
+        },
+        planner_config={
+            "require_free_gpu_overlap": True,
+            "min_data_parallel_size": 1,
+            "max_data_parallel_size": 8,
+        },
+        event="preempt",
+        backend="vllm",
+    )
+
+    assert decision["availability"]["available_gpus"] == 8
+    assert decision["ready_free_gpus"] == 4
+    assert decision["transition_available_gpus"] == 4
+    assert decision["transition_capacity_mode"] == "free_gpu_overlap"
+    assert decision["selected_total_gpus"] == 4
+    assert decision["parallel_plan"]["target_nodes"] == [
+        "4",
+        "5",
+        "6",
+        "7",
+    ]
+
+
 def test_workload_cost_model_is_opt_in_for_reparallelization_score():
     decision = plan_dynamic_reparallelization(
         model_name="cost-aware-vllm",

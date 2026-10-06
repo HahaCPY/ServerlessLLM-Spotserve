@@ -69,7 +69,7 @@ def test_vllm_model_resource_profile_derives_ep_from_tp_dp():
     assert profile["planned_expert_parallel_size"] == 2
     assert profile["effective_expert_parallel_size"] == 2
     assert profile["expert_parallel_size"] == 2
-    assert profile["expert_parallel_size_verified"] is True
+    assert profile["expert_parallel_size_verified"] is False
     assert profile["expert_parallel_size_source"] == "derived_from_tp_dp"
     assert profile["parallel_plan_mismatch"] is False
 

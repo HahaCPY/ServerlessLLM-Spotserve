@@ -1,6 +1,71 @@
 from sllm.spot.metrics import make_replanning_event
 
 
+def test_replanning_event_preserves_preemption_planner_audit():
+    event = make_replanning_event(
+        model="moe-model",
+        event="preempt",
+        decision={
+            "preemption_event_id": "preempt-1",
+            "spot_event_id": "preempt-1",
+            "planner_invocation_id": "planner-1",
+            "event_state_marked_at_s": 10.0,
+            "planner_started_at_s": 10.1,
+            "planner_finished_at_s": 10.2,
+            "planner_input_snapshot_hash": "snapshot-sha",
+            "planner_input_snapshot": {"available_gpus": 4},
+            "candidate_count": 2,
+            "top_candidates": [
+                {
+                    "tensor_parallel_size": 1,
+                    "pipeline_parallel_size": 1,
+                    "data_parallel_size": 2,
+                    "replica_count": 1,
+                    "enable_expert_parallel": True,
+                },
+                {
+                    "tensor_parallel_size": 1,
+                    "pipeline_parallel_size": 1,
+                    "data_parallel_size": 4,
+                    "replica_count": 1,
+                    "enable_expert_parallel": True,
+                },
+            ],
+        },
+    )
+
+    assert event["preemption_event_id"] == "preempt-1"
+    assert event["planner_invocation_id"] == "planner-1"
+    assert event["planner_started_at_s"] >= event["event_state_marked_at_s"]
+    assert event["planner_input_snapshot_hash"] == "snapshot-sha"
+    assert len(event["top_candidates"]) == 2
+
+
+def test_replanning_event_exposes_normalized_expert_assignment():
+    event = make_replanning_event(
+        model="moe-model",
+        event="preempt",
+        decision={
+            "expert_placement_plan": {
+                "target_rank_count": 2,
+                "expert_to_target_rank": {
+                    "layer:0/expert:1": "ep-rank:1",
+                    "layer:0/expert:0": "ep-rank:0",
+                },
+            }
+        },
+    )
+
+    assert event["normalized_expert_placement"] == {
+        "target_rank_count": 2,
+        "expert_to_target_rank": {
+            "layer:0/expert:0": "ep-rank:0",
+            "layer:0/expert:1": "ep-rank:1",
+        },
+        "expert_to_target_ranks": {},
+    }
+
+
 def test_replanning_event_exposes_runtime_expert_placement_hook_status():
     event = make_replanning_event(
         model="moe-model",

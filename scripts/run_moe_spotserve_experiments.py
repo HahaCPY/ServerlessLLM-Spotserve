@@ -50,16 +50,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tensor-parallel-size", type=int, required=True)
     parser.add_argument("--request-count", type=int, default=2)
     parser.add_argument("--prompt-tokens", type=int, default=4096)
+    parser.add_argument(
+        "--prompt-files",
+        nargs="+",
+        default=None,
+        help="Explicit prompt source files forwarded to the recovery harness.",
+    )
     parser.add_argument("--max-model-len", type=int, default=4608)
     parser.add_argument("--max-num-batched-tokens", type=int, default=2048)
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--preempt-after-new-tokens", type=int, default=256)
     parser.add_argument("--preempt-max-overshoot", type=int, default=16)
+    parser.add_argument("--min-continuation-match-tokens", type=int, default=32)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.94)
     parser.add_argument("--cpu-offload-gb", type=float, default=6.0)
     parser.add_argument("--trace-speedup", type=float, default=1000.0)
     parser.add_argument("--token-delay-s", type=float, default=0.0)
     parser.add_argument("--timeout-s", type=float, default=600.0)
+    parser.add_argument("--launch-idle-stable-s", type=float, default=0.0)
+    parser.add_argument("--launch-idle-max-used-mib", type=int, default=512)
+    parser.add_argument("--launch-idle-poll-s", type=float, default=5.0)
+    parser.add_argument("--split-replay-probe", action="store_true")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--max-attempts-per-run", type=int, default=3)
     parser.add_argument("--order-seed", type=int, default=20260912)
@@ -94,11 +105,14 @@ def read_valid_result(path: Path, mode: str) -> dict[str, Any] | None:
         for request_id, expected in requested.items()
     )
     sequence_checks = recovery.get("sequence_checks", {})
-    sequences_equal = (
+    sequences_valid = (
         bool(sequence_checks)
         and set(sequence_checks) == set(requested)
-        and all(bool(row.get("equal")) for row in sequence_checks.values())
-        and bool(recovery.get("all_sequences_equal_reference"))
+        and all(
+            bool(row.get("validation_passed"))
+            for row in sequence_checks.values()
+        )
+        and bool(recovery.get("all_sequences_pass_validation"))
     )
     completed = recovery.get("source_completed_tokens", {})
     boundary_valid = bool(completed) and all(
@@ -119,7 +133,7 @@ def read_valid_result(path: Path, mode: str) -> dict[str, Any] | None:
         or float(recovery.get("success_rate", 0.0) or 0.0) != 1.0
         or int(recovery.get("generated_tokens", 0) or 0) <= 0
         or not outputs_complete
-        or not sequences_equal
+        or not sequences_valid
         or not boundary_valid
         or not routing_valid
     ):
@@ -145,11 +159,16 @@ def command(args: argparse.Namespace, mode: str, output: Path) -> list[str]:
         "--max-new-tokens", str(args.max_new_tokens),
         "--preempt-after-new-tokens", str(args.preempt_after_new_tokens),
         "--preempt-max-overshoot", str(args.preempt_max_overshoot),
+        "--min-continuation-match-tokens",
+        str(args.min_continuation_match_tokens),
         "--gpu-memory-utilization", str(args.gpu_memory_utilization),
         "--cpu-offload-gb", str(args.cpu_offload_gb),
         "--trace-speedup", str(args.trace_speedup),
         "--token-delay-s", str(args.token_delay_s),
         "--timeout-s", str(args.timeout_s),
+        "--launch-idle-stable-s", str(args.launch_idle_stable_s),
+        "--launch-idle-max-used-mib", str(args.launch_idle_max_used_mib),
+        "--launch-idle-poll-s", str(args.launch_idle_poll_s),
         "--host-network",
         "--prestart-target",
         "--require-moe-routing",
@@ -157,6 +176,10 @@ def command(args: argparse.Namespace, mode: str, output: Path) -> list[str]:
     ]
     if mode in MIGRATION_MODES:
         result.extend(["--route-profile", args.route_profile])
+    if args.prompt_files:
+        result.extend(["--prompt-files", *args.prompt_files])
+    if args.split_replay_probe:
+        result.append("--split-replay-probe")
     return result
 
 

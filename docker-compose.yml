@@ -4,7 +4,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: docker.io/serverlessllm/sllm:latest
+    image: ${SLLM_IMAGE:-docker.io/serverlessllm/sllm:latest}
     container_name: sllm_head
     environment:
       - MODEL_FOLDER=${MODEL_FOLDER}
@@ -23,8 +23,8 @@ services:
       - HF_HUB_DISABLE_XET=1
     ports:
       # - "6379:6379"    # Redis port
-      - "6380:6379"
-      - "8345:8343"    # ServerlessLLM port, host:container
+      - "${SLLM_RAY_HEAD_HOST_PORT:-6380}:6379"
+      - "${SLLM_API_HOST_PORT:-8345}:8343"    # ServerlessLLM port, host:container
     shm_size: "10gb"
     pids_limit: 32768
     networks:
@@ -40,7 +40,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: docker.io/serverlessllm/sllm:latest
+    image: ${SLLM_IMAGE:-docker.io/serverlessllm/sllm:latest}
     container_name: sllm_worker_0
     group_add:
       - keep-groups

@@ -13,6 +13,11 @@ docker-compose.yml
 
 # Local model checkpoints are mounted at runtime and are not part of the image.
 model/
+models/
+checkpoints/
+
+# Experiment artifacts are written to shared storage at runtime.
+results/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

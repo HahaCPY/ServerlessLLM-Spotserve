@@ -18,7 +18,7 @@
 import asyncio
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import ray
 
@@ -77,6 +77,7 @@ class InstanceStatus:
     state: Optional[str] = None
     num_current_tokens: Optional[int] = None
     resuming_latency: Optional[float] = None
+    member_node_ids: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -92,6 +93,17 @@ class InstanceHandle:
     state: InstanceState = InstanceState.STARTING
 
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Ray worker IDs, not Kubernetes host names. node_id is only the primary
+    # actor location; every participating rank belongs to this instance.
+    member_node_ids: List[str] = field(default_factory=list)
+    node_allocations: Dict[str, int] = field(default_factory=dict)
+    preemption_deadline_time_s: Optional[float] = None
+
+    def worker_node_ids(self) -> List[str]:
+        return list(dict.fromkeys(
+            [str(node) for node in self.member_node_ids]
+            + ([str(self.node_id)] if self.node_id is not None else [])
+        ))
 
     def _can_accept_request_locked(self, num_requests: int = 1) -> bool:
         if num_requests <= 0:
@@ -177,4 +189,5 @@ class InstanceHandle:
                 self.num_gpu,
                 self.concurrency,
                 state=self.state.value,
+                member_node_ids=self.worker_node_ids(),
             )

@@ -562,6 +562,18 @@ def summarize_instance_state_metrics(
         if safe_float(row.get("deadline_time_s"), 0.0) > 0.0
         and safe_float(row.get("timestamp"), 0.0) > 0.0
     ]
+    preemption_progress_rows = [
+        row
+        for row in instance_rows
+        if row.get("to") == "preempting"
+        and "preemption_progress_observed" in row
+    ]
+    generated_tokens = [
+        safe_int(value, 0)
+        for row in preemption_progress_rows
+        for value in row.get("preemption_generated_tokens_per_request", [])
+        if isinstance(row.get("preemption_generated_tokens_per_request"), list)
+    ]
 
     return {
         "instance_state_rows": len(instance_rows),
@@ -582,6 +594,32 @@ def summarize_instance_state_metrics(
         ),
         "preemption_max_auto_deadline_lag_ms": (
             max(auto_dead_lag_ms) if auto_dead_lag_ms else 0.0
+        ),
+        "preemption_progress_events": len(preemption_progress_rows),
+        "preemption_progress_observed_events": sum(
+            1
+            for row in preemption_progress_rows
+            if bool(row.get("preemption_progress_observed", False))
+        ),
+        "preemption_inflight_request_count": sum(
+            safe_int(row.get("preemption_inflight_request_count"), 0)
+            for row in preemption_progress_rows
+        ),
+        "preemption_generated_tokens_min": (
+            min(generated_tokens) if generated_tokens else 0
+        ),
+        "preemption_generated_tokens_max": (
+            max(generated_tokens) if generated_tokens else 0
+        ),
+        "preemption_generated_tokens_avg": (
+            mean(generated_tokens) if generated_tokens else 0.0
+        ),
+        "preemption_generated_tokens_per_request": json.dumps(
+            generated_tokens, sort_keys=True
+        ),
+        "preemption_requests_in_progress_window": sum(
+            safe_int(row.get("preemption_requests_in_progress_window"), 0)
+            for row in preemption_progress_rows
         ),
     }
 
@@ -610,6 +648,11 @@ def summarize_replanning_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     ]
     latest_plan = (
         replanning_rows[-1].get("parallel_plan") if replanning_rows else None
+    )
+    latest_normalized_expert_placement = (
+        replanning_rows[-1].get("normalized_expert_placement")
+        if replanning_rows
+        else None
     )
     execution_statuses = [
         str(row.get("execution_status", "") or "")
@@ -703,6 +746,51 @@ def summarize_replanning_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         )
         for row in replanning_rows
     ]
+    preemption_replanning_rows = [
+        row for row in replanning_rows if row.get("event") == "preempt"
+    ]
+    add_replanning_rows = [
+        row for row in replanning_rows if row.get("event") == "add"
+    ]
+    planner_audit_complete_rows = [
+        row for row in preemption_replanning_rows
+        if row.get("preemption_event_id")
+        and row.get("planner_invocation_id")
+        and row.get("planner_input_snapshot_hash")
+        and safe_float(row.get("planner_started_at_s"), 0.0)
+        >= safe_float(row.get("event_state_marked_at_s"), 0.0)
+        and safe_float(row.get("planner_finished_at_s"), 0.0)
+        >= safe_float(row.get("planner_started_at_s"), 0.0)
+    ]
+    add_planner_audit_complete_rows = [
+        row for row in add_replanning_rows
+        if row.get("spot_event_id")
+        and row.get("planner_invocation_id")
+        and row.get("planner_input_snapshot_hash")
+        and safe_float(row.get("planner_started_at_s"), 0.0)
+        >= safe_float(row.get("event_state_marked_at_s"), 0.0)
+        and safe_float(row.get("planner_finished_at_s"), 0.0)
+        >= safe_float(row.get("planner_started_at_s"), 0.0)
+    ]
+    candidate_shape_counts = []
+    for row in preemption_replanning_rows:
+        signatures = set()
+        for candidate in row.get("top_candidates", []) or []:
+            if not isinstance(candidate, dict):
+                continue
+            signatures.add((
+                safe_int(candidate.get("tensor_parallel_size"), 1),
+                safe_int(candidate.get("pipeline_parallel_size"), 1),
+                safe_int(candidate.get("data_parallel_size"), 1),
+                safe_int(
+                    candidate.get(
+                        "replica_count", candidate.get("num_replicas", 1)
+                    ),
+                    1,
+                ),
+                bool(candidate.get("enable_expert_parallel", False)),
+            ))
+        candidate_shape_counts.append(len(signatures))
     expert_plan_shards = [
         safe_int(row.get("expert_placement_plan_shards"), 0)
         for row in replanning_rows
@@ -766,12 +854,69 @@ def summarize_replanning_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     ]
     return {
         "replanning_events": len(replanning_rows),
+        "replanning_preemption_events": len(preemption_replanning_rows),
+        "replanning_add_events": len(add_replanning_rows),
+        "replanning_unique_add_event_ids": len({
+            str(row.get("spot_event_id"))
+            for row in add_replanning_rows
+            if row.get("spot_event_id")
+        }),
+        "replanning_unique_add_planner_invocation_ids": len({
+            str(row.get("planner_invocation_id"))
+            for row in add_replanning_rows
+            if row.get("planner_invocation_id")
+        }),
+        "replanning_add_planner_audit_complete_events": len(
+            add_planner_audit_complete_rows
+        ),
+        "replanning_add_execution_applied": sum(
+            1
+            for row in add_replanning_rows
+            if row.get("execution_status") == "applied"
+        ),
+        "replanning_add_execution_failed": sum(
+            1
+            for row in add_replanning_rows
+            if row.get("execution_status") == "failed"
+        ),
+        "replanning_unique_preemption_event_ids": len({
+            str(row.get("preemption_event_id"))
+            for row in preemption_replanning_rows
+            if row.get("preemption_event_id")
+        }),
+        "replanning_unique_planner_invocation_ids": len({
+            str(row.get("planner_invocation_id"))
+            for row in preemption_replanning_rows
+            if row.get("planner_invocation_id")
+        }),
+        "replanning_planner_audit_complete_events": len(
+            planner_audit_complete_rows
+        ),
+        "replanning_min_distinct_candidate_shapes": (
+            min(candidate_shape_counts) if candidate_shape_counts else 0
+        ),
+        "replanning_all_selected_plans_use_ep": bool(
+            preemption_replanning_rows
+            and all(
+                bool(row.get("selected_enable_expert_parallel"))
+                and safe_int(
+                    row.get("selected_runtime_effective_expert_parallel_size"),
+                    0,
+                ) > 1
+                for row in preemption_replanning_rows
+            )
+        ),
         "replanning_no_capacity_events": no_capacity_count,
         "replanning_max_selected_gpus": (
             max(selected_total_gpus) if selected_total_gpus else 0
         ),
         "replanning_latest_plan": (
             json.dumps(latest_plan, sort_keys=True) if latest_plan else ""
+        ),
+        "replanning_latest_normalized_expert_placement": (
+            json.dumps(latest_normalized_expert_placement, sort_keys=True)
+            if latest_normalized_expert_placement
+            else ""
         ),
         "replanning_execution_applied": execution_statuses.count("applied"),
         "replanning_execution_failed": execution_statuses.count("failed"),
@@ -1506,6 +1651,23 @@ def summarize_context_migration_metrics(
     )
     latest_event = migration_rows[-1] if migration_rows else {}
     latest_plans = latest_event.get("plans", []) if latest_event else []
+    normalized_plans = []
+    if isinstance(latest_plans, list):
+        for plan in latest_plans:
+            if not isinstance(plan, dict):
+                continue
+            normalized_plans.append({
+                "source_node": str(plan.get("old_node_id", "")),
+                "target_node": str(plan.get("new_node_id", "")),
+                "reusable_tokens": safe_int(
+                    plan.get("reusable_tokens"), 0
+                ),
+                "reusable_context_blocks": safe_int(
+                    plan.get("reusable_context_blocks"), 0
+                ),
+                "reason": str(plan.get("reason", "")),
+            })
+    normalized_plans.sort(key=lambda row: json.dumps(row, sort_keys=True))
     latest_selected_target_ids = latest_event.get("selected_target_ids", [])
     if not isinstance(latest_selected_target_ids, list):
         latest_selected_target_ids = []
@@ -1617,6 +1779,9 @@ def summarize_context_migration_metrics(
         ),
         "context_migration_selected_request_ids": compact_values(
             [str(value) for value in latest_selected_request_ids]
+        ),
+        "context_migration_latest_normalized_plan": json.dumps(
+            normalized_plans, sort_keys=True
         ),
         "context_migration_selected_plan_total_estimated_cost": sum(
             safe_float(row.get("selected_plan_total_estimated_cost"), 0.0)
@@ -2627,7 +2792,16 @@ def analyze_run(run_dir: Path) -> Dict[str, Any]:
                 for row in router_request_rows:
                     metrics_file.write(json.dumps(row, sort_keys=True) + "\n")
 
-    request_summary = summarize_requests(request_rows)
+    excluded_overall_phases = {
+        safe_metric_name(value)
+        for value in metadata.get("exclude_phases_from_overall", [])
+    }
+    measured_request_rows = [
+        row for row in request_rows
+        if safe_metric_name(row.get("benchmark_phase", ""))
+        not in excluded_overall_phases
+    ]
+    request_summary = summarize_requests(measured_request_rows)
     phase_summary = summarize_phase_requests(request_rows)
     response_kv_summary = summarize_response_kv_restore(request_rows)
     router_summary = summarize_router_metrics(
@@ -2645,6 +2819,41 @@ def analyze_run(run_dir: Path) -> Dict[str, Any]:
         "policy": metadata.get("policy", "unknown"),
         "backend": metadata.get("backend", "unknown"),
         "model": metadata.get("model", "unknown"),
+        "deployment_registration_latency_ms": safe_float(
+            metadata.get("deployment_registration_latency_ms"), 0.0
+        ),
+        "deployment_ready_wait_latency_ms": safe_float(
+            metadata.get("deployment_ready_wait_latency_ms"), 0.0
+        ),
+        "deployment_ready_latency_ms": safe_float(
+            metadata.get("deployment_ready_latency_ms"), 0.0
+        ),
+        "runtime_ep_audit_verified": bool(
+            metadata.get("runtime_ep_audit_verified", False)
+        ),
+        "runtime_ep_audit_expected_size": safe_int(
+            metadata.get("runtime_ep_audit_expected_size"), 0
+        ),
+        "runtime_ep_audit_ready_instance_count": safe_int(
+            metadata.get("runtime_ep_audit", {}).get(
+                "ready_instance_count", 0
+            )
+            if isinstance(metadata.get("runtime_ep_audit"), dict)
+            else 0,
+            0,
+        ),
+        "runtime_ep_audit_instances": json.dumps(
+            metadata.get("runtime_ep_audit", {}).get("instances", [])
+            if isinstance(metadata.get("runtime_ep_audit"), dict)
+            else [],
+            sort_keys=True,
+        ),
+        "overall_excluded_phases": ",".join(
+            sorted(excluded_overall_phases)
+        ),
+        "overall_excluded_request_count": (
+            len(request_rows) - len(measured_request_rows)
+        ),
         "router_metrics_path": (
             str(router_metrics_path) if router_metrics_path is not None else ""
         ),

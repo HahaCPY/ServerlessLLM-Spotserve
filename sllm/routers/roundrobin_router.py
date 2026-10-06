@@ -17,6 +17,7 @@
 # ---------------------------------------------------------------------------- #
 import asyncio
 import copy
+import hashlib
 import inspect
 import json
 import logging
@@ -54,7 +55,11 @@ from sllm.spot.reparallelization import (
     apply_spot_event_to_worker_nodes,
     plan_dynamic_reparallelization,
 )
-from sllm.spot.reparallelization_executor import ReparallelizationExecutor
+from sllm.spot.reparallelization_executor import (
+    BREAK_BEFORE_MAKE,
+    MAKE_BEFORE_BREAK,
+    ReparallelizationExecutor,
+)
 from sllm.spot.vllm_deployment_adapter import (
     VllmDeployment,
     VllmDeploymentAdapter,
@@ -69,6 +74,10 @@ from ..utils import InstanceHandle, InstanceState
 from .router_utils import SllmRouter
 
 logger = init_logger(__name__)
+
+
+class NativeKVRecoveryError(ValueError):
+    """A stateful treatment must not silently become a replay treatment."""
 
 
 async def auto_scaler(
@@ -112,6 +121,9 @@ class RoundRobinRouter(SllmRouter):
         self.router_config = router_config
         self.recovery_policy = normalize_policy(
             router_config.get("recovery_policy", RecoveryPolicy.NONE.value)
+        )
+        self.require_native_kv_restore = bool(
+            router_config.get("require_native_kv_restore", False)
         )
         self.max_retries = int(router_config.get("max_retries", 0))
         self.count_preempting_toward_capacity = bool(
@@ -172,6 +184,7 @@ class RoundRobinRouter(SllmRouter):
             ReparallelizationExecutor
         ] = None
         self._reparallelization_execution_active = False
+        self._reparallelization_lock = asyncio.Lock()
         workload_window_max_requests = int(
             self.reparallelization_config.get(
                 "workload_window_max_requests", 128
@@ -237,6 +250,7 @@ class RoundRobinRouter(SllmRouter):
         # active deployment; the original external request_id is retained for
         # the retry on the new worker.
         self.inflight_requests: Dict[str, Dict[str, Any]] = {}
+        self.native_kv_receipts: Dict[str, Dict[str, Any]] = {}
         self.inflight_requests_lock = asyncio.Lock()
         self.auto_scaler = None
         logger.info(f"Created new handler for model {self.model_name}")
@@ -513,6 +527,10 @@ class RoundRobinRouter(SllmRouter):
                 entry["request_id"],
             )
             export_started_at = time.time()
+            export_timeout = float(self.reparallelization_config.get("state_export_timeout_s", 30.0))
+            if instance.preemption_deadline_time_s is not None:
+                export_timeout = min(export_timeout, max(
+                    0.0, instance.preemption_deadline_time_s - export_started_at))
             if summary["state_export_started_at_s"] == 0.0:
                 summary["state_export_started_at_s"] = export_started_at
             try:
@@ -525,28 +543,32 @@ class RoundRobinRouter(SllmRouter):
                         instance,
                         request_data=entry.get("request_data", {}),
                     ),
-                    timeout=float(
-                        self.reparallelization_config.get(
-                            "state_export_timeout_s", 30.0
-                        )
-                    ),
+                    timeout=export_timeout,
                 )
             except asyncio.TimeoutError:
                 logger.warning(
                     "Timed out exporting live state for %s; using token fallback",
                     entry["request_id"],
                 )
-                state = await self._capture_inference_state(
-                    instance,
-                    request_data=entry.get("request_data", {}),
-                    current_output=await self._capture_current_tokens(instance),
-                )
+                # Do not invoke the timed-out hook again. With no committed
+                # snapshot, restart from the original client input; this is
+                # not KV recovery or a successfully migrated token snapshot.
+                state = None
             export_finished_at = time.time()
             summary["state_export_finished_at_s"] = export_finished_at
             state_export_durations_ms.append(
                 (export_finished_at - export_started_at) * 1000
             )
             entry["migration_state"] = state
+            if self.require_native_kv_restore and (
+                state is None or state.state_kind != "vllm_kv_snapshot"
+                or not state.supports_restore
+            ):
+                raise NativeKVRecoveryError("native_kv_export_required_before_abort")
+            if (self.require_native_kv_restore
+                    and self.reparallelization_config.get("require_free_gpu_overlap")
+                    and not state.metadata.get("can_restore_cross_node", False)):
+                raise NativeKVRecoveryError("cross_node_kv_restore_not_validated_before_abort")
             if state is not None:
                 summary["state_exported"] += 1
 
@@ -640,24 +662,42 @@ class RoundRobinRouter(SllmRouter):
             ),
             migration_completion_waiter=self._wait_for_reparallelization_requests,
         )
+        stop_current_before_create = bool(
+            self.reparallelization_config.get(
+                "allow_stop_before_recreate", False
+            )
+        )
+        transition_mode = str(
+            self.reparallelization_config.get(
+                "transition_mode",
+                BREAK_BEFORE_MAKE
+                if stop_current_before_create
+                else MAKE_BEFORE_BREAK,
+            )
+        )
         self.reparallelization_executor = ReparallelizationExecutor(
             self.vllm_deployment_adapter.create_workers,
             self.vllm_deployment_adapter.ready_workers,
             self.vllm_deployment_adapter.switch_workers,
             self.vllm_deployment_adapter.drain_workers,
             self.vllm_deployment_adapter.stop_workers,
-            stop_current_before_create=bool(
-                self.reparallelization_config.get(
-                    "allow_stop_before_recreate", False
-                )
-            ),
+            stop_current_before_create=stop_current_before_create,
             wait_for_migration=self.vllm_deployment_adapter.wait_for_migration_completion,
             migrate_before_create=bool(
                 self.reparallelization_config.get(
                     "migrate_before_create", False
                 )
             ),
+            transition_mode=transition_mode,
+            migration_requires_live_source=bool(
+                self.reparallelization_config.get(
+                    "migration_requires_live_source", False
+                )
+            ),
         )
+        # Validate contradictory transaction settings before a spot event
+        # drains or destroys a serving deployment.
+        self.reparallelization_executor.resolved_transition_mode()
         return True
 
     async def _wait_for_reparallelization_requests(
@@ -670,16 +710,35 @@ class RoundRobinRouter(SllmRouter):
         if not request_ids:
             return
         deadline = asyncio.get_running_loop().time() + max(0.1, timeout_s)
+        source_deadlines = [handle.preemption_deadline_time_s
+                            for handle in deployment.instances.values()
+                            if handle.preemption_deadline_time_s is not None]
+        if source_deadlines:
+            deadline = min(deadline, asyncio.get_running_loop().time()
+                           + max(0.0, min(source_deadlines) - time.time()))
+        active = request_ids
         while asyncio.get_running_loop().time() < deadline:
             async with self.inflight_requests_lock:
                 active = request_ids.intersection(self.inflight_requests)
             if not active:
+                if source_deadlines and time.time() >= min(source_deadlines):
+                    raise TimeoutError("source_kv_lease_deadline_passed_before_release")
+                if self.require_native_kv_restore:
+                    receipts = [self.native_kv_receipts.get(key) for key in request_ids]
+                    if not all(receipts):
+                        raise NativeKVRecoveryError("native_kv_receipt_missing_before_source_release")
+                    self._emit_metric({
+                        "type": "native_kv_source_release_authorized",
+                        "model": self.model_name, "request_ids": sorted(request_ids),
+                        "source_instance_ids": sorted(deployment.instances),
+                        "receipt_kind": "completed_native_request",
+                        "deadline_time_s": min(source_deadlines) if source_deadlines else None,
+                    })
+                    for key in request_ids:
+                        self.native_kv_receipts.pop(key, None)
                 return
             await asyncio.sleep(0.1)
-        logger.warning(
-            "Timed out waiting for %d migrated requests before source stop",
-            len(active),
-        )
+        raise TimeoutError(f"source_kv_lease_not_released_before_deadline:{len(active)}")
 
     async def _switch_vllm_deployment(
         self, deployment: VllmDeployment, plan: ParallelPlan
@@ -687,8 +746,31 @@ class RoundRobinRouter(SllmRouter):
         """Atomically make the newly initialised actors serve traffic."""
         if deployment.plan != plan:
             raise ValueError("vLLM deployment plan mismatch during switch")
+        scheduler = getattr(self, "model_loading_scheduler", None)
+        snapshot = getattr(scheduler, "_get_worker_nodes", None)
+        if snapshot is not None:
+            workers = await self._call_backend_method(self.model_loading_scheduler, "_get_worker_nodes")
+            for handle in deployment.instances.values():
+                for worker in handle.worker_node_ids():
+                    if worker not in workers or workers[worker].get("state", READY) != READY:
+                        raise RuntimeError(f"target_worker_no_longer_ready:{worker}")
         async with self.instance_management_lock:
+            # Source KV leases remain live after the routing switch. Keep the
+            # old actors discoverable by worker ID until they are stopped, so
+            # a deadline event can revoke them even after target activation.
+            self.deleting_inference_instances.update({
+                instance_id: handle
+                for instance_id, handle in self.ready_inference_instances.items()
+                if instance_id not in deployment.instances
+            })
             self.ready_inference_instances = dict(deployment.instances)
+            # Once the planner commits a replica count, the generic scaler
+            # must not recreate the old initial count with the new GPU shape.
+            self.auto_scaling_config = {
+                **self.auto_scaling_config,
+                "min_instances": plan.replica_count,
+                "max_instances": plan.replica_count,
+            }
             self.backend_config = dict(deployment.backend_config)
             self.resource_requirements = dict(deployment.resource_requirements)
             self.vllm_deployment_adapter.backend_config = dict(
@@ -742,6 +824,7 @@ class RoundRobinRouter(SllmRouter):
                     states[instance_id] = {
                         "pool": pool_name,
                         "node_id": status.node_id,
+                        "member_node_ids": status.member_node_ids,
                         "state": status.state,
                         "concurrency": status.concurrency,
                     }
@@ -749,6 +832,131 @@ class RoundRobinRouter(SllmRouter):
                     if failure_reason:
                         states[instance_id]["failure_reason"] = failure_reason
             return states
+
+    async def get_runtime_ep_audit(
+        self, expected_ep_size: int
+    ) -> Dict[str, Any]:
+        """Read back the physical EP ranks reported by every ready backend.
+
+        Configured TP/DP values are deliberately not accepted as evidence.
+        A run passes only when the vLLM runtime reports an explicit ``ep_size``
+        and ``ep_rank`` for every expected rank on every serving instance.
+        """
+        expected_ep_size = max(1, int(expected_ep_size))
+        async with self.instance_management_lock:
+            instances = list(self.ready_inference_instances.values())
+
+        def collect_rank_rows(value: Any) -> List[Mapping[str, Any]]:
+            rows: List[Mapping[str, Any]] = []
+            if isinstance(value, Mapping):
+                if "ep_rank" in value or "ep_size" in value:
+                    rows.append(value)
+                for nested in value.values():
+                    rows.extend(collect_rank_rows(nested))
+            elif isinstance(value, (list, tuple)):
+                for nested in value:
+                    rows.extend(collect_rank_rows(nested))
+            return rows
+
+        audits: List[Dict[str, Any]] = []
+        for instance in instances:
+            audit: Dict[str, Any] = {
+                "instance_id": instance.instance_id,
+                "node_id": str(instance.node_id or ""),
+                "expected_ep_size": expected_ep_size,
+                "verified": False,
+            }
+            if instance.backend_instance is None:
+                audit["reason"] = "backend_unavailable"
+                audits.append(audit)
+                continue
+            try:
+                runtime_metadata = await self._call_backend_method(
+                    instance.backend_instance,
+                    "get_runtime_metadata",
+                    instance_id=instance.instance_id,
+                    node_id=str(instance.node_id or ""),
+                )
+            except Exception as exc:
+                audit.update(
+                    reason="runtime_metadata_error", error=repr(exc)
+                )
+                audits.append(audit)
+                continue
+            if not isinstance(runtime_metadata, Mapping):
+                audit["reason"] = "runtime_metadata_not_mapping"
+                audits.append(audit)
+                continue
+
+            combined: Dict[str, Any] = {}
+            profile = runtime_metadata.get("model_resource_profile")
+            if isinstance(profile, Mapping):
+                combined.update(profile)
+            combined.update(runtime_metadata)
+            evidence = {
+                "worker_snapshots": combined.get(
+                    "runtime_expert_placement_worker_snapshots", {}
+                ),
+                "placement_shards": combined.get(
+                    "runtime_expert_placement_shards", {}
+                ),
+            }
+            rank_rows = collect_rank_rows(evidence)
+            observed_sizes = sorted(
+                {
+                    int(row["ep_size"])
+                    for row in rank_rows
+                    if row.get("ep_size") is not None
+                }
+            )
+            observed_ranks = sorted(
+                {
+                    int(row["ep_rank"])
+                    for row in rank_rows
+                    if row.get("ep_rank") is not None
+                }
+            )
+            worker_count = int(
+                combined.get("runtime_expert_placement_worker_count", 0) or 0
+            )
+            runtime_available = bool(
+                combined.get("runtime_expert_placement_available", False)
+            )
+            expected_ranks = list(range(expected_ep_size))
+            verified = bool(
+                runtime_available
+                and worker_count == expected_ep_size
+                and observed_sizes == [expected_ep_size]
+                and observed_ranks == expected_ranks
+            )
+            if not runtime_available:
+                reason = "runtime_expert_placement_unavailable"
+            elif worker_count != expected_ep_size:
+                reason = "runtime_ep_worker_count_mismatch"
+            elif observed_sizes != [expected_ep_size]:
+                reason = "runtime_ep_size_mismatch_or_missing"
+            elif observed_ranks != expected_ranks:
+                reason = "runtime_ep_rank_coverage_mismatch"
+            else:
+                reason = "runtime_ep_rank_and_size_verified"
+            audit.update(
+                verified=verified,
+                reason=reason,
+                runtime_worker_count=worker_count,
+                observed_ep_sizes=observed_sizes,
+                observed_ep_ranks=observed_ranks,
+                rank_evidence_rows=len(rank_rows),
+            )
+            audits.append(audit)
+
+        return {
+            "verified": bool(audits)
+            and all(bool(audit.get("verified")) for audit in audits),
+            "expected_ep_size": expected_ep_size,
+            "ready_instance_count": len(instances),
+            "audited_instance_count": len(audits),
+            "instances": audits,
+        }
 
     def _matches_spot_target(
         self,
@@ -760,7 +968,7 @@ class RoundRobinRouter(SllmRouter):
             return False
         if instance_id is not None and instance.instance_id != instance_id:
             return False
-        if node_id is not None and instance.node_id != node_id:
+        if node_id is not None and str(node_id) not in instance.worker_node_ids():
             return False
         return True
 
@@ -803,13 +1011,10 @@ class RoundRobinRouter(SllmRouter):
         target_node_ids = []
         seen = set()
         for instance in matches:
-            if instance.node_id is None:
-                continue
-            target_node_id = str(instance.node_id)
-            if target_node_id in seen:
-                continue
-            seen.add(target_node_id)
-            target_node_ids.append(target_node_id)
+            for target_node_id in instance.worker_node_ids():
+                if target_node_id not in seen:
+                    seen.add(target_node_id)
+                    target_node_ids.append(target_node_id)
         return target_node_ids
 
     def _record_reparallelization_request_start(
@@ -870,14 +1075,6 @@ class RoundRobinRouter(SllmRouter):
         return planner_config
 
     async def _snapshot_reparallelization_worker_nodes(self):
-        if self.reparallelization_worker_nodes:
-            return {
-                node_id: dict(node_info)
-                for node_id, node_info in (
-                    self.reparallelization_worker_nodes.items()
-                )
-            }
-
         # The router's active instances only describe nodes already serving
         # this model.  Ask the real scheduler for the complete worker set so a
         # replan can place the replacement on an idle vLLM worker node.
@@ -901,6 +1098,12 @@ class RoundRobinRouter(SllmRouter):
                     "Could not query scheduler worker nodes for replan",
                     exc_info=True,
                 )
+
+        if self.reparallelization_worker_nodes:
+            return {
+                node_id: dict(node_info)
+                for node_id, node_info in self.reparallelization_worker_nodes.items()
+            }
 
         async with self.instance_management_lock:
             instances = (
@@ -1060,10 +1263,32 @@ class RoundRobinRouter(SllmRouter):
         instance_id: Optional[str],
         matches: List[InstanceHandle],
         worker_node_updates: Optional[Mapping[str, Mapping[str, Any]]] = None,
+        spot_event_id: Optional[str] = None,
+        event_state_marked_at_s: Optional[float] = None,
+    ):
+        # Notices/deadline revocation occur outside this lock. Only planning
+        # and topology commits are serialized; each obtains a fresh snapshot.
+        async with self._reparallelization_lock:
+            return await self._replan_after_spot_event_serialized(
+                event, node_id, instance_id, matches, worker_node_updates,
+                spot_event_id, event_state_marked_at_s,
+            )
+
+    async def _replan_after_spot_event_serialized(
+        self,
+        event: str,
+        node_id: Optional[str],
+        instance_id: Optional[str],
+        matches: List[InstanceHandle],
+        worker_node_updates: Optional[Mapping[str, Mapping[str, Any]]] = None,
+        spot_event_id: Optional[str] = None,
+        event_state_marked_at_s: Optional[float] = None,
     ):
         if not self.enable_reparallelization:
             return None
 
+        planner_invocation_id = f"planner-{uuid.uuid4().hex}"
+        planner_started_at_s = time.time()
         worker_nodes = await self._snapshot_reparallelization_worker_nodes()
         normalized_updates = {
             str(update_node_id): dict(update)
@@ -1122,6 +1347,42 @@ class RoundRobinRouter(SllmRouter):
                 runtime_metadata
             )
 
+        planner_config = self._reparallelization_planner_config()
+        async with self.inflight_requests_lock:
+            active_request_count = len(self.inflight_requests)
+        runtime_metadata_fields = sorted(str(key) for key in runtime_metadata)
+        planner_input_snapshot = {
+            "spot_event_id": spot_event_id,
+            "event": event,
+            "node_id": node_id,
+            "instance_id": instance_id,
+            "worker_nodes": worker_nodes,
+            "active_request_count": active_request_count,
+            "queue_depth": self.request_queue.qsize(),
+            "runtime_workload": planner_config.get("runtime_workload", {}),
+            "runtime_metadata_fields": runtime_metadata_fields,
+            "kv_snapshot_available": any(
+                "kv" in field.lower() or "cache" in field.lower()
+                for field in runtime_metadata_fields
+            ),
+            "route_snapshot_available": any(
+                "route" in field.lower() or "expert_hotness" in field.lower()
+                for field in runtime_metadata_fields
+            ),
+            "placement_snapshot_available": any(
+                "placement" in field.lower()
+                for field in runtime_metadata_fields
+            ),
+        }
+        planner_input_snapshot_hash = hashlib.sha256(
+            json.dumps(
+                planner_input_snapshot,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+
         model_config = {
             "model": self.model_name,
             "backend": self.backend,
@@ -1134,16 +1395,38 @@ class RoundRobinRouter(SllmRouter):
             "backend_config": planner_backend_config,
             "runtime_metadata": runtime_metadata,
         }
+        measured_capability = planner_backend_config.get(
+            "spotserve_backend_capability"
+        )
+        if isinstance(measured_capability, Mapping):
+            # The K8s experiment driver only installs this field after every
+            # advertised shape has passed an exact-workload GPU profile.  Keep
+            # it outside AsyncEngineArgs while allowing the planner to consume
+            # the measured latency/load/migration components verbatim.
+            model_config["backend_capability"] = dict(measured_capability)
         decision = plan_dynamic_reparallelization(
             model_name=self.model_name,
             worker_nodes=worker_nodes,
             model_config=model_config,
-            planner_config=self._reparallelization_planner_config(),
+            planner_config=planner_config,
             event=event,
             node_id=node_id,
             instance_id=instance_id,
             backend=self.backend,
         )
+        planner_finished_at_s = time.time()
+        decision.update({
+            "spot_event_id": spot_event_id,
+            "preemption_event_id": (
+                spot_event_id if event == "preempt" else None
+            ),
+            "planner_invocation_id": planner_invocation_id,
+            "event_state_marked_at_s": event_state_marked_at_s,
+            "planner_started_at_s": planner_started_at_s,
+            "planner_finished_at_s": planner_finished_at_s,
+            "planner_input_snapshot_hash": planner_input_snapshot_hash,
+            "planner_input_snapshot": planner_input_snapshot,
+        })
         execution_model = self._reparallelization_execution_model_fields(
             decision
         )
@@ -1385,6 +1668,11 @@ class RoundRobinRouter(SllmRouter):
                         "request_migration": getattr(
                             self.vllm_deployment_adapter,
                             "last_request_migration",
+                            None,
+                        ),
+                        "transition": getattr(
+                            self.reparallelization_executor,
+                            "last_transition",
                             None,
                         ),
                         "duration_ms": (
@@ -2573,11 +2861,14 @@ class RoundRobinRouter(SllmRouter):
         trace_deadline_time_s: Optional[float] = None,
         grace_period_s: Optional[float] = None,
     ):
+        spot_event_id = f"preempt-{uuid.uuid4().hex}"
         matches = await self._matching_inference_instances(
             node_id=node_id, instance_id=instance_id
         )
         marked_instances = []
         timing_metadata = {
+            "spot_event_id": spot_event_id,
+            "preemption_event_id": spot_event_id,
             "notice_time_s": notice_time_s,
             "deadline_time_s": deadline_time_s,
             "trace_event_time_s": trace_event_time_s,
@@ -2585,23 +2876,85 @@ class RoundRobinRouter(SllmRouter):
             "grace_period_s": grace_period_s,
         }
         for instance in matches:
-            await self._set_instance_state(
-                instance,
-                InstanceState.PREEMPTING,
-                reason="trace_event",
-                metadata=timing_metadata,
+            from_state = instance.state.value
+            if deadline_time_s is not None:
+                instance.preemption_deadline_time_s = float(deadline_time_s)
+            await instance.mark_preempting()
+            token_batches = await self._capture_current_tokens(instance)
+            prompt_tokens = max(
+                0,
+                int(
+                    self.backend_config.get(
+                        "spotserve_expected_prompt_tokens", 0
+                    )
+                    or 0
+                ),
             )
-            await self._capture_current_tokens(instance)
+            generated_tokens = [
+                max(0, len(tokens) - prompt_tokens)
+                for tokens in token_batches
+            ]
+            progress_min = int(
+                self.backend_config.get(
+                    "spotserve_preemption_progress_min_tokens", 0
+                )
+                or 0
+            )
+            progress_max = int(
+                self.backend_config.get(
+                    "spotserve_preemption_progress_max_tokens", 0
+                )
+                or 0
+            )
+            progress_metadata = {
+                **timing_metadata,
+                "preemption_progress_observed": bool(token_batches),
+                "preemption_expected_prompt_tokens": prompt_tokens,
+                "preemption_inflight_request_count": len(token_batches),
+                "preemption_generated_tokens_per_request": generated_tokens,
+                "preemption_generated_tokens_min": (
+                    min(generated_tokens) if generated_tokens else 0
+                ),
+                "preemption_generated_tokens_max": (
+                    max(generated_tokens) if generated_tokens else 0
+                ),
+                "preemption_generated_tokens_avg": (
+                    sum(generated_tokens) / len(generated_tokens)
+                    if generated_tokens
+                    else 0.0
+                ),
+                "preemption_progress_window_min_tokens": progress_min,
+                "preemption_progress_window_max_tokens": progress_max,
+                "preemption_requests_in_progress_window": sum(
+                    1
+                    for tokens in generated_tokens
+                    if progress_min <= tokens <= progress_max
+                ),
+            }
+            self._emit_metric(
+                make_instance_state_event(
+                    model=self.model_name,
+                    instance_id=instance.instance_id,
+                    node_id=instance.node_id,
+                    from_state=from_state,
+                    to_state=instance.state.value,
+                    reason="trace_event",
+                    **progress_metadata,
+                )
+            )
             marked_instances.append(instance.instance_id)
             logger.info(
                 f"Marked instance {instance.instance_id} as preempting "
                 f"for model {self.model_name}"
             )
+        event_state_marked_at_s = time.time()
         replanning = await self._replan_after_spot_event(
             event="preempt",
             node_id=node_id,
             instance_id=instance_id,
             matches=matches,
+            spot_event_id=spot_event_id,
+            event_state_marked_at_s=event_state_marked_at_s,
         )
         context_migration = await self._plan_context_migration_after_spot_event(
             event="preempt",
@@ -2610,6 +2963,8 @@ class RoundRobinRouter(SllmRouter):
         return {
             "model": self.model_name,
             "event": "preempt",
+            "spot_event_id": spot_event_id,
+            "preemption_event_id": spot_event_id,
             "instances": marked_instances,
             "notice_time_s": notice_time_s,
             "deadline_time_s": deadline_time_s,
@@ -2685,19 +3040,24 @@ class RoundRobinRouter(SllmRouter):
         tracked requests before switching traffic.
         """
         normalized_node_id = str(node_id)
+        spot_event_id = f"add-{uuid.uuid4().hex}"
         updates = {
             normalized_node_id: {"state": READY, **dict(node_info or {})}
         }
+        event_state_marked_at_s = time.time()
         replanning = await self._replan_after_spot_event(
             event="add",
             node_id=normalized_node_id,
             instance_id=None,
             matches=[],
             worker_node_updates=updates,
+            spot_event_id=spot_event_id,
+            event_state_marked_at_s=event_state_marked_at_s,
         )
         return {
             "model": self.model_name,
             "event": "add",
+            "spot_event_id": spot_event_id,
             "node_id": normalized_node_id,
             "reparallelization": replanning,
         }
@@ -2754,13 +3114,28 @@ class RoundRobinRouter(SllmRouter):
             "auto_deadline": auto_deadline,
         }
         for instance in matches:
-            await self._capture_current_tokens(instance)
+            if not auto_deadline:
+                await self._capture_current_tokens(instance)
             await self._set_instance_state(
                 instance,
                 InstanceState.DEAD,
                 reason="trace_dead",
                 metadata=timing_metadata,
             )
+            if auto_deadline:
+                # Revoke source-owned KV; do not leave it readable after the
+                # simulated provider deadline or delete the Kubernetes pod.
+                actor = instance.backend_instance
+                if actor is not None and hasattr(actor, "_ray_actor_id"):
+                    ray.kill(actor, no_restart=True)
+                elif actor is not None and hasattr(actor, "shutdown"):
+                    await self._call_backend_method(actor, "shutdown")
+                instance.backend_instance = None
+                if self.backend != "dummy":
+                    await self.model_loading_scheduler.deallocate_resource.remote(
+                        self.model_name, instance.instance_id,
+                        {**self.resource_requirements, "num_gpus": instance.num_gpu},
+                    )
             marked_instances.append(instance.instance_id)
             logger.info(
                 f"Marked instance {instance.instance_id} as dead "
@@ -2871,6 +3246,13 @@ class RoundRobinRouter(SllmRouter):
         if state.tokens:
             restore_request["input_tokens"] = list(state.tokens)
         completed_tokens = state.completed_tokens
+        if self.backend == "vllm" and completed_tokens:
+            if completed_tokens > len(state.tokens):
+                raise NativeKVRecoveryError("committed_output_exceeds_visible_tokens")
+            restore_request["_spotserve_committed_output_tokens"] = list(
+                state.tokens[-completed_tokens:]
+            )
+            restore_request["_spotserve_original_prompt_tokens"] = len(state.tokens) - completed_tokens
         if completed_tokens and "max_tokens" in restore_request:
             restore_request["max_tokens"] = max(
                 1,
@@ -3047,7 +3429,13 @@ class RoundRobinRouter(SllmRouter):
             "state_restore_duration_ms": 0.0,
         }
         if state is None:
+            if self.require_native_kv_restore:
+                raise NativeKVRecoveryError("native_kv_snapshot_missing")
             return None, None, counters, False
+        if self.require_native_kv_restore and (
+            state.state_kind != "vllm_kv_snapshot" or not state.supports_restore
+        ):
+            raise NativeKVRecoveryError("native_kv_snapshot_not_restorable")
         counters["state_kind"] = state.state_kind
         counters["supports_state_restore"] = bool(state.supports_restore)
 
@@ -3181,11 +3569,17 @@ class RoundRobinRouter(SllmRouter):
                     counters["state_restore_reason"] = (
                         "vllm_kv_restore_empty"
                     )
+                    if self.require_native_kv_restore:
+                        raise NativeKVRecoveryError("native_kv_restore_empty")
                     return None, [list(state.tokens)], counters, True
                 counters["state_restore_successes"] = 1
                 counters["state_restored_tokens"] = decision.recovered_tokens
                 return state, None, counters, False
             if restore_result.get("staged"):
+                if self.require_native_kv_restore and int(
+                    restore_result.get("expected_blocks", 0) or 0
+                ) <= 0:
+                    raise NativeKVRecoveryError("native_kv_restore_staging_empty")
                 return state, None, counters, False
 
             counters["state_restore_reason"] = str(
@@ -3193,6 +3587,10 @@ class RoundRobinRouter(SllmRouter):
                 or decision.reason
             )
 
+        if self.require_native_kv_restore:
+            raise NativeKVRecoveryError(
+                f"native_kv_restore_required:{counters['state_restore_reason'] or decision.reason}"
+            )
         if state.tokens:
             return None, [list(state.tokens)], counters, True
         return None, None, counters, True
@@ -3511,6 +3909,20 @@ class RoundRobinRouter(SllmRouter):
                         )
                         state_kind = state_snapshot.state_kind or state_kind
                         if kv_restore.get("restored") and kv_restored_blocks > 0:
+                            if int(kv_restore.get("cached_tokens", 0) or 0) > 0:
+                                receipt = {
+                                    "type": "native_kv_receipt", "model": self.model_name,
+                                    "request_id": request_id,
+                                    "source_instance_id": recovery_state_source_instance_id,
+                                    "target_instance_id": instance_id,
+                                    "target_node_id": instance.node_id,
+                                    "cached_tokens": int(kv_restore["cached_tokens"]),
+                                    "restored_blocks": kv_restored_blocks,
+                                    "receipt_kind": "completed_native_request",
+                                }
+                                self._emit_metric(receipt)
+                                if self.require_native_kv_restore:
+                                    self.native_kv_receipts[request_id] = receipt
                             restored_count = (
                                 state_snapshot.completed_tokens
                                 or len(state_snapshot.tokens)
@@ -3521,6 +3933,15 @@ class RoundRobinRouter(SllmRouter):
                         else:
                             state_restore_fallback = True
                             recovery_fallback = True
+                            if self.require_native_kv_restore:
+                                raise NativeKVRecoveryError(
+                                    "native_kv_attach_failed:no_cached_prefix"
+                                )
+                    if self.require_native_kv_restore and state_snapshot is not None and (
+                        not kv_restore.get("restored")
+                        or int(kv_restore.get("cached_tokens", 0) or 0) <= 0
+                    ):
+                        raise NativeKVRecoveryError("native_kv_receipt_required")
                     logger.info("Finished processing request")
 
                     reparallelized = (
@@ -3576,7 +3997,10 @@ class RoundRobinRouter(SllmRouter):
                         migration_state = inflight.get("migration_state")
                         recovery_state = migration_state
                         recovery_state_source_instance_id = instance_id
-                        force_state_recovery = migration_state is not None
+                        force_state_recovery = (
+                            migration_state is not None
+                            and self.recovery_policy == RecoveryPolicy.STATEFUL_RECOVERY
+                        )
                         force_retry_budget = max(force_retry_budget, 1)
                         replay_tokens = (
                             [list(migration_state.tokens)]
@@ -3655,6 +4079,11 @@ class RoundRobinRouter(SllmRouter):
                     ):
                         recovery_fallback = True
 
+                    if self.require_native_kv_restore and (
+                        recovery_state is None or not recovery_state.supports_restore
+                        or recovery_state.state_kind != "vllm_kv_snapshot"
+                    ):
+                        raise NativeKVRecoveryError("native_kv_snapshot_required_for_retry")
                     should_retry = self._should_retry(
                         attempts - 1
                     ) or force_retry_budget > 0
@@ -4105,6 +4534,10 @@ class RoundRobinRouter(SllmRouter):
     async def _start_instance(self, instance_id):
         instance = None
         resources_allocated = False
+        # Each concurrent startup must receive its own reservation snapshot.
+        startup_backend_config = dict(self.backend_config)
+        allocated_nodes = []
+        node_allocations = {}
         try:
             async with self.instance_management_lock:
                 if instance_id not in self.starting_inference_instances:
@@ -4146,7 +4579,7 @@ class RoundRobinRouter(SllmRouter):
                             instance_id,
                             self.resource_requirements,
                             [str(node) for node in distributed_targets],
-                            True,
+                            False,
                         )
                     )
                     if not isinstance(allocation, Mapping):
@@ -4154,20 +4587,22 @@ class RoundRobinRouter(SllmRouter):
                             "scheduler_distributed_allocation_result_invalid"
                         )
                     startup_node = str(allocation.get("node_id") or "")
+                    resources_allocated = True
                     allocated_nodes = [
                         str(node)
                         for node in allocation.get("target_node_ids", [])
                     ]
-                    if not startup_node or len(allocated_nodes) < 2:
+                    if not startup_node or not allocated_nodes:
                         raise RuntimeError(
-                            "scheduler_did_not_reserve_multiple_worker_nodes"
+                            "scheduler_did_not_reserve_worker_nodes"
                         )
-                    self.backend_config[
+                    startup_backend_config[
                         "spotserve_reserved_worker_nodes"
                     ] = allocated_nodes
-                    self.backend_config[
+                    node_allocations = dict(allocation.get("node_allocations", {}))
+                    startup_backend_config[
                         "spotserve_distributed_node_allocations"
-                    ] = dict(allocation.get("node_allocations", {}))
+                    ] = node_allocations
                 else:
                     startup_node = (
                         await self.model_loading_scheduler.allocate_resource.remote(
@@ -4181,6 +4616,10 @@ class RoundRobinRouter(SllmRouter):
                 }
             async with instance.lock:
                 instance.node_id = startup_node
+                instance.member_node_ids = allocated_nodes or [str(startup_node)]
+                instance.node_allocations = node_allocations or {
+                    str(startup_node): int(self.resource_requirements["num_gpus"])
+                }
             startup_config = {
                 "num_cpus": self.resource_requirements["num_cpus"],
                 "num_gpus": (
@@ -4207,7 +4646,7 @@ class RoundRobinRouter(SllmRouter):
                 from sllm.backends.dummy_backend import DummyBackend
 
                 instance.backend_instance = DummyBackend(
-                    self.model_name, self.backend_config
+                    self.model_name, startup_backend_config
                 )
             else:
                 instance.backend_instance = await start_instance.options(
@@ -4216,7 +4655,7 @@ class RoundRobinRouter(SllmRouter):
                     instance_id,
                     self.backend,
                     self.model_name,
-                    self.backend_config,
+                    startup_backend_config,
                     startup_config,
                 )
             logger.info(

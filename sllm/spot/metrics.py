@@ -133,10 +133,49 @@ def make_replanning_event(
             decision.get("expert_placement_physical_migration_required", False),
         )
     )
+    expert_to_target_rank = expert_placement_plan.get(
+        "expert_to_target_rank", {}
+    )
+    if not isinstance(expert_to_target_rank, dict):
+        expert_to_target_rank = {}
+    expert_to_target_ranks = expert_placement_plan.get(
+        "expert_to_target_ranks", {}
+    )
+    if not isinstance(expert_to_target_ranks, dict):
+        expert_to_target_ranks = {}
+    normalized_expert_placement = {
+        "target_rank_count": int(
+            expert_placement_plan.get("target_rank_count", 0) or 0
+        ),
+        "expert_to_target_rank": {
+            str(key): str(value)
+            for key, value in sorted(expert_to_target_rank.items())
+        },
+        "expert_to_target_ranks": {
+            str(key): sorted(str(rank) for rank in value)
+            for key, value in sorted(expert_to_target_ranks.items())
+            if isinstance(value, (list, tuple, set))
+        },
+    }
     return {
         "type": "reparallelization",
         "model": model,
         "event": event,
+        "spot_event_id": decision.get("spot_event_id"),
+        "preemption_event_id": decision.get("preemption_event_id"),
+        "planner_invocation_id": decision.get("planner_invocation_id"),
+        "event_state_marked_at_s": decision.get(
+            "event_state_marked_at_s"
+        ),
+        "planner_started_at_s": decision.get("planner_started_at_s"),
+        "planner_finished_at_s": decision.get("planner_finished_at_s"),
+        "planner_input_snapshot_hash": decision.get(
+            "planner_input_snapshot_hash", ""
+        ),
+        "planner_input_snapshot": decision.get(
+            "planner_input_snapshot", {}
+        ),
+        "top_candidates": decision.get("top_candidates", []),
         "node_id": node_id,
         "instance_id": instance_id,
         "action": decision.get("action"),
@@ -600,6 +639,7 @@ def make_replanning_event(
         "multi_worker_target": len(set(target_nodes)) > 1,
         "parallel_plan": parallel_plan or None,
         "expert_placement_plan": expert_placement_plan or None,
+        "normalized_expert_placement": normalized_expert_placement,
         "execution": execution or None,
         "execution_status": execution.get("status", ""),
         "execution_duration_ms": execution.get("duration_ms", 0.0),

@@ -277,14 +277,17 @@ async def replay_trace(
     events = load_spot_trace(trace_path, default_model_name=model_name)
     controller = ray.get_actor(controller_name)
     replay_started_at = time.monotonic()
-    last_event_time = 0.0
     pending_deadlines: Dict[DeadlineKey, asyncio.Task] = {}
+    dispatch_tasks: list[asyncio.Task] = []
+    deadline_tasks: list[asyncio.Task] = []
     auto_dead_scheduled = 0
     auto_dead_cancelled = 0
     auto_dead_dispatched = 0
 
     for event in events:
-        sleep_time = max(event.time - last_event_time, 0.0) / speedup
+        sleep_time = max(
+            replay_started_at + event.time / speedup - time.monotonic(), 0.0
+        )
         if sleep_time > 0:
             await asyncio.sleep(sleep_time)
         logger.info("Replaying spot event: %s", event)
@@ -300,15 +303,6 @@ async def replay_trace(
             notice_time_s + (grace_period_s / speedup)
             if notice_time_s is not None and grace_period_s is not None
             else None
-        )
-        await _dispatch_event(
-            controller,
-            event,
-            resolved_instance_id=resolved_instance_id,
-            notice_time_s=notice_time_s,
-            deadline_time_s=deadline_time_s,
-            trace_deadline_time_s=trace_deadline_time_s,
-            grace_period_s=grace_period_s,
         )
         if event.event in {"recover", "dead", "remove"}:
             auto_dead_cancelled += await _cancel_pending_deadlines(
@@ -332,16 +326,35 @@ async def replay_trace(
                 )
             )
             for key in _deadline_keys_for_event(event, resolved_instance_id):
+                previous = pending_deadlines.get(key)
+                if previous is not None and not previous.done():
+                    previous.cancel()
                 pending_deadlines[key] = task
+            deadline_tasks.append(task)
             auto_dead_scheduled += 1
-        last_event_time = event.time
+        # Submit the notice without waiting for engine loading/migration.
+        # The provider's deadline and subsequent trace events are independent
+        # of how long a control-plane handler takes to finish.
+        dispatch_tasks.append(asyncio.create_task(_dispatch_event(
+            controller, event,
+            resolved_instance_id=resolved_instance_id,
+            notice_time_s=notice_time_s, deadline_time_s=deadline_time_s,
+            trace_deadline_time_s=trace_deadline_time_s,
+            grace_period_s=grace_period_s,
+        )))
+        await asyncio.sleep(0)
 
-    remaining_tasks = set(pending_deadlines.values())
-    if remaining_tasks:
-        results = await asyncio.gather(*remaining_tasks)
-        auto_dead_dispatched += sum(
-            1 for result in results if result.get("status") == "dispatched"
-        )
+    results = await asyncio.gather(
+        *dispatch_tasks, *deadline_tasks, return_exceptions=True
+    )
+    failures = [result for result in results if isinstance(result, BaseException)
+                and not isinstance(result, asyncio.CancelledError)]
+    if failures:
+        raise failures[0]
+    auto_dead_dispatched = sum(
+        1 for result in results[len(dispatch_tasks):]
+        if isinstance(result, dict) and result.get("status") == "dispatched"
+    )
 
     return {
         "trace": trace_path,

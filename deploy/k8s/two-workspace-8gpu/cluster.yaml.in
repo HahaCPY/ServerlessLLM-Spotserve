@@ -1,0 +1,322 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: __HEAD_SERVICE__
+  namespace: __WORKSPACE_A_NAMESPACE__
+  labels:
+    app.kubernetes.io/name: serverlessllm-head
+    spotserve.openai/cluster: __CLUSTER_NAME__
+spec:
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: serverlessllm-head
+    spotserve.openai/cluster: __CLUSTER_NAME__
+  ports:
+    - name: ray-gcs
+      port: 6379
+      targetPort: 6379
+    - name: ray-client
+      port: 10001
+      targetPort: 10001
+    - name: ray-dashboard
+      port: 8265
+      targetPort: 8265
+    - name: sllm-http
+      port: 8343
+      targetPort: 8343
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: __CLUSTER_NAME__-head
+  namespace: __WORKSPACE_A_NAMESPACE__
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: serverlessllm-head
+      spotserve.openai/cluster: __CLUSTER_NAME__
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: serverlessllm-head
+        spotserve.openai/cluster: __CLUSTER_NAME__
+        spotserve.openai/workspace: a
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: head
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MODE
+              value: HEAD
+            - name: RAY_NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: RAY_RESOURCES
+              value: '{"control_node":1}'
+            - name: RAY_NUM_CPUS
+              value: "4"
+            - name: IMAGE_DIGEST
+              value: __IMAGE_DIGEST__
+            - name: STORAGE_PATH
+              value: /models
+          ports:
+            - name: ray-gcs
+              containerPort: 6379
+            - name: ray-client
+              containerPort: 10001
+            - name: ray-dashboard
+              containerPort: 8265
+            - name: sllm-http
+              containerPort: 8343
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: sllm-http
+            periodSeconds: 5
+            failureThreshold: 60
+          resources:
+            requests:
+              cpu: "4"
+              memory: 16Gi
+            limits:
+              cpu: "8"
+              memory: 32Gi
+          volumeMounts:
+            - name: models
+              mountPath: /models
+              readOnly: true
+            - name: results
+              mountPath: /results
+            - name: ray-tmp
+              mountPath: /tmp/ray
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: __MODEL_PVC_A__
+        - name: results
+          persistentVolumeClaim:
+            claimName: __RESULTS_PVC_A__
+        - name: ray-tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: __CLUSTER_NAME__-workers-a
+  namespace: __WORKSPACE_A_NAMESPACE__
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: serverlessllm-worker
+    spotserve.openai/cluster: __CLUSTER_NAME__
+    spotserve.openai/workspace: a
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: __CLUSTER_NAME__-worker-a
+  namespace: __WORKSPACE_A_NAMESPACE__
+spec:
+  serviceName: __CLUSTER_NAME__-workers-a
+  replicas: 4
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: serverlessllm-worker
+      spotserve.openai/cluster: __CLUSTER_NAME__
+      spotserve.openai/workspace: a
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: serverlessllm-worker
+        spotserve.openai/cluster: __CLUSTER_NAME__
+        spotserve.openai/workspace: a
+    spec:
+      terminationGracePeriodSeconds: 45
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: serverlessllm-worker
+                    spotserve.openai/cluster: __CLUSTER_NAME__
+                    spotserve.openai/workspace: a
+      containers:
+        - name: worker
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              ordinal="${HOSTNAME##*-}"
+              export WORKER_ID="$((ordinal + 0))"
+              exec /app/entrypoint.sh --mem-pool-size __MEM_POOL_SIZE__ --registration-required true
+          env:
+            - name: MODE
+              value: WORKER
+            - name: RAY_HEAD_ADDRESS
+              value: __HEAD_SERVICE__.__WORKSPACE_A_NAMESPACE__.svc.cluster.local:6379
+            - name: RAY_NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: SPOTSERVE_PHYSICAL_HOST_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: SPOTSERVE_FAILURE_DOMAIN_ID
+              value: workspace:__WORKSPACE_A_NAMESPACE__
+            - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: IMAGE_DIGEST
+              value: __IMAGE_DIGEST__
+            - name: STORAGE_PATH
+              value: /models
+          resources:
+            requests:
+              cpu: "8"
+              memory: 48Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "16"
+              memory: 64Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: models
+              mountPath: /models
+              readOnly: true
+            - name: dshm
+              mountPath: /dev/shm
+            - name: ray-tmp
+              mountPath: /tmp/ray
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: __MODEL_PVC_A__
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+        - name: ray-tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: __CLUSTER_NAME__-workers-b
+  namespace: __WORKSPACE_B_NAMESPACE__
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: serverlessllm-worker
+    spotserve.openai/cluster: __CLUSTER_NAME__
+    spotserve.openai/workspace: b
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: __CLUSTER_NAME__-worker-b
+  namespace: __WORKSPACE_B_NAMESPACE__
+spec:
+  serviceName: __CLUSTER_NAME__-workers-b
+  replicas: 4
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: serverlessllm-worker
+      spotserve.openai/cluster: __CLUSTER_NAME__
+      spotserve.openai/workspace: b
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: serverlessllm-worker
+        spotserve.openai/cluster: __CLUSTER_NAME__
+        spotserve.openai/workspace: b
+    spec:
+      terminationGracePeriodSeconds: 45
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: serverlessllm-worker
+                    spotserve.openai/cluster: __CLUSTER_NAME__
+                    spotserve.openai/workspace: b
+      containers:
+        - name: worker
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              ordinal="${HOSTNAME##*-}"
+              export WORKER_ID="$((ordinal + 4))"
+              exec /app/entrypoint.sh --mem-pool-size __MEM_POOL_SIZE__ --registration-required true
+          env:
+            - name: MODE
+              value: WORKER
+            - name: RAY_HEAD_ADDRESS
+              value: __HEAD_SERVICE__.__WORKSPACE_A_NAMESPACE__.svc.cluster.local:6379
+            - name: RAY_NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: SPOTSERVE_PHYSICAL_HOST_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: SPOTSERVE_FAILURE_DOMAIN_ID
+              value: workspace:__WORKSPACE_B_NAMESPACE__
+            - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: IMAGE_DIGEST
+              value: __IMAGE_DIGEST__
+            - name: STORAGE_PATH
+              value: /models
+          resources:
+            requests:
+              cpu: "8"
+              memory: 48Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "16"
+              memory: 64Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: models
+              mountPath: /models
+              readOnly: true
+            - name: dshm
+              mountPath: /dev/shm
+            - name: ray-tmp
+              mountPath: /tmp/ray
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: __MODEL_PVC_B__
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+        - name: ray-tmp
+          emptyDir: {}

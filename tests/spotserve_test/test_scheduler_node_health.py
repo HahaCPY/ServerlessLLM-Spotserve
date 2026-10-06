@@ -330,6 +330,8 @@ async def test_scheduler_preserves_node_state_during_worker_update():
 async def test_scheduler_preserves_allocated_capacity_during_worker_refresh(
     monkeypatch,
 ):
+    monkeypatch.setattr(fcfs_scheduler_module.ray, "available_resources",
+                        lambda: {"worker_id_0": 1.0, "worker_id_1": 1.0})
     scheduler = FcfsScheduler({})
     scheduler.model_instance = {
         "test-model": {

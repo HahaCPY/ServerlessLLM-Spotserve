@@ -686,6 +686,34 @@ class VllmBackend(SllmBackend):
                 )
             os.environ["VLLM_RAY_DP_PACK_STRATEGY"] = normalized_pack_strategy
 
+        reserved_workers = backend_config.get("spotserve_reserved_worker_nodes")
+        if reserved_workers:
+            import ray
+            from vllm import envs
+            from sllm.spot.worker_pool import reserved_worker_ips
+
+            if "VLLM_RAY_DP_PLACEMENT_NODE_IPS" not in envs.environment_variables:
+                raise RuntimeError("vllm_reserved_worker_placement_patch_required")
+            ips = reserved_worker_ips(
+                reserved_workers,
+                backend_config.get("spotserve_distributed_node_allocations", {}),
+                ray.nodes(),
+                int(backend_config.get("tensor_parallel_size", 1))
+                * int(backend_config.get("pipeline_parallel_size", 1))
+                * int(backend_config.get("data_parallel_size", 1)),
+            )
+            address_arg = (
+                "data_parallel_address" if "data_parallel_address" in async_engine_fields
+                else "data_parallel_master_ip"
+            )
+            if address_arg not in async_engine_fields:
+                raise RuntimeError("vllm_explicit_dp_master_address_required")
+            filtered_engine_config[address_arg] = ips[0]
+            filtered_engine_config["data_parallel_size_local"] = 1
+            os.environ["VLLM_RAY_DP_PLACEMENT_NODE_IPS"] = ",".join(ips)
+            os.environ["VLLM_RAY_DP_PACK_STRATEGY"] = "fill"
+            self.backend_config["spotserve_reserved_worker_ips"] = ips
+
         self.engine_args = AsyncEngineArgs(**filtered_engine_config)
         self._async_engine_fields = async_engine_fields
 
@@ -1555,9 +1583,9 @@ class VllmBackend(SllmBackend):
         metadata["runtime_effective_expert_parallel_size"] = effective_ep_size
         metadata["derived_effective_expert_parallel_size"] = effective_ep_size
         metadata["expert_parallel_size"] = effective_ep_size
-        metadata["expert_parallel_size_verified"] = True
+        metadata["expert_parallel_size_verified"] = False
         metadata["expert_parallel_size_source"] = (
-            "derived_from_tp_dp" if enable_ep else "disabled"
+            "configured_tp_dp_not_runtime_readback" if enable_ep else "disabled"
         )
         metadata["vllm_data_parallel_size"] = data_parallel_size
         metadata["sllm_replica_count"] = max(
@@ -2812,6 +2840,8 @@ class VllmBackend(SllmBackend):
         return_token_ids = bool(
             request_data.pop("_spotserve_return_token_ids", False)
         )
+        committed_output_tokens = request_data.pop("_spotserve_committed_output_tokens", [])
+        original_prompt_tokens = request_data.pop("_spotserve_original_prompt_tokens", None)
         request_token_delay_s = request_data.pop(
             "_spotserve_token_delay_s", self.test_token_delay_s
         )
@@ -2909,6 +2939,26 @@ class VllmBackend(SllmBackend):
             self._clear_request_expert_route_histogram(request_id)
 
         response = process_output(final_output, model_name)
+        output_token_ids = list(final_output.outputs[0].token_ids or [])
+        prompt_token_ids = list(final_output.prompt_token_ids or [])
+        if committed_output_tokens:
+            from sllm.backends.vllm_response_state import completed_response_tokens
+
+            if len(final_output.outputs) != 1:
+                raise ValueError("committed_output_requires_single_sequence")
+            output_token_ids = completed_response_tokens(
+                committed_output_tokens, output_token_ids,
+                original_prompt_tokens, prompt_token_ids,
+            )
+            response["choices"][0]["message"]["content"] = self.engine.get_tokenizer().decode(
+                output_token_ids, skip_special_tokens=sampling_params.skip_special_tokens,
+            )
+            prompt_token_ids = prompt_token_ids[:original_prompt_tokens]
+            response["usage"].update(
+                prompt_tokens=original_prompt_tokens,
+                completion_tokens=len(output_token_ids),
+                total_tokens=original_prompt_tokens + len(output_token_ids),
+            )
         expected_blocks = self.pending_kv_restores.pop(request_id, 0)
         if expected_blocks:
             cached_tokens = int(
@@ -2925,12 +2975,8 @@ class VllmBackend(SllmBackend):
                 ),
             }
         if return_token_ids:
-            response["_spotserve_token_ids"] = list(
-                final_output.outputs[0].token_ids or []
-            )
-            response["_spotserve_prompt_token_ids"] = list(
-                final_output.prompt_token_ids or []
-            )
+            response["_spotserve_token_ids"] = output_token_ids
+            response["_spotserve_prompt_token_ids"] = prompt_token_ids
         return response
 
     async def _reparallelization_abort_result(

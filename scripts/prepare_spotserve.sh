@@ -423,7 +423,7 @@ done
 if [[ "$DEPLOY_SET" == "reparallelization" || "$DEPLOY_SET" == "reparallelization-performance" || "$DEPLOY_SET" == "expert-remap-active-performance" || "$DEPLOY_SET" == "reparallelization-multi-worker-performance" || "$DEPLOY_SET" == "context-migration-performance" || "$DEPLOY_SET" == "stateful-recovery-performance" || "$DEPLOY_SET" == "spotserve-core-performance" || "$DEPLOY_SET" == "vllm-dense" || "$DEPLOY_SET" == "vllm-moe" || "$DEPLOY_SET" == "vllm-blackbox" || "$DEPLOY_SET" == "all" ]]; then
   log "Checking vLLM worker resources"
   podman exec "$WORKER_CONTAINER" bash -lc \
-    "mkdir -p /hf-cache/hub /hf-cache/modules && chmod -R a+rwX /hf-cache && touch /hf-cache/modules/.spotserve-write-test"
+    "mkdir -p /hf-cache/hub /hf-cache/modules && (chmod -R a+rwX /hf-cache 2>/dev/null || true) && touch /hf-cache/modules/.spotserve-write-test"
   if ! podman exec -i "$WORKER_CONTAINER" "$WORKER_PYTHON" - \
       "$DEPLOY_SET" \
       "${SPOTSERVE_REQUIRE_MOE_ROUTE_INSTRUMENTATION:-0}" \

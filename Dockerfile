@@ -148,5 +148,16 @@ RUN bash -c "source /opt/venvs/worker/bin/activate && cd /app && ./vllm_patch/pa
 COPY entrypoint.sh .
 RUN chmod +x entrypoint.sh
 
+# Copy the audited SpotServe MoE F1/F2 experiment driver and its runtime files.
+COPY scripts/run_k8s_moe_f1_f2.py \
+     scripts/run_k8s_two_workspace_f1_f2.py \
+     scripts/verify_k8s_two_workspace_pool.py \
+     scripts/analyze_spotserve_benchmark.py \
+     /app/scripts/
+COPY benchmarks/spotserve/run_benchmark.py \
+     /app/benchmarks/spotserve/run_benchmark.py
+COPY benchmarks/spotserve/formal/k8s_qwen15_moe_a27b_8gpu.json \
+     /app/benchmarks/spotserve/formal/k8s_qwen15_moe_a27b_8gpu.json
+
 # Set the entrypoint directly to the entrypoint script
 ENTRYPOINT ["/app/entrypoint.sh"]

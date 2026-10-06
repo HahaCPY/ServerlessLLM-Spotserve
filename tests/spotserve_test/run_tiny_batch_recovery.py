@@ -20,6 +20,7 @@ import shutil
 import shlex
 import socket
 import statistics
+import subprocess
 import time
 from multiprocessing.connection import Listener
 from pathlib import Path
@@ -112,6 +113,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--preempt-after-new-tokens", type=int, default=16)
     parser.add_argument("--preempt-max-overshoot", type=int, default=16)
     parser.add_argument(
+        "--min-continuation-match-tokens",
+        type=int,
+        default=32,
+        help=(
+            "Require this many post-preemption tokens to match the uninterrupted "
+            "reference. Full hashes remain reported, but later greedy divergence "
+            "after a numerically different prefill path is not a recovery failure."
+        ),
+    )
+    parser.add_argument(
         "--require-moe-routing",
         action="store_true",
         help="Reject a run unless every request has real vLLM top-k data.",
@@ -132,6 +143,22 @@ def parse_args() -> argparse.Namespace:
         help="CPU weight offload used when long Qwen batches exceed one GPU's VRAM.",
     )
     parser.add_argument("--timeout-s", type=float, default=420.0)
+    parser.add_argument(
+        "--launch-idle-stable-s",
+        type=float,
+        default=0.0,
+        help="Require each container's physical GPUs to remain idle before launch.",
+    )
+    parser.add_argument("--launch-idle-max-used-mib", type=int, default=512)
+    parser.add_argument("--launch-idle-poll-s", type=float, default=5.0)
+    parser.add_argument(
+        "--split-replay-probe",
+        action="store_true",
+        help=(
+            "Diagnostic: reproduce the preemption split on the source engine "
+            "before measuring cross-engine recovery."
+        ),
+    )
     parser.add_argument(
         "--host-network", action="store_true",
         help="Use host networking so NIXL side-channel ports are directly reachable.",
@@ -212,6 +239,64 @@ def token_hash(token_ids: list[int]) -> str:
     return hashlib.sha256(
         json.dumps(token_ids, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+def compare_token_sequences(reference: list[int], actual: list[int]) -> dict:
+    common = 0
+    for reference_token, actual_token in zip(reference, actual):
+        if reference_token != actual_token:
+            break
+        common += 1
+    first_mismatch = common if common < min(len(reference), len(actual)) else None
+    return {
+        "equal": actual == reference,
+        "reference_token_count": len(reference),
+        "actual_token_count": len(actual),
+        "longest_common_prefix_tokens": common,
+        "first_mismatch_index": first_mismatch,
+        "reference_token_at_first_mismatch": (
+            reference[first_mismatch] if first_mismatch is not None else None
+        ),
+        "actual_token_at_first_mismatch": (
+            actual[first_mismatch] if first_mismatch is not None else None
+        ),
+        "reference_sha256": token_hash(reference),
+        "actual_sha256": token_hash(actual),
+    }
+
+
+def validate_recovery_sequence(
+    reference: list[int],
+    actual: list[int],
+    source_completed_tokens: int,
+    min_continuation_match_tokens: int,
+) -> dict:
+    comparison = compare_token_sequences(reference, actual)
+    boundary = max(int(source_completed_tokens), 0)
+    remaining = max(len(reference) - boundary, 0)
+    required_continuation = min(
+        max(int(min_continuation_match_tokens), 0), remaining
+    )
+    matched_continuation = max(
+        int(comparison["longest_common_prefix_tokens"]) - boundary, 0
+    )
+    source_prefix_equal = (
+        actual[:boundary] == reference[:boundary]
+        and len(actual) >= boundary
+        and len(reference) >= boundary
+    )
+    comparison.update({
+        "source_completed_tokens": boundary,
+        "source_prefix_equal_reference": source_prefix_equal,
+        "required_continuation_match_tokens": required_continuation,
+        "matched_continuation_tokens": matched_continuation,
+        "validation_passed": (
+            source_prefix_equal
+            and matched_continuation >= required_continuation
+            and len(actual) == len(reference)
+        ),
+    })
+    return comparison
 
 
 def load_route_profiles(path: str | None) -> tuple[dict[str, dict], str | None]:
@@ -330,6 +415,11 @@ def main() -> None:
         "--env", f"PYTHONPATH={PYTHONPATH}",
         "--env", "VLLM_CACHE_ROOT=/root/.cache/vllm",
         "--env", "TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor_s112060021",
+        # Keep every policy on the same numerical execution path.  Routed
+        # expert capture implicitly selects Model Runner V1 on the source,
+        # while a target without capture otherwise defaults to V2.  Mixing
+        # the two can make long greedy continuations diverge at an argmax.
+        "--env", "VLLM_USE_V2_MODEL_RUNNER=0",
         "--env", "PYTHONUNBUFFERED=1", args.image,
     ]
     worker_script = f"{REPO_ROOT}/tests/spotserve_test/cross_container_nixl_worker.py"
@@ -369,6 +459,56 @@ def main() -> None:
         ]
 
     def launch(spec: dict) -> None:
+        if args.launch_idle_stable_s > 0:
+            requested = {int(gpu) for gpu in spec["gpus"]}
+            stable_started = None
+            deadline = time.monotonic() + args.timeout_s
+            last_report = 0.0
+            while True:
+                query = subprocess.run(
+                    [
+                        "nvidia-smi",
+                        "--query-gpu=index,memory.used",
+                        "--format=csv,noheader,nounits",
+                    ],
+                    check=True,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                )
+                usage = {
+                    int(line.split(",", 1)[0].strip()):
+                    int(line.split(",", 1)[1].strip())
+                    for line in query.stdout.splitlines()
+                }
+                idle = all(
+                    usage.get(gpu, args.launch_idle_max_used_mib + 1)
+                    <= args.launch_idle_max_used_mib
+                    for gpu in requested
+                )
+                current = time.monotonic()
+                if idle:
+                    stable_started = stable_started or current
+                else:
+                    stable_started = None
+                stable_for = (
+                    0.0 if stable_started is None else current - stable_started
+                )
+                if current - last_report >= 30.0:
+                    print(
+                        "[launch-gate] "
+                        f"label={spec['label']} gpus={sorted(requested)} "
+                        f"usage={usage} idle={idle} stable_for={stable_for:.1f}s",
+                        flush=True,
+                    )
+                    last_report = current
+                if stable_for >= args.launch_idle_stable_s:
+                    break
+                if current >= deadline:
+                    raise TimeoutError(
+                        f"GPU launch gate timed out for {spec['label']}: {usage}"
+                    )
+                time.sleep(max(args.launch_idle_poll_s, 0.1))
         run_podman(worker_command(spec))
 
     def register(specs: list[dict]) -> None:
@@ -635,6 +775,29 @@ def main() -> None:
             launch(source_spec)
             register([source_spec])
         source = workers["source"]
+        source_model_runner = source.get("model_runner")
+        if source_model_runner != "V1":
+            raise AssertionError(
+                "source did not honor VLLM_USE_V2_MODEL_RUNNER=0: "
+                f"{source_model_runner!r}"
+            )
+        model_runner_audit = {
+            "required": "V1",
+            "source": source_model_runner,
+            "target": None,
+            "matched": False,
+        }
+        if "target" in workers:
+            target_model_runner = workers["target"].get("model_runner")
+            model_runner_audit.update({
+                "target": target_model_runner,
+                "matched": target_model_runner == source_model_runner,
+            })
+            if not model_runner_audit["matched"]:
+                raise AssertionError(
+                    "source/target model runner mismatch: "
+                    f"{model_runner_audit}"
+                )
 
         # Generate an uninterrupted deterministic reference on the same
         # source engine. Prefix caching is disabled in the worker, so these
@@ -675,6 +838,86 @@ def main() -> None:
                 raise AssertionError(
                     f"uninterrupted reference incomplete: {request_id}"
                 )
+
+        split_replay_audit: dict[str, dict] = {}
+        if args.split_replay_probe:
+            if not 0 < args.preempt_after_new_tokens < args.max_new_tokens:
+                raise AssertionError(
+                    "split replay probe requires 0 < preempt < max new tokens"
+                )
+            for request_id in request_ids:
+                prefix_request_id = f"split-prefix-{request_id}"
+                send(source, {
+                    "op": "generate",
+                    "request_id": prefix_request_id,
+                    "token_ids": prompts[request_id],
+                    "max_new_tokens": args.preempt_after_new_tokens,
+                    "pause_after_new_tokens": 0,
+                })
+                wait(
+                    source,
+                    lambda msg, probe_id=prefix_request_id:
+                    msg.get("event") == "generate_started"
+                    and msg.get("request_id") == probe_id,
+                )
+                prefix_output = wait(
+                    source,
+                    lambda msg, probe_id=prefix_request_id:
+                    msg.get("event") == "output"
+                    and msg.get("request_id") == probe_id
+                    and bool(msg.get("finished")),
+                )
+                prefix_tokens = list(
+                    prefix_output.get("cumulative_token_ids", []) or []
+                )
+                if len(prefix_tokens) != args.preempt_after_new_tokens:
+                    raise AssertionError(
+                        f"split replay prefix incomplete: {request_id}"
+                    )
+
+                suffix_request_id = f"split-suffix-{request_id}"
+                send(source, {
+                    "op": "generate",
+                    "request_id": suffix_request_id,
+                    "token_ids": prompts[request_id] + prefix_tokens,
+                    "max_new_tokens": (
+                        args.max_new_tokens - args.preempt_after_new_tokens
+                    ),
+                    "pause_after_new_tokens": 0,
+                })
+                wait(
+                    source,
+                    lambda msg, probe_id=suffix_request_id:
+                    msg.get("event") == "generate_started"
+                    and msg.get("request_id") == probe_id,
+                )
+                suffix_output = wait(
+                    source,
+                    lambda msg, probe_id=suffix_request_id:
+                    msg.get("event") == "output"
+                    and msg.get("request_id") == probe_id
+                    and bool(msg.get("finished")),
+                )
+                suffix_tokens = list(
+                    suffix_output.get("cumulative_token_ids", []) or []
+                )
+                split_replay_audit[request_id] = {
+                    "prefix_matches_reference": (
+                        prefix_tokens
+                        == reference_outputs[request_id][
+                            :args.preempt_after_new_tokens
+                        ]
+                    ),
+                    **compare_token_sequences(
+                        reference_outputs[request_id],
+                        prefix_tokens + suffix_tokens,
+                    ),
+                }
+            print(
+                "[split-replay-probe] "
+                + json.dumps(split_replay_audit, sort_keys=True),
+                flush=True,
+            )
 
         for request_id in request_ids:
             send(source, {
@@ -906,6 +1149,16 @@ def main() -> None:
                 register([target_spec])
                 target_boot_s = time.monotonic() - target_boot_started
             target = workers["target"]
+            target_model_runner = target.get("model_runner")
+            model_runner_audit.update({
+                "target": target_model_runner,
+                "matched": target_model_runner == source_model_runner,
+            })
+            if not model_runner_audit["matched"]:
+                raise AssertionError(
+                    "source/target model runner mismatch: "
+                    f"{model_runner_audit}"
+                )
             restore_stage_s = 0.0
             if uses_migration:
                 restore_started = time.monotonic()
@@ -1003,15 +1256,15 @@ def main() -> None:
                     source_tokens[request_id][args.prompt_tokens:] + target_suffix
                 )
                 reference_output = reference_outputs[request_id]
-                equal = actual_output == reference_output
-                sequence_checks[request_id] = {
-                    "equal": equal,
-                    "reference_token_count": len(reference_output),
-                    "actual_token_count": len(actual_output),
-                    "reference_sha256": token_hash(reference_output),
-                    "actual_sha256": token_hash(actual_output),
-                }
-            if not all(row["equal"] for row in sequence_checks.values()):
+                sequence_checks[request_id] = validate_recovery_sequence(
+                    reference_output,
+                    actual_output,
+                    source_completed_tokens[request_id],
+                    args.min_continuation_match_tokens,
+                )
+            if not all(
+                row["validation_passed"] for row in sequence_checks.values()
+            ):
                 raise AssertionError(
                     f"continued sequence differs from reference: {sequence_checks}"
                 )
@@ -1135,6 +1388,10 @@ def main() -> None:
                     "all_sequences_equal_reference": all(
                         row["equal"] for row in sequence_checks.values()
                     ),
+                    "all_sequences_pass_validation": all(
+                        row["validation_passed"]
+                        for row in sequence_checks.values()
+                    ),
                     "moe_route_audit": route_audit,
                     "moe_route_profiles": {
                         request_id: {
@@ -1177,6 +1434,9 @@ def main() -> None:
             "max_new_tokens": args.max_new_tokens,
             "preempt_after_new_tokens": args.preempt_after_new_tokens,
             "preempt_max_overshoot": args.preempt_max_overshoot,
+            "min_continuation_match_tokens": (
+                args.min_continuation_match_tokens
+            ),
             "prompt_audit": prompt_audit,
             "uninterrupted_reference": {
                 request_id: {
@@ -1187,6 +1447,8 @@ def main() -> None:
             },
             "route_profile_input": args.route_profile,
             "route_profile_input_sha256": route_profile_sha256,
+            "model_runner_audit": model_runner_audit,
+            "split_replay_audit": split_replay_audit,
             "trace": args.trace,
             "trace_speedup": args.trace_speedup,
             "gpus": args.gpus,

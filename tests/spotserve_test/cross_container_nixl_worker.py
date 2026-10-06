@@ -168,7 +168,6 @@ async def main() -> None:
         data_parallel_size=max(int(args.data_parallel_size), 1),
         data_parallel_size_local=max(int(args.data_parallel_size), 1),
         enable_expert_parallel=args.enable_expert_parallel,
-        all2all_backend="allgather_reducescatter" if args.enable_expert_parallel else None,
         enforce_eager=True,
         gpu_memory_utilization=min(
             max(float(args.gpu_memory_utilization), 0.01), 0.99
@@ -192,6 +191,8 @@ async def main() -> None:
         # keeps the cross-container test focused on NIXL transport.
         moe_backend="triton",
     )
+    if args.enable_expert_parallel:
+        engine_kwargs["all2all_backend"] = "allgather_reducescatter"
     if args.native_freeze_barrier:
         engine_kwargs.update({
             "async_scheduling": False,
@@ -361,6 +362,9 @@ async def main() -> None:
                 "restore_supported": args.kv_transfer_mode == "nixl",
                 "side_channel_host": args.side_channel_host,
                 "side_channel_port": args.side_channel_port,
+                "model_runner": (
+                    "V2" if engine.vllm_config.use_v2_model_runner else "V1"
+                ),
             }
         )
         while True:

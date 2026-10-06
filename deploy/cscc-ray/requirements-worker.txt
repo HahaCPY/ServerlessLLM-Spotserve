@@ -1,0 +1,13 @@
+# Extras metadata used by setup.py for the CSCC-specific wheel.
+accelerate>=1.7.0
+datasets>=3.6.0
+GPUtil==1.4.0
+nixl
+peft>=0.15.2
+ray==2.58.0
+speedtest-cli==2.1.3
+torch==2.9.0
+torchvision==0.24.0
+torchaudio==2.9.0
+transformers>=4.52.4
+vllm==0.11.2

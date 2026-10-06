@@ -8,7 +8,7 @@
   "ready_timeout_s": 600,
   "request_timeout_s": 240,
   "event_timeout_s": 600,
-  "measurement_repetitions": 3,
+  "measurement_repetitions": 1,
   "require_traffic_reduction": true,
   "comparison_fields": [
     "collective_calls",

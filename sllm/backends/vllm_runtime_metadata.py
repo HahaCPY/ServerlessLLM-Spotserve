@@ -186,7 +186,6 @@ def get_vllm_model_resource_profile(
         runtime_expert_parallel_size or derived_expert_parallel_size
     )
     runtime_expert_parallel_size = effective_expert_parallel_size
-    expert_parallel_size_verified = True
     if runtime_metadata.get("expert_parallel_size_source"):
         expert_parallel_size_source = str(
             runtime_metadata["expert_parallel_size_source"]

@@ -1,11 +1,13 @@
 import asyncio
 import json
 from contextlib import suppress
+from dataclasses import replace
 
 import pytest
 
-from sllm.routers.roundrobin_router import RoundRobinRouter
+from sllm.routers.roundrobin_router import NativeKVRecoveryError, RoundRobinRouter
 from sllm.spot.reparallelization import ParallelPlan
+from sllm.spot.stateful_recovery import InferenceState
 from sllm.spot.vllm_deployment_adapter import VllmDeployment
 from sllm.utils import InstanceHandle, InstanceState
 
@@ -100,6 +102,7 @@ class FakeMoeContextBackend(FakeContextBackendNoExplicitReuse):
                 {
                     "moe_route_histogram_available": True,
                     "moe_route_histogram_source": "request_fixture",
+                    "moe_route_histogram_kind": "request_instrumentation",
                     "per_request_expert_route_histogram": {
                         "request-live-0": {
                             "layer:0/expert:1": 8,
@@ -1049,6 +1052,11 @@ async def test_router_replans_when_capacity_is_added_mid_run(tmp_path):
 
     replanning = result["reparallelization"]
     assert result["event"] == "add"
+    assert result["spot_event_id"].startswith("add-")
+    assert replanning["spot_event_id"] == result["spot_event_id"]
+    assert replanning["planner_started_at_s"] >= replanning[
+        "event_state_marked_at_s"
+    ]
     assert replanning["action"] == "reparallelize"
     assert replanning["parallel_plan"]["num_gpus"] == 2
     assert replanning["parallel_plan"]["target_nodes"] == [
@@ -1698,8 +1706,8 @@ async def test_first_replan_remaps_ready_vllm_actor_in_place(monkeypatch):
     applied_plans = []
 
     class ApplyHook:
-        async def remote(self, plan):
-            applied_plans.append(plan)
+        async def remote(self, *, expert_placement_plan):
+            applied_plans.append(expert_placement_plan)
             return {"success": True}
 
     class Backend:
@@ -1987,3 +1995,120 @@ async def test_replan_snapshots_and_aborts_inflight_request():
     assert summary["migratable"] == 1
     assert summary["state_exported"] == 1
     assert backend.abort_calls == [("req-migrate", "reparallelization")]
+
+
+def native_router(config=None):
+    return RoundRobinRouter(
+        model_name="test-model", resource_requirements={"num_cpus": 1, "num_gpus": 0},
+        backend="vllm", backend_config={},
+        router_config={"recovery_policy": "stateful_recovery",
+                       "require_native_kv_restore": True, **(config or {})},
+    )
+
+
+@pytest.mark.asyncio
+async def test_native_mode_does_not_abort_unsupported_cross_worker_snapshot():
+    router = native_router({"reparallelization_config": {"require_free_gpu_overlap": True}})
+    backend = FakeReparallelizationBackend()
+    source = InstanceHandle(instance_id="source", max_queue_length=1, num_gpu=1,
+                            node_id="source-node", backend_instance=backend)
+    await source.mark_ready(node_id="source-node")
+    await router._track_inflight_request("r", {"request_id": "r"}, "generate", source)
+    deployment = VllmDeployment(plan=ParallelPlan(
+        model_name="test-model", backend="vllm", tensor_parallel_size=1,
+        pipeline_parallel_size=1, data_parallel_size=1, num_replicas=1,
+        num_gpus=1, target_nodes=["source-node"]), instances={"source": source})
+    with pytest.raises(NativeKVRecoveryError, match="cross_node_kv_restore_not_validated"):
+        await router._prepare_reparallelization_requests(deployment)
+    assert backend.export_calls == 1
+    assert backend.abort_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restore_result", [
+    {"restored": False, "reason": "cross_node_restore_unsupported"},
+    {"restored": True, "restored_blocks": 0},
+    {"staged": True, "expected_blocks": 0},
+])
+async def test_native_restore_failure_does_not_become_token_replay(restore_result):
+    router = native_router()
+    target = InstanceHandle(instance_id="target", max_queue_length=1, num_gpu=0,
+                            backend_instance=FakeRouterRestoreBackend())
+    state = InferenceState.from_dict(await target.backend_instance.export_inference_state())
+    async def restore(*args):
+        return restore_result
+    router._restore_inference_state = restore
+    with pytest.raises(NativeKVRecoveryError):
+        await router._prepare_stateful_recovery("r", "source", target, state, {"max_tokens": 8})
+
+
+@pytest.mark.asyncio
+async def test_native_source_is_not_released_when_failed_request_disappears(tmp_path):
+    router = native_router({"metrics_path": str(tmp_path / "metrics.jsonl")})
+    router.vllm_deployment_adapter = type("Adapter", (), {
+        "last_request_migration": {"request_ids": ["r"]}})()
+    plan = ParallelPlan(model_name="test-model", backend="vllm", tensor_parallel_size=1,
+                        pipeline_parallel_size=1, data_parallel_size=1, num_replicas=1,
+                        num_gpus=1, target_nodes=["source-node"])
+    source = InstanceHandle(instance_id="source", max_queue_length=1, num_gpu=1)
+    deployment = VllmDeployment(plan=plan, instances={"source": source})
+    with pytest.raises(NativeKVRecoveryError, match="receipt_missing"):
+        await router._wait_for_reparallelization_requests(deployment, 1)
+    router.native_kv_receipts["r"] = {"request_id": "r"}
+    await router._wait_for_reparallelization_requests(deployment, 1)
+    assert router.native_kv_receipts == {}
+    rows = [json.loads(line) for line in (tmp_path / "metrics.jsonl").read_text().splitlines()]
+    assert rows[-1]["type"] == "native_kv_source_release_authorized"
+    assert rows[-1]["source_instance_ids"] == ["source"]
+
+
+@pytest.mark.asyncio
+async def test_native_request_carries_full_committed_output_boundary():
+    router = native_router()
+    state = InferenceState.from_dict({"tokens": [10, 11, 20, 21], "completed_tokens": 2})
+    request = router._build_stateful_restore_request({"max_tokens": 4}, state)
+    assert request["max_tokens"] == 2
+    assert request["_spotserve_committed_output_tokens"] == [20, 21]
+    assert request["_spotserve_original_prompt_tokens"] == 2
+    state = replace(state, completed_tokens=5)
+    with pytest.raises(NativeKVRecoveryError, match="committed_output_exceeds"):
+        router._build_stateful_restore_request({"max_tokens": 4}, state)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cached_tokens", [0, 3])
+async def test_native_inference_requires_actual_cached_prefix_receipt(tmp_path, cached_tokens):
+    router = native_router({"max_retries": 1, "metrics_path": str(tmp_path / "metrics.jsonl")})
+    class Target(FakeRouterRestoreBackend):
+        async def generate(self, request_data):
+            return {"usage": {"completion_tokens": 2}, "choices": [],
+                    "_spotserve_kv_restore": {"restored": cached_tokens > 0,
+                    "restored_blocks": 1 if cached_tokens else 0, "cached_tokens": cached_tokens}}
+    source = InstanceHandle(instance_id="source", max_queue_length=1, num_gpu=0,
+                            backend_instance=FakeRouterRestoreBackend(source=True))
+    target = InstanceHandle(instance_id="target", max_queue_length=1, num_gpu=0,
+                            backend_instance=Target())
+    await source.mark_ready(node_id="node-shared")
+    await target.mark_ready(node_id="node-shared")
+    router.ready_inference_instances.update(source=source, target=target)
+    allocations = iter([source, target])
+    async def allocate():
+        instance = next(allocations)
+        return instance.instance_id, instance
+    router._allocate_instance_for_request = allocate
+    router.running = True
+    result = await router.inference({"request_id": "r", "max_tokens": 8}, "generate")
+    rows = [json.loads(line) for line in (tmp_path / "metrics.jsonl").read_text().splitlines()]
+    requests = [row for row in rows if row["type"] == "request"]
+    assert len(requests) == 1
+    if cached_tokens:
+        assert not result.get("error")
+        receipt = router.native_kv_receipts["r"]
+        assert receipt["source_instance_id"] == "source"
+        assert receipt["target_instance_id"] == "target"
+        assert receipt["cached_tokens"] == 3
+        assert requests[0]["success"] is True
+    else:
+        assert result.get("error")
+        assert not router.native_kv_receipts
+        assert requests[0]["success"] is False

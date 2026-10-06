@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "description": "A bounded eight-GPU availability trace derived from the supplied add/remove pattern. Six GPUs are initially available so two EP2 source instances retain two-GPU make-before-break headroom. A live source GPU is reclaimed with a 30-second notice, replacement capacity arrives gradually, and the trace finishes at six GPUs.",
+  "units": {
+    "capacity": "gpu",
+    "time": "second"
+  },
+  "maximum_gpus": 8,
+  "initial_available_gpus": 6,
+  "initially_unavailable_targets": [
+    "pool-slot-6",
+    "pool-slot-7"
+  ],
+  "events": [
+    {
+      "name": "reclaim-source-gpu-notice",
+      "event": "preempt",
+      "gpu_count": 1,
+      "targets": ["pool-slot-3"],
+      "time_s": 570.0,
+      "grace_period_s": 30.0
+    },
+    {
+      "name": "add-first-replacement-gpu",
+      "event": "add",
+      "gpu_count": 1,
+      "targets": ["pool-slot-6"],
+      "time_s": 660.0,
+      "node_info": {"free_gpu": 1, "total_gpu": 1, "state": "ready"}
+    },
+    {
+      "name": "add-second-replacement-gpu",
+      "event": "add",
+      "gpu_count": 1,
+      "targets": ["pool-slot-7"],
+      "time_s": 780.0,
+      "node_info": {"free_gpu": 1, "total_gpu": 1, "state": "ready"}
+    },
+    {
+      "name": "restore-one-gpu",
+      "event": "add",
+      "gpu_count": 1,
+      "targets": ["pool-slot-3"],
+      "time_s": 900.0,
+      "node_info": {"free_gpu": 1, "total_gpu": 1, "state": "ready"}
+    },
+    {
+      "name": "final-two-gpu-reclaim-notice",
+      "event": "preempt",
+      "gpu_count": 2,
+      "targets": ["pool-slot-3", "pool-slot-6"],
+      "time_s": 1170.0,
+      "grace_period_s": 30.0
+    }
+  ],
+  "constraints": {
+    "target_generated_tokens_at_preempt": 512,
+    "progress_min_tokens": 384,
+    "progress_max_tokens": 640,
+    "trace_end_s": 1320.0,
+    "formal_burst_count": 6,
+    "background_burst_times_s": [20.0, 360.0, 800.0, 1220.0]
+  },
+  "expected_capacity_path": [6, 5, 6, 7, 8, 6]
+}

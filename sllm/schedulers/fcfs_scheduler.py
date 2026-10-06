@@ -291,7 +291,11 @@ class FcfsScheduler(SllmScheduler):
             if node is None:
                 raise RuntimeError(f"distributed_target_node_not_found:{node_id}")
             if node.get("state", NodeState.READY.value) != NodeState.READY.value:
-                raise RuntimeError(f"distributed_target_node_not_ready:{node_id}")
+                if require_all_target_nodes:
+                    raise RuntimeError(f"distributed_target_node_not_ready:{node_id}")
+                # An allowed resource pool is not an exact placement request.
+                capacities[node_id] = 0
+                continue
             capacities[node_id] = max(
                 0, int(float(node.get("free_gpu", 0) or 0))
             )

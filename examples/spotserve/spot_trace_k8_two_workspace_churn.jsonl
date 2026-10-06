@@ -1,0 +1,6 @@
+{"time":90.0,"event":"preempt","node_id":"4","grace_period_s":30.0}
+{"time":150.0,"event":"preempt","node_id":"1","grace_period_s":30.0}
+{"time":150.0,"event":"preempt","node_id":"5","grace_period_s":30.0}
+{"time":210.0,"event":"recover","node_id":"4"}
+{"time":270.0,"event":"recover","node_id":"1"}
+{"time":330.0,"event":"recover","node_id":"5"}
