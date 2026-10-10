@@ -133,6 +133,25 @@ class EvidenceTests(unittest.TestCase):
     def test_invalid_blocks_are_not_restore(self):
         self.assertFalse(self.evidence(1, invalid=True)["restore_success"])
 
+    def test_warmup_is_excluded_from_recovery_compute(self):
+        audit = [
+            {"event": "scheduled", "request_id": "warmup", "scheduled_tokens": 512},
+            {"event": "scheduled", "request_id": "actual", "scheduled_tokens": 1},
+            {"event": "connector_completion", "finished_recving": ["actual"],
+             "invalid_block_ids": []},
+        ]
+        result = canary.restore_evidence(audit, 768, request_id="actual")
+        self.assertTrue(result["restore_success"])
+        self.assertEqual(result["prefix_recomputed_tokens"], 1)
+
+    def test_another_requests_completion_does_not_prove_restore(self):
+        audit = [
+            {"event": "scheduled", "request_id": "actual", "scheduled_tokens": 1},
+            {"event": "connector_completion", "finished_recving": ["other"],
+             "invalid_block_ids": []},
+        ]
+        self.assertFalse(canary.restore_evidence(audit, 768, "actual")["restore_success"])
+
     def test_early_done_is_preserved_while_waiting_for_resume_ack(self):
         process = canary.EngineProcess()
         process._pending = []
