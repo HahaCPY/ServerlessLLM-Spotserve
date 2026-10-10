@@ -486,6 +486,28 @@ async def test_restore_rejects_cross_node_without_transfer_support():
 
 
 @pytest.mark.asyncio
+async def test_explicit_experimental_nixl_opt_in_allows_cross_node_restore():
+    backend = make_backend(
+        FakeStatefulEngine(),
+        kv_transfer_config={"kv_connector": "NixlConnector"},
+        allow_experimental_cross_node_kv_restore=True,
+    )
+    state = await backend.export_inference_state(
+        request_data={"request_id": "req-1"}, current_output=[[1]]
+    )
+
+    assert state["metadata"]["can_restore_cross_node"] is True
+    assert state["metadata"]["cross_node_restore_validation_scope"] == (
+        "experimental_cscc_nixl_direct_api"
+    )
+    result = await backend.restore_inference_state(
+        state, {"request_id": "req-1", "node_id": "node-1"}
+    )
+    assert result["restored"] is True
+    assert result["restore_scope"] == "cross_node"
+
+
+@pytest.mark.asyncio
 async def test_restore_rejects_success_without_restored_kv_blocks():
     backend = make_backend(FakeEmptyRestoreEngine())
     state = await backend.export_inference_state(

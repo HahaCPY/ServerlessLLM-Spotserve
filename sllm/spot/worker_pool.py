@@ -17,6 +17,13 @@ def reserved_worker_ips(
     for worker_id in ids:
         matches = [node for node in ray_nodes if node.get("Alive", False)
                    and node.get("Resources", {}).get(f"worker_id_{worker_id}", 0) > 0]
+        if not matches:
+            matches = [
+                node for node in ray_nodes
+                if node.get("Alive", False)
+                and str(node.get("NodeID") or "") == worker_id
+                and int(float(node.get("Resources", {}).get("GPU", 0) or 0)) > 0
+            ]
         if len(matches) != 1:
             raise ValueError(f"reserved_worker_not_uniquely_alive:{worker_id}")
         node = matches[0]

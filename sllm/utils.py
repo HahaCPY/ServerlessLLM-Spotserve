@@ -16,15 +16,26 @@
 #  limitations under the license.                                              #
 # ---------------------------------------------------------------------------- #
 import asyncio
+import os
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import ray
 
 
+def _managed_ray_fallback_enabled() -> bool:
+    return os.getenv("SLLM_ALLOW_RAY_NODE_ID_WORKERS", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _alive_ray_nodes():
+    return [node for node in ray.nodes() if node.get("Alive", False)]
+
+
 def get_worker_nodes():
-    ray_nodes = ray.nodes()
+    ray_nodes = _alive_ray_nodes()
     worker_node_info = {}
     for node in ray_nodes:
         ray_node_id = node.get("NodeID", None)
@@ -48,7 +59,93 @@ def get_worker_nodes():
                     "total_gpu": resources.get("GPU", 0),
                 }
 
+    if worker_node_info or not _managed_ray_fallback_enabled():
+        return worker_node_info
+
+    # CSCC Managed Ray owns the raylets and does not expose a way for a job to
+    # attach worker_id_* custom resources to those existing nodes.  In this
+    # explicit opt-in mode, a one-GPU Ray node is the worker identity.  The
+    # full NodeID is stable for the session and NodeAffinity is used by every
+    # placement call below, so this does not silently weaken placement.
+    for node in sorted(
+        ray_nodes,
+        key=lambda row: (
+            str(row.get("NodeManagerAddress") or ""),
+            str(row.get("NodeID") or ""),
+        ),
+    ):
+        resources = node.get("Resources", {})
+        gpu_count = int(float(resources.get("GPU", 0) or 0))
+        if gpu_count <= 0:
+            continue
+        if gpu_count != 1:
+            raise RuntimeError(
+                "managed_ray_node_id_fallback_requires_one_gpu_per_node"
+            )
+        node_id = str(node.get("NodeID") or "")
+        address = str(node.get("NodeManagerAddress") or "")
+        if not node_id or not address:
+            raise RuntimeError("managed_ray_worker_identity_is_incomplete")
+        worker_node_info[node_id] = {
+            "ray_node_id": node_id,
+            "address": address,
+            "free_gpu": float(resources.get("GPU", 0) or 0),
+            "total_gpu": float(resources.get("GPU", 0) or 0),
+            "identity_source": "ray_node_id",
+        }
+
     return worker_node_info
+
+
+def worker_placement_options(
+    worker_id: str, resource_fraction: float = 0.1
+) -> Dict[str, Any]:
+    """Return strict placement options for an SLLM logical worker."""
+    worker_id = str(worker_id)
+    resource_key = f"worker_id_{worker_id}"
+    for node in _alive_ray_nodes():
+        resources = node.get("Resources", {})
+        if float(resources.get(resource_key, 0) or 0) > 0:
+            return {
+                "resources": {
+                    "worker_node": resource_fraction,
+                    resource_key: resource_fraction,
+                }
+            }
+    if not _managed_ray_fallback_enabled():
+        return {
+            "resources": {
+                "worker_node": resource_fraction,
+                resource_key: resource_fraction,
+            }
+        }
+    workers = get_worker_nodes()
+    if worker_id not in workers:
+        raise ValueError(f"unknown_managed_ray_worker:{worker_id}")
+    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+    return {
+        "scheduling_strategy": NodeAffinitySchedulingStrategy(
+            node_id=str(workers[worker_id]["ray_node_id"]), soft=False
+        )
+    }
+
+
+def control_plane_placement_options() -> Dict[str, Any]:
+    """Keep control actors on the Ray head when custom resources are absent."""
+    for node in _alive_ray_nodes():
+        if float(node.get("Resources", {}).get("control_node", 0) or 0) > 0:
+            return {"resources": {"control_node": 0.1}}
+    if not _managed_ray_fallback_enabled():
+        return {"resources": {"control_node": 0.1}}
+    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+    current_node_id = str(ray.get_runtime_context().get_node_id())
+    return {
+        "scheduling_strategy": NodeAffinitySchedulingStrategy(
+            node_id=current_node_id, soft=False
+        )
+    }
 
 
 class InstanceState(str, Enum):

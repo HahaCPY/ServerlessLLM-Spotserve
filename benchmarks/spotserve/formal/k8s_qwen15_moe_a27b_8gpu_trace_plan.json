@@ -1,16 +1,13 @@
 {
   "schema_version": 1,
-  "description": "A bounded eight-GPU availability trace derived from the supplied add/remove pattern. Six GPUs are initially available so two EP2 source instances retain two-GPU make-before-break headroom. A live source GPU is reclaimed with a 30-second notice, replacement capacity arrives gradually, and the trace finishes at six GPUs.",
+  "description": "A controlled synthetic availability trace adapted from the supplied add/remove pattern and capped at eight GPUs. It preserves the original one-GPU removal, two-GPU removal, and gradual one-GPU recovery sequence.",
   "units": {
     "capacity": "gpu",
     "time": "second"
   },
   "maximum_gpus": 8,
-  "initial_available_gpus": 6,
-  "initially_unavailable_targets": [
-    "pool-slot-6",
-    "pool-slot-7"
-  ],
+  "initial_available_gpus": 8,
+  "initially_unavailable_targets": [],
   "events": [
     {
       "name": "reclaim-source-gpu-notice",
@@ -21,45 +18,45 @@
       "grace_period_s": 30.0
     },
     {
+      "name": "final-two-gpu-reclaim-notice",
+      "event": "preempt",
+      "gpu_count": 2,
+      "targets": ["pool-slot-1", "pool-slot-5"],
+      "time_s": 630.0,
+      "grace_period_s": 30.0
+    },
+    {
       "name": "add-first-replacement-gpu",
       "event": "add",
       "gpu_count": 1,
-      "targets": ["pool-slot-6"],
-      "time_s": 660.0,
+      "targets": ["pool-slot-3"],
+      "time_s": 690.0,
       "node_info": {"free_gpu": 1, "total_gpu": 1, "state": "ready"}
     },
     {
       "name": "add-second-replacement-gpu",
       "event": "add",
       "gpu_count": 1,
-      "targets": ["pool-slot-7"],
-      "time_s": 780.0,
+      "targets": ["pool-slot-1"],
+      "time_s": 750.0,
       "node_info": {"free_gpu": 1, "total_gpu": 1, "state": "ready"}
     },
     {
-      "name": "restore-one-gpu",
+      "name": "add-third-replacement-gpu",
       "event": "add",
       "gpu_count": 1,
-      "targets": ["pool-slot-3"],
-      "time_s": 900.0,
+      "targets": ["pool-slot-5"],
+      "time_s": 810.0,
       "node_info": {"free_gpu": 1, "total_gpu": 1, "state": "ready"}
-    },
-    {
-      "name": "final-two-gpu-reclaim-notice",
-      "event": "preempt",
-      "gpu_count": 2,
-      "targets": ["pool-slot-3", "pool-slot-6"],
-      "time_s": 1170.0,
-      "grace_period_s": 30.0
     }
   ],
   "constraints": {
     "target_generated_tokens_at_preempt": 512,
     "progress_min_tokens": 384,
     "progress_max_tokens": 640,
-    "trace_end_s": 1320.0,
+    "trace_end_s": 900.0,
     "formal_burst_count": 6,
-    "background_burst_times_s": [20.0, 360.0, 800.0, 1220.0]
+    "background_burst_times_s": [20.0, 240.0, 420.0, 840.0]
   },
-  "expected_capacity_path": [6, 5, 6, 7, 8, 6]
+  "expected_capacity_path": [8, 7, 5, 6, 7, 8]
 }

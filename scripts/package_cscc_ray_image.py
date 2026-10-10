@@ -27,6 +27,7 @@ REQUIRED_FILES = (
     "deploy/cscc-ray/requirements-runtime.txt",
     "deploy/cscc-ray/verify_image.py",
     "deploy/cscc-ray/smoke_ray_image.py",
+    "deploy/cscc-ray/run_formal_f1_f2.py",
 )
 
 REQUIRED_TREES = (

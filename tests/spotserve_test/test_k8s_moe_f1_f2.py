@@ -215,23 +215,23 @@ def test_repeat_workloads_are_paired_without_overwriting_previous_input(tmp_path
         if line.strip()
     ]
     assert [row["event"] for row in trace] == [
-        "preempt", "add", "add", "add", "preempt", "preempt",
+        "preempt", "preempt", "preempt", "add", "add", "add",
     ]
     assert [row["node_id"] for row in trace] == [
-        "3", "6", "7", "3", "3", "6",
+        "3", "1", "5", "3", "1", "5",
     ]
     assert [row["time"] for row in trace] == [
-        570.0, 660.0, 780.0, 900.0, 1170.0, 1170.0,
+        570.0, 630.0, 630.0, 690.0, 750.0, 810.0,
     ]
     assert trace[0]["grace_period_s"] == 30.0
-    assert trace[1]["node_info"] == {
+    assert trace[3]["node_info"] == {
         "free_gpu": 1, "state": "ready", "total_gpu": 1,
     }
     assert all(row["gpu_count"] == 1 for row in trace)
     assert all(row["capacity_unit"] == "gpu" for row in trace)
     assert all("instance_selector" not in row for row in trace)
-    assert original["initial_unavailable_worker_nodes"] == ["6", "7"]
-    assert original["restore_worker_nodes_after_run"] == ["3", "6", "7"]
+    assert original["initial_unavailable_worker_nodes"] == []
+    assert original["restore_worker_nodes_after_run"] == ["1", "3", "5"]
 
 
 def test_trace_schedule_is_calibrated_and_never_exceeds_eight_gpus():
@@ -248,15 +248,15 @@ def test_trace_schedule_is_calibrated_and_never_exceeds_eight_gpus():
     schedule = driver.derive_preemption_schedule(spec, [profile])
 
     assert schedule["effective_preemption_time_s"] == 570.0
-    assert schedule["effective_add_time_s"] == 660.0
-    assert schedule["preemption_notice_times_s"] == [570.0, 1170.0]
-    assert schedule["calibrated_anchor_arrival_times_s"] == [544.0, 1144.0]
+    assert schedule["effective_add_time_s"] == 690.0
+    assert schedule["preemption_notice_times_s"] == [570.0, 630.0]
+    assert schedule["calibrated_anchor_arrival_times_s"] == [544.0, 604.0]
     assert schedule["formal_burst_start_times_s"] == [
-        20.0, 360.0, 544.0, 800.0, 1144.0, 1220.0,
+        20.0, 240.0, 420.0, 544.0, 604.0, 840.0,
     ]
     assert schedule["configured_output_tokens"] == 2048
     assert [row["available_gpus"] for row in schedule["capacity_timeline"]] == [
-        6, 5, 6, 7, 8, 6,
+        8, 7, 5, 6, 7, 8,
     ]
     assert max(
         row["available_gpus"] for row in schedule["capacity_timeline"]
@@ -708,6 +708,49 @@ def test_expert_placement_only_divergence_is_valid_contribution_evidence():
     contribution = driver.contribution_result(ledger)
     assert contribution["status"] == "supported"
     assert contribution["expert_placement_divergence_observed"] is True
+
+
+def test_single_pass_reuses_identical_f1_rows_and_reports_f2_latency():
+    driver = load_driver()
+
+    def formal_row(experiment, treatment, p95):
+        return {
+            "status": "valid",
+            "stage": "formal",
+            "experiment": experiment,
+            "treatment": treatment,
+            "repeat": 1,
+            "summary": {"latency_p95_ms": p95},
+        }
+
+    ledger = [
+        formal_row("f1", "original_spotserve", 100.0),
+        formal_row("f1", "moe_spotserve", 70.0),
+    ]
+    added = driver.reuse_f1_rows_for_f2(ledger, 1)
+
+    assert len(added) == 2
+    assert all(row["reused_without_gpu_rerun"] is True for row in added)
+    assert {
+        (row["treatment"], row["reused_from"]["treatment"])
+        for row in added
+    } == {
+        ("original_spotserve", "original_spotserve"),
+        ("full_moe_spotserve", "moe_spotserve"),
+    }
+
+    ledger.extend([
+        formal_row("f2", "reparallelization_only", 90.0),
+        formal_row("f2", "migration_only", 80.0),
+    ])
+    result = driver.f2_latency_ablation_result(ledger, expected_repeats=1)
+    assert result["status"] == "complete"
+    assert result["reparallelization_only_vs_original_percent"] == pytest.approx(10.0)
+    assert result["migration_only_vs_original_percent"] == pytest.approx(20.0)
+    assert result["full_vs_original_percent"] == pytest.approx(30.0)
+    assert result[
+        "reparallelization_marginal_with_migration_percent"
+    ] == pytest.approx(12.5)
 
 
 def test_generated_token_gate_rejects_incomplete_request_set(tmp_path):

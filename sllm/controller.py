@@ -33,6 +33,7 @@ from sllm.spot.controller_config import (
     spotserve_scheduler_config,
 )
 from sllm.store_manager import StoreManager
+from sllm.utils import control_plane_placement_options
 
 
 class SllmControllerException(Exception):
@@ -75,7 +76,7 @@ class SllmController:
         ray_manager_cls = ray.remote(StoreManager)
         self.store_manager = ray_manager_cls.options(
             name="store_manager",
-            resources={"control_node": 0.1},
+            **control_plane_placement_options(),
         ).remote()
         await self.store_manager.initialize_cluster.remote()
 
@@ -92,7 +93,8 @@ class SllmController:
             logger.warning(LEGACY_MIGRATION_WARNING)
         self.router_cls = ray.remote(RoundRobinRouter)
         self.scheduler = ray_scheduler_cls.options(
-            name="model_loading_scheduler", resources={"control_node": 0.1}
+            name="model_loading_scheduler",
+            **control_plane_placement_options(),
         ).remote(scheduler_config=scheduler_config)
         self.scheduler.start.remote()
 
@@ -159,7 +161,7 @@ class SllmController:
             "num_cpus": router_num_cpus,
         }
         if backend != "dummy":
-            router_options["resources"] = {"control_node": 0.1}
+            router_options.update(control_plane_placement_options())
 
         request_router = self.router_cls.options(**router_options).remote(
             model_name,
@@ -808,7 +810,7 @@ class SllmController:
             namespace="fine_tuning",
             num_cpus=job_info["config"].get("num_cpus", 1),
             num_gpus=job_info["config"].get("num_gpus", 0),
-            resources={"control_node": 0.1},
+            **control_plane_placement_options(),
         ).remote(
             job_info["config"]["model"],
             resource_requirements,

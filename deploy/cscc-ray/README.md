@@ -1,13 +1,13 @@
 # CSCC Managed Ray 映像與從零操作手冊
 
-這個目錄提供 CSCC AI Platform Managed Ray 使用的 SpotServe 實驗映像，以及正式執行
-F1/F2 前的八張 GPU smoke test。
+這個目錄提供 CSCC AI Platform Managed Ray 使用的 SpotServe 實驗映像、八張 GPU smoke
+test，以及正式 F1/F2 的單一 Ray Job wrapper。
 
-> 目前狀態：Dockerfile 與 Ray 八 GPU smoke test已備妥；正式 F1/F2 runner 還不能直接在
-> CSCC Managed Ray 上執行。原因不只是 GPU 數量：官方文件目前只說 Managed Ray worker
-> 使用平台 Ray image，沒有提供 Ray Job 自選 project-built image 的介面；現有 runner 另假設
-> 可用 `worker_id_*` Ray resources 與常駐 ServerlessLLM HTTP control plane。請先由管理員確認
-> image/runtime 與控制面接法，再完成八 GPU smoke 和小型平台 adapter。
+> 目前狀態：專案 image 已在 CSCC 以 `X-CSCC-Image` 驗證；8-GPU／8-node smoke 與
+> 2-worker TCP probe 已通過。`run_formal_f1_f2.py` 會用 Ray Node ID 取代平台沒有提供的
+> `worker_id_*` resources、固定 8 個 workers、啟動本次 Job 專用的 ServerlessLLM control
+> plane，然後執行 profile 與單次 F1/F2。trace 是受控的 logical graceful preemption，不能
+> 說成平台真的刪除了 Pod 或證明了不同 physical host。
 
 ## 1. 這個映像包含什麼
 
@@ -42,17 +42,14 @@ F1/F2 前的八張 GPU smoke test。
 10. 平台是否允許在 Ray worker 設定自訂 resources，或至少能查到 stable worker/node ID。
 11. 是否能讓 8 個 workers 在整個實驗期間常駐；官方預設 idle worker 約一分鐘會停止，
     但本實驗的 trace 必須保留 stable worker ID 並在稍後執行 `add`。
-12. Ray session 的執行時間上限至少 8 小時；完整 profile、pilot 與 8 個 formal runs 不能被
+12. Ray session 的執行時間上限至少 8 小時；完整 profile 與 6 個唯一 formal runs 不能被
     queue/session lifetime 截斷。
-
-可直接把 [admin-request-template.md](admin-request-template.md) 交給管理員填答。
 
 ## 3. 建置 reference image，再由管理員確認如何接到 Managed Ray
 
-CSCC 文件說 Project 的 Build 功能可從壓縮檔建立 private image，且 `Dockerfile` 必須位於
-壓縮檔最上層；但 Ray Jobs 文件同時說 workers 使用平台 Ray image，並未列出自選 image
-的方法。因此以下 build 先作為可重現的 reference artifact，除非管理員明確確認能把它接到
-Managed Ray head/workers，否則不能直接跳到 smoke test。請在 repository 根目錄執行：
+CSCC 的 Project Build 可從壓縮檔建立 private image，且 `Dockerfile` 必須位於壓縮檔最上層。
+本專案已確認可在 Ray submission headers 以 `X-CSCC-Image` 指定完成的 private image；請在
+repository 根目錄執行：
 
 ```bash
 python3 scripts/package_cscc_ray_image.py \
@@ -254,23 +251,15 @@ ray job stop --address "$RAY_ADDRESS" <job-id>
 重送同一個 smoke job 一次。若持續數分鐘仍為 `503`，停止重試並交由管理員查看叢集啟動
 原因。
 
-## 8. Smoke test 通過後，仍須完成的四個正式實驗條件
+## 8. 正式單次 F1/F2
 
-Smoke test 只證明「八張 GPU 可以被同一個 Ray Job 使用」，不等於 F1/F2 已有效。正式 runner
-接上 CSCC Managed Ray 前，至少要補齊：
+正式 protocol 固定使用同一個 Qwen1.5-MoE checkpoint、同一份 8192-input／2048-output
+workload 與 `8 → 7 → 5 → 6 → 7 → 8` logical capacity trace。F1 執行 Rerouting、
+Reparallelization、Original SpotServe、MoE-SpotServe；F2 對 MoE-aware Reparallelization 與
+MoE-aware Migration 做 2×2 ablation。F1 Original 與 MoE-SpotServe 分別等同 F2 的
+off/off 與 on/on，所以 F2 引用這兩列，只需 6 次唯一 formal GPU runs。
 
-1. **Worker discovery adapter**：以 Ray Node ID／GPU ID 取代現有 `worker_id_*` custom
-   resources，且保存 logical worker 與 physical host/failure-domain 的對照。
-2. **Graceful preemption adapter**：把 trace 的 logical remove 事件接到平台 termination
-   notice；grace time 內先 freeze/export/transfer/attach/ack，時間到才把 source 視為不可用。
-3. **Cross-worker transport probe**：先用很小的 KV payload 驗證 NIXL side channel、TCP
-   address、worker-to-worker network 與 attach acknowledgment，成功後才跑長 prompt。
-4. **F2 live selection**：讓兩個 target 同時 READY；Target A 使用 linear baseline，Target B
-   使用根據 hot-expert histogram 計算並實際套用的 optimized placement，再讓 Standard
-   SpotServe 與 MoE-aware policy 在相同 snapshot 下選擇。
-
-上述四點沒有完成前，可以宣稱 image/Ray/GPU smoke 成功，但不能宣稱完成正式 cross-node
-SpotServe F1/F2。
+完整命令、輸出與解讀限制見 [FORMAL_F1_F2.md](FORMAL_F1_F2.md)。
 
 ## 9. 常見失敗與最小診斷
 

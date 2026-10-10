@@ -30,7 +30,7 @@ from sllm.model_downloader import (
     download_lora_adapter,
     download_transformers_model,
 )
-from sllm.utils import get_worker_nodes
+from sllm.utils import get_worker_nodes, worker_placement_options
 from sllm_store.client import SllmStoreClient
 
 logger = init_logger(__name__)
@@ -246,12 +246,32 @@ class StoreManager:
             logger.error("No worker nodes found")
             return False
 
+        if os.getenv("SLLM_DIRECT_VLLM_NO_STORE", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }:
+            # Formal CSCC runs use an immutable checkpoint on shared storage
+            # and vLLM load_format=auto.  StoreManager.register already skips
+            # download/registration for that path, so requiring a separate
+            # sllm-store daemon on every managed Ray pod adds no data service.
+            self.hardware_info = {
+                node_id: {
+                    "ray_node_id": row["ray_node_id"],
+                    "address": row["address"],
+                    "direct_vllm_shared_checkpoint": True,
+                }
+                for node_id, row in worker_node_info.items()
+            }
+            logger.info(
+                "Direct-vLLM shared-checkpoint mode: skipping sllm-store daemons"
+            )
+            return True
+
         # Initialize hardware_info dictionary
         self.hardware_info = {}
         # Collect hardware info from each node
         hardware_info_futures = {
             node_id: collect_all_info.options(
-                resources={f"worker_id_{node_id}": 0.01}
+                **worker_placement_options(node_id, 0.01)
             ).remote()
             for node_id in worker_node_info
         }

@@ -17,7 +17,7 @@ from typing import Any, Awaitable, Callable, Dict, Mapping, Optional
 import ray
 
 from sllm.inference_instance import start_instance
-from sllm.utils import InstanceHandle
+from sllm.utils import InstanceHandle, worker_placement_options
 
 from .reparallelization import ParallelPlan
 
@@ -349,17 +349,14 @@ class VllmDeploymentAdapter:
                     ),
                 )
                 deployment.instances[instance_id] = handle
-                startup_resources = {
-                    "worker_node": 0.1,
-                    f"worker_id_{startup_node}": 0.1,
-                }
+                startup_placement = worker_placement_options(startup_node)
                 startup_config = {
                     **resource_requirements,
                     "num_gpus": outer_actor_num_gpus,
-                    "resources": startup_resources,
+                    **startup_placement,
                 }
                 actor = await _call(
-                    start_instance.options(resources=startup_resources).remote,
+                    start_instance.options(**startup_placement).remote,
                     instance_id,
                     "vllm",
                     self.model_name,

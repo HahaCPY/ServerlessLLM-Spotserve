@@ -70,7 +70,7 @@ from sllm.spot.stateful_recovery import (
     plan_stateful_recovery,
 )
 
-from ..utils import InstanceHandle, InstanceState
+from ..utils import InstanceHandle, InstanceState, worker_placement_options
 from .router_utils import SllmRouter
 
 logger = init_logger(__name__)
@@ -4546,7 +4546,7 @@ class RoundRobinRouter(SllmRouter):
                 instance = self.starting_inference_instances[instance_id]
             if self.backend == "dummy":
                 startup_node = "control"
-                startup_resources = {}
+                startup_placement = {}
             else:
                 # Now ask model loading scheduler to load the model
                 logger.info(
@@ -4610,10 +4610,7 @@ class RoundRobinRouter(SllmRouter):
                         )
                     )
                 resources_allocated = True
-                startup_resources = {
-                    "worker_node": 0.1,
-                    f"worker_id_{startup_node}": 0.1,
-                }
+                startup_placement = worker_placement_options(startup_node)
             async with instance.lock:
                 instance.node_id = startup_node
                 instance.member_node_ids = allocated_nodes or [str(startup_node)]
@@ -4632,15 +4629,13 @@ class RoundRobinRouter(SllmRouter):
                     )
                     else self.resource_requirements["num_gpus"]
                 ),
-                "resources": startup_resources,
+                **startup_placement,
             }
             logger.info(
                 f"Startup config: {startup_config}, {self.backend_config}"
             )
 
-            starter_options = {}
-            if startup_resources:
-                starter_options["resources"] = startup_resources
+            starter_options = dict(startup_placement)
 
             if self.backend == "dummy":
                 from sllm.backends.dummy_backend import DummyBackend
@@ -4795,18 +4790,16 @@ class RoundRobinRouter(SllmRouter):
             )
             raise
 
+        startup_placement = worker_placement_options(startup_node)
         startup_config = {
             "num_cpus": self.resource_requirements["num_cpus"],
             "num_gpus": self.resource_requirements["num_gpus"],
-            "resources": {
-                "worker_node": 0.1,
-                f"worker_id_{startup_node}": 0.1,
-            },
+            **startup_placement,
         }
 
         try:
             instance.backend_instance = await start_ft_instance.options(
-                resources=startup_config["resources"]
+                **startup_placement
             ).remote(
                 instance_id,
                 self.backend,

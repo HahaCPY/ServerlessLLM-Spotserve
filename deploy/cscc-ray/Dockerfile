@@ -110,6 +110,7 @@ COPY scripts/analyze_spotserve_benchmark.py \
      /app/scripts/
 COPY deploy/cscc-ray/verify_image.py \
      deploy/cscc-ray/smoke_ray_image.py \
+     deploy/cscc-ray/run_formal_f1_f2.py \
      /app/deploy/cscc-ray/
 
 RUN python -m pip check && \

@@ -3384,6 +3384,23 @@ class VllmBackend(SllmBackend):
         state_metadata.setdefault("cache_engine", "vllm")
         state_metadata.setdefault("can_restore_same_node", False)
         state_metadata.setdefault("can_restore_cross_node", False)
+        if self.backend_config.get(
+            "allow_experimental_cross_node_kv_restore", False
+        ):
+            kv_transfer_config = self.backend_config.get(
+                "kv_transfer_config"
+            ) or {}
+            if kv_transfer_config.get("kv_connector") != "NixlConnector":
+                raise RuntimeError(
+                    "experimental_cross_node_kv_restore_requires_nixl"
+                )
+            # The CSCC two-worker canary validates the same patched NIXL
+            # export/stage/attach/ack API.  Production use remains opt-in;
+            # receipt and restored-block gates still fail closed downstream.
+            state_metadata["can_restore_cross_node"] = True
+            state_metadata["cross_node_restore_validation_scope"] = (
+                "experimental_cscc_nixl_direct_api"
+            )
         parallel_metadata = self._engine_parallel_metadata()
         config_metadata = {
             "tensor_parallel_size": parallel_metadata.get(

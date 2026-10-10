@@ -11,6 +11,7 @@ pod (or another pod that can reach both the HTTP endpoint and the Ray cluster).
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -43,6 +44,10 @@ F2_TREATMENTS = (
     "migration_only",
     "full_moe_spotserve",
 )
+F2_REUSED_FROM_F1 = {
+    "original_spotserve": "original_spotserve",
+    "full_moe_spotserve": "moe_spotserve",
+}
 # Kept callable for diagnostics, never mixed into the pre-registered matrix.
 F2_REPLAY_CONTROLS = (
     "original_spotserve_replay",
@@ -470,11 +475,24 @@ def probe_cluster(
             ignore_reinit_error=True,
         )
     ray_nodes = [node for node in ray.nodes() if node.get("Alive")]
+    managed_node_ids = bool(
+        spec["cluster"].get("managed_ray_node_id_workers", False)
+    )
     if spec["cluster"].get("require_single_control_head", False):
-        heads = [node for node in ray_nodes
-                 if node.get("Resources", {}).get("control_node", 0) > 0]
+        if managed_node_ids:
+            heads = [
+                node for node in ray_nodes
+                if float(node.get("Resources", {}).get("GPU", 0) or 0) == 0
+            ]
+        else:
+            heads = [node for node in ray_nodes
+                     if node.get("Resources", {}).get("control_node", 0) > 0]
         if len(heads) != 1 or heads[0].get("Resources", {}).get("GPU", 0) > 0:
-            raise ExperimentError("require exactly one control_node head with zero GPUs")
+            raise ExperimentError(
+                "require exactly one zero-GPU Ray head node"
+                if managed_node_ids else
+                "require exactly one control_node head with zero GPUs"
+            )
     gpu_nodes = [
         node
         for node in ray_nodes
@@ -584,11 +602,16 @@ def probe_cluster(
             for key, value in resources.items()
             if key.startswith("worker_id_") and float(value or 0) > 0
         )
+        identity_source = "custom_resource"
+        if not worker_ids and managed_node_ids:
+            worker_ids = [str(node["NodeID"])]
+            identity_source = "ray_node_id"
         nodes.append({
             "ray_node_id": node["NodeID"],
             "address": node.get("NodeManagerAddress"),
             "gpu_count": int(float(resources.get("GPU", 0) or 0)),
             "worker_ids": worker_ids,
+            "worker_identity_source": identity_source,
             "physical_host_markers": physical_markers,
         })
     for observation, node in zip(observations, actor_nodes):
@@ -1763,6 +1786,7 @@ def formal_deploy_config(
     moe_replan = flags.pop("moe_reparallelization")
     moe_migration = flags.pop("moe_migration")
     true_kv_restore = flags["recovery_policy"] == "stateful_recovery"
+    backend["allow_experimental_cross_node_kv_restore"] = true_kv_restore
     router = config["router_config"]
     router.update(flags)
     router["require_native_kv_restore"] = true_kv_restore
@@ -1841,6 +1865,7 @@ def formal_deploy_config(
         ),
         "source_context_ownership": "vllm_engine",
         "persistent_context_daemon": False,
+        "experimental_cross_node_kv_restore": true_kv_restore,
         "required_overlap_headroom_gpus": (
             max(
                 int(row["num_gpus"])
@@ -2223,6 +2248,71 @@ def run_one_formal(
     }
 
 
+def reuse_f1_rows_for_f2(
+    ledger: list[dict[str, Any]], repeat: int
+) -> list[dict[str, Any]]:
+    """Alias byte-identical F1 configurations into the F2 ablation.
+
+    F1 Original SpotServe is F2 (reparallelization off, migration off), and
+    F1 MoE-SpotServe is F2 (on, on).  Re-running either would add GPU cost but
+    no new treatment.  The copied row retains explicit provenance.
+    """
+    added: list[dict[str, Any]] = []
+    for f2_treatment, f1_treatment in F2_REUSED_FROM_F1.items():
+        if treatment_flags("f1", f1_treatment) != treatment_flags(
+            "f2", f2_treatment
+        ):
+            raise ExperimentError(
+                f"cannot reuse f1/{f1_treatment} as f2/{f2_treatment}: "
+                "treatment flags differ"
+            )
+        existing = next(
+            (
+                row
+                for row in ledger
+                if row.get("stage") == "formal"
+                and row.get("status") == "valid"
+                and row.get("experiment") == "f2"
+                and row.get("treatment") == f2_treatment
+                and int(row.get("repeat", -1)) == repeat
+            ),
+            None,
+        )
+        if existing is not None:
+            continue
+        source = next(
+            (
+                row
+                for row in reversed(ledger)
+                if row.get("stage") == "formal"
+                and row.get("status") == "valid"
+                and row.get("experiment") == "f1"
+                and row.get("treatment") == f1_treatment
+                and int(row.get("repeat", -1)) == repeat
+            ),
+            None,
+        )
+        if source is None:
+            raise ExperimentError(
+                f"missing f1/{f1_treatment}/r{repeat} required by F2 reuse"
+            )
+        alias = copy.deepcopy(source)
+        alias.update(
+            experiment="f2",
+            treatment=f2_treatment,
+            reused_from={
+                "experiment": "f1",
+                "treatment": f1_treatment,
+                "repeat": repeat,
+            },
+            reused_without_gpu_rerun=True,
+            completed_at=taipei_now(),
+        )
+        ledger.append(alias)
+        added.append(alias)
+    return added
+
+
 def mean_sd(rows: list[Mapping[str, Any]], key: str) -> str:
     values = [float(row["summary"].get(key, 0.0) or 0.0) for row in rows]
     if not values:
@@ -2401,6 +2491,73 @@ def contribution_result(
     }
 
 
+def f2_latency_ablation_result(
+    ledger: list[Mapping[str, Any]], expected_repeats: int = 1
+) -> dict[str, Any]:
+    """Report latency contribution of each MoE-aware F2 component."""
+    rows = [
+        row
+        for row in ledger
+        if row.get("stage") == "formal"
+        and row.get("status") == "valid"
+        and row.get("experiment") == "f2"
+    ]
+    grouped = {
+        treatment: [
+            row for row in rows if row.get("treatment") == treatment
+        ]
+        for treatment in F2_TREATMENTS
+    }
+    incomplete = {
+        treatment: len(treatment_rows)
+        for treatment, treatment_rows in grouped.items()
+        if len(treatment_rows) != expected_repeats
+    }
+    if incomplete:
+        return {
+            "status": "pending",
+            "reason": f"F2 formal rows are incomplete: {incomplete}",
+        }
+    p95 = {
+        treatment: statistics.mean(
+            float(row["summary"]["latency_p95_ms"])
+            for row in treatment_rows
+        )
+        for treatment, treatment_rows in grouped.items()
+    }
+
+    def improvement(reference: float, candidate: float) -> float:
+        return (reference - candidate) / reference * 100 if reference else 0.0
+
+    baseline = p95["original_spotserve"]
+    reparallelization_only = p95["reparallelization_only"]
+    migration_only = p95["migration_only"]
+    full = p95["full_moe_spotserve"]
+    return {
+        "status": "complete",
+        "metric": "latency_p95_ms",
+        "lower_is_better": True,
+        "p95_ms": p95,
+        "reparallelization_only_vs_original_percent": improvement(
+            baseline, reparallelization_only
+        ),
+        "migration_only_vs_original_percent": improvement(
+            baseline, migration_only
+        ),
+        "full_vs_original_percent": improvement(baseline, full),
+        "reparallelization_marginal_with_migration_percent": improvement(
+            migration_only, full
+        ),
+        "migration_marginal_with_reparallelization_percent": improvement(
+            reparallelization_only, full
+        ),
+        "interpretation": (
+            "Positive percentages mean lower p95 latency. With one run per "
+            "configuration these are point estimates, not confidence bounds."
+        ),
+    }
+
+
 def render_report(
     spec: Mapping[str, Any], output: Path, hardware: Mapping[str, Any] | None,
     profiles: list[Mapping[str, Any]], pilot_gate: Mapping[str, Any] | None,
@@ -2445,6 +2602,9 @@ def render_report(
         "- Prefix caching: disabled; every request has a unique exact-token prompt.",
         "- Network-cost caveat: planner bandwidth is a pod-to-pod TCP proxy; "
         "runtime KV movement uses NixlConnector.",
+        "- Cross-worker KV restore is an explicit experimental opt-in backed "
+        "by the CSCC NIXL canary; every formal stateful run still requires "
+        "real restored blocks and receipt evidence.",
     ]
     if error:
         lines += [f"- Blocking error: `{error}`"]
@@ -2486,7 +2646,12 @@ def render_report(
         "## Contribution-readiness pilot",
         "",
     ]
-    if pilot_gate:
+    if pilot_gate and pilot_gate.get("skipped"):
+        lines += [
+            "Skipped intentionally in single-pass mode.",
+            f"Reason: {pilot_gate.get('reason')}",
+        ]
+    elif pilot_gate:
         lines += [
             f"- Passed: **{bool(pilot_gate.get('passed'))}**",
             f"- Normalized decision divergence observed: "
@@ -2532,6 +2697,19 @@ def render_report(
                 f"{mean_sd(rows, 'runtime_ep_audit_verified')} | "
                 f"{mean_sd(rows, 'replanning_avg_execution_duration_ms')} |"
             )
+        if experiment == "f2":
+            reused = [
+                row for row in formal
+                if row.get("experiment") == "f2"
+                and row.get("reused_without_gpu_rerun") is True
+            ]
+            if reused:
+                lines += [
+                    "",
+                    "F2 Original and Full reuse the byte-identical F1 "
+                    "Original/Full executions; they are not additional samples. "
+                    f"Reused rows: `{len(reused)}`.",
+                ]
     contribution = contribution_result(
         ledger, int(spec["experiment"]["formal_repeats"])
     )
@@ -2561,6 +2739,30 @@ def render_report(
             f"{throughput_delta['ci95_available']})",
             f"- Direction-consistent improvement: "
             f"{contribution['performance_improvement_direction_consistent']}",
+        ]
+    f2_ablation = f2_latency_ablation_result(
+        ledger, int(spec["experiment"]["formal_repeats"])
+    )
+    lines += [
+        "",
+        "## F2 p95 latency component ablation",
+        "",
+        f"- Result: **{f2_ablation['status']}**",
+        f"- Interpretation: {f2_ablation.get('interpretation', f2_ablation.get('reason'))}",
+    ]
+    if f2_ablation["status"] == "complete":
+        lines += [
+            f"- Reparallelization only vs Original: "
+            f"{f2_ablation['reparallelization_only_vs_original_percent']:.2f}%",
+            f"- Migration only vs Original: "
+            f"{f2_ablation['migration_only_vs_original_percent']:.2f}%",
+            f"- Full MoE-SpotServe vs Original: "
+            f"{f2_ablation['full_vs_original_percent']:.2f}%",
+            f"- Reparallelization marginal gain when Migration is already enabled: "
+            f"{f2_ablation['reparallelization_marginal_with_migration_percent']:.2f}%",
+            f"- Migration marginal gain when Reparallelization is already enabled: "
+            f"{f2_ablation['migration_marginal_with_reparallelization_percent']:.2f}%",
+            "- Positive values mean p95 latency decreased; negative values mean it increased.",
         ]
     lines += [
         "",
@@ -2918,8 +3120,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force-profile", action="store_true")
     parser.add_argument("--force-smoke", action="store_true", help="Explicit diagnostic rerun; keeps the prior attempt artifacts")
     parser.add_argument("--force-core-probe", action="store_true", help="Explicit diagnostic rerun after inspecting the prior core probe")
+    parser.add_argument(
+        "--single-pass",
+        action="store_true",
+        help=(
+            "Run each unique formal configuration once, skip the duplicate "
+            "pilot, and reuse the identical F1 Original/Full rows in F2."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    if args.single_pass and args.repeats != 1:
+        parser.error("--single-pass requires --repeats 1")
     if args.model_path and args.phase != "smoke":
         parser.error("--model-path is smoke-only; for formal runs use a separate config and output directory")
     if args.force_smoke and args.phase != "smoke":
@@ -2969,6 +3181,10 @@ def main() -> int:
         )
         return 2
     state["requested_formal_repeats"] = int(args.repeats)
+    state["single_pass"] = bool(args.single_pass)
+    state["unique_formal_gpu_runs_expected"] = (
+        6 if args.single_pass else 8 * int(args.repeats)
+    )
     hardware: dict[str, Any] | None = None
     profiles: list[dict[str, Any]] = []
     pilot_gate: dict[str, Any] | None = None
@@ -3086,31 +3302,42 @@ def main() -> int:
             render_report(spec, output, hardware, profiles, None, ledger, state["status"])
             return 0
 
-        pilot_rows = []
-        for treatment in ("original_spotserve", "moe_spotserve"):
-            matching_pilots = [
-                row for row in ledger
-                if row.get("stage") == "pilot"
-                and row.get("status") == "valid"
-                and row.get("experiment") == "f1"
-                and row.get("treatment") == treatment
-                and int(row.get("repeat", -1)) == 0
-            ]
-            if matching_pilots:
-                # Preserve the evidence ledger.  If an older runner already
-                # left duplicate pilots, use the latest valid entry without
-                # launching another GPU run.
-                pilot_rows.append(matching_pilots[-1])
-            else:
-                row = run_one_formal(
-                    spec, hardware, capability, prompts, output, endpoint,
-                    args.ray_address, args.ray_namespace, "f1", treatment, 0,
-                )
-                row["stage"] = "pilot"
-                ledger.append(row)
-                pilot_rows.append(row)
-                write_json(ledger_path, ledger)
-        pilot_gate = pilot_contribution_gate(pilot_rows)
+        if args.single_pass:
+            pilot_gate = {
+                "passed": True,
+                "skipped": True,
+                "decision_divergence_observed": None,
+                "reason": (
+                    "The user requested one execution per configuration; "
+                    "the formal Original and Full rows provide the same paired evidence."
+                ),
+            }
+        else:
+            pilot_rows = []
+            for treatment in ("original_spotserve", "moe_spotserve"):
+                matching_pilots = [
+                    row for row in ledger
+                    if row.get("stage") == "pilot"
+                    and row.get("status") == "valid"
+                    and row.get("experiment") == "f1"
+                    and row.get("treatment") == treatment
+                    and int(row.get("repeat", -1)) == 0
+                ]
+                if matching_pilots:
+                    # Preserve the evidence ledger.  If an older runner already
+                    # left duplicate pilots, use the latest valid entry without
+                    # launching another GPU run.
+                    pilot_rows.append(matching_pilots[-1])
+                else:
+                    row = run_one_formal(
+                        spec, hardware, capability, prompts, output, endpoint,
+                        args.ray_address, args.ray_namespace, "f1", treatment, 0,
+                    )
+                    row["stage"] = "pilot"
+                    ledger.append(row)
+                    pilot_rows.append(row)
+                    write_json(ledger_path, ledger)
+            pilot_gate = pilot_contribution_gate(pilot_rows)
         write_json(output / "pilot" / "contribution-readiness.json", pilot_gate)
         state["status"] = "pilot_completed"
         write_json(state_path, state)
@@ -3127,10 +3354,27 @@ def main() -> int:
             if row.get("stage") == "formal" and row.get("status") == "valid"
         }
         seed = int(spec["experiment"].get("order_seed", 20261002))
-        for experiment, treatments in (("f1", F1_TREATMENTS), ("f2", F2_TREATMENTS)):
+        formal_groups = (
+            (
+                ("f1", F1_TREATMENTS),
+                ("f2", ("reparallelization_only", "migration_only")),
+            )
+            if args.single_pass
+            else (("f1", F1_TREATMENTS), ("f2", F2_TREATMENTS))
+        )
+        for experiment, treatments in formal_groups:
             for repeat in range(
                 1, int(spec["experiment"]["formal_repeats"]) + 1
             ):
+                if args.single_pass and experiment == "f2":
+                    if reuse_f1_rows_for_f2(ledger, repeat):
+                        write_json(ledger_path, ledger)
+                    completed = {
+                        (row.get("experiment"), row.get("treatment"), row.get("repeat"))
+                        for row in ledger
+                        if row.get("stage") == "formal"
+                        and row.get("status") == "valid"
+                    }
                 ordered = list(treatments)
                 random.Random(seed + repeat + (0 if experiment == "f1" else 100)).shuffle(ordered)
                 for treatment in ordered:
@@ -3152,6 +3396,9 @@ def main() -> int:
                     )
         state["status"] = "passed"
         state["contribution"] = contribution_result(
+            ledger, int(spec["experiment"]["formal_repeats"])
+        )
+        state["f2_latency_ablation"] = f2_latency_ablation_result(
             ledger, int(spec["experiment"]["formal_repeats"])
         )
         write_json(state_path, state)

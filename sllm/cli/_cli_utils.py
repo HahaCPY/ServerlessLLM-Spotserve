@@ -28,6 +28,7 @@ import uvicorn
 from sllm.app_lib import create_app
 from sllm.controller import SllmController
 from sllm.logger import init_logger
+from sllm.utils import control_plane_placement_options
 
 logger = init_logger(__name__)
 
@@ -56,7 +57,8 @@ def start_server(
         click.echo("[ℹ] Starting SLLM controller...")
         controller_cls = ray.remote(SllmController)
         controller = controller_cls.options(
-            name="controller", num_cpus=1, resources={"control_node": 0.1}
+            name="controller", num_cpus=1,
+            **control_plane_placement_options(),
         ).remote(
             {
                 "enable_storage_aware": enable_storage_aware,

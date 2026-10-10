@@ -221,6 +221,11 @@ class FcfsScheduler(SllmScheduler):
             return updated_node_info
 
         worker_resource_key = f"worker_id_{node_id}"
+        if worker_resource_key not in available_resources:
+            # Managed Ray node-ID placement has no per-node custom resource.
+            # Scheduler-owned reservations remain authoritative; Ray enforces
+            # the final one-GPU allocation on the selected NodeAffinity target.
+            return updated_node_info
         try:
             available_worker_resource = float(
                 available_resources.get(worker_resource_key, 0.0) or 0.0
