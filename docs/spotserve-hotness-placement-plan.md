@@ -2,7 +2,7 @@
 
 日期：2026-10-11
 
-更新：2026-10-12，補充 request routing 差異、公平 latency comparison 與 candidate latency profiling table。
+更新：2026-10-12，補充 request routing 差異、公平 latency comparison、bounded profiling MVP、movement 單次計分與三階段驗收。
 
 狀態：設計計畫，尚未實作或驗收。此文件補充 [MoE-aware SpotServe Planner](spotserve-moe-aware-planner.md) 的 expert-aware re-parallelization；已有的 physical remap 能力作為執行基礎。
 
@@ -21,17 +21,51 @@
 
 本次不新增 expert replication 或 redundant hot experts。既有 EP resize、KV restore 與跨 failure domain remap 可在固定 EP 策略驗收後做整合回歸。
 
+### 1.1 三階段目標與 Claim
+
+以下 Phase 1–3 僅指本次 hotness placement 優化，不改動原 MoE-aware planner 的 Phase 編號。
+
+| 階段 | 核心能力 | 獨立驗收與可支持的 Claim |
+|---|---|---|
+| Phase 1 | Runtime hotness 的 movement-aware load balancing | 驗證實際 expert ownership、weight/inference correctness、rank load 與 moved bytes；只依結果報告負載平衡，不以 imbalance 代替 latency 或 A2A 效益 |
+| Phase 2 | 實測 candidate profiles 的 latency/throughput ranking | 固定 profile 條件、held-out prediction error、同批 requests 的配對結果；只有實測支持時才報告 serving performance 改善 |
+| Phase 3 | Source-rank-aware routing locality | 收集 source-rank/expert joint statistics，再驗證 remote dispatch 與 sparse A2A payload delta；只有實測流量下降且 correctness 通過時才報告 A2A reduction |
+
+三階段可以分別通過或未通過，不能用其中一種 metric 的改善替代另一階段的驗收。
+
+### 1.2 第一版固定實驗範圍
+
+為避免 profiling state-space explosion，MVP 固定以下條件：
+
+| 維度 | MVP 限制 |
+|---|---|
+| Model | 一個模型，先用 Qwen2-MoE-Tiny，revision/dtype/quantization 固定 |
+| GPU/environment | 一種 GPU type、一份固定 runtime/interconnect/deployment manifest |
+| Parallel shape | 固定 TP1、PP1、vLLM DP2、effective EP2、SLLM replica count 1；不做 topology sweep 或 EP resize |
+| Placement strategies | 三種：linear、round_robin、hotness_balanced；同一份 calibration snapshot 下凍結實際 mappings |
+| Workload buckets | 先做兩個有完整 manifest 的固定 workload suites，覆蓋實際觀測的不同 routing 分布；第三個 bucket 為選配 |
+| 其他條件 | 固定 sampling/stop policy、generation budget、arrival/concurrency 設定、cache policy 與 warmup；記錄實際 token lengths/batch/routing |
+
+第一份 profile table 最多先有 `3 placements * 2 workload buckets = 6` 個條件組合；加第三個 bucket 才增為 9 個。每組可以有多次 repeats，但不為每個 request、每個新 arrival rate 或每次 replan 的 fingerprint 自動新增 row。
+
+不同策略可能產生相同 actual mapping，這種情況需去重或明確標示，不能把相同 placement 當作不同物理候選的改善證據。
+
+完整 schema 保留 hardware/runtime/placement 等 provenance 與 invalidation checks。固定的維度存於 dataset manifest；MVP 查詢入口縮成 frozen candidate ID 與 workload bucket ID，再驗證其 actual placement fingerprint/manifest 相符。fingerprint 作為一致性檢查，不展開所有可能 expert mappings。
+
+舊的排序分組 `hotness` 只保留為 synthetic 診斷案例；movement weight 的 sensitivity study、更多模型/GPU/EP shapes、arrival/batch sweeps 與 profile interpolation 留到 MVP 通過後。若真實模型沒有產生不同程度的 routing skew，記錄實際分布與此限制。
+
 ## 2. 現況與待修項目
 
-以下依目前工作目錄的程式碼整理；其中 `hotness` 雛形仍有未提交修改。
+以下依目前工作目錄的程式碼整理；已有的 `hotness` 仍是排序分組雛形。
 
 | 位置 | 已有能力 | 本計畫需補強 |
 |---|---|---|
 | `sllm/spot/moe_placement.py` | `ExpertPlacementPlan`、linear/round-robin placement、hotness 排序雛形、movement diff/bytes/cost | 統一 hotness contract、負載平衡分配、選擇理由與 stability gate |
-| `sllm/spot/reparallelization.py` | 各 topology candidate 的 workload score 與 expert movement penalty；latency 取自 candidate config 或共用預設值 | 建立實測 latency/throughput profiling table 與 lookup，接入 placement 預測負載，保留各 candidate 的 placement 決策證據 |
+| `sllm/spot/reparallelization.py` | weighted score 與 expert movement penalty；另有 `spotserve_algorithm1` 的 profile-only latency/throughput ranking | 沿用 profiling 基礎，加入固定 EP2 下的 placement/workload matching 與單次 movement 計分 |
 | `sllm/routers/roundrobin_router.py` | replan、runtime metadata 與執行協調 | 為同一次 replan 擷取一致的 routing/placement snapshot |
 | `sllm/backends/vllm_backend.py` | runtime apply/verify、由 config 推導的 placement metadata | 避免從 strategy 名稱推導出尚未實際套用的 placement |
 | `sllm/vllm_expert_remap.py` | DP EngineCore metadata aggregation 與 remap 協調 | 保留統計 provenance，檢查跨 TP/DP 的 aggregation 語意 |
+| `scripts/run_k8s_moe_f1_f2.py` | `ensure_candidate_profiles()` 的 shape profiling、cache hash 與 repeated measurements | 先確認可共用的 schema/量測流程，再擴充 bounded placement profiles；MVP 不依賴完整 K8s topology sweep |
 | `sllm_store/vllm_patch/runtime_moe_metadata.patch` | runtime top-k routing、global/recent histograms | 補足 window、sample count、freshness 與 rank aggregation metadata |
 
 目前 `hotness` 是先按熱度排序，再切成連續區段分給 ranks，因此可能把熱門 experts 集中到同一個 rank。planner 會加總 global/recent 原始 counts，backend 推導路徑則讓 recent 覆蓋 global，兩邊尚未共用相同語意。
@@ -138,6 +172,8 @@ Greedy 是可解釋的 heuristic，並非全域最優解。單一 expert 特別�
 
 對同一個合法 topology，至少產生 `current`（仍合法時）、`linear`、`round_robin`、`hotness_balanced` candidates。所有 candidates 使用相同 hotness snapshot 與 movement estimator。
 
+`current` 是 no-op/reference candidate，不一定是第四種策略；若它不在已凍結的 profile mappings 中，仍可作 Phase 1 的保留決策，但不得聲稱已有 Phase 2 的 latency profile。
+
 逐層計算 load imbalance，避免只加總所有 layers 而掩蓋單層 bottleneck：
 
 ```text
@@ -151,6 +187,8 @@ J(P) = B(P) + movement_weight * normalized_movement_cost(P)
 
 movement cost 使用已有的 weight bytes 與 bandwidth/per-expert estimate，正規化的 reference cost 必須寫入 config/report。memory capacity 作為硬限制，第一版不額外加入 memory penalty 權重。
 
+`J(P)` 只用於同一 topology 內挑選 placement，屬於局部比較的 objective。它可保留在 diagnostics，但不作為一個額外 penalty 疊加到 existing workload score；最終 movement 計分規則見 4.4。
+
 若 movement cost 未知，記錄 `unknown`，不能當成已知零成本。自動策略採保守的 move-count/byte budget；需要搬動但連 bytes 都不明時，先只產生建議 plan。
 
 初始 greedy 以負載為主，再以 movement objective 在 candidates 間選擇。若實驗顯示搬動過多，可增加受容量限制的 pair-swap refinement；此項不列為第一版必要條件。
@@ -159,13 +197,31 @@ movement cost 使用已有的 weight bytes 與 bandwidth/per-expert estimate，�
 
 `J(P)` 用於相同 topology 下比較 placement。不能單憑 imbalance 跨 EP sizes 排名，因為 EP1 的 imbalance 天然為零，卻不代表 throughput 最佳。
 
+Phase 1 用 J 選擇 placement；Phase 2 的候選單位是 `(parallel shape, frozen placement, workload bucket)`。即使 MVP 固定 EP2，仍保留三種合法 mappings 的可比 profiles 供 latency/throughput ranking，不能先用 J 把同一 topology 裁成唯一 mapping，讓 profiling 失去比較對象。J 在 Phase 2 保留作 diagnostics，movement 則依下述單次計分或既有 policy 的 budget gates 處理。若只有一個有效且不同的 actual mapping，記錄候選不足，不宣稱已驗證 profile ranking 效益。
+
 每個 topology candidate 附帶選定的 placement、per-layer/rank load、`B(P)`、movement cost 與 confidence，再進入既有 workload cost model。movement penalty 沿用現有路徑，只計入一次。candidate latency/throughput 採下節的實測 profiling table；`B(P)` 不直接換算成 milliseconds，也不能假設 imbalance 降低 20% 就讓 request latency 降低 20%。
+
+對 weighted score 路徑固定以下責任：
+
+```text
+placement_J(P) = B(P) + lambda * normalized_movement_cost(P)
+  -> only selects a placement within the same topology
+
+final_score = workload_score_excluding_expert_movement
+            - expert_weight_movement_penalty_weight * movement_cost_ms
+```
+
+`final_score` 不再扣一次 `placement_J(P)`，也不扣 J 內的 normalized movement 分量。局部比較與最終排名可以參考同一份成本資料，但同一最終 objective 只能包含一份 movement penalty；raw movement bytes/time 可以同時出現在多個觀測欄位。
+
+目前 weighted score 的 `replan_window_cost_ms` 已包含 expert movement，若 `replan_window_penalty_weight` 與 `expert_weight_movement_penalty_weight` 同時非零，movement 會經兩個 score components 扣分。實作本計畫時需將「完整 window estimate」與「供 aggregate penalty 計分的 window 分量」分開，movement 的 score ownership 固定給 `expert_weight_movement_penalty`。其他 load/migration/queue 分量也需避免 aggregate penalty 與細項重複計入。
+
+`spotserve_algorithm1` 目前按 profile latency/throughput 排名，不使用 weighted objective；保留其 policy 語意。movement-aware placement selection 與 budget gates 在 placement 層處理，不自動把 `J(P)` 或 weighted penalty 加進該 ranking。
 
 同一次 replan 的最終 `ExpertPlacementPlan` 應重用 candidate scoring 時的內容，避免重新讀 hotness 後產生不同 mapping。report 需保留 strategy、snapshot identity、selection reason 與 score components。
 
 ### 4.5 Candidate Latency Profiling Table
 
-此表是待實作項目。現有 `_score_parallel_candidates_for_workload()` 優先使用 `candidate.latency_estimate_ms`，沒有時使用共用 `latency_estimate_ms`；目前這些 config 值不足以證明不同 candidates 的真實 latency 差異。
+本次待實作的是 bounded placement/workload table 與其 matching。現有 weighted 路徑優先使用 `candidate.latency_estimate_ms`，沒有時使用共用 `latency_estimate_ms`；`spotserve_algorithm1` 已有 profile-only ranking，`ensure_candidate_profiles()` 也已有 shape profiling/cache 流程。先沿用可用的部分，再補 placement fingerprint、hotness snapshot 與 workload bucket 驗證，不把既有 profiling 基礎列成完全未實作。
 
 表格估計的是「候選配置在某種 workload 條件下的 latency 分布」，不是由 expert hotness 推導出某個 request 的確定完成時間，也不為每個 request ID 各建一張表。
 
@@ -190,22 +246,24 @@ movement cost 使用已有的 weight bytes 與 bandwidth/per-expert estimate，�
 |---|---:|---:|---:|---|---|---|---|---|
 | P1 | 1 | 2 | 2 | linear，actual mapping A | W1 | 待量測 | 待量測 | 待量測 |
 | P2 | 1 | 2 | 2 | hotness_balanced，actual mapping B | W1 | 待量測 | 待量測 | 待量測 |
-| P3 | 1 | 4 | 4 | linear，actual mapping C | W1 | 待量測 | 待量測 | 待量測 |
+| P3 | 1 | 2 | 2 | round_robin，actual mapping C | W1 | 待量測 | 待量測 | 待量測 |
 
 `effective EP` 沿用 runtime 對 TP/DP/EP 的語意，不把 EP 當成額外獨立相乘的 GPU 維度。不同硬體、topology、workload、cache 或通信 backend 的 rows 不能任意互換。
 
 #### Profiling 與 Lookup 流程
 
-1. 固定 hardware/runtime/model，列出合法 topology 與代表性的 placement candidates。
+1. 先通過 A/B 的 contract、hotness semantics 與 actual placement smoke gates，再依 1.2 固定 hardware/runtime/model、EP2 shape、三個 placement candidates 與兩個 workload buckets。
 2. 用共同 history window 產生各策略的 placement，凍結 mapping，再重播共同的獨立 profiling workload。
 3. 每個 candidate warmup 後，在指定 concurrency/load 下量測並保存 raw per-request records、routing、batch、placement 與 counters；load/model startup/remap window 另量。
 4. 彙整相同條件的 latency/throughput distribution，保存 sample count 與變異。需要 serving capacity 時另做 load sweep，找出穩定可承受的吞吐量。
 5. planner 用目前 workload window 與 selected placement 查表，記錄 `profile_id`、匹配方式與 confidence，再填入 candidate 的 latency/throughput estimate。
 6. 在未參與建表的 workload 上驗證 prediction error，通過後才開啟 profile-based latency ranking。
 
-第一版先做指定模型/workload buckets 與已量測 placement 的 exact lookup。動態產生的 mapping 未命中時，標記 `profile_unavailable`；之後可加入經驗證的 bucket interpolation 或校準模型，但不得僅憑 strategy 名稱或 GPU 數匹配。
+第一版僅在 1.2 的六個條件組合內做 exact lookup，不展開完整 schema 的笛卡兒積。動態產生的 mapping 未命中時，標記 `profile_unavailable`；之後可加入經驗證的 bucket interpolation 或校準模型，但不得僅憑 strategy 名稱或 GPU 數匹配。
 
 缺資料時保留已有的合法 capacity/movement 決策，該輪對比較集合一致停用無法公平比較的 latency/throughput score components，並輸出 fallback reason；不能只拿掉缺資料 candidate 的 penalty，讓它因為沒有量測而佔優。不將缺值視為零 latency，也不以共用預設值假裝各 candidate 已有相同的實測效能。
+
+上述保留決策屬於明確選用的 Phase 1/weighted mode。既有 `spotserve_algorithm1` 的 profile-only mode 繼續拒絕缺有效 profile 的 candidates；不在同一輪默默切回 heuristic，report 必須標明實際 policy/phase。
 
 #### 服務時間與 End-to-End Latency
 
@@ -263,21 +321,25 @@ backend 的 `derived_from_model_config` 只能表示推導資料。策略名稱�
 
 ## 6. 實作分工與順序
 
+工程順序固定為 **A -> B -> C -> D -> E -> F**。A/B 先凍結 key、counter/window、rank ownership 與 plan serialization 語意，並用既有 apply/verify hooks 做最小 actual placement/hash smoke；通過後才開始 C 的量測與建表，避免 profiles 因 contract 尚未固定而作廢。這個 B 的 smoke 不新增另一套 remap engine；E 負責完整 controller 整合與回歸。
+
+Phase 1 的驗收可關閉 profile ranking，獨立證明 movement-aware load balancing。Phase 2 再開啟 C 的 profiles 並驗證 serving performance；D/E/F 的整合需保留兩種 mode 的獨立結果。Phase 3 的 source-rank instrumentation 與 A2A optimizer 另外立項，在本輪 A–F 完成後進行。
+
 | 步驟 | 預計修改位置 | 交付與驗收 |
 |---|---|---|
 | A. 統一 Hotness Snapshot | runtime patch、`vllm_runtime_metadata.py`、`vllm_expert_remap.py`、router | canonical keys、normalization、window/sample/freshness metadata、TP/DP 去重規則；所有 candidates 使用同一份 snapshot |
-| B. `hotness_balanced` | `moe_placement.py` | 容量限制下的 greedy assignment、deterministic tie-break、per-layer/rank load、合法性檢查 |
-| C. Candidate Profiling Table | 新 profiling script/schema、`reparallelization.py` | 真實 latency/throughput 建表、workload/placement lookup、缺資料退化、prediction error 驗證 |
-| D. Movement 與 Selection | `moe_placement.py`、`reparallelization.py` | current/baseline/balanced 比較、unknown cost 處理、stability gates；選中的 mapping 可追溯至 score/profile |
+| B. `hotness_balanced` | `moe_placement.py`、既有 runtime hooks | 容量限制下的 greedy assignment、deterministic tie-break、per-layer/rank load、合法性檢查與 actual placement smoke |
+| C. Candidate Profiling Table | 既有 profiling 基礎、bounded schema/driver、`reparallelization.py` | 固定 EP2/三種 mappings/兩個 workload buckets 的建表與 lookup；缺資料處理、prediction error 驗證 |
+| D. Movement 與 Selection | `moe_placement.py`、`reparallelization.py` | current/baseline/balanced 比較、unknown cost 處理、stability gates；movement 單次計分、policy 語意保留；mapping 可追溯至 score/profile |
 | E. Runtime 整合 | router、backend、既有 remap hooks | 真實 physical remap、placement/hash verify、epoch 更新與失敗處理 |
 | F. Metrics 與 Benchmark | `metrics.py`、analyzer、benchmark runner/config | predictor、movement、measured serving performance 分開輸出；通過下節驗收 |
 
 追蹤 checklist：
 
 - [ ] A. Hotness snapshot contract 與 aggregation 驗證完成。
-- [ ] B. `hotness_balanced` 分配與合法性測試通過。
-- [ ] C. Candidate latency/throughput profiling table、lookup 與 prediction error 驗證完成。
-- [ ] D. Movement-aware selection、stability gates 與 candidate score/profile 整合完成。
+- [ ] B. `hotness_balanced` 分配、合法性測試與 actual placement smoke 通過。
+- [ ] C. Bounded EP2 candidate profiling table、exact lookup 與 prediction error 驗證完成。
+- [ ] D. Movement-aware selection、stability gates 與 candidate score/profile 整合完成；movement 在最終 objective 只計一次。
 - [ ] E. Runtime remap、actual placement、weight hash 與 inference correctness 驗證通過。
 - [ ] F. 相同 requests 的配對 latency comparison、ablation/benchmark、metrics 與結果文件完成。
 
@@ -296,6 +358,9 @@ backend 的 `derived_from_model_config` 只能表示推導資料。策略名稱�
 - 相同 snapshot/config 多次輸出相同 mapping；平手保留 current owner。
 - 搬動成本過高或改善不足時保留合法 current placement；unknown cost 有明確狀態。
 - 候選 score、序列化 plan、執行 mapping 一致，movement penalty 無重複計算。
+- 固定所有其他成本，只增加已知 movement cost；weighted final score 的變化僅為一次 `-weight * delta_movement_ms`。同時啟用 replan-window penalty 時仍成立；J 不額外扣分，raw window estimate 仍完整記錄。
+- Bounded profile manifest 限制 model/GPU/EP shape 與最多 6 個 MVP 條件組合；未列入的 mapping/workload 不自動增列或近似命中，profile-only policy 不默默轉成 heuristic。
+- 固定 EP2、至少兩個不同 actual mappings 時，Phase 2 保留所有有效 profiles 參與排名；mapping 重複或候選不足會被標記，不由 J 預先刪掉所有替代 placements。
 - profiling table 的 exact match、workload/placement mismatch、過期/版本不符/缺資料，不會產生虛構的零 latency 或重複計入 queue；分位數不直接相加。
 
 新增預計入口 `scripts/run_hotness_placement_ablation.py`，輸出 baseline/candidate placement、per-layer load、movement diff、selection reason 與 assertions。
@@ -310,7 +375,7 @@ backend 的 `derived_from_model_config` 只能表示推導資料。策略名稱�
 4. 選擇搬動的案例有實際 moved shards/bytes；選擇不搬動的案例有可解釋原因。
 5. active-request 模式沿用既有 step-boundary coordination，request completion、state 與錯誤處理通過回歸。
 
-功能驗證通過後，再跑既有 DP2 coordinated remap、elastic EP resize 與 simulated cross-host 回歸；各路徑是否支援新策略分別記錄，不以單一路徑通過代表全部完成。
+MVP 使用固定 DP2/EP2 coordinated remap 做 runtime 驗收。EP resize 與 simulated cross-host 回歸列為後續擴充，各路徑是否支援新策略分別記錄，不擴大第一版建表範圍。
 
 ### 7.3 Performance 與 Ablation
 
@@ -320,15 +385,15 @@ backend 的 `derived_from_model_config` 只能表示推導資料。策略名稱�
 |---|---|
 | `linear` | runtime 預設 baseline |
 | `round_robin` | deterministic 分散 baseline |
-| 現有排序分組的 `hotness` | 診斷熱門 experts 集中的效果；以固定案例保留其舊行為 |
-| `hotness_balanced`，movement weight 為零 | 隔離負載平衡效益 |
-| `hotness_balanced`，啟用 movement/stability gates | 評估成本與穩定性 |
+| `hotness_balanced`，固定 movement/stability 設定 | 評估 movement-aware 負載平衡與 serving performance |
+
+第一版僅執行上面三種策略與兩個 workload buckets。舊 `hotness` 的連續分組問題先由 synthetic cases 驗證；movement weight 為零的 sensitivity ablation 留到 MVP 通過後，避免策略/參數再乘出額外 profiling 維度。
 
 synthetic histogram 用於證明決策正確；performance claim 使用真實模型 routing。每組保持相同硬體、模型、TP/DP/EP、workload、trace、warmup、sampling 與量測長度。用獨立的相同 warmup/history 建立 training window，固定策略參數後再量測後續 workload；不可用 candidate evaluation 的未來 routing 反過來挑 placement。
 
 先依 4.5 建立 candidate profiling table，再使用另一份 evaluation workload 做 end-to-end comparison。每筆 request 依 3.3 配對，保留 token lengths、完成狀態與 routing 差異；不能拿 baseline 的 request A 與 candidate 的 request B latency 宣稱 placement 效益。
 
-比較 uniform routing、skewed routing、hotness shift 三類情境。實際模型若無法產生足夠 routing skew，應如實報告，不靠注入 histogram 宣稱 end-to-end 效能改善。多次重複並報告變異；remap window 與 post-remap steady state 分開呈現。
+先比較兩個固定 workload suites 實際觀測的 routing 分布，優先涵蓋較均勻與較偏斜的情境；hotness shift 作為後續第三個 bucket 或 held-out stress test。實際模型若無法產生足夠 routing skew，應如實報告，不靠注入 histogram 宣稱 end-to-end 效能改善。多次重複並報告變異；remap window 與 post-remap steady state 分開呈現。
 
 必要 metrics：
 
@@ -340,6 +405,8 @@ synthetic histogram 用於證明決策正確；performance claim 使用真實模
 - request-level paired latency delta、配對 coverage、prompt/output-length 分層結果。
 - remap window latency 與 post-remap steady-state latency。
 - baseline/candidate A2A counters 的相同區間 delta；流量計數與 predictor 分開標示。
+
+Phase 1/2 中的 A2A counters 僅作 observation；global/recent hotness 不含 token source rank，無法直接估計 remote dispatch，也不能因 load CV 或 latency 下降就宣稱 A2A reduction。該 claim 等待 Phase 3 的 joint routing statistics 與獨立實測 gate。
 
 完成判準是策略影響了真實 runtime placement、correctness 通過且量測可重現。若 predicted imbalance 降低但 throughput/latency 沒改善，保留此結果並分析計算/通信瓶頸；不把功能驗收當成 performance conclusion。
 
