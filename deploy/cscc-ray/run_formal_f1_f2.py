@@ -89,8 +89,12 @@ def run_and_tee(command: list[str], log_path: Path, env: dict[str, str]) -> int:
 
 
 def hold_eight_gpu_nodes(ray: Any, worker_count: int, timeout_s: float):
-    """Scale to eight GPU nodes, then keep those nodes alive without GPUs."""
-    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+    """Atomically reserve eight GPU nodes, then keep them alive without GPUs."""
+    from ray.util.placement_group import placement_group, remove_placement_group
+    from ray.util.scheduling_strategies import (
+        NodeAffinitySchedulingStrategy,
+        PlacementGroupSchedulingStrategy,
+    )
 
     class GPUReservation:
         def identify(self) -> dict[str, str]:
@@ -111,20 +115,121 @@ def hold_eight_gpu_nodes(ray: Any, worker_count: int, timeout_s: float):
                 "hostname": socket.gethostname(),
             }
 
-    reservation_type = ray.remote(num_cpus=0.05, num_gpus=1)(GPUReservation)
-    reservations = [reservation_type.remote() for _ in range(worker_count)]
+    bundle = {"CPU": 0.1, "GPU": 1}
+    group = placement_group(
+        [bundle.copy() for _ in range(worker_count)],
+        strategy="STRICT_SPREAD",
+    )
+    print(
+        "CSCC_GPU_PROVISIONING="
+        + json.dumps(
+            {
+                "phase": "placement_group_pending",
+                "workers": worker_count,
+                "bundle": bundle,
+                "strategy": "STRICT_SPREAD",
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    ready_ref = group.ready()
+    deadline = time.monotonic() + timeout_s
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            snapshot = {
+                "phase": "placement_group_timeout",
+                "workers": worker_count,
+                "cluster_resources": ray.cluster_resources(),
+                "available_resources": ray.available_resources(),
+                "alive_nodes": [
+                    {
+                        "node_id": row.get("NodeID"),
+                        "node_ip": row.get("NodeManagerAddress"),
+                        "resources": row.get("Resources", {}),
+                    }
+                    for row in ray.nodes()
+                    if row.get("Alive")
+                ],
+            }
+            print(
+                "CSCC_GPU_PROVISIONING="
+                + json.dumps(snapshot, sort_keys=True),
+                flush=True,
+            )
+            remove_placement_group(group)
+            raise TimeoutError(
+                "timed out waiting for one STRICT_SPREAD placement group "
+                f"with {worker_count} GPU bundles"
+            )
+        ready, _ = ray.wait(
+            [ready_ref], num_returns=1, timeout=min(15.0, remaining)
+        )
+        if ready:
+            ray.get(ready_ref)
+            break
+        print(
+            "CSCC_GPU_PROVISIONING="
+            + json.dumps(
+                {
+                    "phase": "placement_group_pending",
+                    "remaining_s": round(remaining, 1),
+                    "cluster_gpu": ray.cluster_resources().get("GPU", 0),
+                    "available_gpu": ray.available_resources().get("GPU", 0),
+                    "alive_gpu_nodes": sum(
+                        1
+                        for row in ray.nodes()
+                        if row.get("Alive")
+                        and row.get("Resources", {}).get("GPU", 0) >= 1
+                    ),
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
+    print(
+        "CSCC_GPU_PROVISIONING="
+        + json.dumps(
+            {
+                "phase": "placement_group_ready",
+                "cluster_gpu": ray.cluster_resources().get("GPU", 0),
+                "alive_gpu_nodes": sum(
+                    1
+                    for row in ray.nodes()
+                    if row.get("Alive")
+                    and row.get("Resources", {}).get("GPU", 0) >= 1
+                ),
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+
+    reservation_type = ray.remote(num_cpus=0.1, num_gpus=1)(GPUReservation)
+    reservations = [
+        reservation_type.options(
+            scheduling_strategy=PlacementGroupSchedulingStrategy(
+                placement_group=group,
+                placement_group_bundle_index=index,
+                placement_group_capture_child_tasks=False,
+            )
+        ).remote()
+        for index in range(worker_count)
+    ]
     keepers = []
     try:
         rows = ray.get(
             [actor.identify.remote() for actor in reservations],
-            timeout=timeout_s,
+            timeout=60,
         )
         node_ids = [row["node_id"] for row in rows]
         if len(set(node_ids)) != worker_count:
             raise RuntimeError(
                 f"expected {worker_count} distinct GPU Ray nodes, got {rows}"
             )
-        keeper_type = ray.remote(num_cpus=0.05)(NodeKeeper)
+        keeper_type = ray.remote(num_cpus=0.1)(NodeKeeper)
         keepers = [
             keeper_type.options(
                 scheduling_strategy=NodeAffinitySchedulingStrategy(
@@ -141,6 +246,7 @@ def hold_eight_gpu_nodes(ray: Any, worker_count: int, timeout_s: float):
     finally:
         for actor in reservations:
             ray.kill(actor, no_restart=True)
+        remove_placement_group(group)
     return rows, keepers
 
 
@@ -225,15 +331,9 @@ def main() -> int:
     except ModuleNotFoundError as exc:
         raise RuntimeError("this command must run inside the CSCC Ray image") from exc
 
-    ray.init(address="auto", namespace="sllm", ignore_reinit_error=True)
-    worker_rows, keepers = hold_eight_gpu_nodes(
-        ray, args.workers, args.startup_timeout_s
-    )
-    write_json(output / "held-gpu-workers.json", worker_rows)
-    server_log = output / "serverlessllm.log"
-    server_process: subprocess.Popen[Any] | None = None
     status = {
-        "status": "running",
+        "status": "provisioning_gpu_workers",
+        "phase": "gpu_provisioning",
         "workers": args.workers,
         "model": args.model,
         "config": str(config_path),
@@ -252,6 +352,24 @@ def main() -> int:
         )),
     }
     write_json(output / "cscc-wrapper-state.json", status)
+    try:
+        ray.init(address="auto", namespace="sllm", ignore_reinit_error=True)
+        worker_rows, keepers = hold_eight_gpu_nodes(
+            ray, args.workers, args.startup_timeout_s
+        )
+    except BaseException as exc:
+        status.update(
+            status="blocked",
+            phase="gpu_provisioning",
+            error=str(exc) or type(exc).__name__,
+        )
+        write_json(output / "cscc-wrapper-state.json", status)
+        raise
+    write_json(output / "held-gpu-workers.json", worker_rows)
+    status.update(status="running", phase="server_start")
+    write_json(output / "cscc-wrapper-state.json", status)
+    server_log = output / "serverlessllm.log"
+    server_process: subprocess.Popen[Any] | None = None
     try:
         try:
             ray.get_actor("controller", namespace="sllm")
@@ -291,11 +409,16 @@ def main() -> int:
             env,
         )
         status["status"] = "passed" if return_code == 0 else "blocked"
+        status["phase"] = "complete" if return_code == 0 else "formal_driver"
         status["driver_exit_code"] = return_code
         write_json(output / "cscc-wrapper-state.json", status)
         return return_code
     except BaseException as exc:
-        status.update(status="blocked", error=str(exc) or type(exc).__name__)
+        status.update(
+            status="blocked",
+            phase="server_or_formal_driver",
+            error=str(exc) or type(exc).__name__,
+        )
         write_json(output / "cscc-wrapper-state.json", status)
         raise
     finally:
