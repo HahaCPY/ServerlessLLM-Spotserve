@@ -842,23 +842,58 @@ class VllmBackend(SllmBackend):
         ep_size = max(1, int(effective_ep_size or 1))
         strategy = str(
             self.backend_config.get("expert_placement_strategy") or "linear"
-        )
-        if strategy not in {"linear", "round_robin"}:
+        ).strip().lower()
+        if strategy not in {"linear", "round_robin", "hotness"}:
             return None
-        experts_per_rank, remainder = divmod(num_experts, ep_size)
-        linear_ranks = [
-            rank
-            for rank in range(ep_size)
-            for _ in range(experts_per_rank + int(rank < remainder))
-        ]
         placement: Dict[str, Any] = {}
         for layer_id in range(num_layers):
-            for expert_id in range(num_experts):
-                rank_index = (
-                    linear_ranks[expert_id]
-                    if strategy == "linear"
-                    else expert_id % ep_size
+            ordered_experts = list(range(num_experts))
+            if strategy == "hotness":
+                histogram = {
+                    **self.backend_config.get("global_expert_hotness", {}),
+                    **self.backend_config.get("recent_window_expert_hotness", {}),
+                }
+                ordered_experts = sorted(
+                    ordered_experts,
+                    key=lambda expert_id: (
+                        -float(
+                            histogram.get(
+                                f"layer:{layer_id}/expert:{expert_id}",
+                                histogram.get(f"expert:{expert_id}", 0),
+                            )
+                            or 0
+                        ),
+                        expert_id,
+                    ),
                 )
+
+            if strategy == "linear":
+                experts_per_rank, remainder = divmod(num_experts, ep_size)
+                linear_ranks = [
+                    rank
+                    for rank in range(ep_size)
+                    for _ in range(
+                        experts_per_rank + int(rank < remainder)
+                    )
+                ]
+                rank_for_expert = {
+                    expert_id: linear_ranks[expert_id]
+                    for expert_id in range(num_experts)
+                }
+            elif strategy == "round_robin":
+                rank_for_expert = {
+                    expert_id: expert_id % ep_size
+                    for expert_id in range(num_experts)
+                }
+            else:  # hotness
+                rank_for_expert = {}
+                for position, expert_id in enumerate(ordered_experts):
+                    rank_for_expert[expert_id] = min(
+                        (position * ep_size) // max(1, len(ordered_experts)),
+                        ep_size - 1,
+                    )
+            for expert_id in range(num_experts):
+                rank_index = rank_for_expert[expert_id]
                 rank_id = f"ep-rank-{rank_index}"
                 placement[f"layer:{layer_id}/expert:{expert_id}"] = {
                     "layer_id": layer_id,

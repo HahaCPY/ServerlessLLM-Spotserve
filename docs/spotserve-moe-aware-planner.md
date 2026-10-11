@@ -1078,6 +1078,8 @@ prefix warmup，recovery 會退回 token replay fallback。這讓 V7/V8 的 loca
 
 目標：re-parallelization planner 真的能決定 expert placement。
 
+Hotness placement 的後續實作計畫見 [Hotness-aware Expert Placement 實作計畫](spotserve-hotness-placement-plan.md)。該計畫先補固定 EP 下的 hotness load balancing、movement-aware selection 與 runtime 驗證，再擴充 source-rank routing locality；其 checklist 與 performance 結論需獨立驗收。
+
 完成條件：
 
 - `ExpertPlacementPlan` 可序列化到 metrics。（已完成 logical plan）

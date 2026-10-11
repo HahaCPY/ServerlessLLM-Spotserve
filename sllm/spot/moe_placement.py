@@ -646,6 +646,57 @@ def _default_expert_weight_size_bytes(
     return _as_positive_int(value, 0) or None
 
 
+def _expert_hotness_lookup(
+    expert_key: str,
+    model_config: Mapping[str, Any],
+    planner_config: Mapping[str, Any],
+) -> float:
+    sources = _config_sources(planner_config, model_config)
+    candidates = {str(expert_key)}
+    normalized = str(expert_key).replace("/", "/")
+    for part in str(expert_key).split("/"):
+        name, _, raw_value = part.partition(":")
+        if name == "expert":
+            candidates.add(f"expert:{raw_value}")
+            candidates.add(raw_value)
+        elif name == "layer":
+            candidates.add(f"layer:{raw_value}")
+    score = 0.0
+    for source in sources:
+        for field in ("global_expert_hotness", "recent_window_expert_hotness"):
+            histogram = source.get(field)
+            if not isinstance(histogram, Mapping):
+                continue
+            for key, value in histogram.items():
+                if str(key) not in candidates:
+                    continue
+                try:
+                    score += float(value or 0)
+                except (TypeError, ValueError):
+                    continue
+    return score
+
+
+def _expert_hotness_order(
+    layer_id: int,
+    num_experts: int,
+    model_config: Mapping[str, Any],
+    planner_config: Mapping[str, Any],
+) -> list[int]:
+    ordered = list(range(num_experts))
+    ordered.sort(
+        key=lambda expert_id: (
+            -_expert_hotness_lookup(
+                f"layer:{layer_id}/expert:{expert_id}",
+                model_config,
+                planner_config,
+            ),
+            expert_id,
+        )
+    )
+    return ordered
+
+
 def _estimate_expert_weight_movement_cost_ms(
     moved_weight_bytes: Optional[int],
     moved_expert_count: int,
@@ -934,6 +985,8 @@ def build_logical_expert_placement_plan(
         expert_rank_indices = [
             expert_id % target_rank_count for expert_id in range(num_experts)
         ]
+    elif placement_strategy in {"hotness", "hotspot", "hotspot_aware"}:
+        expert_rank_indices = [0] * num_experts
     else:
         return ExpertPlacementPlan(
             model_name=model_name,
@@ -951,6 +1004,15 @@ def build_logical_expert_placement_plan(
         model_config, planner_config
     )
     for layer_id in range(num_layers):
+        if placement_strategy in {"hotness", "hotspot", "hotspot_aware"}:
+            ordered_experts = _expert_hotness_order(
+                layer_id, num_experts, model_config, planner_config
+            )
+            for position, expert_id in enumerate(ordered_experts):
+                expert_rank_indices[expert_id] = min(
+                    (position * target_rank_count) // max(1, len(ordered_experts)),
+                    target_rank_count - 1,
+                )
         for expert_id in range(num_experts):
             expert_key = f"layer:{layer_id}/expert:{expert_id}"
             rank_index = expert_rank_indices[expert_id]
