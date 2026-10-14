@@ -235,7 +235,22 @@ class ExpertRemapPreflightTests(unittest.TestCase):
     def test_aggregates_dp_engine_runtime_metadata(self):
         result = aggregate_dp_engine_moe_metadata([
             {
-                "global_expert_hotness": {"0": 3},
+                "moe_route_histogram_available": True,
+                "global_expert_hotness": {"layer:0/expert:0": 3},
+                "recent_window_expert_hotness": {"layer:0/expert:0": 2},
+                "global_source_rank_expert_hotness": {
+                    "source-rank:0/layer:0/expert:0": 3
+                },
+                "recent_window_source_rank_expert_hotness": {
+                    "source-rank:0/layer:0/expert:0": 2
+                },
+                "moe_route_recent_event_count": 2,
+                "moe_route_last_observation_time_s": 10.0,
+                "moe_route_global_reset_marker": "engine-0",
+                "moe_route_counter_unit": "topk_routed_assignments",
+                "moe_route_histogram_key_granularity": "layer_expert",
+                "moe_route_histogram_complete_sparse": True,
+                "moe_route_tp_aggregation": "per_key_max_across_tp_workers",
                 "runtime_expert_placement_shards": {
                     "layer:0/expert:0": [{"ep_rank": 0}]
                 },
@@ -246,7 +261,22 @@ class ExpertRemapPreflightTests(unittest.TestCase):
                 ),
             },
             {
-                "global_expert_hotness": {"1": 5},
+                "moe_route_histogram_available": True,
+                "global_expert_hotness": {"layer:0/expert:1": 5},
+                "recent_window_expert_hotness": {"layer:0/expert:1": 4},
+                "global_source_rank_expert_hotness": {
+                    "source-rank:1/layer:0/expert:1": 5
+                },
+                "recent_window_source_rank_expert_hotness": {
+                    "source-rank:1/layer:0/expert:1": 4
+                },
+                "moe_route_recent_event_count": 3,
+                "moe_route_last_observation_time_s": 12.0,
+                "moe_route_global_reset_marker": "engine-1",
+                "moe_route_counter_unit": "topk_routed_assignments",
+                "moe_route_histogram_key_granularity": "layer_expert",
+                "moe_route_histogram_complete_sparse": True,
+                "moe_route_tp_aggregation": "per_key_max_across_tp_workers",
                 "runtime_expert_placement_shards": {
                     "layer:0/expert:1": [{"ep_rank": 1}]
                 },
@@ -263,6 +293,29 @@ class ExpertRemapPreflightTests(unittest.TestCase):
         self.assertEqual(
             result["all_to_all_measurement_kind"],
             "runtime_sparse_transfer_payload",
+        )
+        self.assertEqual(result["moe_route_global_sample_count"], 8)
+        self.assertEqual(result["moe_route_recent_sample_count"], 6)
+        self.assertEqual(result["moe_route_recent_event_count"], 5)
+        self.assertEqual(result["moe_route_last_observation_time_s"], 12.0)
+        self.assertEqual(result["moe_route_dp_engine_count"], 2)
+        self.assertTrue(result["moe_source_rank_expert_histogram_available"])
+        self.assertEqual(
+            result["global_source_rank_expert_hotness"],
+            {
+                "source-rank:0/layer:0/expert:0": 3,
+                "source-rank:1/layer:0/expert:1": 5,
+            },
+        )
+        self.assertEqual(
+            result["moe_source_rank_expert_observation_point"],
+            "pre_dispatch",
+        )
+        self.assertTrue(result["moe_route_histogram_complete_sparse"])
+        self.assertTrue(result["moe_route_metadata_consistent"])
+        self.assertEqual(
+            result["moe_route_tp_aggregation"],
+            "per_key_max_across_tp_workers",
         )
 
     def test_rejects_parallel_size_change(self):

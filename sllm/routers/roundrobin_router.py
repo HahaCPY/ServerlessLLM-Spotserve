@@ -1348,6 +1348,9 @@ class RoundRobinRouter(SllmRouter):
             )
 
         planner_config = self._reparallelization_planner_config()
+        # Every topology/placement candidate in this replan evaluates one
+        # frozen routing snapshot against the same wall-clock instant.
+        planner_config["hotness_snapshot_time_s"] = planner_started_at_s
         async with self.inflight_requests_lock:
             active_request_count = len(self.inflight_requests)
         runtime_metadata_fields = sorted(str(key) for key in runtime_metadata)

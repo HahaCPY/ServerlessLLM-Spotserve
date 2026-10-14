@@ -1,0 +1,8 @@
+{
+  "trace_replay_error": "",
+  "trace_replay_exit_code": 0,
+  "trace_replay_failed": false,
+  "trace_replay_log_path": "results/spotserve_expert_remap_active_request_performance/2026-10-13_15-03-16_vllm-expert-remap-active-request-applied/trace_replayer.log",
+  "trace_replay_started": true,
+  "trace_replay_success": true
+}

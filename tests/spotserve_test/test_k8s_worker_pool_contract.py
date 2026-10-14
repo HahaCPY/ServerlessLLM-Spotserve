@@ -94,6 +94,15 @@ def test_reserved_workers_resolve_pod_ips_not_physical_host_count():
         "10.0.0.3", "10.0.0.4"]
 
 
+def test_reserved_workers_allow_whole_multi_gpu_ray_nodes():
+    pool = ray_workers()[:2]
+    for worker in pool:
+        worker["Resources"]["GPU"] = 2
+    assert reserved_worker_ips(
+        ["0", "1"], {"0": 2, "1": 2}, pool, 4
+    ) == ["10.0.0.1", "10.0.0.2"]
+
+
 def test_reserved_worker_ip_placement_rejects_ambiguous_or_partial_ownership():
     pool = ray_workers()
     pool[1]["NodeManagerAddress"] = pool[0]["NodeManagerAddress"]

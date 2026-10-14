@@ -130,6 +130,37 @@ def test_vllm_model_resource_profile_prefers_runtime_effective_ep():
     assert profile["moe_route_histogram_kind"] == "instrumentation_derived"
 
 
+def test_vllm_runtime_metadata_preserves_source_rank_joint_histogram():
+    joint = {"source-rank:0/layer:0/expert:1": 7}
+    metadata = get_vllm_runtime_metadata(
+        model_name="vllm-moe",
+        backend_config={
+            "tensor_parallel_size": 1,
+            "data_parallel_size": 2,
+            "enable_expert_parallel": True,
+        },
+        runtime_metadata={
+            "global_source_rank_expert_hotness": joint,
+            "recent_window_source_rank_expert_hotness": joint,
+            "moe_source_rank_expert_histogram_available": True,
+            "moe_source_rank_expert_observation_point": "pre_dispatch",
+            "moe_source_rank_expert_key_granularity": (
+                "source_rank_layer_expert"
+            ),
+            "moe_source_rank_semantics": (
+                "vllm_dp_rank_equals_effective_ep_rank"
+            ),
+        },
+    )
+
+    assert metadata["global_source_rank_expert_hotness"] == joint
+    assert metadata["recent_window_source_rank_expert_hotness"] == joint
+    assert metadata["moe_source_rank_expert_histogram_available"] is True
+    assert metadata["moe_source_rank_expert_observation_point"] == (
+        "pre_dispatch"
+    )
+
+
 def test_vllm_model_resource_profile_reports_placement_contract():
     profile = get_vllm_model_resource_profile(
         model_name="vllm-moe",
@@ -420,3 +451,37 @@ def test_vllm_runtime_metadata_omits_unknown_spot_signals():
     assert metadata["loading_cost"] == 3.0
     assert "spot_risk" not in metadata
     assert "remaining_lifetime_s" not in metadata
+
+
+def test_vllm_runtime_metadata_preserves_hotness_contract_provenance():
+    metadata = get_vllm_runtime_metadata(
+        model_name="vllm-moe",
+        backend_config={"tensor_parallel_size": 1},
+        runtime_metadata={
+            "global_expert_hotness": {"layer:0/expert:0": 7},
+            "recent_window_expert_hotness": {"layer:0/expert:0": 3},
+            "moe_route_histogram_available": True,
+            "moe_route_histogram_source": "vllm_runtime_topk",
+            "moe_route_histogram_kind": "runtime_observed_topk",
+            "moe_route_counter_unit": "topk_routed_assignments",
+            "moe_route_aggregation_scope": "deployment",
+            "moe_route_tp_aggregation": "per_key_max_across_tp_workers",
+            "moe_route_dp_aggregation": "sum_independent_dp_engine_streams",
+            "moe_route_histogram_key_granularity": "layer_expert",
+            "moe_route_histogram_complete_sparse": True,
+            "moe_route_global_sample_count": 7,
+            "moe_route_recent_sample_count": 3,
+            "moe_route_recent_event_count": 2,
+            "moe_route_last_observation_time_s": 42.0,
+            "moe_route_global_reset_marker": "reset-1",
+        },
+    )
+
+    assert metadata["moe_route_counter_unit"] == "topk_routed_assignments"
+    assert metadata["moe_route_aggregation_scope"] == "deployment"
+    assert metadata["moe_route_histogram_complete_sparse"] is True
+    assert metadata["moe_route_global_sample_count"] == 7
+    assert metadata["moe_route_recent_sample_count"] == 3
+    assert metadata["moe_route_recent_event_count"] == 2
+    assert metadata["moe_route_last_observation_time_s"] == 42.0
+    assert metadata["moe_route_global_reset_marker"] == "reset-1"

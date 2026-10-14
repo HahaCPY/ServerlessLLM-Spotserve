@@ -599,6 +599,16 @@ class VllmBackend(SllmBackend):
                 backend_config.get("recent_window_expert_hotness")
             )
         )
+        self.moe_route_recent_event_count = int(
+            backend_config.get("moe_route_recent_event_count", 0) or 0
+        )
+        self.moe_route_last_observation_time_s = backend_config.get(
+            "moe_route_last_observation_time_s"
+        )
+        self.moe_route_global_reset_marker = str(
+            backend_config.get("moe_route_global_reset_marker")
+            or f"backend:{os.getpid()}/start_ns:{time.time_ns()}"
+        )
         self._model_config_cache: Optional[Dict[str, Any]] = None
         self._forced_failures_seen = set()
         self.abort_reasons: Dict[str, str] = {}
@@ -709,7 +719,12 @@ class VllmBackend(SllmBackend):
             if address_arg not in async_engine_fields:
                 raise RuntimeError("vllm_explicit_dp_master_address_required")
             filtered_engine_config[address_arg] = ips[0]
-            filtered_engine_config["data_parallel_size_local"] = 1
+            first_reserved_worker = str(reserved_workers[0])
+            filtered_engine_config["data_parallel_size_local"] = int(
+                backend_config["spotserve_distributed_node_allocations"][
+                    first_reserved_worker
+                ]
+            )
             os.environ["VLLM_RAY_DP_PLACEMENT_NODE_IPS"] = ",".join(ips)
             os.environ["VLLM_RAY_DP_PACK_STRATEGY"] = "fill"
             self.backend_config["spotserve_reserved_worker_ips"] = ips
@@ -1445,6 +1460,10 @@ class VllmBackend(SllmBackend):
             str(kind or "request_instrumentation")
         )
         _merge_int_histogram(self.global_expert_hotness, normalized)
+        self.moe_route_recent_event_count = int(
+            getattr(self, "moe_route_recent_event_count", 0) or 0
+        ) + 1
+        self.moe_route_last_observation_time_s = time.time()
 
     def _clear_request_expert_route_histogram(self, request_id: str) -> None:
         request_key = str(request_id)
@@ -1736,6 +1755,31 @@ class VllmBackend(SllmBackend):
             metadata["recent_window_expert_hotness"] = dict(
                 self.recent_window_expert_hotness
             )
+        if (
+            getattr(self, "global_expert_hotness", {})
+            or getattr(self, "recent_window_expert_hotness", {})
+        ):
+            metadata.update({
+                "moe_route_counter_unit": "topk_routed_assignments",
+                "moe_route_aggregation_scope": "engine",
+                "moe_route_histogram_key_granularity": "layer_expert",
+                "moe_route_histogram_complete_sparse": True,
+                "moe_route_global_sample_count": sum(
+                    getattr(self, "global_expert_hotness", {}).values()
+                ),
+                "moe_route_recent_sample_count": sum(
+                    getattr(self, "recent_window_expert_hotness", {}).values()
+                ),
+                "moe_route_recent_event_count": int(
+                    getattr(self, "moe_route_recent_event_count", 0) or 0
+                ),
+                "moe_route_last_observation_time_s": getattr(
+                    self, "moe_route_last_observation_time_s", None
+                ),
+                "moe_route_global_reset_marker": str(
+                    getattr(self, "moe_route_global_reset_marker", "") or ""
+                ),
+            })
         metadata["parallel_plan_mismatch"] = (
             metadata["planned_effective_expert_parallel_size"] != effective_ep_size
         )
@@ -2787,6 +2831,18 @@ class VllmBackend(SllmBackend):
         output_tokens = list(output.outputs[0].token_ids or [])
         return len(output_tokens) >= int(forced_failure["fail_after_tokens"])
 
+    async def _decode_output_token_ids(
+        self,
+        token_ids: List[int],
+        *,
+        skip_special_tokens: bool,
+    ) -> str:
+        tokenizer = await _maybe_await(self.engine.get_tokenizer())
+        return tokenizer.decode(
+            token_ids,
+            skip_special_tokens=skip_special_tokens,
+        )
+
     async def _forced_failure_result(
         self,
         request_data: Dict[str, Any],
@@ -2985,8 +3041,11 @@ class VllmBackend(SllmBackend):
                 committed_output_tokens, output_token_ids,
                 original_prompt_tokens, prompt_token_ids,
             )
-            response["choices"][0]["message"]["content"] = self.engine.get_tokenizer().decode(
-                output_token_ids, skip_special_tokens=sampling_params.skip_special_tokens,
+            response["choices"][0]["message"]["content"] = (
+                await self._decode_output_token_ids(
+                    output_token_ids,
+                    skip_special_tokens=sampling_params.skip_special_tokens,
+                )
             )
             prompt_token_ids = prompt_token_ids[:original_prompt_tokens]
             response["usage"].update(
@@ -3606,6 +3665,32 @@ class VllmBackend(SllmBackend):
             ),
             "recent_window_expert_hotness": parallel_metadata.get(
                 "recent_window_expert_hotness"
+            ),
+            "global_source_rank_expert_hotness": parallel_metadata.get(
+                "global_source_rank_expert_hotness"
+            ),
+            "recent_window_source_rank_expert_hotness": (
+                parallel_metadata.get(
+                    "recent_window_source_rank_expert_hotness"
+                )
+            ),
+            "moe_source_rank_expert_histogram_available": (
+                parallel_metadata.get(
+                    "moe_source_rank_expert_histogram_available"
+                )
+            ),
+            "moe_source_rank_expert_observation_point": (
+                parallel_metadata.get(
+                    "moe_source_rank_expert_observation_point"
+                )
+            ),
+            "moe_source_rank_expert_key_granularity": (
+                parallel_metadata.get(
+                    "moe_source_rank_expert_key_granularity"
+                )
+            ),
+            "moe_source_rank_semantics": parallel_metadata.get(
+                "moe_source_rank_semantics"
             ),
             "cache_block_size": self.backend_config.get("block_size"),
             "cache_dtype": self.backend_config.get("kv_cache_dtype"),

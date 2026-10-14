@@ -38,6 +38,11 @@ Environment overrides:
                             Useful when validating vLLM patch layer changes.
   SPOTSERVE_HOST_TMPDIR     Host temp dir for prepare logs.
                             Default: <repo>/.spotserve-tmp
+  SLLM_RAY_HEAD_TMPDIR      Host Ray temp dir mounted by the head container.
+                            Default: /tmp/sllm-ray/head
+  SLLM_RAY_WORKER_TMPDIR    Host Ray temp dir mounted by the worker container.
+                            Default: /tmp/sllm-ray/worker
+  RAY_WORKER_NUM_CPUS       Ray CPUs registered by each worker. Default: 8
   SPOTSERVE_WORKDIR          Container workdir. Default: /tmp/spotserve-work
   SPOTSERVE_HEALTH_URL       Container API health URL. Default: http://127.0.0.1:8343/health
   SPOTSERVE_WORKER_CONTAINER Worker container used by vLLM deploy sets. Default: sllm_worker_0

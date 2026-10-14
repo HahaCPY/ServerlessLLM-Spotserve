@@ -249,11 +249,26 @@ Temporary Items
 *.ckpt
 *.gguf
 
-# Benchmark and experiment outputs.
-/results/
+# Benchmark and experiment outputs. Keep the canonical hotness-placement
+# validation reports reviewable with the implementation; ignore all other runs.
+/results/*
+!/results/hotness_placement/
+/results/hotness_placement/*
+!/results/hotness_placement/physical-remap-smoke.json
+!/results/hotness_placement/runtime-experiment.json
+!/results/hotness_placement/runtime-experiment-complete.json
+!/results/hotness_placement/active-request-remap-summary.json
+!/results/hotness_placement/active-request-remap-trace-status.json
+!/results/hotness_placement/sensitivity-ablation.json
+!/results/hotness_placement/elastic-ep-resize.json
+!/results/hotness_placement/simulated-cross-host-remap.json
+!/results/hotness_placement/stateful-recovery-regression-summary.json
+!/results/hotness_placement/stateful-recovery-regression-requests.jsonl
+!/results/hotness_placement/stateful-recovery-regression-router.jsonl
 /ray_results/
 /logs/
 /.spotserve-tmp/
+/.spotserve-ray/
 reports/spotserve/runs/
 reports/spotserve/generated/
 

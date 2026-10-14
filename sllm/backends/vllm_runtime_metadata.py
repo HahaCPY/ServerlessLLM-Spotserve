@@ -991,12 +991,41 @@ def get_vllm_model_resource_profile(
         ("global_expert_hotness", "global_expert_hotness"),
         ("recent_window_expert_hotness", "recent_window_expert_hotness"),
         (
+            "global_source_rank_expert_hotness",
+            "global_source_rank_expert_hotness",
+        ),
+        (
+            "recent_window_source_rank_expert_hotness",
+            "recent_window_source_rank_expert_hotness",
+        ),
+        (
             "per_request_expert_route_histogram",
             "per_request_expert_route_histogram",
         ),
     ):
         if _has_payload(runtime_metadata.get(source_key)):
             profile[target_key] = runtime_metadata[source_key]
+    for key in (
+        "moe_route_counter_unit",
+        "moe_route_aggregation_scope",
+        "moe_route_dp_aggregation",
+        "moe_route_tp_aggregation",
+        "moe_route_histogram_key_granularity",
+        "moe_route_histogram_complete_sparse",
+        "moe_route_metadata_consistent",
+        "moe_route_global_sample_count",
+        "moe_route_recent_sample_count",
+        "moe_route_recent_event_count",
+        "moe_route_last_observation_time_s",
+        "moe_route_global_reset_marker",
+        "moe_route_dp_engine_count",
+        "moe_source_rank_expert_histogram_available",
+        "moe_source_rank_expert_observation_point",
+        "moe_source_rank_expert_key_granularity",
+        "moe_source_rank_semantics",
+    ):
+        if key in runtime_metadata:
+            profile[key] = runtime_metadata[key]
     return profile
 
 
@@ -1279,6 +1308,32 @@ def get_vllm_runtime_metadata(
         result["expert_placement_snapshot"] = profile[
             "expert_placement_snapshot"
         ]
+    for key in (
+        "global_expert_hotness",
+        "recent_window_expert_hotness",
+        "global_source_rank_expert_hotness",
+        "recent_window_source_rank_expert_hotness",
+        "per_request_expert_route_histogram",
+        "moe_route_counter_unit",
+        "moe_route_aggregation_scope",
+        "moe_route_dp_aggregation",
+        "moe_route_tp_aggregation",
+        "moe_route_histogram_key_granularity",
+        "moe_route_histogram_complete_sparse",
+        "moe_route_metadata_consistent",
+        "moe_route_global_sample_count",
+        "moe_route_recent_sample_count",
+        "moe_route_recent_event_count",
+        "moe_route_last_observation_time_s",
+        "moe_route_global_reset_marker",
+        "moe_route_dp_engine_count",
+        "moe_source_rank_expert_histogram_available",
+        "moe_source_rank_expert_observation_point",
+        "moe_source_rank_expert_key_granularity",
+        "moe_source_rank_semantics",
+    ):
+        if key in profile:
+            result[key] = profile[key]
     if runtime_metadata.get("spot_risk") is not None:
         result["spot_risk"] = _non_negative_float(
             runtime_metadata.get("spot_risk"), 0.0

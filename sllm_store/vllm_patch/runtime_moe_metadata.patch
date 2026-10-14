@@ -3,7 +3,7 @@ new file mode 100644
 index 000000000..5b1bb3f55
 --- /dev/null
 +++ b/vllm/spotserve_moe.py
-@@ -0,0 +1,783 @@
+@@ -0,0 +1,854 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Lightweight SpotServe MoE routing instrumentation.
@@ -18,6 +18,7 @@ index 000000000..5b1bb3f55
 +import os
 +import re
 +import threading
++import time
 +from collections import deque
 +from contextlib import contextmanager
 +from contextvars import ContextVar
@@ -34,6 +35,11 @@ index 000000000..5b1bb3f55
 +_PER_REQUEST_HISTOGRAMS: dict[str, dict[str, int]] = {}
 +_GLOBAL_HISTOGRAM: dict[str, int] = {}
 +_RECENT_EVENTS: deque[dict[str, int]] = deque(maxlen=64)
++_GLOBAL_SOURCE_EXPERT_HISTOGRAM: dict[str, int] = {}
++_RECENT_SOURCE_EXPERT_EVENTS: deque[dict[str, int]] = deque(maxlen=64)
++_CACHED_SOURCE_RANK: int | None = None
++_LAST_ROUTING_OBSERVATION_TIME_S: float | None = None
++_GLOBAL_RESET_MARKER = f"pid:{os.getpid()}/start_ns:{time.time_ns()}"
 +_LAST_EXPERT_PLACEMENT_PLAN: dict[str, Any] = {}
 +
 +
@@ -73,6 +79,35 @@ index 000000000..5b1bb3f55
 +    if layer_id == "unknown":
 +        return f"expert:{expert_id}"
 +    return f"layer:{layer_id}/expert:{expert_id}"
++
++
++def _source_rank() -> int | None:
++    """Return the pre-dispatch DP/EP source rank for the current token stream."""
++    global _CACHED_SOURCE_RANK
++    if _CACHED_SOURCE_RANK is not None:
++        return _CACHED_SOURCE_RANK
++    try:
++        from vllm.distributed import get_dp_group
++
++        group = get_dp_group()
++        rank = int(group.rank_in_group)
++    except Exception:
++        return None
++    if rank < 0:
++        return None
++    _CACHED_SOURCE_RANK = rank
++    return rank
++
++
++def _source_expert_histogram(
++    source_rank: int,
++    histogram: Mapping[str, int],
++) -> dict[str, int]:
++    return {
++        f"source-rank:{source_rank}/{expert_key}": int(count)
++        for expert_key, count in histogram.items()
++        if int(count) > 0
++    }
 +
 +
 +def _merge_histogram(
@@ -512,6 +547,7 @@ index 000000000..5b1bb3f55
 +    layer_name: str | None,
 +    topk_ids: torch.Tensor,
 +) -> None:
++    global _LAST_ROUTING_OBSERVATION_TIME_S
 +    if not _enabled():
 +        return
 +    context = _ROUTE_CONTEXT.get()
@@ -551,6 +587,16 @@ index 000000000..5b1bb3f55
 +            _merge_histogram(event_total, histogram)
 +        if event_total:
 +            _RECENT_EVENTS.append(event_total)
++            source_rank = _source_rank()
++            if source_rank is not None:
++                source_event = _source_expert_histogram(
++                    source_rank, event_total
++                )
++                _merge_histogram(
++                    _GLOBAL_SOURCE_EXPERT_HISTOGRAM, source_event
++                )
++                _RECENT_SOURCE_EXPERT_EVENTS.append(source_event)
++            _LAST_ROUTING_OBSERVATION_TIME_S = time.time()
 +
 +
 +def clear_moe_request_metadata(request_ids: Iterable[str]) -> None:
@@ -605,7 +651,13 @@ index 000000000..5b1bb3f55
 +        recent: dict[str, int] = {}
 +        for event in _RECENT_EVENTS:
 +            _merge_histogram(recent, event)
++        recent_source_expert: dict[str, int] = {}
++        for event in _RECENT_SOURCE_EXPERT_EVENTS:
++            _merge_histogram(recent_source_expert, event)
 +        global_histogram = dict(_GLOBAL_HISTOGRAM)
++        global_source_expert = dict(_GLOBAL_SOURCE_EXPERT_HISTOGRAM)
++        recent_event_count = len(_RECENT_EVENTS)
++        last_observation_time_s = _LAST_ROUTING_OBSERVATION_TIME_S
 +    available = bool(global_histogram)
 +    result = {
 +        "moe_route_tracing_enabled": _enabled(),
@@ -618,6 +670,25 @@ index 000000000..5b1bb3f55
 +        ),
 +        "global_expert_hotness": global_histogram,
 +        "recent_window_expert_hotness": recent,
++        "global_source_rank_expert_hotness": global_source_expert,
++        "recent_window_source_rank_expert_hotness": recent_source_expert,
++        "moe_source_rank_expert_histogram_available": bool(
++            global_source_expert
++        ),
++        "moe_source_rank_expert_observation_point": "pre_dispatch",
++        "moe_source_rank_expert_key_granularity": (
++            "source_rank_layer_expert"
++        ),
++        "moe_source_rank_semantics": "vllm_dp_rank_equals_effective_ep_rank",
++        "moe_route_counter_unit": "topk_routed_assignments",
++        "moe_route_aggregation_scope": "worker",
++        "moe_route_histogram_key_granularity": "layer_expert",
++        "moe_route_histogram_complete_sparse": True,
++        "moe_route_global_sample_count": sum(global_histogram.values()),
++        "moe_route_recent_sample_count": sum(recent.values()),
++        "moe_route_recent_event_count": recent_event_count,
++        "moe_route_last_observation_time_s": last_observation_time_s,
++        "moe_route_global_reset_marker": _GLOBAL_RESET_MARKER,
 +        "worker_rank": worker_rank,
 +    }
 +    if isinstance(runtime_expert_placement_snapshot, Mapping):
@@ -993,7 +1064,7 @@ index 5bc564f36..7fbdc4101 100644
          # Check for any requests remaining in the scheduler - unfinished,
          # or finished and not yet removed from the batch.
          if not self.scheduler.has_requests():
-@@ -654,6 +654,411 @@ class EngineCore:
+@@ -654,6 +658,484 @@ class EngineCore:
              for request_id in list(requests)
          ]
  
@@ -1009,6 +1080,21 @@ index 5bc564f36..7fbdc4101 100644
 +                continue
 +            if parsed > 0:
 +                target[str(key)] = target.get(str(key), 0) + parsed
++
++    @staticmethod
++    def _merge_max_int_histogram(
++        target: dict[str, int],
++        source: Mapping[str, Any],
++    ) -> None:
++        # TP workers observe the same token stream.  Per-key max preserves
++        # disjoint PP layers while avoiding duplicate TP counts.
++        for key, value in source.items():
++            try:
++                parsed = int(value)
++            except (TypeError, ValueError):
++                continue
++            if parsed > 0:
++                target[str(key)] = max(target.get(str(key), 0), parsed)
 +
 +    def get_request_moe_metadata(self, request_id: str) -> dict[str, Any]:
 +        snapshots = self.model_executor.collective_rpc(
@@ -1079,9 +1165,14 @@ index 5bc564f36..7fbdc4101 100644
 +        )
 +        global_histogram: dict[str, int] = {}
 +        recent_histogram: dict[str, int] = {}
++        global_source_expert: dict[str, int] = {}
++        recent_source_expert: dict[str, int] = {}
 +        runtime_worker_snapshots: dict[str, dict[str, Any]] = {}
 +        runtime_placement_shards: dict[str, list[dict[str, Any]]] = {}
 +        all_to_all_snapshots: list[dict[str, Any]] = []
++        recent_event_counts: list[int] = []
++        last_observation_times: list[float] = []
++        reset_markers: set[str] = set()
 +        enabled = False
 +        for snapshot in snapshots or []:
 +            if not isinstance(snapshot, dict):
@@ -1089,10 +1180,35 @@ index 5bc564f36..7fbdc4101 100644
 +            enabled = enabled or bool(snapshot.get("moe_route_tracing_enabled"))
 +            histogram = snapshot.get("global_expert_hotness")
 +            if isinstance(histogram, dict):
-+                self._merge_int_histogram(global_histogram, histogram)
++                self._merge_max_int_histogram(global_histogram, histogram)
 +            recent = snapshot.get("recent_window_expert_hotness")
 +            if isinstance(recent, dict):
-+                self._merge_int_histogram(recent_histogram, recent)
++                self._merge_max_int_histogram(recent_histogram, recent)
++            source_expert = snapshot.get(
++                "global_source_rank_expert_hotness"
++            )
++            if isinstance(source_expert, dict):
++                self._merge_max_int_histogram(
++                    global_source_expert, source_expert
++                )
++            recent_source = snapshot.get(
++                "recent_window_source_rank_expert_hotness"
++            )
++            if isinstance(recent_source, dict):
++                self._merge_max_int_histogram(
++                    recent_source_expert, recent_source
++                )
++            recent_event_counts.append(
++                int(snapshot.get("moe_route_recent_event_count", 0) or 0)
++            )
++            observed_at = snapshot.get("moe_route_last_observation_time_s")
++            if observed_at is not None:
++                last_observation_times.append(float(observed_at))
++            reset_marker = str(
++                snapshot.get("moe_route_global_reset_marker") or ""
++            )
++            if reset_marker:
++                reset_markers.add(reset_marker)
 +            all_to_all = snapshot.get("all_to_all_counters")
 +            if isinstance(all_to_all, dict):
 +                all_to_all_snapshots.append(all_to_all)
@@ -1119,6 +1235,34 @@ index 5bc564f36..7fbdc4101 100644
 +            ),
 +            "global_expert_hotness": global_histogram,
 +            "recent_window_expert_hotness": recent_histogram,
++            "global_source_rank_expert_hotness": global_source_expert,
++            "recent_window_source_rank_expert_hotness": (
++                recent_source_expert
++            ),
++            "moe_source_rank_expert_histogram_available": bool(
++                global_source_expert
++            ),
++            "moe_source_rank_expert_observation_point": "pre_dispatch",
++            "moe_source_rank_expert_key_granularity": (
++                "source_rank_layer_expert"
++            ),
++            "moe_source_rank_semantics": (
++                "vllm_dp_rank_equals_effective_ep_rank"
++            ),
++            "moe_route_counter_unit": "topk_routed_assignments",
++            "moe_route_aggregation_scope": "engine",
++            "moe_route_tp_aggregation": "per_key_max_across_tp_workers",
++            "moe_route_histogram_key_granularity": "layer_expert",
++            "moe_route_histogram_complete_sparse": True,
++            "moe_route_global_sample_count": sum(global_histogram.values()),
++            "moe_route_recent_sample_count": sum(recent_histogram.values()),
++            "moe_route_recent_event_count": (
++                max(recent_event_counts) if recent_event_counts else 0
++            ),
++            "moe_route_last_observation_time_s": (
++                max(last_observation_times) if last_observation_times else None
++            ),
++            "moe_route_global_reset_marker": ",".join(sorted(reset_markers)),
 +            "runtime_expert_placement_available": bool(runtime_placement_shards),
 +            "runtime_expert_placement_worker_count": len(runtime_worker_snapshots),
 +            "runtime_expert_placement_shard_count": sum(

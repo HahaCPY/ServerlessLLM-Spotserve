@@ -2,6 +2,7 @@ from sllm.spot.moe_placement import (
     ExpertPlacementPlan,
     ExpertPlacementState,
     ExpertShard,
+    build_hotness_snapshot,
     build_logical_expert_placement_plan,
 )
 
@@ -61,6 +62,353 @@ def test_expert_placement_plan_serializes_cost_fields():
     assert payload["estimated_dispatch_cost"] == 0.25
     assert payload["movement_observation_available"] is False
     assert payload["movement_source"] == "unavailable"
+
+
+def test_hotness_snapshot_normalizes_each_source_before_mixing():
+    snapshot = build_hotness_snapshot(
+        num_layers=1,
+        num_experts=2,
+        model_config={
+            "runtime_metadata": {
+                "global_expert_hotness": {
+                    "layer:0/expert:0": 80,
+                    "layer:0/expert:1": 20,
+                },
+                "recent_window_expert_hotness": {
+                    "layer:0/expert:0": 20,
+                    "layer:0/expert:1": 80,
+                },
+                "moe_route_histogram_complete_sparse": True,
+                "moe_route_counter_unit": "topk_routed_assignments",
+                "moe_route_histogram_key_granularity": "layer_expert",
+                "moe_route_global_reset_marker": "test-normalization",
+            }
+        },
+        planner_config={"hotness_alpha": 0.75},
+    )
+
+    assert snapshot.available is True
+    assert round(snapshot.hotness["layer:0/expert:0"], 6) == 0.35
+    assert round(snapshot.hotness["layer:0/expert:1"], 6) == 0.65
+    assert snapshot.sample_count == 100
+    assert snapshot.layer_coverage == 1.0
+
+
+def test_hotness_snapshot_rejects_ambiguous_expert_only_keys():
+    snapshot = build_hotness_snapshot(
+        num_layers=2,
+        num_experts=2,
+        model_config={
+            "runtime_metadata": {
+                "global_expert_hotness": {"expert:0": 10},
+                "moe_route_histogram_complete_sparse": True,
+            }
+        },
+    )
+
+    assert snapshot.available is False
+    assert snapshot.reason == (
+        "invalid_global_histogram:noncanonical_expert_key"
+    )
+
+
+def test_hotness_balanced_greedy_spreads_hot_experts_and_reports_load():
+    plan = build_logical_expert_placement_plan(
+        model_name="tiny-moe",
+        target_parallel_plan={
+            "backend": "vllm",
+            "tensor_parallel_size": 1,
+            "data_parallel_size": 2,
+            "enable_expert_parallel": True,
+            "effective_expert_parallel_size": 2,
+        },
+        model_config={
+            "runtime_metadata": {
+                "global_expert_hotness": {
+                    "layer:0/expert:0": 100,
+                    "layer:0/expert:1": 80,
+                    "layer:0/expert:2": 20,
+                    "layer:0/expert:3": 10,
+                },
+                "recent_window_expert_hotness": {
+                    "layer:0/expert:0": 100,
+                    "layer:0/expert:1": 80,
+                    "layer:0/expert:2": 20,
+                    "layer:0/expert:3": 10,
+                },
+                "moe_route_histogram_complete_sparse": True,
+                "moe_route_counter_unit": "topk_routed_assignments",
+                "moe_route_histogram_key_granularity": "layer_expert",
+                "moe_route_global_reset_marker": "test-greedy",
+            },
+            "backend_config": {
+                "model_config": {
+                    "num_hidden_layers": 1,
+                    "num_experts": 4,
+                }
+            },
+        },
+        planner_config={
+            "target_expert_placement_strategy": "hotness_balanced"
+        },
+    )
+
+    assert plan is not None
+    assert [
+        plan.expert_to_target_rank[f"layer:0/expert:{expert_id}"]
+        for expert_id in range(4)
+    ] == [
+        "replica:0/ep-rank:0",
+        "replica:0/ep-rank:1",
+        "replica:0/ep-rank:1",
+        "replica:0/ep-rank:0",
+    ]
+    loads = plan.per_layer_rank_load["0"]
+    assert round(loads["0"], 6) == round(110 / 210, 6)
+    assert round(loads["1"], 6) == round(100 / 210, 6)
+    assert plan.hotness_snapshot_available is True
+    assert plan.selection_reason == "hotness_balance_without_current_reference"
+
+
+def test_hotness_balanced_reuses_current_snapshot_when_stale():
+    current = {
+        f"layer:0/expert:{expert_id}": {
+            "rank_id": f"ep-rank:{rank}",
+            "weight_size_bytes": 1024,
+        }
+        for expert_id, rank in enumerate((0, 0, 1, 1))
+    }
+    plan = build_logical_expert_placement_plan(
+        model_name="tiny-moe",
+        target_parallel_plan={
+            "backend": "vllm",
+            "tensor_parallel_size": 1,
+            "data_parallel_size": 2,
+            "enable_expert_parallel": True,
+            "effective_expert_parallel_size": 2,
+        },
+        model_config={
+            "runtime_metadata": {
+                "global_expert_hotness": {
+                    "layer:0/expert:0": 100,
+                    "layer:0/expert:1": 80,
+                    "layer:0/expert:2": 20,
+                    "layer:0/expert:3": 10,
+                },
+                "moe_route_histogram_complete_sparse": True,
+                "moe_route_last_observation_time_s": 10.0,
+                "moe_route_global_reset_marker": "test-stale",
+            },
+            "backend_config": {
+                "model_config": {
+                    "num_hidden_layers": 1,
+                    "num_experts": 4,
+                }
+            },
+        },
+        planner_config={
+            "target_expert_placement_strategy": "hotness_balanced",
+            "current_expert_placement_snapshot": current,
+            "hotness_snapshot_time_s": 20.0,
+            "hotness_max_age_s": 5.0,
+        },
+    )
+
+    assert plan is not None
+    assert [
+        plan.expert_to_target_rank[f"layer:0/expert:{expert_id}"]
+        for expert_id in range(4)
+    ] == [
+        "replica:0/ep-rank:0",
+        "replica:0/ep-rank:0",
+        "replica:0/ep-rank:1",
+        "replica:0/ep-rank:1",
+    ]
+    assert plan.hotness_snapshot_available is False
+    assert plan.selection_reason == "retain_current:stale_hotness_snapshot"
+
+
+def test_hotness_balanced_movement_objective_can_retain_current():
+    current = {
+        f"layer:0/expert:{expert_id}": {
+            "rank_id": f"ep-rank:{rank}",
+            "weight_size_bytes": 1024,
+        }
+        for expert_id, rank in enumerate((0, 0, 1, 1))
+    }
+    plan = build_logical_expert_placement_plan(
+        model_name="tiny-moe",
+        target_parallel_plan={
+            "backend": "vllm",
+            "tensor_parallel_size": 1,
+            "data_parallel_size": 2,
+            "enable_expert_parallel": True,
+            "effective_expert_parallel_size": 2,
+        },
+        model_config={
+            "runtime_metadata": {
+                "global_expert_hotness": {
+                    "layer:0/expert:0": 100,
+                    "layer:0/expert:1": 80,
+                    "layer:0/expert:2": 20,
+                    "layer:0/expert:3": 10,
+                },
+                "moe_route_histogram_complete_sparse": True,
+                "moe_route_global_reset_marker": "test-movement",
+            },
+            "backend_config": {
+                "model_config": {
+                    "num_hidden_layers": 1,
+                    "num_experts": 4,
+                }
+            },
+        },
+        planner_config={
+            "target_expert_placement_strategy": "hotness_balanced",
+            "current_expert_placement_snapshot": current,
+            "expert_weight_movement_cost_ms_per_expert": 100,
+            "hotness_movement_weight": 1,
+            "movement_normalization_reference_ms": 1,
+        },
+    )
+
+    assert plan is not None
+    assert plan.moved_expert_count == 0
+    assert plan.selection_reason == (
+        "retain_current:movement_adjusted_objective_not_improved"
+    )
+
+
+def test_hotness_locality_uses_source_rank_joint_counts():
+    current = {
+        f"layer:0/expert:{expert_id}": {
+            "rank_id": f"ep-rank:{rank}",
+            "weight_size_bytes": 1024,
+        }
+        for expert_id, rank in enumerate((0, 1, 0, 1))
+    }
+    counts = {
+        "source-rank:0/layer:0/expert:0": 100,
+        "source-rank:0/layer:0/expert:1": 90,
+        "source-rank:1/layer:0/expert:2": 80,
+        "source-rank:1/layer:0/expert:3": 70,
+    }
+    plan = build_logical_expert_placement_plan(
+        model_name="tiny-moe",
+        target_parallel_plan={
+            "backend": "vllm",
+            "tensor_parallel_size": 1,
+            "data_parallel_size": 2,
+            "enable_expert_parallel": True,
+            "effective_expert_parallel_size": 2,
+        },
+        model_config={
+            "runtime_metadata": {
+                "global_expert_hotness": {
+                    "layer:0/expert:0": 100,
+                    "layer:0/expert:1": 90,
+                    "layer:0/expert:2": 80,
+                    "layer:0/expert:3": 70,
+                },
+                "recent_window_expert_hotness": {
+                    "layer:0/expert:0": 100,
+                    "layer:0/expert:1": 90,
+                    "layer:0/expert:2": 80,
+                    "layer:0/expert:3": 70,
+                },
+                "global_source_rank_expert_hotness": counts,
+                "recent_window_source_rank_expert_hotness": counts,
+                "moe_source_rank_expert_histogram_available": True,
+                "moe_source_rank_expert_observation_point": "pre_dispatch",
+                "moe_source_rank_expert_key_granularity": (
+                    "source_rank_layer_expert"
+                ),
+                "moe_source_rank_semantics": (
+                    "vllm_dp_rank_equals_effective_ep_rank"
+                ),
+                "moe_route_histogram_complete_sparse": True,
+                "moe_route_counter_unit": "topk_routed_assignments",
+                "moe_route_histogram_key_granularity": "layer_expert",
+                "moe_route_global_reset_marker": "test-locality",
+            },
+            "backend_config": {
+                "model_config": {
+                    "num_hidden_layers": 1,
+                    "num_experts": 4,
+                }
+            },
+        },
+        planner_config={
+            "target_expert_placement_strategy": "hotness_locality",
+            "current_expert_placement_snapshot": current,
+            "source_rank_locality_weight": 2.0,
+        },
+    )
+
+    assert plan is not None
+    assert [
+        plan.expert_to_target_rank[f"layer:0/expert:{expert_id}"]
+        for expert_id in range(4)
+    ] == [
+        "replica:0/ep-rank:0",
+        "replica:0/ep-rank:0",
+        "replica:0/ep-rank:1",
+        "replica:0/ep-rank:1",
+    ]
+    assert plan.source_rank_locality_available is True
+    assert plan.estimated_total_assignments == 340
+    assert plan.estimated_remote_assignments == 0
+    assert plan.estimated_remote_ratio == 0
+    assert plan.selection_reason == "source_rank_locality_improvement_accepted"
+
+
+def test_hotness_locality_fails_closed_without_predispatch_semantics():
+    plan = build_logical_expert_placement_plan(
+        model_name="tiny-moe",
+        target_parallel_plan={
+            "backend": "vllm",
+            "data_parallel_size": 2,
+            "enable_expert_parallel": True,
+            "effective_expert_parallel_size": 2,
+        },
+        model_config={
+            "runtime_metadata": {
+                "global_expert_hotness": {
+                    f"layer:0/expert:{expert}": 1 for expert in range(4)
+                },
+                "global_source_rank_expert_hotness": {
+                    "source-rank:0/layer:0/expert:0": 1
+                },
+                "moe_source_rank_expert_histogram_available": True,
+                "moe_source_rank_expert_observation_point": "post_dispatch",
+                "moe_source_rank_expert_key_granularity": (
+                    "source_rank_layer_expert"
+                ),
+                "moe_source_rank_semantics": (
+                    "vllm_dp_rank_equals_effective_ep_rank"
+                ),
+                "moe_route_histogram_complete_sparse": True,
+                "moe_route_histogram_key_granularity": "layer_expert",
+                "moe_route_global_reset_marker": "test-locality-invalid",
+            },
+            "backend_config": {
+                "model_config": {
+                    "num_hidden_layers": 1,
+                    "num_experts": 4,
+                }
+            },
+        },
+        planner_config={
+            "target_expert_placement_strategy": "hotness_locality"
+        },
+    )
+
+    assert plan is not None
+    assert plan.source_rank_locality_available is False
+    assert plan.source_rank_locality_reason == (
+        "source_rank_observation_point_not_pre_dispatch"
+    )
+    assert plan.selection_reason.startswith("deterministic_linear_fallback:")
 
 
 def test_build_logical_expert_placement_plan_covers_required_experts():

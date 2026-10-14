@@ -441,19 +441,70 @@ def aggregate_dp_engine_moe_metadata(
     """Merge runtime placement and A2A counters from all DP EngineCores."""
     global_hotness: dict[str, int] = {}
     recent_hotness: dict[str, int] = {}
+    global_source_expert: dict[str, int] = {}
+    recent_source_expert: dict[str, int] = {}
     placement_shards: dict[str, list[dict[str, Any]]] = {}
     worker_snapshots: dict[str, dict[str, Any]] = {}
     a2a_worker_snapshots: list[dict[str, Any]] = []
     tracing_enabled = False
+    route_engine_count = 0
+    recent_event_count = 0
+    last_observation_times: list[float] = []
+    reset_markers: set[str] = set()
+    counter_units: set[str] = set()
+    key_granularities: set[str] = set()
+    tp_aggregation_kinds: set[str] = set()
+    complete_sparse_flags: list[bool] = []
     for dp_rank, result in enumerate(engine_results):
         if not isinstance(result, Mapping):
             continue
         tracing_enabled = tracing_enabled or bool(
             result.get("moe_route_tracing_enabled")
         )
+        if result.get("moe_route_histogram_available"):
+            route_engine_count += 1
+        recent_event_count += max(
+            0, int(result.get("moe_route_recent_event_count", 0) or 0)
+        )
+        try:
+            observed_at = float(
+                result.get("moe_route_last_observation_time_s")
+            )
+        except (TypeError, ValueError):
+            observed_at = 0.0
+        if observed_at > 0.0:
+            last_observation_times.append(observed_at)
+        reset_marker = str(
+            result.get("moe_route_global_reset_marker") or ""
+        )
+        if reset_marker:
+            reset_markers.add(reset_marker)
+        counter_unit = str(result.get("moe_route_counter_unit") or "")
+        if counter_unit:
+            counter_units.add(counter_unit)
+        key_granularity = str(
+            result.get("moe_route_histogram_key_granularity") or ""
+        )
+        if key_granularity:
+            key_granularities.add(key_granularity)
+        tp_aggregation = str(result.get("moe_route_tp_aggregation") or "")
+        if tp_aggregation:
+            tp_aggregation_kinds.add(tp_aggregation)
+        if "moe_route_histogram_complete_sparse" in result:
+            complete_sparse_flags.append(
+                bool(result.get("moe_route_histogram_complete_sparse"))
+            )
         for target, field in (
             (global_hotness, "global_expert_hotness"),
             (recent_hotness, "recent_window_expert_hotness"),
+            (
+                global_source_expert,
+                "global_source_rank_expert_hotness",
+            ),
+            (
+                recent_source_expert,
+                "recent_window_source_rank_expert_hotness",
+            ),
         ):
             values = result.get(field)
             if isinstance(values, Mapping):
@@ -488,6 +539,15 @@ def aggregate_dp_engine_moe_metadata(
         )
 
     available = bool(global_hotness)
+    canonical_keys = all(
+        re.fullmatch(r"layer:\d+/expert:\d+", str(key)) is not None
+        for key in set(global_hotness) | set(recent_hotness)
+    )
+    metadata_consistent = (
+        len(counter_units) <= 1
+        and len(key_granularities) <= 1
+        and len(tp_aggregation_kinds) <= 1
+    )
     return {
         "moe_route_tracing_enabled": tracing_enabled,
         "moe_route_histogram_available": available,
@@ -499,6 +559,53 @@ def aggregate_dp_engine_moe_metadata(
         ),
         "global_expert_hotness": global_hotness,
         "recent_window_expert_hotness": recent_hotness,
+        "global_source_rank_expert_hotness": global_source_expert,
+        "recent_window_source_rank_expert_hotness": recent_source_expert,
+        "moe_source_rank_expert_histogram_available": bool(
+            global_source_expert
+        ),
+        "moe_source_rank_expert_observation_point": "pre_dispatch",
+        "moe_source_rank_expert_key_granularity": (
+            "source_rank_layer_expert"
+        ),
+        "moe_source_rank_semantics": (
+            "vllm_dp_rank_equals_effective_ep_rank"
+        ),
+        "moe_route_counter_unit": (
+            next(iter(counter_units))
+            if len(counter_units) == 1
+            else "topk_routed_assignments"
+        ),
+        "moe_route_aggregation_scope": "deployment",
+        "moe_route_dp_aggregation": "sum_independent_dp_engine_streams",
+        "moe_route_tp_aggregation": (
+            next(iter(tp_aggregation_kinds))
+            if len(tp_aggregation_kinds) == 1
+            else "unverified"
+        ),
+        "moe_route_histogram_key_granularity": (
+            next(iter(key_granularities))
+            if len(key_granularities) == 1
+            else "layer_expert"
+            if canonical_keys
+            else "unknown"
+        ),
+        "moe_route_histogram_complete_sparse": bool(
+            canonical_keys
+            and complete_sparse_flags
+            and all(complete_sparse_flags)
+        ),
+        "moe_route_metadata_consistent": metadata_consistent,
+        "moe_route_global_sample_count": sum(global_hotness.values()),
+        "moe_route_recent_sample_count": sum(recent_hotness.values()),
+        "moe_route_recent_event_count": recent_event_count,
+        "moe_route_last_observation_time_s": (
+            max(last_observation_times) if last_observation_times else None
+        ),
+        "moe_route_global_reset_marker": (
+            ",".join(sorted(reset_markers)) if reset_markers else ""
+        ),
+        "moe_route_dp_engine_count": route_engine_count,
         "runtime_expert_placement_available": bool(placement_shards),
         "runtime_expert_placement_worker_count": len(worker_snapshots),
         "runtime_expert_placement_shard_count": sum(

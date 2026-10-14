@@ -345,6 +345,93 @@ def make_replanning_event(
             "expert_placement_plan_reason",
             expert_placement_plan.get("reason", "unavailable"),
         ),
+        "expert_placement_strategy": expert_placement_plan.get(
+            "placement_strategy", "unavailable"
+        ),
+        "expert_placement_selection_reason": expert_placement_plan.get(
+            "selection_reason", "unavailable"
+        ),
+        "expert_placement_hotness_snapshot_id": expert_placement_plan.get(
+            "hotness_snapshot_id", ""
+        ),
+        "expert_placement_hotness_snapshot_available": bool(
+            expert_placement_plan.get("hotness_snapshot_available", False)
+        ),
+        "expert_placement_hotness_snapshot_reason": expert_placement_plan.get(
+            "hotness_snapshot_reason", "unavailable"
+        ),
+        "expert_placement_hotness_sample_count": (
+            expert_placement_plan.get("hotness_snapshot", {}).get(
+                "sample_count", 0
+            )
+            if isinstance(
+                expert_placement_plan.get("hotness_snapshot"), dict
+            )
+            else 0
+        ),
+        "expert_placement_hotness_age_s": (
+            expert_placement_plan.get("hotness_snapshot", {}).get("age_s")
+            if isinstance(
+                expert_placement_plan.get("hotness_snapshot"), dict
+            )
+            else None
+        ),
+        "expert_placement_hotness_layer_coverage": expert_placement_plan.get(
+            "hotness_layer_coverage", 0.0
+        ),
+        "expert_placement_predicted_improvement_ratio": (
+            expert_placement_plan.get("predicted_improvement_ratio", 0.0)
+        ),
+        "expert_placement_load_balance_penalty": expert_placement_plan.get(
+            "estimated_load_balance_penalty", 0.0
+        ),
+        "expert_placement_objective": expert_placement_plan.get(
+            "placement_objective"
+        ),
+        "expert_placement_per_layer_rank_load": expert_placement_plan.get(
+            "per_layer_rank_load", {}
+        ),
+        "expert_placement_per_layer_load_imbalance": (
+            expert_placement_plan.get("per_layer_load_imbalance", {})
+        ),
+        "expert_placement_per_layer_load_cv": expert_placement_plan.get(
+            "per_layer_load_cv", {}
+        ),
+        "expert_placement_source_rank_locality_available": bool(
+            expert_placement_plan.get("source_rank_locality_available", False)
+        ),
+        "expert_placement_source_rank_locality_reason": (
+            expert_placement_plan.get(
+                "source_rank_locality_reason", "unavailable"
+            )
+        ),
+        "expert_placement_estimated_remote_assignments": (
+            expert_placement_plan.get("estimated_remote_assignments", 0)
+        ),
+        "expert_placement_estimated_total_assignments": (
+            expert_placement_plan.get("estimated_total_assignments", 0)
+        ),
+        "expert_placement_estimated_remote_ratio": (
+            expert_placement_plan.get("estimated_remote_ratio", 0.0)
+        ),
+        "expert_placement_per_source_remote_assignments": (
+            expert_placement_plan.get("per_source_remote_assignments", {})
+        ),
+        "placement_profile_lookup": decision.get(
+            "placement_profile_lookup", {}
+        ),
+        "selected_placement_profile_available": selected_config.get(
+            "placement_profile_available", False
+        ),
+        "selected_placement_profile_id": selected_config.get(
+            "placement_profile_id", ""
+        ),
+        "selected_placement_profile_match_reason": selected_config.get(
+            "placement_profile_match_reason", "not_requested"
+        ),
+        "selected_replan_window_penalty_cost_ms": decision.get(
+            "selected_replan_window_penalty_cost_ms", 0.0
+        ),
         "expert_placement_runtime_metadata_count": (
             expert_placement_runtime.get("metadata_count", 0)
         ),

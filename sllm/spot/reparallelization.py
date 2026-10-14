@@ -312,6 +312,15 @@ class ParallelConfig:
     expert_placement_moved_weight_bytes: Optional[int] = 0
     queue_penalty_ms: float = 0.0
     replan_window_cost_ms: float = 0.0
+    replan_window_penalty_cost_ms: float = 0.0
+    expert_placement_strategy: str = ""
+    expert_placement_fingerprint: str = ""
+    expert_placement_hotness_snapshot_id: str = ""
+    expert_placement_plan: Optional[Mapping[str, Any]] = None
+    placement_profile_available: bool = False
+    placement_profile_id: str = ""
+    placement_profile_match_reason: str = "not_requested"
+    placement_profile_workload_bucket_id: str = ""
     score_components: Dict[str, float] = field(default_factory=dict)
 
     @property
@@ -389,6 +398,24 @@ class ParallelConfig:
             ),
             "queue_penalty_ms": self.queue_penalty_ms,
             "replan_window_cost_ms": self.replan_window_cost_ms,
+            "replan_window_penalty_cost_ms": (
+                self.replan_window_penalty_cost_ms
+            ),
+            "expert_placement_strategy": self.expert_placement_strategy,
+            "expert_placement_fingerprint": (
+                self.expert_placement_fingerprint
+            ),
+            "expert_placement_hotness_snapshot_id": (
+                self.expert_placement_hotness_snapshot_id
+            ),
+            "placement_profile_available": self.placement_profile_available,
+            "placement_profile_id": self.placement_profile_id,
+            "placement_profile_match_reason": (
+                self.placement_profile_match_reason
+            ),
+            "placement_profile_workload_bucket_id": (
+                self.placement_profile_workload_bucket_id
+            ),
             "score_components": dict(self.score_components),
             "reason": self.reason,
         }
@@ -878,6 +905,33 @@ def _score_parallel_candidates_for_workload(
         return candidates, snapshot
 
     scored_candidates: List[ParallelConfig] = []
+    placement_profile_mode = planner_config.get(
+        "expert_placement_profiles"
+    ) is not None
+    comparable_placement_profiles = (
+        not placement_profile_mode
+        or all(candidate.placement_profile_available for candidate in candidates)
+    )
+    snapshot["placement_profile_scoring_enabled"] = bool(
+        placement_profile_mode and comparable_placement_profiles
+    )
+    snapshot["placement_profile_scoring_reason"] = (
+        "all_candidates_exact_match"
+        if placement_profile_mode and comparable_placement_profiles
+        else "disabled_for_candidate_set_due_to_profile_miss"
+        if placement_profile_mode
+        else "placement_profiles_not_configured"
+    )
+    movement_costs_comparable = all(
+        candidate.expert_weight_movement_cost_estimate_ms is not None
+        for candidate in candidates
+    )
+    snapshot["expert_movement_scoring_enabled"] = movement_costs_comparable
+    snapshot["expert_movement_scoring_reason"] = (
+        "all_candidate_costs_available"
+        if movement_costs_comparable
+        else "disabled_for_candidate_set_due_to_unknown_cost"
+    )
     arrival_rate_req_s = float(snapshot["arrival_rate_req_s"])
     batch_size = int(snapshot["batch_size"])
     latency_estimate_ms = float(snapshot["latency_estimate_ms"])
@@ -887,9 +941,13 @@ def _score_parallel_candidates_for_workload(
             candidate.latency_estimate_ms
             if candidate.latency_estimate_ms > 0.0
             else latency_estimate_ms
-        )
+        ) if comparable_placement_profiles else 0.0
         candidate_latency_s = candidate_latency_estimate_ms / 1000.0
-        throughput_estimate_req_s = candidate.throughput_estimate_req_s
+        throughput_estimate_req_s = (
+            candidate.throughput_estimate_req_s
+            if comparable_placement_profiles
+            else 0.0
+        )
         if throughput_estimate_req_s <= 0.0 and candidate_latency_s > 0.0:
             throughput_estimate_req_s = (
                 candidate.replica_count * batch_size
@@ -912,18 +970,37 @@ def _score_parallel_candidates_for_workload(
         queue_penalty_ms = (
             max(0.0, arrival_rate_req_s - throughput_estimate_req_s)
             * float(snapshot["queue_penalty_ms_per_req_s"])
-        )
+        ) if comparable_placement_profiles else 0.0
         raw_expert_weight_movement_cost_estimate_ms = (
             candidate.expert_weight_movement_cost_estimate_ms
         )
         expert_weight_movement_cost_estimate_ms = (
-            raw_expert_weight_movement_cost_estimate_ms or 0.0
+            (raw_expert_weight_movement_cost_estimate_ms or 0.0)
+            if movement_costs_comparable
+            else 0.0
         )
         replan_window_cost_ms = (
             load_time_estimate_ms
             + migration_cost_estimate_ms
             + expert_weight_movement_cost_estimate_ms
             + queue_penalty_ms
+        )
+        # The complete window estimate remains observable, while the
+        # aggregate score only owns costs not already scored by a dedicated
+        # component.  Expert movement always belongs to its dedicated
+        # component and is therefore never included here.
+        replan_window_penalty_cost_ms = (
+            load_time_estimate_ms
+            if float(snapshot["load_time_penalty_weight"]) == 0.0
+            else 0.0
+        ) + (
+            migration_cost_estimate_ms
+            if float(snapshot["migration_cost_penalty_weight"]) == 0.0
+            else 0.0
+        ) + (
+            queue_penalty_ms
+            if float(snapshot["queue_penalty_weight"]) == 0.0
+            else 0.0
         )
         score_components = {
             "base": base_score * float(snapshot["base_score_weight"]),
@@ -951,7 +1028,7 @@ def _score_parallel_candidates_for_workload(
                 queue_penalty_ms * float(snapshot["queue_penalty_weight"])
             ),
             "replan_window_penalty": (
-                replan_window_cost_ms
+                replan_window_penalty_cost_ms
                 * float(snapshot["replan_window_penalty_weight"])
             ),
         }
@@ -986,6 +1063,9 @@ def _score_parallel_candidates_for_workload(
                 ),
                 queue_penalty_ms=float(queue_penalty_ms),
                 replan_window_cost_ms=float(replan_window_cost_ms),
+                replan_window_penalty_cost_ms=float(
+                    replan_window_penalty_cost_ms
+                ),
                 score_components=score_components,
             )
         )
@@ -1285,30 +1365,65 @@ def _attach_expert_placement_movement_estimates(
     if not candidates or planner_config.get("disable_logical_expert_placement") is True:
         return candidates
 
-    enriched: List[ParallelConfig] = []
-    for candidate in candidates:
-        candidate_plan = build_parallel_plan(
-            model_name=model_name,
-            backend=backend,
-            parallel_config=candidate,
-            worker_nodes=worker_nodes,
-            placement_epoch=placement_epoch,
-            reason=f"{event or 'manual'}_replan",
-        )
-        expert_placement_plan = build_logical_expert_placement_plan(
-            model_name=model_name,
-            target_parallel_plan=candidate_plan.to_dict(),
-            model_config=model_config,
-            placement_epoch=placement_epoch,
-            planner_config=planner_config,
-        )
-        if expert_placement_plan is None:
-            enriched.append(candidate)
-            continue
+    raw_strategies = planner_config.get("placement_candidate_strategies")
+    if raw_strategies is None and planner_config.get(
+        "expert_placement_profiles"
+    ):
+        raw_strategies = ("linear", "round_robin", "hotness_balanced")
+    if isinstance(raw_strategies, str):
+        strategies = [
+            value.strip() for value in raw_strategies.split(",") if value.strip()
+        ]
+    elif isinstance(raw_strategies, (list, tuple)):
+        strategies = [str(value).strip() for value in raw_strategies if value]
+    else:
+        strategies = [
+            str(
+                planner_config.get("target_expert_placement_strategy") or ""
+            ).strip()
+        ]
+    strategies = [value for value in strategies if value] or [""]
 
-        plan_payload = expert_placement_plan.to_dict()
-        enriched.append(
-            replace(
+    enriched: List[ParallelConfig] = []
+    seen_mappings: set[tuple[Any, ...]] = set()
+    for candidate in candidates:
+        for strategy in strategies:
+            candidate_planner_config = dict(planner_config)
+            if strategy:
+                candidate_planner_config[
+                    "target_expert_placement_strategy"
+                ] = strategy
+            candidate_plan = build_parallel_plan(
+                model_name=model_name,
+                backend=backend,
+                parallel_config=candidate,
+                worker_nodes=worker_nodes,
+                placement_epoch=placement_epoch,
+                reason=f"{event or 'manual'}_replan",
+            )
+            expert_placement_plan = build_logical_expert_placement_plan(
+                model_name=model_name,
+                target_parallel_plan=candidate_plan.to_dict(),
+                model_config=model_config,
+                placement_epoch=placement_epoch,
+                planner_config=candidate_planner_config,
+            )
+            if expert_placement_plan is None:
+                enriched.append(candidate)
+                continue
+
+            plan_payload = expert_placement_plan.to_dict()
+            dedupe_key = (
+                candidate.tensor_parallel_size,
+                candidate.pipeline_parallel_size,
+                candidate.data_parallel_size,
+                candidate.replica_count,
+                str(plan_payload.get("placement_fingerprint", "")),
+            )
+            if dedupe_key in seen_mappings:
+                continue
+            seen_mappings.add(dedupe_key)
+            enriched.append(replace(
                 candidate,
                 expert_weight_movement_cost_estimate_ms=(
                     _nonnegative_float(
@@ -1339,9 +1454,206 @@ def _attach_expert_placement_movement_estimates(
                     if plan_payload.get("moved_weight_bytes") is not None
                     else None
                 ),
-            )
-        )
+                expert_placement_strategy=str(
+                    plan_payload.get("placement_strategy", "")
+                ),
+                expert_placement_fingerprint=str(
+                    plan_payload.get("placement_fingerprint", "")
+                ),
+                expert_placement_hotness_snapshot_id=str(
+                    plan_payload.get("hotness_snapshot_id", "")
+                ),
+                expert_placement_plan=plan_payload,
+            ))
     return enriched
+
+
+def _attach_exact_placement_profiles(
+    candidates: List[ParallelConfig],
+    planner_config: Mapping[str, Any],
+) -> tuple[List[ParallelConfig], Dict[str, Any]]:
+    raw_profiles = planner_config.get("expert_placement_profiles")
+    if raw_profiles is None:
+        return candidates, {
+            "enabled": False,
+            "reason": "placement_profiles_not_configured",
+        }
+    if not isinstance(raw_profiles, (list, tuple)):
+        raise ValueError("expert_placement_profiles_must_be_a_list")
+    profiles = [row for row in raw_profiles if isinstance(row, Mapping)]
+    manifest = planner_config.get("expert_placement_profile_manifest")
+    if not isinstance(manifest, Mapping):
+        manifest = {}
+    required_context_fields = (
+        "model_id",
+        "gpu_type",
+        "runtime_fingerprint",
+        "dtype",
+        "quantization",
+        "moe_backend",
+    )
+    missing_manifest_fields = [
+        key
+        for key in ("manifest_id", *required_context_fields)
+        if key not in manifest
+    ]
+    if missing_manifest_fields:
+        raise ValueError(
+            "placement_profile_manifest_missing_fields:"
+            + ",".join(missing_manifest_fields)
+        )
+    active_context = planner_config.get("placement_profile_context")
+    if not isinstance(active_context, Mapping):
+        active_context = {}
+    context_mismatches = [
+        key
+        for key in required_context_fields
+        if str(active_context.get(key)) != str(manifest.get(key))
+    ]
+    max_conditions = max(1, _safe_int(manifest.get("max_conditions"), 6))
+    condition_keys = {
+        (
+            str(row.get("placement_fingerprint") or ""),
+            str(row.get("workload_bucket_id") or ""),
+        )
+        for row in profiles
+    }
+    if len(condition_keys) > max_conditions:
+        raise ValueError("placement_profile_condition_limit_exceeded")
+    workload_bucket_id = str(
+        planner_config.get("workload_bucket_id") or ""
+    )
+    manifest_id = str(manifest.get("manifest_id") or "")
+    require_validation = not _truthy_flag(
+        planner_config.get("allow_unvalidated_placement_profiles", False)
+    )
+    max_prediction_error = _safe_float(
+        planner_config.get("maximum_profile_prediction_error_ratio", 1.0),
+        1.0,
+    )
+    attached: List[ParallelConfig] = []
+    matched = 0
+    miss_reasons: Dict[str, int] = {}
+    for candidate in candidates:
+        match: Optional[Mapping[str, Any]] = None
+        reason = (
+            "profile_manifest_context_mismatch"
+            if context_mismatches
+            else "profile_unavailable"
+        )
+        for row in (profiles if not context_mismatches else ()):
+            row_manifest_id = str(row.get("manifest_id") or "")
+            if manifest_id and row_manifest_id != manifest_id:
+                continue
+            if str(row.get("workload_bucket_id") or "") != workload_bucket_id:
+                continue
+            if str(row.get("placement_fingerprint") or "") != (
+                candidate.expert_placement_fingerprint
+            ):
+                continue
+            expected_shape = (
+                candidate.tensor_parallel_size,
+                candidate.pipeline_parallel_size,
+                candidate.data_parallel_size,
+                candidate.effective_expert_parallel_size,
+                candidate.replica_count,
+            )
+            row_shape = (
+                _safe_int(row.get("tensor_parallel_size"), 0),
+                _safe_int(row.get("pipeline_parallel_size"), 0),
+                _safe_int(
+                    row.get(
+                        "vllm_data_parallel_size",
+                        row.get("data_parallel_size"),
+                    ),
+                    0,
+                ),
+                _safe_int(row.get("effective_expert_parallel_size"), 0),
+                _safe_int(
+                    row.get("sllm_replica_count", row.get("replica_count")),
+                    0,
+                ),
+            )
+            if row_shape != expected_shape:
+                continue
+            validated = _truthy_flag(
+                row.get(
+                    "prediction_validated",
+                    manifest.get("prediction_validated", False),
+                )
+            )
+            prediction_error = _nonnegative_float(
+                row.get("held_out_prediction_error_ratio", 0.0)
+            )
+            if require_validation and not validated:
+                reason = "profile_prediction_not_validated"
+                continue
+            if prediction_error > max_prediction_error:
+                reason = "profile_prediction_error_exceeded"
+                continue
+            sample_count = _safe_int(row.get("sample_count"), 0)
+            latency = _nonnegative_float(
+                row.get(
+                    "service_latency_mean_ms",
+                    row.get("latency_estimate_ms", 0.0),
+                )
+            )
+            throughput = _nonnegative_float(
+                row.get(
+                    "throughput_req_s",
+                    row.get("throughput_estimate_req_s", 0.0),
+                )
+            )
+            if sample_count <= 0 or latency <= 0.0 or throughput <= 0.0:
+                reason = "profile_measurements_incomplete"
+                continue
+            match = row
+            break
+        if match is None:
+            miss_reasons[reason] = miss_reasons.get(reason, 0) + 1
+            attached.append(replace(
+                candidate,
+                latency_estimate_ms=0.0,
+                throughput_estimate_req_s=0.0,
+                placement_profile_available=False,
+                placement_profile_match_reason=reason,
+                placement_profile_workload_bucket_id=workload_bucket_id,
+            ))
+            continue
+        matched += 1
+        attached.append(replace(
+            candidate,
+            latency_estimate_ms=_nonnegative_float(
+                match.get(
+                    "service_latency_mean_ms",
+                    match.get("latency_estimate_ms", 0.0),
+                )
+            ),
+            throughput_estimate_req_s=_nonnegative_float(
+                match.get(
+                    "throughput_req_s",
+                    match.get("throughput_estimate_req_s", 0.0),
+                )
+            ),
+            placement_profile_available=True,
+            placement_profile_id=str(match.get("profile_id") or ""),
+            placement_profile_match_reason="exact_match",
+            placement_profile_workload_bucket_id=workload_bucket_id,
+        ))
+    return attached, {
+        "enabled": True,
+        "manifest_id": manifest_id,
+        "workload_bucket_id": workload_bucket_id,
+        "condition_count": len(condition_keys),
+        "candidate_count": len(candidates),
+        "matched_candidate_count": matched,
+        "profile_miss_count": len(candidates) - matched,
+        "profile_miss_reasons": miss_reasons,
+        "all_candidates_matched": matched == len(candidates),
+        "context_match": not context_mismatches,
+        "context_mismatches": context_mismatches,
+        "lookup": "exact_shape_mapping_workload_manifest",
+    }
 
 
 def _next_placement_epoch(
@@ -1439,6 +1751,10 @@ def plan_dynamic_reparallelization(
         placement_epoch=placement_epoch,
         event=event,
     )
+    candidates, placement_profile_lookup = _attach_exact_placement_profiles(
+        candidates,
+        planner_config,
+    )
     candidates, workload_cost_model = _score_parallel_candidates_for_workload(
         candidates,
         planner_config,
@@ -1459,23 +1775,33 @@ def plan_dynamic_reparallelization(
         else None
     )
     expert_placement_plan = None
+    expert_placement_plan_payload: Optional[Dict[str, Any]] = None
     if (parallel_plan is not None
             and planner_config.get("disable_logical_expert_placement") is not True):
-        expert_placement_plan = build_logical_expert_placement_plan(
-            model_name=model_name,
-            target_parallel_plan=parallel_plan.to_dict(),
-            model_config=model_config,
-            placement_epoch=parallel_plan.placement_epoch,
-            planner_config=planner_config,
-        )
-        if expert_placement_plan is not None:
+        if selected is not None and isinstance(
+            selected.expert_placement_plan, Mapping
+        ):
+            expert_placement_plan_payload = dict(
+                selected.expert_placement_plan
+            )
+        else:
+            expert_placement_plan = build_logical_expert_placement_plan(
+                model_name=model_name,
+                target_parallel_plan=parallel_plan.to_dict(),
+                model_config=model_config,
+                placement_epoch=parallel_plan.placement_epoch,
+                planner_config=planner_config,
+            )
+            if expert_placement_plan is not None:
+                expert_placement_plan_payload = expert_placement_plan.to_dict()
+        if expert_placement_plan_payload is not None:
             parallel_plan = build_parallel_plan(
                 model_name=model_name,
                 backend=backend_name,
                 parallel_config=selected,
                 worker_nodes=worker_nodes,
                 placement_epoch=parallel_plan.placement_epoch,
-                expert_placement_plan=expert_placement_plan.to_dict(),
+                expert_placement_plan=expert_placement_plan_payload,
                 reason=f"{event or 'manual'}_replan",
                 require_free_gpu_overlap=require_free_gpu_overlap,
             )
@@ -1512,11 +1838,10 @@ def plan_dynamic_reparallelization(
         "runtime_worker_node_count": runtime_worker_node_count,
         "physical_worker_node_count": runtime_worker_node_count,
         "workload_cost_model": workload_cost_model,
+        "placement_profile_lookup": placement_profile_lookup,
         "parallel_plan": parallel_plan.to_dict() if parallel_plan else None,
         "expert_placement_plan": (
-            expert_placement_plan.to_dict()
-            if expert_placement_plan is not None
-            else None
+            expert_placement_plan_payload
         ),
         "selected_config": selected.to_dict() if selected else None,
         "top_candidates": [
@@ -1525,9 +1850,7 @@ def plan_dynamic_reparallelization(
     }
     if selected is not None:
         expert_plan_payload = (
-            expert_placement_plan.to_dict()
-            if expert_placement_plan is not None
-            else {}
+            expert_placement_plan_payload or {}
         )
         decision.update(
             {
@@ -1611,6 +1934,9 @@ def plan_dynamic_reparallelization(
                 "selected_queue_penalty_ms": selected.queue_penalty_ms,
                 "selected_replan_window_cost_ms": (
                     selected.replan_window_cost_ms
+                ),
+                "selected_replan_window_penalty_cost_ms": (
+                    selected.replan_window_penalty_cost_ms
                 ),
                 "expert_placement_plan_available": bool(
                     expert_plan_payload.get("expert_placement_available")
@@ -1707,6 +2033,7 @@ def plan_dynamic_reparallelization(
                 "selected_expert_placement_moved_weight_bytes": 0,
                 "selected_queue_penalty_ms": 0.0,
                 "selected_replan_window_cost_ms": 0.0,
+                "selected_replan_window_penalty_cost_ms": 0.0,
                 "expert_placement_plan_available": False,
                 "expert_placement_plan_epoch": 0,
                 "expert_placement_plan_fingerprint": "",

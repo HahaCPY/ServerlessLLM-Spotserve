@@ -1,0 +1,167 @@
+{
+  "model": "hotness-ablation-moe",
+  "parallel_shape": {
+    "backend": "vllm",
+    "data_parallel_size": 2,
+    "effective_expert_parallel_size": 2,
+    "enable_expert_parallel": true,
+    "pipeline_parallel_size": 1,
+    "replica_count": 1,
+    "tensor_parallel_size": 1
+  },
+  "sensitivity": {
+    "alpha": {
+      "0.8": {
+        "expert_to_target_rank": {
+          "layer:0/expert:0": "replica:0/ep-rank:1",
+          "layer:0/expert:1": "replica:0/ep-rank:1",
+          "layer:0/expert:2": "replica:0/ep-rank:0",
+          "layer:0/expert:3": "replica:0/ep-rank:0"
+        },
+        "hotness": {
+          "layer:0/expert:0": 0.26998730642295,
+          "layer:0/expert:1": 0.11652703731911652,
+          "layer:0/expert:2": 0.10325463315562325,
+          "layer:0/expert:3": 0.5102310231023103
+        },
+        "load_balance_penalty": 0.226971312515867
+      },
+      "1.0": {
+        "expert_to_target_rank": {
+          "layer:0/expert:0": "replica:0/ep-rank:1",
+          "layer:0/expert:1": "replica:0/ep-rank:0",
+          "layer:0/expert:2": "replica:0/ep-rank:1",
+          "layer:0/expert:3": "replica:0/ep-rank:0"
+        },
+        "hotness": {
+          "layer:0/expert:0": 0.27722772277227725,
+          "layer:0/expert:1": 0.04950495049504951,
+          "layer:0/expert:2": 0.1188118811881188,
+          "layer:0/expert:3": 0.5544554455445545
+        },
+        "load_balance_penalty": 0.2079207920792081
+      }
+    },
+    "assertions_passed": true,
+    "movement_weight": {
+      "high": {
+        "estimated_movement_cost_ms": 0.0,
+        "expert_to_target_rank": {
+          "layer:0/expert:0": "replica:0/ep-rank:0",
+          "layer:0/expert:1": "replica:0/ep-rank:0",
+          "layer:0/expert:2": "replica:0/ep-rank:1",
+          "layer:0/expert:3": "replica:0/ep-rank:1"
+        },
+        "moved_expert_count": 0,
+        "movement_weight": 1.0,
+        "placement_objective": 0.7142857142857142,
+        "selection_reason": "retain_current:movement_adjusted_objective_not_improved"
+      },
+      "zero": {
+        "estimated_movement_cost_ms": 200.0,
+        "expert_to_target_rank": {
+          "layer:0/expert:0": "replica:0/ep-rank:0",
+          "layer:0/expert:1": "replica:0/ep-rank:1",
+          "layer:0/expert:2": "replica:0/ep-rank:1",
+          "layer:0/expert:3": "replica:0/ep-rank:0"
+        },
+        "moved_expert_count": 2,
+        "movement_weight": 0.0,
+        "placement_objective": 0.04761904761904767,
+        "selection_reason": "hotness_balance_improvement_accepted"
+      }
+    }
+  },
+  "strategies": {
+    "hotness_balanced": {
+      "expert_to_target_rank": {
+        "layer:0/expert:0": "replica:0/ep-rank:0",
+        "layer:0/expert:1": "replica:0/ep-rank:1",
+        "layer:0/expert:2": "replica:0/ep-rank:1",
+        "layer:0/expert:3": "replica:0/ep-rank:0"
+      },
+      "hotness_snapshot_id": "64814472",
+      "load_balance_penalty": 0.04761904761904767,
+      "movement": {
+        "estimated_cost_ms": null,
+        "moved_experts": 0,
+        "moved_weight_bytes": null,
+        "source": "unavailable"
+      },
+      "per_layer_load_cv": {
+        "0": 0.04761904761904757
+      },
+      "per_layer_load_imbalance": {
+        "0": 0.04761904761904767
+      },
+      "per_layer_rank_load": {
+        "0": {
+          "0": 0.5238095238095237,
+          "1": 0.47619047619047616
+        }
+      },
+      "placement_fingerprint": "35945226",
+      "selection_reason": "hotness_balance_without_current_reference"
+    },
+    "linear": {
+      "expert_to_target_rank": {
+        "layer:0/expert:0": "replica:0/ep-rank:0",
+        "layer:0/expert:1": "replica:0/ep-rank:0",
+        "layer:0/expert:2": "replica:0/ep-rank:1",
+        "layer:0/expert:3": "replica:0/ep-rank:1"
+      },
+      "hotness_snapshot_id": "64814472",
+      "load_balance_penalty": 0.7142857142857142,
+      "movement": {
+        "estimated_cost_ms": null,
+        "moved_experts": 0,
+        "moved_weight_bytes": null,
+        "source": "unavailable"
+      },
+      "per_layer_load_cv": {
+        "0": 0.7142857142857142
+      },
+      "per_layer_load_imbalance": {
+        "0": 0.7142857142857142
+      },
+      "per_layer_rank_load": {
+        "0": {
+          "0": 0.8571428571428571,
+          "1": 0.14285714285714285
+        }
+      },
+      "placement_fingerprint": "0fa2f893",
+      "selection_reason": "configured_strategy"
+    },
+    "round_robin": {
+      "expert_to_target_rank": {
+        "layer:0/expert:0": "replica:0/ep-rank:0",
+        "layer:0/expert:1": "replica:0/ep-rank:1",
+        "layer:0/expert:2": "replica:0/ep-rank:0",
+        "layer:0/expert:3": "replica:0/ep-rank:1"
+      },
+      "hotness_snapshot_id": "64814472",
+      "load_balance_penalty": 0.1428571428571428,
+      "movement": {
+        "estimated_cost_ms": null,
+        "moved_experts": 0,
+        "moved_weight_bytes": null,
+        "source": "unavailable"
+      },
+      "per_layer_load_cv": {
+        "0": 0.14285714285714285
+      },
+      "per_layer_load_imbalance": {
+        "0": 0.1428571428571428
+      },
+      "per_layer_rank_load": {
+        "0": {
+          "0": 0.5714285714285714,
+          "1": 0.42857142857142855
+        }
+      },
+      "placement_fingerprint": "89074673",
+      "selection_reason": "configured_strategy"
+    }
+  }
+}

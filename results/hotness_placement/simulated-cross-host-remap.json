@@ -1,0 +1,145 @@
+{
+  "model": "vllm-simulated-host-remap-5767f9aa",
+  "instance_id": "vllm-simulated-host-remap-5767f9aa_8cb8f62a-be22-49e9-a104-03f91ad55c06",
+  "host_mode": "simulated_failure_domain",
+  "physical_cross_host_verified": false,
+  "simulated_cross_host_verified": true,
+  "target_workers": [
+    {
+      "worker_id": "0",
+      "ray_node_id": "909bae4a30b48b8890d3f3ad57e5304e40e041b8fd9888a0fb8bc30d",
+      "address": "10.89.21.3",
+      "physical_host_id": "1932bc646ff7551e",
+      "failure_domain_id": "5920c3ac421e5319",
+      "gpu_count": 2.0
+    },
+    {
+      "worker_id": "1",
+      "ray_node_id": "eb6bfa7cf2df2e10033695d80f83c915c64033cf488e6e34dfb31946",
+      "address": "10.89.21.4",
+      "physical_host_id": "1932bc646ff7551e",
+      "failure_domain_id": "2d02fb27ded070d3",
+      "gpu_count": 2.0
+    }
+  ],
+  "changed_expert_count": 8,
+  "changed_experts": {
+    "layer:0/expert:2": {
+      "before_ep_rank": 2,
+      "after_ep_rank": 0
+    },
+    "layer:1/expert:2": {
+      "before_ep_rank": 2,
+      "after_ep_rank": 0
+    },
+    "layer:0/expert:3": {
+      "before_ep_rank": 3,
+      "after_ep_rank": 1
+    },
+    "layer:1/expert:3": {
+      "before_ep_rank": 3,
+      "after_ep_rank": 1
+    },
+    "layer:0/expert:0": {
+      "before_ep_rank": 0,
+      "after_ep_rank": 2
+    },
+    "layer:1/expert:0": {
+      "before_ep_rank": 0,
+      "after_ep_rank": 2
+    },
+    "layer:0/expert:1": {
+      "before_ep_rank": 1,
+      "after_ep_rank": 3
+    },
+    "layer:1/expert:1": {
+      "before_ep_rank": 1,
+      "after_ep_rank": 3
+    }
+  },
+  "runtime": {
+    "host_mode": "simulated_failure_domain",
+    "physical_host_count": 1,
+    "failure_domain_count": 2,
+    "ray_node_count": 2,
+    "verified_placement": true,
+    "physical_weight_migration": true,
+    "cross_physical_host_migration": false,
+    "cross_failure_domain_migration": true,
+    "cross_failure_domain_moved_shards": 8,
+    "cross_failure_domain_moved_bytes": 1572864
+  },
+  "internode_a2a_calls_before": 560,
+  "internode_a2a_calls_after": 1072,
+  "inter_container_a2a_observed": true,
+  "apply_result": {
+    "applied": true,
+    "verified": true,
+    "success": true,
+    "reason": "runtime_verify_succeeded",
+    "runtime_status": {
+      "expert_placement_apply_hook_available": true,
+      "expert_placement_apply_attempted": true,
+      "expert_placement_apply_success": true,
+      "expert_placement_apply_duration_ms": 245.7228391431272,
+      "expert_placement_apply_reason": "runtime_apply_succeeded",
+      "expert_placement_apply_worker_count": 4,
+      "expert_placement_apply_worker_success_count": 4,
+      "expert_placement_verify_hook_available": true,
+      "expert_placement_verify_attempted": true,
+      "expert_placement_verify_success": true,
+      "expert_placement_verify_reason": "runtime_verify_succeeded",
+      "expert_placement_verify_worker_count": 4,
+      "expert_placement_verify_worker_success_count": 4,
+      "expert_placement_contract_seen_by_runtime": true,
+      "expert_placement_contract_seen_by_all_workers": true,
+      "expert_placement_contract_seen_worker_count": 4,
+      "expert_placement_contract_seen_worker_total": 4,
+      "expert_placement_physical_weight_migration": true,
+      "expert_placement_runtime_moved_expert_shards": 8,
+      "expert_placement_runtime_moved_weight_bytes": 1572864,
+      "expert_placement_runtime_remap_duration_ms": 241.17135675624013,
+      "expert_placement_runtime_active_request_remap": false,
+      "expert_placement_runtime_step_boundary_barrier": true,
+      "expert_placement_runtime_physical_host_ids_observed": true,
+      "expert_placement_runtime_physical_host_count": 1,
+      "expert_placement_runtime_physical_host_ids": [
+        "1932bc646ff7551e"
+      ],
+      "expert_placement_runtime_ray_node_count": 2,
+      "expert_placement_runtime_ray_node_ids": [
+        "909bae4a30b48b8890d3f3ad57e5304e40e041b8fd9888a0fb8bc30d",
+        "eb6bfa7cf2df2e10033695d80f83c915c64033cf488e6e34dfb31946"
+      ],
+      "expert_placement_runtime_failure_domain_count": 2,
+      "expert_placement_runtime_failure_domain_ids": [
+        "2d02fb27ded070d3",
+        "5920c3ac421e5319"
+      ],
+      "expert_placement_runtime_host_mode": "simulated_failure_domain",
+      "expert_placement_runtime_cross_failure_domain_weight_migration": true,
+      "expert_placement_runtime_cross_failure_domain_moved_expert_shards": 8,
+      "expert_placement_runtime_cross_failure_domain_moved_weight_bytes": 1572864,
+      "expert_placement_runtime_cross_node_weight_migration": false,
+      "expert_placement_runtime_cross_node_moved_expert_shards": 0,
+      "expert_placement_runtime_cross_node_moved_weight_bytes": 0,
+      "expert_placement_runtime_verification_level": "physical_migration_verified",
+      "expert_placement_runtime_verified_placement": true,
+      "expert_placement_runtime_can_verify_physical_placement": true,
+      "expert_placement_runtime_can_remap_live_ep_rank": false,
+      "expert_placement_runtime_can_measure_all_to_all": true,
+      "expert_placement_runtime_all_to_all_counters_available": true,
+      "expert_placement_runtime_all_to_all_collective_calls": 560,
+      "expert_placement_runtime_all_to_all_dispatch_calls": 280,
+      "expert_placement_runtime_all_to_all_combine_calls": 280,
+      "expert_placement_runtime_all_to_all_observed_input_bytes": 42818832,
+      "expert_placement_runtime_all_to_all_observed_output_bytes": 43219008,
+      "expert_placement_runtime_all_to_all_internode_calls": 560,
+      "expert_placement_runtime_all_to_all_measurement_kind": "runtime_collective_tensor_payload",
+      "expert_placement_runtime_capability_reason": "quiescent_fixed_ep_remap_verified",
+      "expert_placement_physical_migration_required": true,
+      "expert_placement_plan_applied": true,
+      "expert_placement_plan_verified": true
+    }
+  }
+}

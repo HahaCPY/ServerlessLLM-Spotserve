@@ -20,6 +20,7 @@ set -e
 
 SCRIPT_DIR=$(cd "$(dirname "$0")"; pwd)
 PATCH_FILES=(
+    "$SCRIPT_DIR/runtime_ray_dp_placement.patch"
     "$SCRIPT_DIR/runtime_elastic_ep.patch"
     "$SCRIPT_DIR/runtime_sparse_a2a.patch"
     "$SCRIPT_DIR/runtime_moe_metadata.patch"

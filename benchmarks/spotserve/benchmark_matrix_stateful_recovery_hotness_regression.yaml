@@ -1,0 +1,26 @@
+{
+  "endpoint": "http://127.0.0.1:8343/v1/chat/completions",
+  "output_dir": "results/hotness_placement_stateful_recovery_regression",
+  "runs": [
+    {
+      "name": "vllm-stateful-recovery-hotness-regression",
+      "model": "vllm-stateful-recovery-applied-perf",
+      "backend": "vllm",
+      "policy": "stateful_recovery",
+      "max_retries": 2,
+      "deploy_config": "examples/spotserve/config-vllm-stateful-recovery-applied-performance.json",
+      "delete_models_before_run": [
+        "vllm-stateful-recovery-token-replay-perf",
+        "vllm-stateful-recovery-applied-perf"
+      ],
+      "delete_settle_s": 15,
+      "delete_after_run": true,
+      "workload": "benchmarks/spotserve/workloads/stateful_recovery_vllm_performance.jsonl",
+      "trace": null,
+      "min_ready_instances": 2,
+      "ready_timeout_s": 600,
+      "router_metrics_path": "/tmp/spotserve-work/results/hotness_placement_stateful_recovery_regression/router.jsonl"
+    }
+  ],
+  "comparisons": []
+}

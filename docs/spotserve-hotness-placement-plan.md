@@ -2,9 +2,49 @@
 
 日期：2026-10-11
 
-更新：2026-10-12，補充 request routing 差異、公平 latency comparison、bounded profiling MVP、movement 單次計分與三階段驗收。
+更新：2026-10-14，補充 request routing 差異、公平 latency comparison、bounded profiling MVP、movement 單次計分、三階段驗收，以及完成後的 sensitivity/load/elastic/cross-domain/state-restore 回歸。
 
-狀態：設計計畫，尚未實作或驗收。此文件補充 [MoE-aware SpotServe Planner](spotserve-moe-aware-planner.md) 的 expert-aware re-parallelization；已有的 physical remap 能力作為執行基礎。
+實作進度更新：2026-10-14，canonical hotness snapshot、`hotness_balanced` greedy、stability/movement gates、bounded exact profile lookup、movement 單次計分、metrics、無 GPU ablation、GPU physical-remap smoke、實測 profiles、paired latency benchmark、Phase 3 source-rank locality，以及列於本文件的完成後整合回歸均已完成。
+
+狀態：**本計畫定義的 Phase 1–3、A–F 與完成後整合回歸均已完成。** 實測未顯示 `hotness_balanced` 有 latency/throughput 優勢，因此不宣稱 serving performance 改善；Phase 3 locality 則在輸出一致的前提下量得 15.76% sparse A2A payload reduction。Expert replication、多 GPU 型號、完整 K8s topology sweep 與 profile interpolation 是第 1 節明確排除的研究延伸，不是本計畫的未完成項目。此文件補充 [MoE-aware SpotServe Planner](spotserve-moe-aware-planner.md) 的 expert-aware re-parallelization。
+
+### 0.1 2026-10-13 實測結果
+
+主要 profiling 實驗環境固定為 Qwen2-MoE-Tiny、2 張 NVIDIA GeForce RTX 5070 Ti、vLLM 0.11.2、TP1/PP1/DP2/EP2、FP16、單一 SLLM replica。完整機器可讀證據在 [runtime-experiment-complete.json](../results/hotness_placement/runtime-experiment-complete.json) 與 [physical-remap-smoke.json](../results/hotness_placement/physical-remap-smoke.json)，逐 request routing/latency traces 位於同一個 results 目錄。runtime report 狀態為 `passed`。
+
+GPU physical-remap smoke 實際搬動 4 個 expert shards、786,432 bytes；apply/verify 都成功，weight SHA-256 digests 在搬動前後一致，runtime ownership 與 plan 一致，remap 前後 inference 均完成。獨立 smoke 的 remap 時間為 587.78 ms；完整 candidate 實驗中的 round-robin、hotness-balanced、hotness-locality remap 分別為 217.75、183.09、237.79 ms，三者也都通過 physical apply/verify。
+
+Bounded profile manifest `hotness-ep2-db272ba0db9d` 共 9 個條件、10 samples/條件，三種策略產生三個不同 actual mapping；第三個 `hotness-shift` bucket 未參與 calibration。另以 held-out workload 驗證 prediction error：linear 1.104%、round-robin 1.204%、hotness-balanced 0.929%。
+
+| Strategy | Workload bucket | Mean latency (ms) | p95 (ms) | Throughput (req/s) |
+|---|---|---:|---:|---:|
+| linear | short-factual | 1066.89 | 1090.73 | 0.9373 |
+| linear | structured-reasoning | 1098.59 | 1108.50 | 0.9103 |
+| linear | hotness-shift | 1116.28 | 1124.25 | 0.8958 |
+| round_robin | short-factual | 1068.58 | 1092.48 | 0.9358 |
+| round_robin | structured-reasoning | 1096.16 | 1107.96 | 0.9123 |
+| round_robin | hotness-shift | 1115.61 | 1121.46 | 0.8964 |
+| hotness_balanced | short-factual | 1070.30 | 1092.18 | 0.9343 |
+| hotness_balanced | structured-reasoning | 1103.79 | 1112.77 | 0.9060 |
+| hotness_balanced | hotness-shift | 1114.04 | 1121.96 | 0.8976 |
+
+Paired benchmark 使用 30 個相同 request/repetition IDs，coverage 100%，所有 response signatures 相同。相對 linear 的平均 latency delta 為 round-robin -0.471 ms、hotness-balanced +2.125 ms、hotness-locality +0.050 ms。這支持 benchmark/lookup 功能驗收，但不支持 `hotness_balanced` 的 latency 或 throughput 改善 claim。
+
+Phase 3 的 pre-dispatch `source_rank/layer/expert` joint histogram 在 runtime 可用；`hotness_locality` 產生第四個不同 actual mapping。相同 workload 與 13,952 次 sparse collectives 下，linear 的 dispatch+combine payload 為 16,950,912 bytes，locality 為 14,279,232 bytes，減少 2,671,680 bytes（15.76%），且 paired outputs 全部一致，因此本次 A2A reduction claim 成立。這是 communicator 邊界的 sparse tensor payload，不等同實體 wire bytes。
+
+### 0.2 2026-10-14 完成後回歸
+
+| 回歸 | 結果 | 機器可讀證據 |
+|---|---|---|
+| Active-request physical remap | 2/2 requests 成功、零 fallback；4 shards / 786,432 bytes 實際搬動；step-boundary barrier 與 active-request marker 均成立；remap 226.16 ms | [active-request-remap-summary.json](../results/hotness_placement/active-request-remap-summary.json) |
+| `alpha` sensitivity | `alpha=0.8` 與 recent-only `alpha=1.0` 產生不同 mapping；所有 assertions 通過 | [sensitivity-ablation.json](../results/hotness_placement/sensitivity-ablation.json) |
+| Movement-weight sensitivity | weight 0 接受 2 experts / 200 ms 預估搬動；weight 1 保留 current、0 搬動 | [sensitivity-ablation.json](../results/hotness_placement/sensitivity-ablation.json) |
+| Load/arrival sweep | concurrency 1/2 與 offered load 0.5/1.5 req/s 已對四種策略實測；高負載下 latency 上升但沒有策略性 serving 優勢 | [runtime-experiment-complete.json](../results/hotness_placement/runtime-experiment-complete.json) |
+| Elastic EP2→EP4 | in-place resize、actor 未重建、active request 完成、drain=1、runtime placement verified | [elastic-ep-resize.json](../results/hotness_placement/elastic-ep-resize.json) |
+| Simulated cross-host/failure-domain | 2 個 Ray nodes / 2 failure domains；8 experts、1,572,864 bytes 跨 domain 搬動；推論後新增 512 次 inter-container A2A | [simulated-cross-host-remap.json](../results/hotness_placement/simulated-cross-host-remap.json) |
+| KV/state restore | 3/3 requests、1/1 restore、16 restored tokens、6 restored KV blocks、true-KV rate 100%、零 fallback | [stateful-recovery-regression-summary.json](../results/hotness_placement/stateful-recovery-regression-summary.json) |
+
+跨 failure-domain 測試使用同一台實體主機上的兩個獨立 Ray/container domains，因此證明 placement、weight movement 與 inter-container A2A 路徑，不宣稱已量得實體跨機網路效能。硬體只有同型 RTX 5070 Ti，故沒有虛構第二種 GPU 型號的結果。
 
 ## 1. 目標與範圍
 
@@ -17,9 +57,9 @@
 1. **每個 request 的 routing history 不同。** Placement 使用 workload window 的聚合 hotness；latency 評估則將同一批 requests 在不同策略下重播並逐筆配對，另報告整體分布與 throughput，不預設每筆 request 都會變快。詳細比較方式見第 3.3 節。
 2. **Candidate latency 必須透過實測 profiling 建表。** 表格依模型、硬體、parallel configuration、實際 placement 與 workload 條件查詢 latency distribution/throughput，並在獨立 workload 上驗證預測誤差後才啟用 latency ranking。缺少可比 profile 時回到合法 capacity/movement 決策，不用 hotness imbalance 或共用預設值假裝已量得 candidate latency。表格與 lookup 設計見第 4.5 節。
 
-後續再加入 source-rank-conditioned routing statistics，最佳化 expert locality 與 remote dispatch。第一階段的負載平衡不保證 A2A payload 下降；負載平衡與通信最佳化需分別驗證。
+Phase 3 已加入 source-rank-conditioned routing statistics，最佳化 expert locality 與 remote dispatch。第一階段的負載平衡不保證 A2A payload 下降，因此負載平衡與通信最佳化仍分別驗證；結果見 0.1 與第 8 節。
 
-本次不新增 expert replication 或 redundant hot experts。既有 EP resize、KV restore 與跨 failure domain remap 可在固定 EP 策略驗收後做整合回歸。
+本次不新增 expert replication 或 redundant hot experts。EP2→EP4 resize、KV restore 與跨 failure domain remap 已在固定 EP 策略驗收後完成整合回歸，結果見 0.2。
 
 ### 1.1 三階段目標與 Claim
 
@@ -41,24 +81,24 @@
 |---|---|
 | Model | 一個模型，先用 Qwen2-MoE-Tiny，revision/dtype/quantization 固定 |
 | GPU/environment | 一種 GPU type、一份固定 runtime/interconnect/deployment manifest |
-| Parallel shape | 固定 TP1、PP1、vLLM DP2、effective EP2、SLLM replica count 1；不做 topology sweep 或 EP resize |
+| Parallel shape | 核心 profiling 固定 TP1、PP1、vLLM DP2、effective EP2、SLLM replica count 1；EP2→EP4 另做整合回歸，不展開完整 topology sweep |
 | Placement strategies | 三種：linear、round_robin、hotness_balanced；同一份 calibration snapshot 下凍結實際 mappings |
-| Workload buckets | 先做兩個有完整 manifest 的固定 workload suites，覆蓋實際觀測的不同 routing 分布；第三個 bucket 為選配 |
+| Workload buckets | 三個有完整 manifest 的固定 workload suites；前兩個用於 calibration，第三個 `hotness-shift` 作 held-out stress/prediction-error 驗證 |
 | 其他條件 | 固定 sampling/stop policy、generation budget、arrival/concurrency 設定、cache policy 與 warmup；記錄實際 token lengths/batch/routing |
 
-第一份 profile table 最多先有 `3 placements * 2 workload buckets = 6` 個條件組合；加第三個 bucket 才增為 9 個。每組可以有多次 repeats，但不為每個 request、每個新 arrival rate 或每次 replan 的 fingerprint 自動新增 row。
+完成版 profile table 有 `3 placements * 3 workload buckets = 9` 個條件組合，每個條件 10 次 samples。表格不為每個 request、每個新 arrival rate 或每次 replan 的 fingerprint 自動新增 row。
 
 不同策略可能產生相同 actual mapping，這種情況需去重或明確標示，不能把相同 placement 當作不同物理候選的改善證據。
 
 完整 schema 保留 hardware/runtime/placement 等 provenance 與 invalidation checks。固定的維度存於 dataset manifest；MVP 查詢入口縮成 frozen candidate ID 與 workload bucket ID，再驗證其 actual placement fingerprint/manifest 相符。fingerprint 作為一致性檢查，不展開所有可能 expert mappings。
 
-舊的排序分組 `hotness` 只保留為 synthetic 診斷案例；movement weight 的 sensitivity study、更多模型/GPU/EP shapes、arrival/batch sweeps 與 profile interpolation 留到 MVP 通過後。若真實模型沒有產生不同程度的 routing skew，記錄實際分布與此限制。
+舊的排序分組 `hotness` 只保留為 synthetic 診斷案例。MVP 通過後已完成 movement weight、`alpha`、arrival/concurrency 與 EP2→EP4 sensitivity/integration checks；更多模型/GPU shapes、完整 topology sweep 與 profile interpolation 仍屬明確排除的研究延伸。真實模型的 routing 分布與 serving 無顯著改善結果均保留在 canonical report。
 
-## 2. 現況與待修項目
+## 2. 實作前現況與完成項目
 
-以下依目前工作目錄的程式碼整理；已有的 `hotness` 仍是排序分組雛形。
+以下保留實作前的差距與本次對應完成項目，方便追溯原始 plan 與交付內容。
 
-| 位置 | 已有能力 | 本計畫需補強 |
+| 位置 | 實作前能力 | 本次完成項目 |
 |---|---|---|
 | `sllm/spot/moe_placement.py` | `ExpertPlacementPlan`、linear/round-robin placement、hotness 排序雛形、movement diff/bytes/cost | 統一 hotness contract、負載平衡分配、選擇理由與 stability gate |
 | `sllm/spot/reparallelization.py` | weighted score 與 expert movement penalty；另有 `spotserve_algorithm1` 的 profile-only latency/throughput ranking | 沿用 profiling 基礎，加入固定 EP2 下的 placement/workload matching 與單次 movement 計分 |
@@ -68,11 +108,11 @@
 | `scripts/run_k8s_moe_f1_f2.py` | `ensure_candidate_profiles()` 的 shape profiling、cache hash 與 repeated measurements | 先確認可共用的 schema/量測流程，再擴充 bounded placement profiles；MVP 不依賴完整 K8s topology sweep |
 | `sllm_store/vllm_patch/runtime_moe_metadata.patch` | runtime top-k routing、global/recent histograms | 補足 window、sample count、freshness 與 rank aggregation metadata |
 
-目前 `hotness` 是先按熱度排序，再切成連續區段分給 ranks，因此可能把熱門 experts 集中到同一個 rank。planner 會加總 global/recent 原始 counts，backend 推導路徑則讓 recent 覆蓋 global，兩邊尚未共用相同語意。
+實作前的 `hotness` 是先按熱度排序，再切成連續區段分給 ranks，可能把熱門 experts 集中到同一個 rank；planner/backend 對 global/recent counts 的語意也不一致。本次新增 canonical snapshot/normalization contract 與 capacity-constrained greedy，planner、backend 與 runtime aggregation 已共用相同語意。
 
 目前 runtime 的 recent histogram 來自 `_RECENT_EVENTS = deque(maxlen=64)`，代表最近 64 個 routing events；每個 event 的 token 數可能不同，也不能直接稱為最近 64 秒或 64 個完整 decoding steps。
 
-`ExpertPlacementPlan.estimated_load_balance_penalty` 與 `estimated_dispatch_cost` 已有欄位，但目前建構 plan 時未填入 hotness 最佳化結果。新增策略需要接通 candidate scoring，不能只輸出額外 metadata。
+`ExpertPlacementPlan.estimated_load_balance_penalty` 與 `estimated_dispatch_cost` 原有欄位先前未填入 hotness 最佳化結果；本次已接通 candidate scoring、序列化 plan、selection reason 與實際執行 mapping，而非只輸出額外 metadata。
 
 ## 3. Hotness Contract
 
@@ -221,7 +261,7 @@ final_score = workload_score_excluding_expert_movement
 
 ### 4.5 Candidate Latency Profiling Table
 
-本次待實作的是 bounded placement/workload table 與其 matching。現有 weighted 路徑優先使用 `candidate.latency_estimate_ms`，沒有時使用共用 `latency_estimate_ms`；`spotserve_algorithm1` 已有 profile-only ranking，`ensure_candidate_profiles()` 也已有 shape profiling/cache 流程。先沿用可用的部分，再補 placement fingerprint、hotness snapshot 與 workload bucket 驗證，不把既有 profiling 基礎列成完全未實作。
+本次已實作 bounded placement/workload table 與 exact matching。實作沿用 `spotserve_algorithm1` 的 profile-only ranking 與既有 shape profiling/cache 基礎，補上 placement fingerprint、hotness snapshot、workload bucket、provenance 與 invalidation 驗證。
 
 表格估計的是「候選配置在某種 workload 條件下的 latency 分布」，不是由 expert hotness 推導出某個 request 的確定完成時間，也不為每個 request ID 各建一張表。
 
@@ -240,26 +280,26 @@ final_score = workload_score_excluding_expert_movement
 
 `batch size` 以實際量測的 batch 分布與受控 concurrency 記錄；`max_num_seqs` 只是上限，不等於每一步實際 batch size。hotness 需包含 expert IDs 與 placement-induced rank load；只有一個 global skew scalar 無法區分「熱門 experts 集中在一個 rank」與「分散在多個 ranks」。
 
-同一份 workload bucket 下的示意表如下，數字要由 profiling 填入，不預填假設效能：
+同一份 `short-factual` workload bucket 的實測表如下：
 
 | Profile | TP | vLLM DP | Effective EP | Placement | Workload | Mean Service Latency | p95 | Throughput |
 |---|---:|---:|---:|---|---|---|---|---|
-| P1 | 1 | 2 | 2 | linear，actual mapping A | W1 | 待量測 | 待量測 | 待量測 |
-| P2 | 1 | 2 | 2 | hotness_balanced，actual mapping B | W1 | 待量測 | 待量測 | 待量測 |
-| P3 | 1 | 2 | 2 | round_robin，actual mapping C | W1 | 待量測 | 待量測 | 待量測 |
+| P1 | 1 | 2 | 2 | linear，actual mapping A | short-factual | 1066.89 ms | 1090.73 ms | 0.9373 req/s |
+| P2 | 1 | 2 | 2 | hotness_balanced，actual mapping B | short-factual | 1070.30 ms | 1092.18 ms | 0.9343 req/s |
+| P3 | 1 | 2 | 2 | round_robin，actual mapping C | short-factual | 1068.58 ms | 1092.48 ms | 0.9358 req/s |
 
 `effective EP` 沿用 runtime 對 TP/DP/EP 的語意，不把 EP 當成額外獨立相乘的 GPU 維度。不同硬體、topology、workload、cache 或通信 backend 的 rows 不能任意互換。
 
 #### Profiling 與 Lookup 流程
 
-1. 先通過 A/B 的 contract、hotness semantics 與 actual placement smoke gates，再依 1.2 固定 hardware/runtime/model、EP2 shape、三個 placement candidates 與兩個 workload buckets。
+1. 先通過 A/B 的 contract、hotness semantics 與 actual placement smoke gates，再依 1.2 固定 hardware/runtime/model、EP2 shape、三個 placement candidates 與三個 workload buckets。
 2. 用共同 history window 產生各策略的 placement，凍結 mapping，再重播共同的獨立 profiling workload。
 3. 每個 candidate warmup 後，在指定 concurrency/load 下量測並保存 raw per-request records、routing、batch、placement 與 counters；load/model startup/remap window 另量。
 4. 彙整相同條件的 latency/throughput distribution，保存 sample count 與變異。需要 serving capacity 時另做 load sweep，找出穩定可承受的吞吐量。
 5. planner 用目前 workload window 與 selected placement 查表，記錄 `profile_id`、匹配方式與 confidence，再填入 candidate 的 latency/throughput estimate。
 6. 在未參與建表的 workload 上驗證 prediction error，通過後才開啟 profile-based latency ranking。
 
-第一版僅在 1.2 的六個條件組合內做 exact lookup，不展開完整 schema 的笛卡兒積。動態產生的 mapping 未命中時，標記 `profile_unavailable`；之後可加入經驗證的 bucket interpolation 或校準模型，但不得僅憑 strategy 名稱或 GPU 數匹配。
+完成版僅在 1.2 的九個條件組合內做 exact lookup，不展開完整 schema 的笛卡兒積。動態產生的 mapping 未命中時，標記 `profile_unavailable`；profile interpolation 或校準模型仍未納入，且不得僅憑 strategy 名稱或 GPU 數匹配。
 
 缺資料時保留已有的合法 capacity/movement 決策，該輪對比較集合一致停用無法公平比較的 latency/throughput score components，並輸出 fallback reason；不能只拿掉缺資料 candidate 的 penalty，讓它因為沒有量測而佔優。不將缺值視為零 latency，也不以共用預設值假裝各 candidate 已有相同的實測效能。
 
@@ -323,9 +363,9 @@ backend 的 `derived_from_model_config` 只能表示推導資料。策略名稱�
 
 工程順序固定為 **A -> B -> C -> D -> E -> F**。A/B 先凍結 key、counter/window、rank ownership 與 plan serialization 語意，並用既有 apply/verify hooks 做最小 actual placement/hash smoke；通過後才開始 C 的量測與建表，避免 profiles 因 contract 尚未固定而作廢。這個 B 的 smoke 不新增另一套 remap engine；E 負責完整 controller 整合與回歸。
 
-Phase 1 的驗收可關閉 profile ranking，獨立證明 movement-aware load balancing。Phase 2 再開啟 C 的 profiles 並驗證 serving performance；D/E/F 的整合需保留兩種 mode 的獨立結果。Phase 3 的 source-rank instrumentation 與 A2A optimizer 另外立項，在本輪 A–F 完成後進行。
+Phase 1 的驗收可關閉 profile ranking，獨立證明 movement-aware load balancing。Phase 2 再開啟 C 的 profiles 並驗證 serving performance；D/E/F 的整合需保留兩種 mode 的獨立結果。Phase 3 的 source-rank instrumentation 與 A2A optimizer 已在 A–F 後完成，結果見 0.1 與第 8 節。
 
-| 步驟 | 預計修改位置 | 交付與驗收 |
+| 步驟 | 修改位置 | 交付與驗收 |
 |---|---|---|
 | A. 統一 Hotness Snapshot | runtime patch、`vllm_runtime_metadata.py`、`vllm_expert_remap.py`、router | canonical keys、normalization、window/sample/freshness metadata、TP/DP 去重規則；所有 candidates 使用同一份 snapshot |
 | B. `hotness_balanced` | `moe_placement.py`、既有 runtime hooks | 容量限制下的 greedy assignment、deterministic tie-break、per-layer/rank load、合法性檢查與 actual placement smoke |
@@ -336,14 +376,14 @@ Phase 1 的驗收可關閉 profile ranking，獨立證明 movement-aware load ba
 
 追蹤 checklist：
 
-- [ ] A. Hotness snapshot contract 與 aggregation 驗證完成。
-- [ ] B. `hotness_balanced` 分配、合法性測試與 actual placement smoke 通過。
-- [ ] C. Bounded EP2 candidate profiling table、exact lookup 與 prediction error 驗證完成。
-- [ ] D. Movement-aware selection、stability gates 與 candidate score/profile 整合完成；movement 在最終 objective 只計一次。
-- [ ] E. Runtime remap、actual placement、weight hash 與 inference correctness 驗證通過。
-- [ ] F. 相同 requests 的配對 latency comparison、ablation/benchmark、metrics 與結果文件完成。
+- [x] A. Hotness snapshot contract 與 aggregation 驗證完成。
+- [x] B. `hotness_balanced` 分配、合法性測試與 actual placement smoke 通過。
+- [x] C. Bounded EP2 candidate profiling table、exact lookup 與 prediction error 驗證完成。
+- [x] D. Movement-aware selection、stability gates 與 candidate score/profile 整合完成；movement 在最終 objective 只計一次。
+- [x] E. Runtime remap、actual placement、weight hash 與 inference correctness 驗證通過。
+- [x] F. 相同 requests 的配對 latency comparison、ablation/benchmark、metrics 與結果文件完成。
 
-新增 config/metric 名稱與驗證入口都屬本計畫的待實作項目，尚不能當成目前可直接執行的選項。既有 `linear`/`round_robin` 行為應有回歸保護；現有 `hotness` 雛形需明確記錄遷移語意，實驗使用顯式 `hotness_balanced` 名稱。
+驗證入口為 `scripts/run_hotness_placement_ablation.py`（無 GPU）與 `scripts/run_hotness_placement_runtime_experiment.py`（真實 DP2/EP2 runtime）。既有 `linear`/`round_robin` 行為有回歸保護；實驗使用顯式 `hotness_balanced` 與 `hotness_locality` 名稱。
 
 ## 7. 驗證計畫
 
@@ -359,11 +399,11 @@ Phase 1 的驗收可關閉 profile ranking，獨立證明 movement-aware load ba
 - 搬動成本過高或改善不足時保留合法 current placement；unknown cost 有明確狀態。
 - 候選 score、序列化 plan、執行 mapping 一致，movement penalty 無重複計算。
 - 固定所有其他成本，只增加已知 movement cost；weighted final score 的變化僅為一次 `-weight * delta_movement_ms`。同時啟用 replan-window penalty 時仍成立；J 不額外扣分，raw window estimate 仍完整記錄。
-- Bounded profile manifest 限制 model/GPU/EP shape 與最多 6 個 MVP 條件組合；未列入的 mapping/workload 不自動增列或近似命中，profile-only policy 不默默轉成 heuristic。
+- Bounded profile manifest 限制 model/GPU/EP shape 與 9 個完成版條件組合；未列入的 mapping/workload 不自動增列或近似命中，profile-only policy 不默默轉成 heuristic。
 - 固定 EP2、至少兩個不同 actual mappings 時，Phase 2 保留所有有效 profiles 參與排名；mapping 重複或候選不足會被標記，不由 J 預先刪掉所有替代 placements。
 - profiling table 的 exact match、workload/placement mismatch、過期/版本不符/缺資料，不會產生虛構的零 latency 或重複計入 queue；分位數不直接相加。
 
-新增預計入口 `scripts/run_hotness_placement_ablation.py`，輸出 baseline/candidate placement、per-layer load、movement diff、selection reason 與 assertions。
+驗證入口 `scripts/run_hotness_placement_ablation.py` 會輸出 baseline/candidate placement、per-layer load、movement diff、selection reason 與 assertions。
 
 ### 7.2 Runtime 功能驗證
 
@@ -375,25 +415,26 @@ Phase 1 的驗收可關閉 profile ranking，獨立證明 movement-aware load ba
 4. 選擇搬動的案例有實際 moved shards/bytes；選擇不搬動的案例有可解釋原因。
 5. active-request 模式沿用既有 step-boundary coordination，request completion、state 與錯誤處理通過回歸。
 
-MVP 使用固定 DP2/EP2 coordinated remap 做 runtime 驗收。EP resize 與 simulated cross-host 回歸列為後續擴充，各路徑是否支援新策略分別記錄，不擴大第一版建表範圍。
+MVP 使用固定 DP2/EP2 coordinated remap 做 runtime 驗收；另已完成 EP2→EP4 in-place resize 與 simulated cross-host/failure-domain 回歸，各路徑的結果分別記錄在 0.2，且沒有因此擴大 bounded profile lookup 範圍。
 
 ### 7.3 Performance 與 Ablation
 
-預計新增 `benchmark_matrix_hotness_placement_performance.yaml`，比較以下 strategies：
+實際驗收由 `scripts/run_hotness_placement_runtime_experiment.py` 使用固定 manifest 比較以下 strategies：
 
 | 組別 | 目的 |
 |---|---|
 | `linear` | runtime 預設 baseline |
 | `round_robin` | deterministic 分散 baseline |
 | `hotness_balanced`，固定 movement/stability 設定 | 評估 movement-aware 負載平衡與 serving performance |
+| `hotness_locality` | Phase 3 source-rank-aware remote dispatch/A2A 驗收；不列入 9-row Phase 2 profile table |
 
-第一版僅執行上面三種策略與兩個 workload buckets。舊 `hotness` 的連續分組問題先由 synthetic cases 驗證；movement weight 為零的 sensitivity ablation 留到 MVP 通過後，避免策略/參數再乘出額外 profiling 維度。
+Phase 2 對前三種策略與三個 workload buckets 建立 9-row profiles；`hotness_locality` 另作 Phase 3 驗收。舊 `hotness` 的連續分組問題由 synthetic cases 驗證；MVP 通過後也已完成 movement weight 0/1 與 `alpha` 0.8/1.0 sensitivity ablation，而沒有把參數組合乘進 bounded profile lookup。
 
 synthetic histogram 用於證明決策正確；performance claim 使用真實模型 routing。每組保持相同硬體、模型、TP/DP/EP、workload、trace、warmup、sampling 與量測長度。用獨立的相同 warmup/history 建立 training window，固定策略參數後再量測後續 workload；不可用 candidate evaluation 的未來 routing 反過來挑 placement。
 
 先依 4.5 建立 candidate profiling table，再使用另一份 evaluation workload 做 end-to-end comparison。每筆 request 依 3.3 配對，保留 token lengths、完成狀態與 routing 差異；不能拿 baseline 的 request A 與 candidate 的 request B latency 宣稱 placement 效益。
 
-先比較兩個固定 workload suites 實際觀測的 routing 分布，優先涵蓋較均勻與較偏斜的情境；hotness shift 作為後續第三個 bucket 或 held-out stress test。實際模型若無法產生足夠 routing skew，應如實報告，不靠注入 histogram 宣稱 end-to-end 效能改善。多次重複並報告變異；remap window 與 post-remap steady state 分開呈現。
+比較三個固定 workload suites 實際觀測的 routing 分布，其中 `hotness-shift` 未參與 calibration，作為 held-out stress/prediction-error test。實際結果如實保留 routing skew 與沒有 end-to-end serving 優勢的結論，未以 synthetic histogram 取代 performance claim；各條件有 10 次 samples，remap window 與 post-remap steady state 分開呈現。
 
 必要 metrics：
 
@@ -406,11 +447,11 @@ synthetic histogram 用於證明決策正確；performance claim 使用真實模
 - remap window latency 與 post-remap steady-state latency。
 - baseline/candidate A2A counters 的相同區間 delta；流量計數與 predictor 分開標示。
 
-Phase 1/2 中的 A2A counters 僅作 observation；global/recent hotness 不含 token source rank，無法直接估計 remote dispatch，也不能因 load CV 或 latency 下降就宣稱 A2A reduction。該 claim 等待 Phase 3 的 joint routing statistics 與獨立實測 gate。
+Phase 1/2 中的 A2A counters 僅作 observation；global/recent hotness 不含 token source rank，無法直接估計 remote dispatch，也不能因 load CV 或 latency 下降就宣稱 A2A reduction。A2A reduction claim 已由 Phase 3 的 joint routing statistics 與獨立實測 gate 支持。
 
 完成判準是策略影響了真實 runtime placement、correctness 通過且量測可重現。若 predicted imbalance 降低但 throughput/latency 沒改善，保留此結果並分析計算/通信瓶頸；不把功能驗收當成 performance conclusion。
 
-## 8. 後續：Routing Locality 與 A2A
+## 8. Phase 3：Routing Locality 與 A2A（已完成）
 
 global hotness 沒有 token source 的資訊。要減少 remote dispatch，需保留 source rank 與 destination expert 的 joint statistics：
 
@@ -423,6 +464,6 @@ estimated_remote_assignments(P)
 
 這個簡式先限 TP1、單一 owner 的 topology；TP sharding、replication 與跨 domain 情況需用 runtime 實際 dispatch semantics 計算 locality。資料應在 dispatch 前觀測，避免搬動後把 expert execution rank 誤當 token source。
 
-之後在負載與容量限制下加入 remote dispatch objective，利用現有 destination-aware sparse A2A backend 重播相同 workload，比較 collective payload delta。先定義 payload 包含哪些 tensor/metadata、是否以 sender bytes 計數，避免 send/receive 重複加總。internode/network wire bytes 與 collective tensor payload 分開報告。
+已在負載與容量限制下加入 remote dispatch objective，利用 destination-aware sparse A2A backend 重播相同 workload，比較 collective payload delta。runtime patch 在 dispatch 前記錄 `source-rank:{rank}/layer:{layer}/expert:{expert}`，DP aggregation 對獨立 source streams 加總並對 TP 重複觀測取每 key 最大值；contract 不完整或 rank semantics 不符時 fail closed，不啟用 locality placement。
 
-該階段的 claim 必須由實測 reduction 與 output correctness 支持。第一階段可宣稱使用 runtime hotness 做 movement-aware expert load balancing；A2A reduction 則等待這一階段的獨立驗收。
+實測以 communicator 實際傳輸的 sender/receiver sparse tensor bytes 計數，未把它描述成 internode/network wire bytes。linear 與 `hotness_locality` 的相同 workload payload 分別為 16,950,912 與 14,279,232 bytes，降低 2,671,680 bytes（15.76%）；collective calls 都是 13,952，paired output signatures 全部一致。完整 counters 與 mappings 保存於 [runtime-experiment-complete.json](../results/hotness_placement/runtime-experiment-complete.json)。

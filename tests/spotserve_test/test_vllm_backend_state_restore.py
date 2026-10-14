@@ -243,6 +243,22 @@ class FakeStagingEngine(FakeStatefulEngine):
         return {"restored": False, "staged": True, "expected_blocks": 2}
 
 
+class FakeAsyncTokenizerEngine:
+    class Tokenizer:
+        def __init__(self):
+            self.calls = []
+
+        def decode(self, token_ids, *, skip_special_tokens):
+            self.calls.append((list(token_ids), skip_special_tokens))
+            return "decoded-output"
+
+    def __init__(self):
+        self.tokenizer = self.Tokenizer()
+
+    async def get_tokenizer(self):
+        return self.tokenizer
+
+
 def make_backend(engine=None, **backend_config):
     backend = VllmBackend.__new__(VllmBackend)
     backend.model_name = "model"
@@ -261,6 +277,20 @@ def make_backend(engine=None, **backend_config):
     backend.status = BackendStatus.RUNNING
     backend.status_lock = asyncio.Lock()
     return backend
+
+
+@pytest.mark.asyncio
+async def test_output_decode_awaits_async_vllm_tokenizer():
+    engine = FakeAsyncTokenizerEngine()
+    backend = make_backend(engine)
+
+    decoded = await backend._decode_output_token_ids(
+        [10, 20, 30],
+        skip_special_tokens=True,
+    )
+
+    assert decoded == "decoded-output"
+    assert engine.tokenizer.calls == [([10, 20, 30], True)]
 
 
 def test_runtime_routed_expert_chunks_are_aggregated_by_layer_and_expert():

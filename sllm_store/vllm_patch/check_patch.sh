@@ -26,6 +26,7 @@ PATCH_FILES=(
     "$SCRIPT_DIR/runtime_moe_metadata.patch"
     "$SCRIPT_DIR/runtime_sparse_a2a.patch"
     "$SCRIPT_DIR/runtime_elastic_ep.patch"
+    "$SCRIPT_DIR/runtime_ray_dp_placement.patch"
 )
 
 VLLM_PATH_OUTPUT=$(python -c "import vllm; import os; print(os.path.dirname(os.path.abspath(vllm.__file__)))" 2>/dev/null)
@@ -174,5 +175,10 @@ fi
 if ! grep -q "falling back to ray.nodes()" \
     "$VLLM_PATH/v1/engine/utils.py"; then
     echo "Missing patched vLLM elastic EP Ray node fallback" >&2
+    exit 1
+fi
+if ! grep -q '"VLLM_RAY_DP_PLACEMENT_NODE_IPS"' "$VLLM_PATH/envs.py" ||
+    ! grep -q "placement_node_ips =" "$VLLM_PATH/v1/engine/utils.py"; then
+    echo "Missing patched vLLM reserved-worker Ray DP placement" >&2
     exit 1
 fi

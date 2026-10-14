@@ -1,5 +1,8 @@
+from sllm.spot.moe_placement import build_logical_expert_placement_plan
 from sllm.spot.reparallelization import (
+    ParallelConfig,
     ParallelPlan,
+    _score_parallel_candidates_for_workload,
     apply_spot_event_to_worker_nodes,
     generate_parallel_candidates,
     plan_dynamic_reparallelization,
@@ -883,3 +886,178 @@ def test_parallel_plan_shared_interface_serializes_to_dict():
     assert payload["placement_epoch"] == 0
     assert payload["expert_placement_plan"] is None
     assert payload["reason"] == "spot_preempt"
+
+
+def test_weighted_score_counts_expert_movement_once_with_window_penalty():
+    candidate = ParallelConfig(
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
+        data_parallel_size=1,
+        replica_count=1,
+        total_gpus=1,
+        unused_gpus=0,
+        score=1.0,
+        reason="candidate",
+        expert_weight_movement_cost_estimate_ms=100.0,
+    )
+    scored, snapshot = _score_parallel_candidates_for_workload(
+        [candidate],
+        {
+            "enable_workload_cost_model": True,
+            "base_score_weight": 0,
+            "throughput_score_weight": 0,
+            "latency_penalty_weight": 0,
+            "load_time_penalty_weight": 1,
+            "migration_cost_penalty_weight": 1,
+            "queue_penalty_weight": 1,
+            "expert_weight_movement_penalty_weight": 1,
+            "replan_window_penalty_weight": 1,
+            "latency_estimate_ms": 1000,
+            "model_load_time_ms": 10,
+            "migration_cost_ms": 20,
+        },
+        {},
+    )
+
+    assert snapshot["expert_movement_scoring_enabled"] is True
+    assert scored[0].replan_window_cost_ms == 130.0
+    assert scored[0].replan_window_penalty_cost_ms == 0.0
+    assert scored[0].score_components[
+        "expert_weight_movement_penalty"
+    ] == 100.0
+    assert scored[0].score_components["replan_window_penalty"] == 0.0
+    assert scored[0].score == -130.0
+
+
+def test_exact_placement_profiles_rank_distinct_frozen_mappings():
+    model_config = {
+        "model": "tiny-moe",
+        "backend": "vllm",
+        "num_gpus": 2,
+        "runtime_metadata": {
+            "global_expert_hotness": {
+                "layer:0/expert:0": 100,
+                "layer:0/expert:1": 80,
+                "layer:0/expert:2": 20,
+                "layer:0/expert:3": 10,
+            },
+            "recent_window_expert_hotness": {
+                "layer:0/expert:0": 100,
+                "layer:0/expert:1": 80,
+                "layer:0/expert:2": 20,
+                "layer:0/expert:3": 10,
+            },
+            "moe_route_histogram_complete_sparse": True,
+            "moe_route_global_reset_marker": "test-profiles",
+        },
+        "backend_config": {
+            "enable_expert_parallel": True,
+            "model_config": {"num_hidden_layers": 1, "num_experts": 4},
+        },
+        "backend_capability": {
+            "supported_configs": [{
+                "tensor_parallel_size": 1,
+                "pipeline_parallel_size": 1,
+                "data_parallel_size": 2,
+                "replica_count": 1,
+                "enable_expert_parallel": True,
+                "num_gpus": 2,
+            }]
+        },
+    }
+    target = {
+        "backend": "vllm",
+        "tensor_parallel_size": 1,
+        "pipeline_parallel_size": 1,
+        "data_parallel_size": 2,
+        "replica_count": 1,
+        "enable_expert_parallel": True,
+        "effective_expert_parallel_size": 2,
+    }
+    fingerprints = {}
+    for strategy in ("linear", "round_robin", "hotness_balanced"):
+        plan = build_logical_expert_placement_plan(
+            "tiny-moe",
+            target,
+            model_config=model_config,
+            planner_config={
+                "target_expert_placement_strategy": strategy,
+            },
+        )
+        assert plan is not None
+        fingerprints[strategy] = plan.placement_fingerprint
+
+    profiles = []
+    for strategy, latency in (
+        ("linear", 30.0),
+        ("round_robin", 20.0),
+        ("hotness_balanced", 10.0),
+    ):
+        profiles.append({
+            "profile_id": f"profile-{strategy}",
+            "manifest_id": "mvp-1",
+            "workload_bucket_id": "skewed",
+            "placement_fingerprint": fingerprints[strategy],
+            "tensor_parallel_size": 1,
+            "pipeline_parallel_size": 1,
+            "vllm_data_parallel_size": 2,
+            "effective_expert_parallel_size": 2,
+            "sllm_replica_count": 1,
+            "service_latency_mean_ms": latency,
+            "throughput_req_s": 100.0 / latency,
+            "sample_count": 10,
+            "prediction_validated": True,
+            "held_out_prediction_error_ratio": 0.1,
+        })
+
+    decision = plan_dynamic_reparallelization(
+        model_name="tiny-moe",
+        worker_nodes={
+            "0": {
+                "ray_node_id": "node-0",
+                "address": "10.0.0.1",
+                "free_gpu": 2,
+                "total_gpu": 2,
+                "state": "ready",
+            }
+        },
+        model_config=model_config,
+        planner_config={
+            "selection_policy": "spotserve_algorithm1",
+            "arrival_rate_req_s": 1.0,
+            "workload_bucket_id": "skewed",
+            "expert_placement_profile_manifest": {
+                "manifest_id": "mvp-1",
+                "max_conditions": 6,
+                "model_id": "tiny-moe",
+                "gpu_type": "test-gpu",
+                "runtime_fingerprint": "runtime-1",
+                "dtype": "float16",
+                "quantization": "none",
+                "moe_backend": "all-to-all",
+            },
+            "placement_profile_context": {
+                "model_id": "tiny-moe",
+                "gpu_type": "test-gpu",
+                "runtime_fingerprint": "runtime-1",
+                "dtype": "float16",
+                "quantization": "none",
+                "moe_backend": "all-to-all",
+            },
+            "expert_placement_profiles": profiles,
+        },
+        event="manual",
+        backend="vllm",
+    )
+
+    assert decision["candidate_count"] == 3
+    assert decision["placement_profile_lookup"][
+        "all_candidates_matched"
+    ] is True
+    assert decision["selected_config"]["placement_profile_id"] == (
+        "profile-hotness_balanced"
+    )
+    assert decision["expert_placement_plan"]["placement_strategy"] == (
+        "hotness_balanced"
+    )
+    assert decision["selected_latency_estimate_ms"] == 10.0

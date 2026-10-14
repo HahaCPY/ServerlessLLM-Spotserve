@@ -48,11 +48,43 @@ def test_replanning_event_exposes_normalized_expert_assignment():
         decision={
             "expert_placement_plan": {
                 "target_rank_count": 2,
+                "placement_strategy": "hotness_balanced",
+                "selection_reason": "hotness_balance_improvement_accepted",
+                "hotness_snapshot_id": "snapshot-1",
+                "hotness_snapshot_available": True,
+                "hotness_snapshot_reason": "valid_hotness_snapshot",
+                "hotness_snapshot": {"sample_count": 210, "age_s": 0.5},
+                "hotness_layer_coverage": 1.0,
+                "predicted_improvement_ratio": 0.9,
+                "estimated_load_balance_penalty": 0.05,
+                "placement_objective": 0.05,
+                "per_layer_rank_load": {"0": {"0": 0.52, "1": 0.48}},
+                "per_layer_load_imbalance": {"0": 0.05},
+                "per_layer_load_cv": {"0": 0.04},
+                "source_rank_locality_available": True,
+                "source_rank_locality_reason": "valid_source_rank_histogram",
+                "estimated_remote_assignments": 42,
+                "estimated_total_assignments": 100,
+                "estimated_remote_ratio": 0.42,
+                "per_source_remote_assignments": {
+                    "0": {"remote": 20, "total": 50},
+                    "1": {"remote": 22, "total": 50},
+                },
                 "expert_to_target_rank": {
                     "layer:0/expert:1": "ep-rank:1",
                     "layer:0/expert:0": "ep-rank:0",
                 },
-            }
+            },
+            "placement_profile_lookup": {
+                "enabled": True,
+                "matched_candidate_count": 3,
+            },
+            "selected_config": {
+                "placement_profile_available": True,
+                "placement_profile_id": "profile-1",
+                "placement_profile_match_reason": "exact_match",
+            },
+            "selected_replan_window_penalty_cost_ms": 12.0,
         },
     )
 
@@ -64,6 +96,18 @@ def test_replanning_event_exposes_normalized_expert_assignment():
         },
         "expert_to_target_ranks": {},
     }
+    assert event["expert_placement_strategy"] == "hotness_balanced"
+    assert event["expert_placement_hotness_sample_count"] == 210
+    assert event["expert_placement_per_layer_rank_load"]["0"]["0"] == 0.52
+    assert event["expert_placement_source_rank_locality_available"] is True
+    assert event["expert_placement_estimated_remote_assignments"] == 42
+    assert event["expert_placement_estimated_remote_ratio"] == 0.42
+    assert event["expert_placement_per_source_remote_assignments"]["1"] == {
+        "remote": 22,
+        "total": 50,
+    }
+    assert event["selected_placement_profile_id"] == "profile-1"
+    assert event["selected_replan_window_penalty_cost_ms"] == 12.0
 
 
 def test_replanning_event_exposes_runtime_expert_placement_hook_status():

@@ -26,6 +26,7 @@ PATCH_FILES=(
     "$SCRIPT_DIR/runtime_moe_metadata.patch"
     "$SCRIPT_DIR/runtime_sparse_a2a.patch"
     "$SCRIPT_DIR/runtime_elastic_ep.patch"
+    "$SCRIPT_DIR/runtime_ray_dp_placement.patch"
 )
 
 for PATCH_FILE in "${PATCH_FILES[@]}"; do
@@ -110,6 +111,10 @@ fi
 if ! grep -q "falling back to ray.nodes()" \
     "$VLLM_PATH/v1/engine/utils.py"; then
     MISSING_MOE_MARKERS+=("elastic_ep.ray_nodes_fallback")
+fi
+if ! grep -q '"VLLM_RAY_DP_PLACEMENT_NODE_IPS"' "$VLLM_PATH/envs.py" ||
+    ! grep -q "placement_node_ips =" "$VLLM_PATH/v1/engine/utils.py"; then
+    MISSING_MOE_MARKERS+=("ray_dp.reserved_worker_placement")
 fi
 if [[ "${#MISSING_MOE_MARKERS[@]}" -gt 0 ]]; then
     echo "Missing patched vLLM MoE/placement markers: ${MISSING_MOE_MARKERS[*]}" >&2

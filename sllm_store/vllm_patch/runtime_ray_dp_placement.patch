@@ -1,0 +1,74 @@
+diff --git a/vllm/envs.py b/vllm/envs.py
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -140,6 +140,7 @@ if TYPE_CHECKING:
+     VLLM_MOE_DP_CHUNK_SIZE: int = 256
+     VLLM_RANDOMIZE_DP_DUMMY_INPUTS: bool = False
+     VLLM_RAY_DP_PACK_STRATEGY: Literal["strict", "fill", "span"] = "strict"
++    VLLM_RAY_DP_PLACEMENT_NODE_IPS: str = ""
+     VLLM_MARLIN_USE_ATOMIC_ADD: bool = False
+     VLLM_MXFP4_USE_MARLIN: bool | None = None
+     VLLM_V1_USE_OUTLINES_CACHE: bool = False
+@@ -1082,6 +1083,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_RAY_DP_PACK_STRATEGY": lambda: os.getenv(
+         "VLLM_RAY_DP_PACK_STRATEGY", "strict"
+     ),
++    "VLLM_RAY_DP_PLACEMENT_NODE_IPS": lambda: os.getenv(
++        "VLLM_RAY_DP_PLACEMENT_NODE_IPS", ""
++    ),
+     # Whether to use S3 path for model loading in CI via RunAI Streamer
+     "VLLM_CI_USE_S3": lambda: os.environ.get("VLLM_CI_USE_S3", "0") == "1",
+     # Use model_redirect to redirect the model name to a local folder.
+diff --git a/vllm/v1/engine/utils.py b/vllm/v1/engine/utils.py
+--- a/vllm/v1/engine/utils.py
++++ b/vllm/v1/engine/utils.py
+@@ -363,9 +363,46 @@ class CoreEngineActorManager:
+         local_dp_ranks: list[int] = []
+ 
+         dp_master_ip_key = f"node:{dp_master_ip}"
+-        nodes = sorted(
+-            available_resources.values(), key=lambda x: dp_master_ip_key not in x
+-        )
++        placement_node_ips = [
++            value.strip()
++            for value in envs.VLLM_RAY_DP_PLACEMENT_NODE_IPS.split(",")
++            if value.strip()
++        ]
++        if placement_node_ips:
++            if len(placement_node_ips) != len(set(placement_node_ips)):
++                raise ValueError(
++                    "VLLM_RAY_DP_PLACEMENT_NODE_IPS contains duplicate IPs"
++                )
++            if placement_node_ips[0] != dp_master_ip:
++                raise ValueError(
++                    "The first VLLM_RAY_DP_PLACEMENT_NODE_IPS entry must "
++                    "match the data-parallel master IP"
++                )
++            resources_by_ip = {}
++            for node_resources in available_resources.values():
++                node_ip_keys = [
++                    key
++                    for key in node_resources
++                    if key != "node:__internal_head__" and key.startswith("node:")
++                ]
++                if len(node_ip_keys) == 1:
++                    resources_by_ip[node_ip_keys[0].split(":", 1)[1]] = (
++                        node_resources
++                    )
++            missing_node_ips = [
++                value for value in placement_node_ips if value not in resources_by_ip
++            ]
++            if missing_node_ips:
++                raise ValueError(
++                    "Reserved Ray DP placement nodes are unavailable: "
++                    f"{missing_node_ips}"
++                )
++            nodes = [resources_by_ip[value] for value in placement_node_ips]
++        else:
++            nodes = sorted(
++                available_resources.values(),
++                key=lambda x: dp_master_ip_key not in x,
++            )
+         assert len(nodes) > 0, "No nodes with resources found in Ray cluster."
+         assert dp_master_ip_key in nodes[0], (
+             "The DP master node (ip: %s) is missing or dead",
