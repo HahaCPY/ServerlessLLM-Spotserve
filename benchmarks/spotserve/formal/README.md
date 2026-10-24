@@ -7,9 +7,9 @@ Ray namespace。
 
 預設實驗使用 Qwen1.5-MoE-A2.7B-Chat。K8 testbed 是一個不配置 GPU 的 head pod，
 加上八個各配置一張 GPU 的 Ray worker pods。八張 GPU 是同一個 resource pool，不是
-八個固定 serving instances。正式 trace 在 model deployment 前先將 pool-slot 6、7 標為
-不可用，因此初始可服務容量是 6 GPU；其中兩個獨立 EP2 serving deployments 使用 4 GPU，
-保留 2 GPU 作 make-before-break reconfiguration/migration headroom。Workload 使用彼此
+八個固定 serving instances。正式 trace 初始開放全部 8 GPU；其中兩個獨立 EP2 serving
+deployments 使用 4 GPU，保留 4 GPU 作 make-before-break reconfiguration/migration
+headroom。Workload 使用彼此
 不同的 8192-token prompt、產生 2048 tokens、關閉 prefix caching，並根據離線 profile
 校正 anchor request 的抵達時間，使固定的 preemption notice 發生在約 512 個 generated
 tokens（允許範圍 384--640）。
@@ -24,18 +24,18 @@ tokens（允許範圍 384--640）。
 
 | Trace time | 事件 | deadline 後可用 GPU | 實驗語意 |
 | ---: | --- | ---: | --- |
-| 0 s | 8 個 workers 中先開放 slots 0--5 | 6 | 兩個 EP2 sources + 2-GPU migration headroom |
-| 570 s | slot 3 收到 preemption notice | 6 | grace 期間 source 尚活著，開始 freeze/export/transfer/attach/ack |
-| 600 s | 30 秒 grace 到期 | 5 | slot 3 正式不可用 |
-| 660 s | add slot 6 | 6 | 新容量加入並觸發一次 runtime replanning |
-| 780 s | add slot 7 | 7 | 再加入一張 GPU 並重新規劃 |
-| 900 s | add slot 3 | 8 | pool 回到上限 |
-| 1170 s | slots 3、6 同時收到 notice | 8 | 測試較高容量下的雙 GPU churn |
-| 1200 s | 第二次 grace 到期 | 6 | trace 最後保持 6 張可用 GPU |
+| 0 s | 8 個 workers 全部可用 | 8 | 兩個 EP2 sources + 4-GPU migration headroom |
+| 570 s | active slot 3 收到 preemption notice | 8 | grace 期間 source 尚活著，開始 freeze/export/transfer/attach/receipt |
+| 600 s | 第一個 30 秒 grace 到期 | 7 | slot 3 正式不可用 |
+| 690 s | restore slot 3 | 8 | 第一輪 recovery 與第二輪 churn 分離 |
+| 1170 s | slots 1、5 同時收到 notice | 8 | 在 pool 回滿後測試雙 GPU churn |
+| 1200 s | 第二個 30 秒 grace 到期 | 6 | slots 1、5 正式不可用 |
+| 1260 s | restore slot 1 | 7 | 逐步恢復容量 |
+| 1320 s | restore slot 5 | 8 | pool 回到上限 |
 
-這條路徑是 `6 → 5 → 6 → 7 → 8 → 6`，同時包含縮容、逐步擴容、回復到滿載以及
-多 GPU 回收，比單純 `8 → 7 → 8` 多出可觀察的 planner 選擇點。每個 event 的容量單位
-都是一張 GPU；`pool-slot-N` 會在正式 run 前解析成實際 Ray worker ID。
+這條路徑是 `8 → 7 → 8 → 6 → 7 → 8`。第一輪單 GPU recovery 完成後才進入第二輪
+雙 GPU churn，避免兩輪 recovery 因事件距離過近而混在一起。每個 event 的容量單位都是
+一張 GPU；`pool-slot-N` 會在正式 run 前解析成實際 Ray worker ID。
 
 名稱中的 `A2.7B` 是 active-parameter scale，不可當成 dense 2.7B checkpoint 的顯存需求；
 EP2/EP3/EP4 都必須用正式 GPU 與相同 model snapshot 個別通過 peak-memory/profile gate。
@@ -59,9 +59,14 @@ Preemption 後的 planner 候選為 EP2、EP3 與 EP4。候選是以 TP/PP/DP/EP
    降級命名為 `SpotServe-planner` 或 live make-before-break migration。
 3. KM device mapping、逐層搬運、token-budget JIT 與 transfer ACK 尚未完成；global engine
    recreation 仍可能中斷 unaffected instance。不能稱為完整原版 SpotServe。
-4. 每次呼叫 runner 都必須提供 `--repeats R`；F1 四組加 F2 四組，共執行 `8 × R`
-   個 formal runs。`R=1` 只能作 exploratory evidence；`R>=2` 才能估計 sample variance
-   與 paired Student-t confidence interval。
+4. 每次呼叫 runner 都必須提供 `--repeats R`。一般模式執行 `8 × R` 個 formal runs；
+   CSCC `--single-pass` 會重用 F1/F2 中 flags 完全相同的 off/off 與 on/on cells，因此每個
+   repeat 是 6 個唯一 runs。六個 unique cells 會用固定 seed 一起隨機排序，避免兩個
+   F2-only cells 固定排在 F1 後面。`R=1` 只能作 exploratory evidence；`R>=2` 才能估計
+   sample variance 與 paired Student-t confidence interval。
+5. Stateful cell 必須同時通過 raw response restored-block、native completion receipt、零
+   fallback，以及 receipt 後／deadline 前才釋放 source 的 gate。這裡的 receipt 是
+   request 完成證據，不是 early connector transfer ACK。
 
 請先閱讀 [implementation status](../../../docs/spotserve-k8s-implementation-status.md)，
 不要直接以 `--phase all` 的骨架存在就認定 stateful recovery 可在 9 pods 上成立。

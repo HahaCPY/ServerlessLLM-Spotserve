@@ -186,6 +186,24 @@ def test_stateful_formal_treatments_require_native_kv_not_replay():
             assert required == (driver.treatment_flags(experiment, treatment)["recovery_policy"] == "stateful_recovery")
 
 
+def test_single_pass_randomizes_all_six_unique_cells_together():
+    driver = load_driver()
+    order = driver.formal_run_order(20261002, 1, True)
+
+    assert len(order) == 6
+    assert len(set(order)) == 6
+    assert {cell for cell in order if cell[0] == "f1"} == {
+        ("f1", treatment) for treatment in driver.F1_TREATMENTS
+    }
+    assert {cell for cell in order if cell[0] == "f2"} == {
+        ("f2", "reparallelization_only"),
+        ("f2", "migration_only"),
+    }
+    assert any(
+        experiment == "f2" for experiment, _ in order[:-2]
+    ), "F2-only cells must not be structurally forced to the end"
+
+
 def test_repeat_workloads_are_paired_without_overwriting_previous_input(tmp_path):
     driver = load_driver()
     spec = load_default_spec()
@@ -215,16 +233,16 @@ def test_repeat_workloads_are_paired_without_overwriting_previous_input(tmp_path
         if line.strip()
     ]
     assert [row["event"] for row in trace] == [
-        "preempt", "preempt", "preempt", "add", "add", "add",
+        "preempt", "add", "preempt", "preempt", "add", "add",
     ]
     assert [row["node_id"] for row in trace] == [
-        "3", "1", "5", "3", "1", "5",
+        "3", "3", "1", "5", "1", "5",
     ]
     assert [row["time"] for row in trace] == [
-        570.0, 630.0, 630.0, 690.0, 750.0, 810.0,
+        570.0, 690.0, 1170.0, 1170.0, 1260.0, 1320.0,
     ]
     assert trace[0]["grace_period_s"] == 30.0
-    assert trace[3]["node_info"] == {
+    assert trace[1]["node_info"] == {
         "free_gpu": 1, "state": "ready", "total_gpu": 1,
     }
     assert all(row["gpu_count"] == 1 for row in trace)
@@ -249,14 +267,14 @@ def test_trace_schedule_is_calibrated_and_never_exceeds_eight_gpus():
 
     assert schedule["effective_preemption_time_s"] == 570.0
     assert schedule["effective_add_time_s"] == 690.0
-    assert schedule["preemption_notice_times_s"] == [570.0, 630.0]
-    assert schedule["calibrated_anchor_arrival_times_s"] == [544.0, 604.0]
+    assert schedule["preemption_notice_times_s"] == [570.0, 1170.0]
+    assert schedule["calibrated_anchor_arrival_times_s"] == [544.0, 1144.0]
     assert schedule["formal_burst_start_times_s"] == [
-        20.0, 240.0, 420.0, 544.0, 604.0, 840.0,
+        20.0, 360.0, 544.0, 800.0, 1144.0, 1220.0,
     ]
     assert schedule["configured_output_tokens"] == 2048
     assert [row["available_gpus"] for row in schedule["capacity_timeline"]] == [
-        8, 7, 5, 6, 7, 8,
+        8, 7, 8, 6, 7, 8,
     ]
     assert max(
         row["available_gpus"] for row in schedule["capacity_timeline"]

@@ -27,13 +27,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", required=True)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
-    parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument(
+        "--workers", type=int, default=int(os.getenv("N_GPUS", "8"))
+    )
     parser.add_argument("--port", type=int, default=8343)
-    parser.add_argument("--startup-timeout-s", type=float, default=300.0)
+    parser.add_argument(
+        "--startup-timeout-s",
+        type=float,
+        default=float(os.getenv("WAIT_SECONDS", "3600")),
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     if args.workers != 8:
         parser.error("the formal protocol requires exactly 8 GPU workers")
+    if args.startup_timeout_s <= 0:
+        parser.error("--startup-timeout-s must be positive")
     return args
 
 
@@ -115,7 +123,7 @@ def hold_eight_gpu_nodes(ray: Any, worker_count: int, timeout_s: float):
                 "hostname": socket.gethostname(),
             }
 
-    bundle = {"CPU": 0.1, "GPU": 1}
+    bundle = {"CPU": 1, "GPU": 1}
     group = placement_group(
         [bundle.copy() for _ in range(worker_count)],
         strategy="STRICT_SPREAD",
@@ -207,7 +215,7 @@ def hold_eight_gpu_nodes(ray: Any, worker_count: int, timeout_s: float):
         flush=True,
     )
 
-    reservation_type = ray.remote(num_cpus=0.1, num_gpus=1)(GPUReservation)
+    reservation_type = ray.remote(num_cpus=1, num_gpus=1)(GPUReservation)
     reservations = [
         reservation_type.options(
             scheduling_strategy=PlacementGroupSchedulingStrategy(

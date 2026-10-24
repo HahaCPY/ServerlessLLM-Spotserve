@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "description": "A controlled synthetic availability trace adapted from the supplied add/remove pattern and capped at eight GPUs. It preserves the original one-GPU removal, two-GPU removal, and gradual one-GPU recovery sequence.",
+  "description": "A controlled synthetic availability trace over an eight-GPU pool. A single active source GPU is reclaimed first and restored before a later two-GPU reclaim, so the first recovery is not confounded by cascading churn.",
   "units": {
     "capacity": "gpu",
     "time": "second"
@@ -18,15 +18,7 @@
       "grace_period_s": 30.0
     },
     {
-      "name": "final-two-gpu-reclaim-notice",
-      "event": "preempt",
-      "gpu_count": 2,
-      "targets": ["pool-slot-1", "pool-slot-5"],
-      "time_s": 630.0,
-      "grace_period_s": 30.0
-    },
-    {
-      "name": "add-first-replacement-gpu",
+      "name": "restore-first-reclaimed-gpu",
       "event": "add",
       "gpu_count": 1,
       "targets": ["pool-slot-3"],
@@ -34,19 +26,27 @@
       "node_info": {"free_gpu": 1, "total_gpu": 1, "state": "ready"}
     },
     {
-      "name": "add-second-replacement-gpu",
+      "name": "later-two-gpu-reclaim-notice",
+      "event": "preempt",
+      "gpu_count": 2,
+      "targets": ["pool-slot-1", "pool-slot-5"],
+      "time_s": 1170.0,
+      "grace_period_s": 30.0
+    },
+    {
+      "name": "restore-second-reclaimed-gpu",
       "event": "add",
       "gpu_count": 1,
       "targets": ["pool-slot-1"],
-      "time_s": 750.0,
+      "time_s": 1260.0,
       "node_info": {"free_gpu": 1, "total_gpu": 1, "state": "ready"}
     },
     {
-      "name": "add-third-replacement-gpu",
+      "name": "restore-third-reclaimed-gpu",
       "event": "add",
       "gpu_count": 1,
       "targets": ["pool-slot-5"],
-      "time_s": 810.0,
+      "time_s": 1320.0,
       "node_info": {"free_gpu": 1, "total_gpu": 1, "state": "ready"}
     }
   ],
@@ -54,9 +54,9 @@
     "target_generated_tokens_at_preempt": 512,
     "progress_min_tokens": 384,
     "progress_max_tokens": 640,
-    "trace_end_s": 900.0,
+    "trace_end_s": 1440.0,
     "formal_burst_count": 6,
-    "background_burst_times_s": [20.0, 240.0, 420.0, 840.0]
+    "background_burst_times_s": [20.0, 360.0, 800.0, 1220.0]
   },
-  "expected_capacity_path": [8, 7, 5, 6, 7, 8]
+  "expected_capacity_path": [8, 7, 8, 6, 7, 8]
 }

@@ -254,10 +254,15 @@ ray job stop --address "$RAY_ADDRESS" <job-id>
 ## 8. 正式單次 F1/F2
 
 正式 protocol 固定使用同一個 Qwen1.5-MoE checkpoint、同一份 8192-input／2048-output
-workload 與 `8 → 7 → 5 → 6 → 7 → 8` logical capacity trace。F1 執行 Rerouting、
+workload 與 `8 → 7 → 8 → 6 → 7 → 8` logical capacity trace。F1 執行 Rerouting、
 Reparallelization、Original SpotServe、MoE-SpotServe；F2 對 MoE-aware Reparallelization 與
 MoE-aware Migration 做 2×2 ablation。F1 Original 與 MoE-SpotServe 分別等同 F2 的
 off/off 與 on/on，所以 F2 引用這兩列，只需 6 次唯一 formal GPU runs。
+
+提交前必須在沒有既存 Ray session 的狀態下設定 `X-CSCC-GPUs: 8` 與
+`X-CSCC-Gang: true`。平台會等 8 張 GPU 同時可用才一起啟動 workers；程式內再以八個
+`{"CPU": 1, "GPU": 1}` bundles 的 placement group 作第二層 fail-closed gate。詳見
+[CSCC gang scheduling](https://www.cs.nthu.edu.tw/~cscc/site/manual/zh/use-cases/ray-placement-group-gang/)。
 
 完整命令、輸出與解讀限制見 [FORMAL_F1_F2.md](FORMAL_F1_F2.md)。
 

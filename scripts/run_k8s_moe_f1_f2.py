@@ -28,6 +28,8 @@ from typing import Any, Iterable, Mapping, Optional
 from urllib import request
 from zoneinfo import ZoneInfo
 
+from sllm.spot.core_validation import audit_native_kv_receipts
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BENCHMARK_RUNNER = REPO_ROOT / "benchmarks/spotserve/run_benchmark.py"
@@ -116,6 +118,14 @@ def write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
 
 def read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
 
 
 def shape_signature(shape: Mapping[str, Any]) -> tuple[int, int, int, int, bool]:
@@ -2026,6 +2036,8 @@ def write_one_run_artifacts(
             "formal_treatment": treatment,
             "formal_repeat": repeat,
             "require_runtime_ep_audit": True,
+            "capture_instance_states": True,
+            "capture_instance_states_after_workload": True,
             "runtime_ep_audit_expected_size": int(
                 spec["initial_parallel"]["tensor_parallel_size"]
             ) * int(spec["initial_parallel"]["data_parallel_size"]),
@@ -2039,28 +2051,151 @@ def write_one_run_artifacts(
     return matrix_path, deploy_path
 
 
+def audit_formal_runtime_evidence(
+    spec: Mapping[str, Any], summary: Mapping[str, Any], experiment: str,
+    treatment: str, metrics_path: Path,
+) -> dict[str, Any]:
+    if not metrics_path.is_file():
+        raise ExperimentError(
+            f"{experiment}/{treatment}: router metrics are missing: "
+            f"{metrics_path}"
+        )
+    run_dir = Path(str(summary["run_dir"]))
+    request_path = run_dir / "raw_requests.jsonl"
+    if not request_path.is_file():
+        raise ExperimentError(
+            f"{experiment}/{treatment}: raw request evidence is missing"
+        )
+    metrics = read_jsonl(metrics_path)
+    requests = read_jsonl(request_path)
+
+    expected_notice_times = sorted({
+        float(event["time_s"])
+        for event in load_trace_plan(spec)["events"]
+        if event["event"] == "preempt"
+    })
+    progress_rows = [
+        row for row in metrics
+        if row.get("type") == "instance_state"
+        and row.get("to") == "preempting"
+    ]
+    trace_groups: dict[str, dict[str, Any]] = {}
+    for notice_time in expected_notice_times:
+        matching = [
+            row for row in progress_rows
+            if abs(float(row.get("trace_event_time_s", -1) or -1)
+                   - notice_time) < 1e-6
+        ]
+        checks = {
+            "instance_hit": bool(matching),
+            "progress_observed": any(
+                bool(row.get("preemption_progress_observed"))
+                for row in matching
+            ),
+            "inflight_request": any(
+                int(row.get("preemption_inflight_request_count", 0) or 0) > 0
+                for row in matching
+            ),
+            "request_in_target_window": any(
+                int(row.get("preemption_requests_in_progress_window", 0) or 0)
+                > 0
+                for row in matching
+            ),
+        }
+        trace_groups[str(notice_time)] = {
+            "matched_instance_events": len(matching),
+            "checks": checks,
+        }
+        if not all(checks.values()):
+            raise ExperimentError(
+                f"{experiment}/{treatment}: preemption group at "
+                f"{notice_time}s failed evidence gates: "
+                f"{[name for name, passed in checks.items() if not passed]}"
+            )
+
+    flags = treatment_flags(experiment, treatment)
+    stateful = flags["recovery_policy"] == "stateful_recovery"
+    native_receipts = [
+        row for row in metrics if row.get("type") == "native_kv_receipt"
+    ]
+    if stateful:
+        native_kv = audit_native_kv_receipts(requests, metrics)
+        native_kv["covers_all_preemption_groups"] = (
+            int(native_kv["native_receipt_count"])
+            >= len(expected_notice_times)
+            and int(native_kv["source_release_count"])
+            >= len(expected_notice_times)
+        )
+        if (
+            native_kv["status"] != "native_kv_verified"
+            or not native_kv["covers_all_preemption_groups"]
+        ):
+            failed = [
+                name for name, passed in native_kv["checks"].items()
+                if not passed
+            ]
+            if not native_kv["covers_all_preemption_groups"]:
+                failed.append("native KV receipt/release per preemption group")
+            raise ExperimentError(
+                f"{experiment}/{treatment}: native KV evidence gates failed: "
+                f"{failed}"
+            )
+    else:
+        measured_ids = {
+            str(row.get("request_id")) for row in requests
+            if row.get("benchmark_phase") == "measured"
+        }
+        unexpected = [
+            row for row in native_receipts
+            if str(row.get("request_id")) in measured_ids
+        ]
+        if unexpected:
+            raise ExperimentError(
+                f"{experiment}/{treatment}: replay/control emitted native KV "
+                "receipts"
+            )
+        native_kv = {
+            "status": "not_applicable_non_stateful",
+            "native_receipt_count": 0,
+            "receipt_kind": "completed_native_request_not_early_connector_ACK",
+        }
+    return {
+        "expected_preemption_groups": len(expected_notice_times),
+        "preemption_groups": trace_groups,
+        "native_kv": native_kv,
+    }
+
+
 def validate_run_summary(
     spec: Mapping[str, Any], summary: Mapping[str, Any], experiment: str,
-    treatment: str,
-) -> None:
+    treatment: str, metrics_path: Path,
+) -> dict[str, Any]:
     if not bool(summary.get("runtime_ep_audit_verified", False)):
         raise ExperimentError(
             f"{experiment}/{treatment}: runtime EP rank/size readback failed"
         )
     if int(summary.get("trace_replay_success", 0)) != 1:
         raise ExperimentError(f"{experiment}/{treatment}: trace replay failed")
-    if int(summary.get("instances_marked_preempting", 0)) < 1:
+    expected_preemption_groups = len({
+        float(event["time_s"])
+        for event in load_trace_plan(spec)["events"]
+        if event["event"] == "preempt"
+    })
+    if int(summary.get("instances_marked_preempting", 0)) < expected_preemption_groups:
         raise ExperimentError(f"{experiment}/{treatment}: preemption was not observed")
     progress_gates = {
+        "notice groups": int(
+            summary.get("preemption_notice_events", 0)
+        ) >= expected_preemption_groups,
         "progress snapshot": int(
             summary.get("preemption_progress_observed_events", 0)
-        ) >= 1,
+        ) >= expected_preemption_groups,
         "in-flight request": int(
             summary.get("preemption_inflight_request_count", 0)
-        ) >= 1,
+        ) >= expected_preemption_groups,
         "target decode window": int(
             summary.get("preemption_requests_in_progress_window", 0)
-        ) >= 1,
+        ) >= expected_preemption_groups,
         "before decode completion": int(
             summary.get("preemption_generated_tokens_max", 0)
         ) < int(spec["workload"]["output_tokens"]),
@@ -2126,20 +2261,137 @@ def validate_run_summary(
             raise ExperimentError(
                 f"{experiment}/{treatment}: planner gates failed: {failed}"
             )
-    stateful = treatment_flags(experiment, treatment)[
-        "recovery_policy"
-    ] == "stateful_recovery"
+    flags = treatment_flags(experiment, treatment)
+    stateful = flags["recovery_policy"] == "stateful_recovery"
     restored_blocks = int(summary.get("true_kv_restored_blocks_total", 0))
-    if stateful and restored_blocks <= 0:
-        raise ExperimentError(
-            f"{experiment}/{treatment}: stateful recovery did not restore "
-            "real KV blocks"
-        )
+    if stateful:
+        kv_gates = {
+            "restore attempted": int(
+                summary.get("state_restore_attempts_total", 0)
+            ) > 0,
+            "native restore succeeded": int(
+                summary.get("true_kv_restore_successes_total", 0)
+            ) > 0,
+            "real KV blocks restored": restored_blocks > 0,
+            "raw response restored blocks": int(
+                summary.get("response_kv_restore_restored_blocks", 0)
+            ) > 0,
+            "raw response evidence": "raw_response" in str(
+                summary.get("true_kv_restore_evidence_sources", "")
+            ),
+            "no state restore fallback": int(
+                summary.get("state_restore_fallback_count", 0)
+            ) == 0,
+            "no request fallback": int(
+                summary.get("fallback_request_count", 0)
+            ) == 0,
+        }
+        failed_kv = [
+            name for name, passed in kv_gates.items() if not passed
+        ]
+        if failed_kv:
+            raise ExperimentError(
+                f"{experiment}/{treatment}: stateful KV gates failed: "
+                f"{failed_kv}"
+            )
     if not stateful and restored_blocks != 0:
         raise ExperimentError(
             f"{experiment}/{treatment}: replay/control unexpectedly restored "
             "real KV blocks"
         )
+    if not stateful and int(
+        summary.get("true_kv_restore_successes_total", 0)
+    ) != 0:
+        raise ExperimentError(
+            f"{experiment}/{treatment}: replay/control unexpectedly reported "
+            "native KV successes"
+        )
+
+    if flags["moe_reparallelization"]:
+        placement_gates = {
+            "runtime routing histogram": int(
+                summary.get("replanning_moe_route_histogram_available_events", 0)
+            ) > 0 and "vllm_runtime_topk" in str(
+                summary.get("replanning_moe_route_histogram_sources", "")
+            ),
+            "placement plan available": int(
+                summary.get(
+                    "replanning_expert_placement_plan_available_events", 0
+                )
+            ) > 0,
+            "movement observed": int(
+                summary.get(
+                    "replanning_expert_placement_plan_movement_observation_events",
+                    0,
+                )
+            ) > 0,
+            "movement fully known": int(
+                summary.get(
+                    "replanning_total_expert_placement_plan_unknown_movement_experts",
+                    0,
+                )
+            ) == 0,
+        }
+        moved_experts = int(
+            summary.get(
+                "replanning_total_expert_placement_plan_moved_experts", 0
+            )
+        )
+        if moved_experts > 0:
+            apply_attempted = int(summary.get(
+                "replanning_expert_placement_runtime_apply_attempted", 0
+            ))
+            verify_attempted = int(summary.get(
+                "replanning_expert_placement_runtime_verify_attempted", 0
+            ))
+            placement_gates.update({
+                "runtime apply hook": int(summary.get(
+                    "replanning_expert_placement_runtime_apply_hook_available", 0
+                )) > 0,
+                "runtime apply succeeded": apply_attempted > 0 and int(
+                    summary.get(
+                        "replanning_expert_placement_runtime_apply_success", 0
+                    )
+                ) == apply_attempted,
+                "runtime verify hook": int(summary.get(
+                    "replanning_expert_placement_runtime_verify_hook_available", 0
+                )) > 0,
+                "runtime verify succeeded": verify_attempted > 0 and int(
+                    summary.get(
+                        "replanning_expert_placement_runtime_verify_success", 0
+                    )
+                ) == verify_attempted,
+                "contract seen by all workers": int(summary.get(
+                    "replanning_expert_placement_runtime_contract_seen_all_workers",
+                    0,
+                )) > 0,
+                "physical weight migration": int(summary.get(
+                    "replanning_expert_placement_runtime_physical_weight_migration",
+                    0,
+                )) > 0,
+                "expert shards moved": int(summary.get(
+                    "replanning_total_expert_placement_runtime_moved_expert_shards",
+                    0,
+                )) > 0,
+                "expert bytes moved": int(summary.get(
+                    "replanning_total_expert_placement_runtime_moved_weight_bytes",
+                    0,
+                )) > 0,
+                "placement applied": int(summary.get(
+                    "replanning_expert_placement_runtime_plan_applied", 0
+                )) > 0,
+                "placement verified": int(summary.get(
+                    "replanning_expert_placement_runtime_plan_verified", 0
+                )) > 0,
+            })
+        failed_placement = [
+            name for name, passed in placement_gates.items() if not passed
+        ]
+        if failed_placement:
+            raise ExperimentError(
+                f"{experiment}/{treatment}: MoE placement gates failed: "
+                f"{failed_placement}"
+            )
     moe_migration_treatments = {
         "moe_spotserve",
         "migration_only",
@@ -2151,6 +2403,9 @@ def validate_run_summary(
         sources = str(summary.get("context_migration_moe_route_histogram_sources", ""))
         if "vllm_runtime_topk" not in sources:
             raise ExperimentError("MoE-aware run lacks runtime top-k routing evidence")
+    return audit_formal_runtime_evidence(
+        spec, summary, experiment, treatment, metrics_path
+    )
 
 
 def plan_signature_from_summary(summary: Mapping[str, Any]) -> tuple[Any, ...]:
@@ -2232,7 +2487,11 @@ def run_one_formal(
     if len(summaries) != 1:
         raise ExperimentError("one-run matrix produced an unexpected summary count")
     summary = summaries[0]
-    validate_run_summary(spec, summary, experiment, treatment)
+    matrix = read_json(matrix_path)
+    metrics_path = Path(str(matrix["runs"][0]["router_metrics_path"]))
+    validation = validate_run_summary(
+        spec, summary, experiment, treatment, metrics_path
+    )
     return {
         "status": "valid",
         "experiment": experiment,
@@ -2245,6 +2504,7 @@ def run_one_formal(
         "matrix": str(matrix_path),
         "deploy_config": str(deploy_path),
         "summary": summary,
+        "validation": validation,
     }
 
 
@@ -2311,6 +2571,32 @@ def reuse_f1_rows_for_f2(
         ledger.append(alias)
         added.append(alias)
     return added
+
+
+def formal_run_order(
+    seed: int, repeat: int, single_pass: bool
+) -> list[tuple[str, str]]:
+    """Return the pre-registered randomized order for one repeat."""
+    if single_pass:
+        cells = [
+            *(("f1", treatment) for treatment in F1_TREATMENTS),
+            ("f2", "reparallelization_only"),
+            ("f2", "migration_only"),
+        ]
+        random.Random(seed + repeat).shuffle(cells)
+        return cells
+
+    cells: list[tuple[str, str]] = []
+    for experiment, treatments in (
+        ("f1", F1_TREATMENTS),
+        ("f2", F2_TREATMENTS),
+    ):
+        ordered = list(treatments)
+        random.Random(
+            seed + repeat + (0 if experiment == "f1" else 100)
+        ).shuffle(ordered)
+        cells.extend((experiment, treatment) for treatment in ordered)
+    return cells
 
 
 def mean_sd(rows: list[Mapping[str, Any]], key: str) -> str:
@@ -2597,8 +2883,9 @@ def render_report(
         f"`{spec['experiment']['grace_period_s']} s`.",
         f"- Capacity trace: `{' -> '.join(str(value) for value in trace_plan['expected_capacity_path'])} GPU`; hard maximum "
         f"`{trace_plan['maximum_gpus']} GPU`.",
-        "- Initial unavailable GPUs are marked in the scheduler before model "
-        "deployment; physical Ray workers remain allocated.",
+        f"- Initially unavailable logical GPU slots: "
+        f"`{trace_plan.get('initially_unavailable_targets', []) or 'none (all 8 available)'}`; "
+        "physical Ray workers remain allocated throughout the logical trace.",
         "- Prefix caching: disabled; every request has a unique exact-token prompt.",
         "- Network-cost caveat: planner bandwidth is a pod-to-pod TCP proxy; "
         "runtime KV movement uses NixlConnector.",
@@ -3183,7 +3470,7 @@ def main() -> int:
     state["requested_formal_repeats"] = int(args.repeats)
     state["single_pass"] = bool(args.single_pass)
     state["unique_formal_gpu_runs_expected"] = (
-        6 if args.single_pass else 8 * int(args.repeats)
+        (6 if args.single_pass else 8) * int(args.repeats)
     )
     hardware: dict[str, Any] | None = None
     profiles: list[dict[str, Any]] = []
@@ -3354,46 +3641,42 @@ def main() -> int:
             if row.get("stage") == "formal" and row.get("status") == "valid"
         }
         seed = int(spec["experiment"].get("order_seed", 20261002))
-        formal_groups = (
-            (
-                ("f1", F1_TREATMENTS),
-                ("f2", ("reparallelization_only", "migration_only")),
+        for repeat in range(
+            1, int(spec["experiment"]["formal_repeats"]) + 1
+        ):
+            ordered_cells = formal_run_order(
+                seed, repeat, bool(args.single_pass)
             )
-            if args.single_pass
-            else (("f1", F1_TREATMENTS), ("f2", F2_TREATMENTS))
-        )
-        for experiment, treatments in formal_groups:
-            for repeat in range(
-                1, int(spec["experiment"]["formal_repeats"]) + 1
-            ):
-                if args.single_pass and experiment == "f2":
-                    if reuse_f1_rows_for_f2(ledger, repeat):
-                        write_json(ledger_path, ledger)
-                    completed = {
-                        (row.get("experiment"), row.get("treatment"), row.get("repeat"))
-                        for row in ledger
-                        if row.get("stage") == "formal"
-                        and row.get("status") == "valid"
-                    }
-                ordered = list(treatments)
-                random.Random(seed + repeat + (0 if experiment == "f1" else 100)).shuffle(ordered)
-                for treatment in ordered:
-                    key = (experiment, treatment, repeat)
-                    if key in completed:
-                        continue
-                    row = run_one_formal(
-                        spec, hardware, capability, prompts, output, endpoint,
-                        args.ray_address, args.ray_namespace, experiment,
-                        treatment, repeat,
-                    )
-                    row["stage"] = "formal"
-                    ledger.append(row)
-                    completed.add(key)
+            for experiment, treatment in ordered_cells:
+                key = (experiment, treatment, repeat)
+                if key in completed:
+                    continue
+                row = run_one_formal(
+                    spec, hardware, capability, prompts, output, endpoint,
+                    args.ray_address, args.ray_namespace, experiment,
+                    treatment, repeat,
+                )
+                row["stage"] = "formal"
+                row["execution_order"] = ordered_cells.index(key[:2]) + 1
+                ledger.append(row)
+                completed.add(key)
+                write_json(ledger_path, ledger)
+                render_report(
+                    spec, output, hardware, profiles, pilot_gate, ledger,
+                    "formal_running",
+                )
+            if args.single_pass:
+                if reuse_f1_rows_for_f2(ledger, repeat):
                     write_json(ledger_path, ledger)
-                    render_report(
-                        spec, output, hardware, profiles, pilot_gate, ledger,
-                        "formal_running",
+                completed = {
+                    (
+                        row.get("experiment"), row.get("treatment"),
+                        row.get("repeat"),
                     )
+                    for row in ledger
+                    if row.get("stage") == "formal"
+                    and row.get("status") == "valid"
+                }
         state["status"] = "passed"
         state["contribution"] = contribution_result(
             ledger, int(spec["experiment"]["formal_repeats"])

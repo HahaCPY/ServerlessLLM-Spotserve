@@ -5,7 +5,10 @@ import copy
 import pytest
 
 from sllm.backends.vllm_response_state import completed_response_tokens
-from sllm.spot.core_validation import audit_live_kv_core
+from sllm.spot.core_validation import (
+    audit_live_kv_core,
+    audit_native_kv_receipts,
+)
 
 
 def evidence():
@@ -42,6 +45,23 @@ def test_audited_live_kv_is_not_claimed_as_full_spotserve():
     assert all(result["checks"].values())
     assert result["full_spotserve_verified"] is False
     assert "persistent_context_owner" in result["not_verified"]
+
+
+def test_native_kv_receipt_audit_checks_raw_response_and_release_order():
+    _, recovery, metrics, _, _, _, _ = evidence()
+    result = audit_native_kv_receipts(recovery, metrics)
+
+    assert result["status"] == "native_kv_verified"
+    assert all(result["checks"].values())
+    assert result["native_receipt_count"] == 1
+    assert result["receipt_kind"] == (
+        "completed_native_request_not_early_connector_ACK"
+    )
+
+    recovery[0]["response"]["_spotserve_kv_restore"]["restored_blocks"] = 0
+    blocked = audit_native_kv_receipts(recovery, metrics)
+    assert blocked["status"] == "blocked"
+    assert not blocked["checks"]["native_cached_prefix_observed"]
 
 
 @pytest.mark.parametrize("failure", [

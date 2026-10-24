@@ -1,4 +1,103 @@
-"""Evidence gates for a live-KV/dynamic-target probe, not full paper parity."""
+"""Evidence gates for live-KV experiments, not full paper parity."""
+
+
+def audit_native_kv_receipts(recovery_rows, metrics):
+    """Validate native KV completion receipts and source-release ordering.
+
+    This deliberately validates completed-request receipts.  It must not be
+    described as an early connector transfer acknowledgment.
+    """
+    measured_rows = [
+        row for row in recovery_rows
+        if row.get("benchmark_phase") == "measured"
+    ]
+    measured = {
+        str(row.get("request_id")): row
+        for row in measured_rows
+        if row.get("request_id") not in (None, "")
+    }
+    unique_requests = bool(measured) and len(measured) == len(measured_rows)
+    receipts = [
+        row for row in metrics
+        if row.get("type") == "native_kv_receipt"
+        and str(row.get("request_id")) in measured
+    ]
+    native = bool(receipts) and all(
+        int(row.get("cached_tokens", 0) or 0) > 0
+        and int(row.get("restored_blocks", 0) or 0) > 0
+        and bool(row.get("source_instance_id"))
+        and bool(row.get("target_instance_id"))
+        and row.get("source_instance_id") != row.get("target_instance_id")
+        and bool(
+            measured[str(row["request_id"])]
+            .get("response", {})
+            .get("_spotserve_kv_restore", {})
+            .get("restored")
+        )
+        and int(
+            measured[str(row["request_id"])]
+            .get("response", {})
+            .get("_spotserve_kv_restore", {})
+            .get("cached_tokens", 0)
+            or 0
+        ) > 0
+        and int(
+            measured[str(row["request_id"])]
+            .get("response", {})
+            .get("_spotserve_kv_restore", {})
+            .get("restored_blocks", 0)
+            or 0
+        ) > 0
+        for row in receipts
+    )
+    request_metrics = [
+        row for row in metrics
+        if row.get("type") == "request"
+        and str(row.get("request_id")) in measured
+    ]
+    no_replay = (
+        unique_requests
+        and {str(row.get("request_id")) for row in request_metrics}
+        == set(measured)
+        and len(request_metrics) == len(measured)
+        and all(
+            row.get("success")
+            and row.get("recovery_fallback") is False
+            and row.get("state_restore_fallback") is False
+            for row in request_metrics
+        )
+    )
+    releases = [
+        row for row in metrics
+        if row.get("type") == "native_kv_source_release_authorized"
+    ]
+    release_order = bool(receipts) and all(
+        any(
+            receipt.get("request_id") in row.get("request_ids", [])
+            and receipt.get("source_instance_id")
+            in row.get("source_instance_ids", [])
+            and isinstance(row.get("deadline_time_s"), (int, float))
+            and 0 < float(receipt.get("timestamp", 0) or 0)
+            <= float(row.get("timestamp", 0) or 0)
+            <= float(row["deadline_time_s"])
+            for row in releases
+        )
+        for receipt in receipts
+    )
+    checks = {
+        "unique_measured_requests": unique_requests,
+        "native_cached_prefix_observed": native,
+        "no_token_replay_fallback": no_replay,
+        "source_release_after_native_receipt_before_deadline": release_order,
+    }
+    return {
+        "status": "native_kv_verified" if all(checks.values()) else "blocked",
+        "checks": checks,
+        "measured_request_count": len(measured),
+        "native_receipt_count": len(receipts),
+        "source_release_count": len(releases),
+        "receipt_kind": "completed_native_request_not_early_connector_ACK",
+    }
 
 
 def audit_live_kv_core(baseline_rows, recovery_rows, metrics, initial, final,
