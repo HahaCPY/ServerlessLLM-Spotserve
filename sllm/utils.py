@@ -150,12 +150,23 @@ def control_plane_placement_options() -> Dict[str, Any]:
     current_node_cpu = float(
         (current_node or {}).get("Resources", {}).get("CPU", 0) or 0
     )
+    cpu_less_internal_head = any(
+        float(
+            node.get("Resources", {}).get("node:__internal_head__", 0) or 0
+        )
+        > 0
+        and float(node.get("Resources", {}).get("CPU", 0) or 0) <= 0
+        for node in alive_nodes
+    )
+    cpu_worker_exists = any(
+        float(node.get("Resources", {}).get("CPU", 0) or 0) > 0
+        for node in alive_nodes
+    )
     requires_cpu_fallback = (
-        current_node is not None
-        and current_node_cpu <= 0
-        and any(
-            float(node.get("Resources", {}).get("CPU", 0) or 0) > 0
-            for node in alive_nodes
+        cpu_worker_exists
+        and (
+            cpu_less_internal_head
+            or (current_node is not None and current_node_cpu <= 0)
         )
     )
     if not _managed_ray_fallback_enabled() and not requires_cpu_fallback:
