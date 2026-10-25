@@ -72,13 +72,21 @@ def is_allowed_file(path: Path) -> bool:
 
 
 def add_file(archive: tarfile.TarFile, source: Path, archive_name: str) -> None:
-    info = archive.gettarinfo(str(source), arcname=archive_name)
+    # CSCC Project Build rejects symbolic-link entries in uploaded contexts.
+    # Preserve the archive path while materializing a file symlink's target as
+    # an ordinary file.  This is required for sllm_store's storage.proto link.
+    archive_source = source.resolve(strict=True) if source.is_symlink() else source
+    info = archive.gettarinfo(str(archive_source), arcname=archive_name)
+    if not info.isreg():
+        raise ValueError(
+            f"build context entry must be a regular file: {source}"
+        )
     info.uid = 0
     info.gid = 0
     info.uname = "root"
     info.gname = "root"
     info.mtime = 0
-    with source.open("rb") as handle:
+    with archive_source.open("rb") as handle:
         archive.addfile(info, handle)
 
 
