@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1.7
-
 ARG RAY_BASE_IMAGE=docker.io/rayproject/ray:2.58.0-py311-gpu
 ARG PYTORCH_BUILD_IMAGE=docker.io/pytorch/pytorch:2.9.0-cuda12.8-cudnn9-devel
 
