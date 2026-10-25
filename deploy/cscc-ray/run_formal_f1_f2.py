@@ -32,14 +32,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--port", type=int, default=8343)
     parser.add_argument(
+        "--gpu-wait-timeout-s",
+        type=float,
+        default=float(os.getenv("WAIT_SECONDS", "0")),
+        help="Seconds to wait for all GPU bundles; 0 waits indefinitely.",
+    )
+    parser.add_argument(
         "--startup-timeout-s",
         type=float,
-        default=float(os.getenv("WAIT_SECONDS", "3600")),
+        default=3600.0,
+        help="ServerlessLLM startup timeout after all GPU workers are ready.",
     )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     if args.workers != 8:
         parser.error("the formal protocol requires exactly 8 GPU workers")
+    if args.gpu_wait_timeout_s < 0:
+        parser.error("--gpu-wait-timeout-s must be non-negative")
     if args.startup_timeout_s <= 0:
         parser.error("--startup-timeout-s must be positive")
     return args
@@ -142,10 +151,12 @@ def hold_eight_gpu_nodes(ray: Any, worker_count: int, timeout_s: float):
         flush=True,
     )
     ready_ref = group.ready()
-    deadline = time.monotonic() + timeout_s
+    deadline = None if timeout_s == 0 else time.monotonic() + timeout_s
     while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
+        remaining = (
+            None if deadline is None else deadline - time.monotonic()
+        )
+        if remaining is not None and remaining <= 0:
             snapshot = {
                 "phase": "placement_group_timeout",
                 "workers": worker_count,
@@ -172,7 +183,9 @@ def hold_eight_gpu_nodes(ray: Any, worker_count: int, timeout_s: float):
                 f"with {worker_count} GPU bundles"
             )
         ready, _ = ray.wait(
-            [ready_ref], num_returns=1, timeout=min(15.0, remaining)
+            [ready_ref],
+            num_returns=1,
+            timeout=(15.0 if remaining is None else min(15.0, remaining)),
         )
         if ready:
             ray.get(ready_ref)
@@ -182,7 +195,11 @@ def hold_eight_gpu_nodes(ray: Any, worker_count: int, timeout_s: float):
             + json.dumps(
                 {
                     "phase": "placement_group_pending",
-                    "remaining_s": round(remaining, 1),
+                    "remaining_s": (
+                        "unbounded"
+                        if remaining is None
+                        else round(remaining, 1)
+                    ),
                     "cluster_gpu": ray.cluster_resources().get("GPU", 0),
                     "available_gpu": ray.available_resources().get("GPU", 0),
                     "alive_gpu_nodes": sum(
@@ -343,6 +360,8 @@ def main() -> int:
         "status": "provisioning_gpu_workers",
         "phase": "gpu_provisioning",
         "workers": args.workers,
+        "gpu_wait_timeout_s": args.gpu_wait_timeout_s,
+        "server_startup_timeout_s": args.startup_timeout_s,
         "model": args.model,
         "config": str(config_path),
         "unique_formal_gpu_runs": 6,
@@ -363,7 +382,7 @@ def main() -> int:
     try:
         ray.init(address="auto", namespace="sllm", ignore_reinit_error=True)
         worker_rows, keepers = hold_eight_gpu_nodes(
-            ray, args.workers, args.startup_timeout_s
+            ray, args.workers, args.gpu_wait_timeout_s
         )
     except BaseException as exc:
         status.update(

@@ -86,13 +86,16 @@ PY
 ```bash
 ray job submit \
   --no-wait \
-  --runtime-env-json '{"env_vars":{"N_GPUS":"8","WAIT_SECONDS":"3600"}}' \
+  --runtime-env-json '{"env_vars":{"N_GPUS":"8","WAIT_SECONDS":"0"}}' \
   -- \
   bash -lc 'cd /home/ps2026004/ServerlessLLM-Spotserve && python -u deploy/cscc-ray/run_formal_f1_f2.py --model /home/ps2026004/models/Qwen1.5-MoE-A2.7B-Chat --output-dir results/cscc_ray_20261024/formal_f1_f2_single_01'
 ```
 
 `X-CSCC-Gang: true` 讓平台在 8 張 GPU 尚未同時可用時一張都不啟動；8 張到齊後，程式內
-的 8-bundle placement group 才會 ready 並開始 preflight/profile/formal runs。第一次建立
+的 8-bundle placement group 才會 ready 並開始 preflight/profile/formal runs。
+`WAIT_SECONDS=0` 表示 placement group 不設使用者端 timeout；它會等待到 ready，或直到你
+執行 `ray job stop <job-id>`／在 Ray 分頁結束 session。平台本身的 project、queue 與最長
+24 小時 session 上限仍然有效，程式無法把平台期限改成真正無限。第一次建立
 session 若在兩分鐘內未完成，CLI 可能回 `503`；只有在**沒有拿到 job ID**時才依
 `Retry-After` 重送相同 submit。拿到 job ID 後不可重送。
 

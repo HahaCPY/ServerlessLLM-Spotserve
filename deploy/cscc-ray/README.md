@@ -263,6 +263,8 @@ off/off 與 on/on，所以 F2 引用這兩列，只需 6 次唯一 formal GPU ru
 `X-CSCC-Gang: true`。平台會等 8 張 GPU 同時可用才一起啟動 workers；程式內再以八個
 `{"CPU": 1, "GPU": 1}` bundles 的 placement group 作第二層 fail-closed gate。詳見
 [CSCC gang scheduling](https://www.cs.nthu.edu.tw/~cscc/site/manual/zh/use-cases/ray-placement-group-gang/)。
+正式命令使用 `WAIT_SECONDS=0`，代表程式端不設 GPU 等待期限；平台本身的 session/queue
+最長執行時間仍然有效。
 
 完整命令、輸出與解讀限制見 [FORMAL_F1_F2.md](FORMAL_F1_F2.md)。
 
