@@ -132,7 +132,7 @@ def worker_placement_options(
 
 
 def control_plane_placement_options() -> Dict[str, Any]:
-    """Keep control actors on the Ray head when custom resources are absent."""
+    """Prefer the Ray head for control actors, with a worker fallback."""
     for node in _alive_ray_nodes():
         if float(node.get("Resources", {}).get("control_node", 0) or 0) > 0:
             return {"resources": {"control_node": 0.1}}
@@ -143,7 +143,12 @@ def control_plane_placement_options() -> Dict[str, Any]:
     current_node_id = str(ray.get_runtime_context().get_node_id())
     return {
         "scheduling_strategy": NodeAffinitySchedulingStrategy(
-            node_id=current_node_id, soft=False
+            # Managed Ray heads may deliberately expose no CPU resource.  A
+            # hard affinity then makes a num_cpus=1 controller impossible to
+            # schedule even when all GPU workers are healthy.  Prefer the
+            # driver node, but allow Ray to place the actor on a worker that
+            # has CPU capacity.
+            node_id=current_node_id, soft=True
         )
     }
 
