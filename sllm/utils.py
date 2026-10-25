@@ -133,14 +133,35 @@ def worker_placement_options(
 
 def control_plane_placement_options() -> Dict[str, Any]:
     """Prefer the Ray head for control actors, with a worker fallback."""
-    for node in _alive_ray_nodes():
+    alive_nodes = _alive_ray_nodes()
+    for node in alive_nodes:
         if float(node.get("Resources", {}).get("control_node", 0) or 0) > 0:
             return {"resources": {"control_node": 0.1}}
-    if not _managed_ray_fallback_enabled():
+
+    current_node_id = str(ray.get_runtime_context().get_node_id())
+    current_node = next(
+        (
+            node
+            for node in alive_nodes
+            if str(node.get("NodeID") or "") == current_node_id
+        ),
+        None,
+    )
+    current_node_cpu = float(
+        (current_node or {}).get("Resources", {}).get("CPU", 0) or 0
+    )
+    requires_cpu_fallback = (
+        current_node is not None
+        and current_node_cpu <= 0
+        and any(
+            float(node.get("Resources", {}).get("CPU", 0) or 0) > 0
+            for node in alive_nodes
+        )
+    )
+    if not _managed_ray_fallback_enabled() and not requires_cpu_fallback:
         return {"resources": {"control_node": 0.1}}
     from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
-    current_node_id = str(ray.get_runtime_context().get_node_id())
     return {
         "scheduling_strategy": NodeAffinitySchedulingStrategy(
             # Managed Ray heads may deliberately expose no CPU resource.  A
